@@ -1,12 +1,12 @@
-# esp32-jk1dvplog
-
-手のひらサイズのアマチュア無線　コンテストロガーです。
+# dvplogger
+field companion for ham radio operator
+手のひらサイズのアマチュア無線家のためのフィールド支援ツール、コンテストロガーです。
 
 Release にマニュアル、ログ変換プログラム、内蔵Bluetooth モデム用プログラム(Arduino)を置いています。
 
 # License
-下記の通りGPLv2です。
-/* Copyright (c) 2021-2024 Eiichiro Araki
+下記の通りGPLv2 or laterです。
+/* Copyright (c) 2021-2025 Eiichiro Araki
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
 as published by the Free Software Foundation; either version 2
