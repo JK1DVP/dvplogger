@@ -48,25 +48,25 @@ git clone -b 2.0.17 --recursive https://github.com/espressif/arduino-esp32 ./com
 
 その上で、メインCPU用のプログラムを
 
-cd dvplogger
-idf.py build flash monitor
+cd dvplogger<br>
+idf.py build flash monitor<br>
 
 すれば、ビルドして書き込みまでできるはずです。
 
 [注意] 本システムのメインCPUのプログラムはmini 版とwide版でビルドを分けることが必要です。
 ビルド前に
 
-dvplogger/main/decl.h に
-\#define JK1DVPLOG_HWVER
-の記述がありますので、mini版の方は
-\#define JK1DVPLOG_HWVER 1
-、Wide版の方は
-\#define JK1DVPLOG_HWVER 3
+dvplogger/main/decl.h に<br>
+\#define JK1DVPLOG_HWVER<br>
+の記述がありますので、mini版の方は<br>
+\#define JK1DVPLOG_HWVER 1<br>
+、Wide版の方は<br>
+\#define JK1DVPLOG_HWVER 3<br>
 とコメントアウトを外してください。
 
-サブCPUのプログラムの方は、同様に
-cd dvplogger_ext
-idf.py build
+サブCPUのプログラムの方は、同様に<br>
+cd dvplogger_ext<br>
+idf.py build<br>
 することにより、dvplogger_ext にapp0.bin , bootload.bin, parttio.bin, spiffs.bin のそれぞれシンボリックリンク先の実態ができていると思います。
 これをdvplogger のWebサーバーにアクセスし、DVPloggerのSDメモリにアップロードをしてください。
 そのうえで、dvploggerのターミナル接続(idf.py monitorなどでやると良いでしょう）から、flashersd app0 boot part spiffs [Enter]とコマンドを打つことで、サブCPUへのflash書き込みができるようになっています。
