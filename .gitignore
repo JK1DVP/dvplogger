@@ -1,4 +1,4 @@
-# 除外: Arduino-ESP32本体
+# 除外: Arduino-ESP31本体
 dvplogger/components/arduino/*
 dvplogger/arduino-esp32/*
 

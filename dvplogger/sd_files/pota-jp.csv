@@ -1,0 +1,1188 @@
+reference,name,latitude,longitude,grid,locationDesc,attempts,activations,qsos,my_activations,my_hunted_qsos
+JP-0001,Rishiri-Rebun-Sarobetsu National Park,45.1942,141.239,QN05oe,JP-HK,25,17,654,0,0
+JP-0002,Shiretoko National Park,44.165,145.205,QN24od,JP-HK,11,11,373,0,0
+JP-0003,Akan-Mashu National Park,43.4362,144.103,QN23bk,JP-HK,34,29,731,0,0
+JP-0004,Kushiroshitsugen National Park,43.1383,144.445,QN23fd,JP-HK,55,23,728,0,0
+JP-0005,Daisetsuzan National Park,43.6717,142.907,QN13kq,JP-HK,42,38,961,0,0
+JP-0006,Shikotsu-Toya National Park,42.7959,141.221,QN02ot,JP-HK,55,46,1341,0,0
+JP-0007,Towada-Hachimantai National Park,40.2442,140.939,QN00lf,"JP-AK,JP-AO,JP-IW",84,68,2423,0,0
+JP-0008,Sanriku Fukko National Park,39.0046,141.585,QM09ta,"JP-AO,JP-IW,JP-MG",262,244,11165,0,0
+JP-0009,Bandai-Asahi National Park,37.8229,139.74,PM97ut,"JP-FS,JP-NI,JP-YT",229,196,7225,0,0
+JP-0010,Nikko National Park,36.8763,139.464,PM96rv,"JP-FS,JP-GM,JP-TC",460,418,17538,0,3
+JP-0011,Oze National Park,36.9382,139.287,PM96pw,"JP-FS,JP-GM,JP-NI,JP-TC",46,44,1513,0,0
+JP-0012,Joshinetsu Kogen National Park,36.6919,138.519,PM96gq,"JP-GM,JP-NI,JP-NN",399,346,12400,0,1
+JP-0013,Myoko-Togakushi renzan National Park,36.8364,138.077,PM96au,"JP-NI,JP-NN",75,71,2134,0,0
+JP-0014,Chichibu-Tama-Kai National Park,35.8593,138.863,PM95ku,"JP-NN,JP-ST,JP-TK,JP-YN",922,822,45295,0,9
+JP-0015,Ogasawara National Park,27.0671,142.211,QL17cb,JP-OG,7,7,457,0,0
+JP-0016,Fuji-Hakone-Izu National Park,35.2347,139.022,PM95mf,"JP-KN,JP-SZ,JP-TK,JP-YN",1577,1238,58829,0,31
+JP-0017,Chubusangaku National Park,36.449,137.622,PM86tk,"JP-GF,JP-NI,JP-NN,JP-TY",116,94,2595,0,0
+JP-0018,Hakusan National Park,36.1579,136.765,PM86jd,"JP-FI,JP-GF,JP-IS,JP-TY",50,47,1453,0,0
+JP-0019,Minami Alps National Park,35.6421,138.217,PM95cp,"JP-NN,JP-SZ,JP-YN",30,25,590,0,0
+JP-0020,Ise-Shima National Park,34.426,136.802,PM84jk,JP-ME,91,79,3631,0,0
+JP-0021,Yoshino-Kumano National Park,33.6542,135.659,PM73tp,"JP-ME,JP-NR,JP-WK",94,88,3221,0,1
+JP-0022,San'inkaigan National Park,35.6485,134.65,PM75hp,"JP-HG,JP-KY,JP-TT",73,67,2992,0,0
+JP-0023,Setonaikai National Park,34.2796,133.229,PM64og,"JP-EH,JP-FO,JP-HG,JP-HS,JP-KG,JP-OS,JP-OT,JP-OY,JP-TS,JP-WK,JP-YC",1050,908,30569,0,0
+JP-0024,Daisen-Oki National Park,35.4072,133.543,PM65sj,"JP-OY,JP-SM,JP-TT",88,78,3338,0,0
+JP-0025,Ashizuri-Uwakai National Park,32.7791,132.979,PM62ls,"JP-EH,JP-KC",52,46,7829,0,5
+JP-0026,Saikai National Park,33.1642,129.677,PM43ud,JP-NS,22,17,563,0,0
+JP-0027,Unzen-Amakusa National Park,32.7105,130.273,PM52dr,"JP-KM,JP-KS,JP-NS",33,29,2182,0,0
+JP-0028,Aso-Kuju National Park,32.9499,131.086,PM52nw,"JP-KM,JP-OT",101,87,4727,0,1
+JP-0029,Kirishima-Kinkowan National Park,31.9211,130.877,PM51kw,"JP-KS,JP-MZ",50,43,2009,0,0
+JP-0030,Yakushima (Island) National Park,30.3261,130.53,PM50gh,JP-KS,5,3,136,0,0
+JP-0031,Amamigunto National Park,28.2426,129.309,PL48pf,JP-KS,19,18,988,0,0
+JP-0032,Yambaru National Park,26.7286,128.221,PL46cr,JP-ON,12,12,369,0,0
+JP-0033,Keramashoto National Park,26.202,127.36,PL36qe,JP-ON,7,6,184,0,0
+JP-0034,Iriomote-Ishigaki National Park,24.3515,123.924,PL14xi,JP-ON,65,34,2611,0,0
+JP-0101,Shokanbetsu-Teuri-Yagishiri Quasi-National Park,43.7292,141.542,QN03sr,JP-HK,14,13,882,0,0
+JP-0102,Abashiri Quasi-National Park,44.1892,143.748,QN14ue,JP-HK,19,18,533,0,0
+JP-0103,Niseko-Shakotan-Otaru Kaigan Quasi-National Park,42.8973,140.57,QN02gv,JP-HK,27,27,1288,0,0
+JP-0105,Onuma Quasi-National Park,41.9858,140.669,QN01ix,JP-HK,9,9,517,0,0
+JP-0106,Shimokita Hanto Quasi-National Park,41.3286,141.06,QN01mh,JP-AO,18,18,964,0,0
+JP-0107,Tsugaru Quasi-National Park,41.2536,140.345,QN01eg,JP-AO,46,44,1647,0,0
+JP-0108,Hayachine Quasi-National Park,39.5432,141.492,QM09rn,JP-IW,15,14,499,0,0
+JP-0109,Kurikoma Quasi-National Park,38.9447,140.805,QM08jw,"JP-AK,JP-IW,JP-MG,JP-YT",63,60,2375,0,0
+JP-0110,Zao Quasi-National Park,38.1479,140.45,QM08fd,"JP-MG,JP-YT",276,245,9880,0,0
+JP-0111,Oga Quasi-National Park,39.8873,139.777,PM99vv,JP-AK,39,34,1243,0,0
+JP-0112,Chokai Quasi-National Park,39.0781,140.041,QM09ab,"JP-AK,JP-YT",46,41,1779,0,0
+JP-0113,Echigo sanzan-Tadami Quasi-National Park,37.2688,139.051,PM97mg,"JP-FS,JP-NI",68,62,2490,0,0
+JP-0114,Suigo-Tsukuba Quasi-National Park,35.99,140.474,QM05fx,"JP-CH,JP-IB",897,773,52184,0,24
+JP-0115,Myogi-Arafune-Saku Kogen Quasi-National Park,36.2934,138.842,PM96kh,"JP-GM,JP-NN",102,94,5059,0,0
+JP-0116,Minami-Boso Quasi-National Park,35.1161,140.122,QM05bc,JP-CH,371,333,22015,0,9
+JP-0117,Meiji no Mori Takao Quasi-National Park,35.6334,139.266,PM95pp,JP-TK,105,88,3048,0,0
+JP-0118,Tanzawa-Oyama Quasi-National Park,35.4105,139.21,PM95oj,JP-KN,216,188,12543,0,10
+JP-0119,Sado-Yahiko-Yoneyama Quasi-National Park,38.1614,138.324,PM98dd,JP-NI,30,27,1455,0,0
+JP-0120,Noto Hanto Quasi-National Park,37.5256,137.257,PM87pm,"JP-IS,JP-TY",88,83,3255,0,0
+JP-0121,Echizen-Kaga Kaigan Quasi-National Park,36.249,136.199,PM86cf,"JP-FI,JP-IS",63,61,2369,0,0
+JP-0122,Wakasa Wan Quasi-National Park,35.5781,135.875,PM75wn,"JP-FI,JP-KY",83,77,5653,0,2
+JP-0123,Yatsugatake-Chushin Kogen Quasi-National Park,35.9981,138.358,PM95ex,"JP-NN,JP-YN",1221,712,21511,0,0
+JP-0124,Chuo Alps Quasi-National Park,35.7901,137.811,PM85vs,JP-NN,68,63,2038,0,0
+JP-0125,Tenryu-Okumikawa Quasi-National Park,35.1872,137.757,PM85ve,"JP-AI,JP-NN,JP-SZ",160,143,5821,0,1
+JP-0126,Ibi-Sekigahara-Yoro Quasi-National Park,35.2942,136.509,PM85gh,JP-GF,222,180,11310,0,4
+JP-0127,Hida-Kisogawa Quasi-National Park,35.7334,137.203,PM85or,"JP-AI,JP-GF",136,127,4123,0,0
+JP-0128,Aichi Kogen Quasi-National Park,35.0331,137.41,PM85qa,JP-AI,322,290,8071,0,0
+JP-0129,Mikawa Wan Quasi-National Park,34.8155,137.233,PM84ot,JP-AI,956,854,21412,0,0
+JP-0130,Suzuka Quasi-National Park,35.0769,136.339,PM85eb,"JP-ME,JP-SH",110,99,2378,0,0
+JP-0131,Muro-Akame-Aoyama Quasi-National Park,34.5597,136.092,PM84bn,"JP-ME,JP-NR",627,415,15329,0,1
+JP-0132,Biwako Quasi-National Park,35.2377,136.166,PM85bf,"JP-KY,JP-SH",284,249,7866,0,0
+JP-0133,Tango-Amanohashidate-Oeyama Quasi-National Park,35.5669,135.19,PM75on,JP-KY,70,66,3641,0,0
+JP-0134,Kyoto Tamba Kogen Quasi-National Park,35.2765,135.589,PM75tg,JP-KY,62,60,2492,0,0
+JP-0135,Meiji no Mori Mino Quasi-National Park,34.8577,135.478,PM74ru,JP-OS,69,64,1764,0,0
+JP-0136,Kongo-Ikoma-Kisen Quasi-National Park,34.4607,135.687,PM74ul,"JP-NR,JP-OS,JP-WK",498,453,11647,0,0
+JP-0137,Hyonosen-Ushiroyama-Nagisan Quasi-National Park,35.4969,134.471,PM75fl,"JP-HG,JP-OY,JP-TT",44,42,1511,0,0
+JP-0138,Yamato-Aogaki Quasi-National Park,34.5394,135.857,PM74wm,JP-NR,69,60,1382,0,0
+JP-0139,Koya-Ryujin Quasi-National Park,34.0765,135.56,PM74sb,"JP-NR,JP-WK",72,71,1908,0,0
+JP-0140,Hiba-Dogo-Taishaku Quasi-National Park,35.0732,133.057,PM65mb,"JP-HS,JP-SM,JP-TT",40,35,1273,0,0
+JP-0141,Nishi-Chugoku Sanchi Quasi-National Park,34.5624,132.025,PM64an,"JP-HS,JP-SM,JP-YC",54,41,2342,0,0
+JP-0142,Kita-Nagato Kaigan Quasi-National Park,34.5321,131.499,PM54rm,JP-YC,32,32,1872,0,0
+JP-0143,Akiyoshidai Quasi-National Park,34.2499,131.304,PM54pf,JP-YC,16,16,800,0,0
+JP-0144,Tsurugisan Quasi-National Park,33.9177,133.805,PM63vw,"JP-KC,JP-TS",44,39,3350,0,0
+JP-0145,Muroto-Anan Kaigan Quasi-National Park,33.8353,134.747,PM73iu,"JP-KC,JP-TS",80,79,4986,0,0
+JP-0146,Ishizuchi Quasi-National Park,33.7667,133.114,PM63ns,"JP-EH,JP-KC",21,18,775,0,0
+JP-0147,Kitakyushu Quasi-National Park,33.8461,130.794,PM53ju,JP-FO,21,20,1366,0,0
+JP-0148,Genkai Quasi-National Park,33.58,130.097,PM53bn,"JP-FO,JP-NS,JP-SG",56,50,1846,0,0
+JP-0149,Yaba-Hita-Hikosan Quasi-National Park,33.5144,131.005,PM53mm,"JP-FO,JP-KM,JP-OT",37,35,1706,0,0
+JP-0150,Iki-Tsushima Quasi-National Park,33.7412,129.708,PM43ur,JP-NS,9,9,507,0,0
+JP-0151,Kyushu Chuo Sanchi Quasi-National Park,32.5319,131.023,PM52mm,"JP-KM,JP-MZ",20,18,1009,0,0
+JP-0152,Nippo Kaigan Quasi-National Park,33.0578,132.007,PM63ab,"JP-MZ,JP-OT",83,73,4453,0,0
+JP-0153,Sobo-Katamuki Quasi-National Park,32.8359,131.431,PM52ru,"JP-MZ,JP-OT",25,22,1605,0,0
+JP-0154,Nichinan Kaigan Quasi-National Park,31.8034,131.469,PM51rt,"JP-KS,JP-MZ",251,246,7983,0,0
+JP-0155,Koshikishima Quasi-National Park,31.8617,129.877,PM41wu,JP-KS,8,7,822,0,0
+JP-0156,Okinawa Kaigan Quasi-National Park,26.778,128.213,PL46cs,JP-ON,35,31,1168,0,0
+JP-0157,Okinawa Senseki Quasi-National Park,26.088,127.699,PL36uc,JP-ON,27,25,525,0,0
+JP-0201,Takino Suzuran Hillside National Government Park,42.9109,141.38,QN02qv,JP-HK,12,12,312,0,0
+JP-0202,Michinoku Lakewood National Government Park,38.1848,140.672,QM08ie,JP-MG,33,33,1143,0,0
+JP-0203,Hitachi Seaside National Government Park,36.4029,140.598,QM06hj,JP-IB,24,22,505,0,0
+JP-0204,Musashi-Kyuryo National Government Park,36.0836,139.369,PM96qc,JP-ST,31,30,797,0,0
+JP-0205,Showa Kinen National Government Park,35.7108,139.396,PM95qr,JP-TK,115,98,2328,0,0
+JP-0206,The Tokyo Rinkai Disaster Prevention National Government Park,35.6355,139.796,PM95vp,JP-TK,90,81,1211,0,0
+JP-0207,Echigo Hillside National Government Park,37.4174,138.746,PM97ik,JP-NI,13,12,389,0,0
+JP-0208,Alps Azumino National Government Park,36.315,137.842,PM86wh,JP-NN,59,56,1284,0,0
+JP-0209,Kiso Sansen National Government Park,35.3578,136.813,PM85ji,"JP-AI,JP-GF,JP-ME",439,377,10157,0,0
+JP-0210,Yodogawa Riverside National Government Park,34.7446,135.558,PM74sr,"JP-KY,JP-OS",206,193,5295,0,0
+JP-0211,Akashi Kaikyo National Government Park,34.5628,135.011,PM74mn,JP-HG,17,17,345,0,0
+JP-0213,Asuka Historical National Government Park,34.4654,135.804,PM74vl,JP-NR,53,53,1112,0,0
+JP-0214,Bihoku Hillside National Government Park,34.8385,132.997,PM64lu,JP-HS,17,16,419,0,0
+JP-0215,Sanuki Manno National Government Park,34.1648,133.891,PM64wd,JP-KG,18,18,402,0,0
+JP-0216,Uminonakamichi Seaside National Government Park,33.655,130.356,PM53ep,JP-FO,21,19,471,0,0
+JP-0217,Yoshinogari Historical National Government Park,33.3242,130.384,PM53eh,JP-SG,12,12,575,0,0
+JP-0218,Okinawa Kinen National Government Park,26.6919,127.88,PL36wq,JP-ON,17,15,404,0,0
+JP-1001,Akkeshi-Kiritappu-Konbumori Quasi-National Park,43.0169,144.838,QN23ka,JP-HK,30,11,567,0,0
+JP-1002,Furano-Ashibetsu Prefectural Nature Park,43.2133,142.284,QN13df,JP-HK,51,51,1113,0,0
+JP-1003,Hiyama Prefectural Nature Park,41.8689,140.114,QN01bu,JP-HK,13,12,809,0,0
+JP-1004,Esan Prefectural Nature Park,41.815,141.173,QN01ot,JP-HK,15,11,369,0,0
+JP-1005,Notsuke-Furen Prefectural Nature Park,43.6049,145.284,QN23po,JP-HK,9,8,561,0,0
+JP-1006,Matsumae-Yagoshi Prefectural Nature Park,41.3983,140.199,QN01cj,JP-HK,10,10,409,0,0
+JP-1007,North Okhotsk Prefectural Nature Park,45.1472,142.37,QN15ed,JP-HK,5,4,234,0,0
+JP-1008,Nopporo Shinrin Kouen Prefectural Nature Park,43.0525,141.501,QN03sb,JP-HK,17,16,446,0,0
+JP-1009,Kariba-Motta Prefectural Nature Park,42.6097,139.853,PN92wo,JP-HK,12,12,843,0,0
+JP-1010,Shumarinai Prefectural Nature Park,44.3083,142.181,QN14ch,JP-HK,6,6,298,0,0
+JP-1011,Teshiodake Prefectural Nature Park,43.9875,142.861,QN13kx,JP-HK,4,4,187,0,0
+JP-1012,Sharidake Prefectural Nature Park,43.7617,144.723,QN23is,JP-HK,4,4,103,0,0
+JP-1013,Makomanai Prefectural Park,42.9957,141.344,QN02qx,JP-HK,22,20,500,0,0
+JP-1014,Hokkaido kodomo no kuni Prefectural Park,43.524,141.94,QN03xm,JP-HK,16,10,295,0,0
+JP-1015,Nopporo Sports Prefectural Park,43.0692,141.531,QN03sb,JP-HK,11,10,272,0,0
+JP-1016,Okhotsk Prefectural Park,43.9902,144.243,QN23cx,JP-HK,11,9,263,0,0
+JP-1017,Okhotsk Sea Ice Prefectural Park,44.3167,143.394,QN14qh,JP-HK,8,6,296,0,0
+JP-1018,Soya Fureai Prefectural Park,45.3942,141.757,QN05vj,JP-HK,15,11,892,0,0
+JP-1019,Sunpillar Prefectural Park,44.3739,142.479,QN14fi,JP-HK,5,5,270,0,0
+JP-1020,Yumenomori Prefectural Park,43.5688,144.956,QN23ln,JP-HK,10,8,360,0,0
+JP-1021,Tokachi Ecology Prefectural Park,42.9336,143.31,QN12pw,JP-HK,14,10,359,0,0
+JP-1022,South Hokkaido Shiki no Mori Prefectural Park,41.8489,140.768,QN01ju,JP-HK,8,7,340,0,0
+JP-1023,Volcano Bay Panorama Prefectural Park,42.2268,140.314,QN02df,JP-HK,10,9,244,0,0
+JP-1024,Asamushi-Natsudomari Prefectural Nature Park,40.9981,140.893,QN00kx,JP-AO,24,24,949,0,0
+JP-1025,Owani Ikarigaseki Onsenkyo Prefectural Nature Park,40.4092,140.644,QN00hj,JP-AO,27,26,896,0,0
+JP-1026,Nakuidake Prefectural Nature Park,40.3879,141.308,QN00pj,JP-AO,17,17,689,0,0
+JP-1027,Ashinochishogun Prefectural Nature Park,40.9136,140.452,QN00fv,JP-AO,25,24,952,0,0
+JP-1028,Kuroishi Onsenkyo Prefectural Nature Park,40.5681,140.732,QN00in,JP-AO,19,19,731,0,0
+JP-1029,Iwaki Kogen Prefectural Nature Park,40.6144,140.305,QN00do,JP-AO,22,22,734,0,0
+JP-1030,Tsugaru Shirakami Prefectural Nature Park,40.6294,140.111,QN00bp,JP-AO,12,11,514,0,0
+JP-1031,New Aomori Prefectural Sports Prefectural Park,40.8428,140.841,QN00ku,JP-AO,21,20,484,0,0
+JP-1033,Hanamaki Onsenkyo Prefectural Nature Park,39.4489,141.073,QM09mk,JP-IW,19,19,624,0,0
+JP-1034,Kuji-Hiraniwa Prefectural Nature Park,40.0839,141.508,QN00sc,JP-IW,12,11,474,0,0
+JP-1035,Sotoyama-Hayasaka Heights Prefectural Nature Park,39.8183,141.378,QM09qt,JP-IW,21,19,740,0,0
+JP-1036,Yuda Onsenkyo Prefectural Nature Park,39.3406,140.79,QM09ji,JP-IW,23,22,857,0,0
+JP-1037,Orizume-Basenkyo Prefectural Nature Park,40.251,141.276,QN00pg,JP-IW,20,19,1015,0,0
+JP-1038,Goyozan Prefectural Nature Park,39.203,141.729,QM09ue,JP-IW,56,50,1653,0,0
+JP-1039,Murone Kogen Prefectural Nature Park,38.9739,141.446,QM08rx,JP-IW,54,43,1395,0,0
+JP-1040,Goshoko Koiki Prefectural Park,39.6676,140.978,QM09lq,JP-IW,29,28,1246,0,0
+JP-1041,Takizawa Forest Prefectural Park,39.8067,141.138,QM09nt,JP-IW,24,22,709,0,0
+JP-1042,Hanamaki Koiki Prefectural Park,39.4335,141.056,QM09mk,JP-IW,24,20,556,0,0
+JP-1043,Uchimaru Ryokuchi Prefectural Park,39.7026,141.153,QM09nq,JP-IW,13,13,245,0,0
+JP-1044,Zao Kogen Prefectural Nature Park,38.0819,140.549,QM08gb,JP-MG,41,40,1819,0,0
+JP-1045,Abukuma Keikoku Prefectural Nature Park,37.8333,140.715,QM07it,JP-MG,42,42,1668,0,0
+JP-1046,Futakuchi Kyokoku Prefectural Nature Park,38.2737,140.601,QM08hg,JP-MG,45,44,1481,0,0
+JP-1047,Funagatarenpo Prefectural Nature Park,38.4503,140.631,QM08hk,JP-MG,105,103,4066,0,0
+JP-1048,Matsushima Prefectural Nature Park,38.3533,141.064,QM08mi,JP-MG,192,183,6646,0,0
+JP-1049,Asahiyama Prefectural Nature Park,38.4883,141.181,QM08ol,JP-MG,26,25,1303,0,0
+JP-1050,Kenjosan Mangokuura Prefectural Nature Park,38.4058,141.401,QM08qj,JP-MG,57,51,1998,0,0
+JP-1051,Kesennuma Prefectural Nature Park,38.8608,141.499,QM08ru,JP-MG,42,40,1363,0,0
+JP-1052,Matsushima Koen Prefectural Park,38.3661,141.061,QM08mi,JP-MG,92,91,3423,0,0
+JP-1053,Miyaginohara Prefectural Park,38.2564,140.902,QM08kg,JP-MG,34,31,733,0,0
+JP-1054,Sendaiko Tagajo Chiku Kansho Ryokuchi Prefectural Park,38.2895,141.033,QM08mg,JP-MG,32,31,779,0,0
+JP-1055,Yamoto Kaihin Ryokuchi Prefectural Park,38.4053,141.238,QM08oj,JP-MG,21,21,678,0,0
+JP-1056,Iwanuma Kaihin Ryokuchi Prefectural Park,38.1187,140.932,QM08lc,JP-MG,41,39,1103,0,0
+JP-1057,Kasenuma Prefectural Park,38.3124,140.986,QM08lh,JP-MG,26,25,808,0,0
+JP-1058,Miyagi Sports Prefectural Park,38.3354,140.953,QM08li,JP-MG,26,26,730,0,0
+JP-1059,Hachimori Iwadate Prefectural Nature Park,40.37,140.01,QN00ai,JP-AK,15,13,472,0,0
+JP-1060,Akita Shirakami Prefectural Nature Park,40.42,140.12,QN00bk,JP-AK,15,15,707,0,0
+JP-1061,Tashirodake Prefectural Nature Park,40.43,140.41,QN00ek,JP-AK,11,11,587,0,0
+JP-1062,Kimimachi-zaka Prefectural Nature Park,40.2214,140.256,QN00df,JP-AK,16,15,625,0,0
+JP-1063,Moriyoshizan Prefectural Nature Park,39.98,140.54,QM09gx,JP-AK,8,6,329,0,0
+JP-1064,Taiheizan Prefectural Nature Park,39.79,140.31,QM09ds,JP-AK,35,31,880,0,0
+JP-1065,Tazawako Dakigaeri Prefectural Nature Park,39.73,140.66,QM09hr,JP-AK,25,24,723,0,0
+JP-1066,Magi Mahiru Prefectural Nature Park,39.5375,140.69,QM09im,JP-AK,17,16,551,0,0
+JP-1067,Akita Prefectural Central Prefectural Park,39.6231,140.204,QM09co,JP-AK,19,17,586,0,0
+JP-1068,Hokuo no Mori Prefectural Park,40.1645,140.367,QN00ed,JP-AK,17,17,477,0,0
+JP-1069,Koizumigata Prefectural Park,39.8136,140.07,QM09at,JP-AK,26,23,610,0,0
+JP-1070,Shonai Kaihin Prefectural Nature Park,38.8513,139.787,PM98vu,JP-YT,35,34,1636,0,0
+JP-1071,Goshozan Prefectural Nature Park,38.4555,140.614,QM08hk,JP-YT,61,60,3094,0,0
+JP-1072,Kennan Prefectural Nature Park,38.0034,140.205,QM08ca,JP-YT,44,43,2252,0,0
+JP-1073,Kabusan Prefectural Nature Park,38.9905,140.389,QM08ex,JP-YT,19,19,1080,0,0
+JP-1074,Tendo Kogen Prefectural Nature Park,38.349,140.452,QM08fi,JP-YT,134,133,6371,0,0
+JP-1075,Mogamigawa Prefectural Nature Park,38.7565,140.051,QM08as,JP-YT,31,28,1388,0,0
+JP-1076,Yamagata Prefectural General Sports Prefectural Park,38.3361,140.377,QM08ei,JP-YT,98,97,3412,0,1
+JP-1077,Nishizao Prefectural Park,38.205,140.355,QM08ee,JP-YT,40,38,1278,0,0
+JP-1078,Yumiharidaira Prefectural Park,38.4761,140.003,QM08al,JP-YT,20,19,657,0,0
+JP-1079,Nakayama Prefectural Park,38.3421,140.267,QM08di,JP-YT,35,32,1348,0,1
+JP-1080,Mogamigawa Furusato Sogo Prefectural Park,38.3652,140.263,QM08di,JP-YT,43,37,1314,0,0
+JP-1081,Mogami Central Prefectural Park,38.7601,140.308,QM08ds,JP-YT,20,20,699,0,0
+JP-1082,Zao Miharashi no Oka Museum Prefectural Park,38.1879,140.295,QM08de,JP-YT,33,30,1051,0,0
+JP-1083,Kenko no Mori Prefectural Park,38.3003,140.345,QM08eh,JP-YT,87,82,2927,0,0
+JP-1084,Yuso no Oka Prefectural Park,38.2152,140.349,QM08ef,JP-YT,37,37,932,0,0
+JP-1085,Shonai Kuko Kansho Ryokuchi Prefectural Park,38.816,139.792,PM98vt,JP-YT,26,22,744,0,0
+JP-1086,Kenmin Ryokuchi Prefectural Park,38.2395,140.362,QM08ef,JP-YT,35,33,888,0,0
+JP-1087,Kenseishi Ryokuchi Prefectural Park,38.2565,140.341,QM08eg,JP-YT,18,18,566,0,0
+JP-1088,Ryozen Prefectural Nature Park,37.7765,140.677,QM07is,JP-FS,28,27,1406,0,0
+JP-1089,Kasumigajo Prefectural Nature Park,37.5991,140.429,QM07fo,JP-FS,37,36,1942,0,1
+JP-1090,Nanko Prefectural Nature Park,37.1097,140.22,QM07cc,JP-FS,84,80,2733,0,0
+JP-1091,Okukuji Prefectural Nature Park,36.9379,140.28,QM06dw,JP-FS,46,45,1849,0,0
+JP-1092,Iwaki Kaigan Prefectural Nature Park,37.1364,140.998,QM07ld,JP-FS,159,52,1914,0,0
+JP-1093,Matsukawaura Prefectural Nature Park,37.7981,140.976,QM07lt,JP-FS,27,27,963,0,0
+JP-1094,Nakoso Prefectural Nature Park,36.8678,140.782,QM06ju,JP-FS,28,26,806,0,0
+JP-1096,Okawa Hatori Prefectural Nature Park,37.2615,140.07,QM07ag,JP-FS,261,254,6677,0,0
+JP-1097,Abukuma Kogen Chubu Prefectural Nature Park,37.3549,140.698,QM07ii,JP-FS,46,44,3248,0,0
+JP-1098,Natsuigawa Keikoku Prefectural Nature Park,37.1016,140.798,QM07jc,JP-FS,22,20,956,0,0
+JP-1099,Azuma Sports Prefectural Park,37.7201,140.36,QM07er,JP-FS,36,36,1170,0,0
+JP-1100,Ouse Prefectural Park,37.4128,140.274,QM07dj,JP-FS,67,62,1967,0,0
+JP-1101,Fukushima Airport Prefectural Park,37.2467,140.42,QM07ff,JP-FS,36,34,1763,0,0
+JP-1102,Azumagaoka Prefectural Park,37.6313,140.969,QM07lp,JP-FS,17,17,848,0,0
+JP-1103,Iwaki Prefectural Park,37.0108,140.92,QM07la,JP-FS,17,17,405,0,0
+JP-1104,Hirono Bosai Ryokuchi Prefectural Park,37.2087,141.004,QM07mf,JP-FS,16,16,706,0,0
+JP-1105,Aizu Recreation Prefectural Park,37.515,140.018,QM07am,JP-FS,40,39,1236,0,0
+JP-1106,Hanazono Hananuki Prefectural Nature Park,36.8348,140.703,QM06iu,JP-IB,30,27,944,0,0
+JP-1107,Takasuzu Prefectural Nature Park,36.6143,140.589,QM06ho,JP-IB,55,44,1242,0,0
+JP-1108,Ota Prefectural Nature Park,36.5418,140.514,QM06gn,JP-IB,26,23,733,0,0
+JP-1109,Okukuji Prefectural Nature Park,36.9269,140.263,QM06dw,JP-IB,66,58,2517,0,0
+JP-1110,Oarai Prefectural Prefectural Nature Park,36.3591,140.614,QM06hi,JP-IB,96,44,1721,0,0
+JP-1111,Mito Prefectural Nature Park,36.3724,140.46,QM06fi,JP-IB,55,52,1806,0,0
+JP-1112,Gozenyama Prefectural Nature Park,36.5448,140.324,QM06dn,JP-IB,33,31,891,0,0
+JP-1113,Wagakuni Atago Prefectural Nature Park,36.3047,140.225,QM06ch,JP-IB,63,59,1808,0,0
+JP-1114,Kasama Prefectural Nature Park,36.3837,140.268,QM06dj,JP-IB,59,58,2770,0,1
+JP-1115,Kairakuen Prefectural Park,36.3725,140.452,QM06fi,JP-IB,27,26,525,0,0
+JP-1116,Kodokan Prefectural Park,36.3761,140.478,QM06fj,JP-IB,25,21,404,0,0
+JP-1117,Oarai Prefectural Park,36.3257,140.593,QM06hh,JP-IB,33,32,1294,0,0
+JP-1118,Kasama Geijutsu no mori Prefectural Park,36.3715,140.266,QM06di,JP-IB,27,27,615,0,0
+JP-1119,Minato Prefectural Park,35.9134,140.672,QM05iv,JP-IB,49,47,1227,0,0
+JP-1120,Kashimanada Sea Side Prefectural Park,36.1505,140.577,QM06gd,JP-IB,37,34,1033,0,0
+JP-1121,Daigo Koiki Prefectural Park,36.7915,140.35,QM06es,JP-IB,20,20,588,0,0
+JP-1123,Sanuma Koiki Prefectural Park,36.1891,139.948,PM96xe,JP-IB,111,102,2979,0,0
+JP-1124,Kensei Sogo Prefectural Park,36.3052,140.017,QM06ah,JP-IB,91,85,2074,0,0
+JP-1125,Kasamatsu Sports Prefectural Park,36.455,140.539,QM06gk,JP-IB,320,37,1570,0,0
+JP-1126,Horihara Sports Prefectural Park,36.3984,140.44,QM06fj,JP-IB,26,25,514,0,0
+JP-1128,Mae Nikko Prefectural Nature Park,36.623,139.521,PM96so,JP-TC,87,78,3712,0,0
+JP-1129,Yamizo Prefectural Nature Park,36.7838,140.144,QM06bs,JP-TC,91,83,2775,0,0
+JP-1130,Nakagawa Prefectural Nature Park,36.5978,140.188,QM06co,JP-TC,35,33,1362,0,0
+JP-1131,Mashiko Prefectural Nature Park,36.4661,140.119,QM06bl,JP-TC,42,40,1489,0,0
+JP-1132,Ohirasan Prefectural Nature Park,36.3599,139.698,PM96ui,JP-TC,433,361,12354,0,0
+JP-1133,Karasawayama Prefectural Nature Park,36.3538,139.6,PM96ti,JP-TC,128,116,4202,0,0
+JP-1134,Ashikaga Prefectural Nature Park,36.3798,139.442,PM96rj,JP-TC,91,85,4435,0,5
+JP-1135,Utsunomiya Prefectural Nature Park,36.6059,139.81,PM96vo,JP-TC,133,122,6557,0,2
+JP-1136,Tochigi Sports Prefectural Park,36.5109,139.859,PM96wm,JP-TC,61,60,1715,0,0
+JP-1137,Igashira Prefectural Park,36.4944,139.997,PM96xl,JP-TC,42,41,1073,0,0
+JP-1138,Kinu Green Prefectural Park,36.6302,139.957,PM96xp,JP-TC,79,74,2118,0,0
+JP-1139,Tochigi Central Prefectural Park,36.5583,139.863,PM96wn,JP-TC,59,55,1388,0,0
+JP-1140,Nasunogahara Prefectural Park,36.9323,139.949,PM96xw,JP-TC,44,42,1218,0,0
+JP-1141,Mikamoyama Prefectural Park,36.3053,139.627,PM96th,JP-TC,88,79,2430,0,0
+JP-1142,Nikko Tamozawa Implerial Villa Memorial Prefectural Park,36.7524,139.591,PM96ts,JP-TC,17,17,318,0,0
+JP-1143,Nikko Daiyagawa Prefectural Park,36.7353,139.663,PM96tr,JP-TC,26,24,610,0,0
+JP-1144,Tochigi Wanpaku Prefectural Park,36.4587,139.808,PM96vl,JP-TC,85,78,2538,0,0
+JP-1145,Sayama Prefectural Nature Park,35.7777,139.416,PM95qs,JP-ST,241,215,6670,0,0
+JP-1146,Okumusashi Prefectural Nature Park,35.9061,139.19,PM95ov,JP-ST,411,353,14839,0,0
+JP-1147,Kuroyama Prefectural Nature Park,35.9592,139.236,PM95ox,JP-ST,460,413,43085,0,13
+JP-1148,Nagatoro Tamayodo Prefectural Nature Park,36.0949,139.115,PM96nc,JP-ST,423,383,22535,0,5
+JP-1149,Hikikyuryo Prefectural Nature Park,36.0004,139.364,PM96qa,JP-ST,194,181,8010,0,0
+JP-1150,Jobu Prefectural Nature Park,36.1292,139.023,PM96md,JP-ST,96,92,2995,0,0
+JP-1151,Buko Prefectural Nature Park,35.9539,139.013,PM95mw,JP-ST,194,168,5842,0,1
+JP-1152,Angyo Bunan Prefectural Nature Park,35.8541,139.735,PM95uu,JP-ST,136,130,3622,0,0
+JP-1153,Ryogami Prefectural Nature Park,36,138.927,PM96la,JP-ST,34,33,999,0,0
+JP-1154,Nishichichibu Prefectural Nature Park,36.0615,138.963,PM96lb,JP-ST,64,61,2800,0,0
+JP-1155,Kitaurawa Prefectural Park,35.8699,139.644,PM95tu,JP-ST,101,79,1645,0,0
+JP-1156,Saitama Stadium 2002 Prefectural Park,35.903,139.715,PM95uv,JP-ST,70,69,1712,0,0
+JP-1157,Akigase Prefectural Park,35.8499,139.602,PM95tu,JP-ST,516,428,12923,0,4
+JP-1158,Omiya Prefectural Park,35.9187,139.631,PM95tw,JP-ST,159,132,3515,0,0
+JP-1159,Shirakobato Suijo Prefectural Park,35.9134,139.749,PM95uv,JP-ST,60,58,1456,0,0
+JP-1160,Ageo Undo Prefectural Park,35.9684,139.602,PM95tx,JP-ST,192,187,4617,0,0
+JP-1162,Kumagaya Sports & Culture Prefectural Park,36.1665,139.405,PM96qd,JP-ST,95,93,2084,0,0
+JP-1163,Yoshimi Athletic Prefectural Park,36.0575,139.472,PM96rb,JP-ST,155,152,4761,0,0
+JP-1164,Saitama Prefectural Forest,35.9895,139.157,PM95nx,JP-ST,98,87,3054,0,0
+JP-1165,Wako Jurin Prefectural Park,35.7773,139.599,PM95ts,JP-ST,113,106,2744,0,0
+JP-1166,Sainomori Iruma Prefectural Park,35.8376,139.399,PM95qu,JP-ST,95,89,2088,0,0
+JP-1167,Kazo Hanasaki Prefectural Park,36.1012,139.633,PM96tc,JP-ST,63,59,1472,0,0
+JP-1168,Matsubushi Midorinooka Prefectural Park,35.9458,139.81,PM95vw,JP-ST,98,98,2838,0,0
+JP-1169,Hanyu Suigo Prefectural Park,36.1716,139.595,PM96te,JP-ST,56,55,1510,0,0
+JP-1170,Gongendo Prefectural Park,36.1076,139.725,PM96uc,JP-ST,96,90,2598,0,0
+JP-1171,Kukisyobu Prefectural Park,36.0543,139.646,PM96tb,JP-ST,63,59,1568,0,0
+JP-1172,Yoshikawa Prefectural Park,35.911,139.873,PM95wv,JP-ST,68,64,2066,0,0
+JP-1173,Misato Prefectural Park,35.7846,139.873,PM95ws,JP-ST,96,91,2069,0,0
+JP-1174,Kawagoe Prefectural Park,35.9134,139.451,PM95rv,JP-ST,309,298,6085,0,0
+JP-1175,Kodomo Dobutsu Prefectural Park,35.997,139.374,PM95qx,JP-ST,35,34,1014,0,0
+JP-1176,Kitamoto Shizen Kansatsu Prefectural Park,36.0108,139.509,PM96sa,JP-ST,51,49,1528,0,0
+JP-1177,Arakawa Oaso Prefectural Park,36.1434,139.349,PM96qd,JP-ST,67,64,2168,0,1
+JP-1178,Sakitama Kofun Prefectural Park,36.1277,139.475,PM96rd,JP-ST,118,112,3255,0,0
+JP-1179,Toda Prefectural Park,35.8017,139.676,PM95ut,JP-ST,92,90,2194,0,0
+JP-1180,Tokorozawa Aviation Memorial Prefectural Park,35.7976,139.474,PM95rt,JP-ST,266,237,6289,0,0
+JP-1181,Sayama Inariyama Prefectural Park,35.8475,139.397,PM95qu,JP-ST,93,87,1910,0,0
+JP-1182,Yoro Keikoku Okukiyosumi Prefectural Nature Park,35.2517,140.163,QM05bg,JP-CH,26,24,792,0,0
+JP-1183,Kujukuri Prefectural Nature Park,35.4473,140.404,QM05ek,JP-CH,130,118,4730,0,0
+JP-1184,Inba Tega Prefectural Nature Park,35.7566,140.189,QM05cs,JP-CH,492,467,16536,0,0
+JP-1185,Takagoyama Prefectural Nature Park,35.198,139.993,PM95xe,JP-CH,72,65,3119,0,0
+JP-1186,Mineoka Sankei Prefectural Nature Park,35.106,140.01,QM05ac,JP-CH,39,36,1073,0,0
+JP-1187,Tomisan Prefectural Nature Park,35.0953,139.882,PM95wc,JP-CH,56,50,1399,0,0
+JP-1188,Otone Prefectural Nature Park,35.9151,140.468,QM05fv,JP-CH,43,41,1443,0,0
+JP-1189,Kasamori Tsurumai Prefectural Nature Park,35.3995,140.201,QM05cj,JP-CH,80,72,2492,0,0
+JP-1190,Hagoromo Prefectural Park,35.6037,140.123,QM05bo,JP-CH,35,32,818,0,0
+JP-1191,Aobanomori Prefectural Park,35.5965,140.141,QM05bo,JP-CH,110,103,2667,0,0
+JP-1192,Chiba Central Sports Center Prefectural Park,35.6503,140.126,QM05bp,JP-CH,68,67,2223,0,0
+JP-1193,Makuhari Seaside Prefectural Park,35.6446,140.043,QM05ap,JP-CH,93,90,2502,0,0
+JP-1194,Gyoda Prefectural Park,35.7195,139.973,PM95xr,JP-CH,107,98,2114,0,0
+JP-1195,Kashiwa no Ha Prefectural Park,35.8957,139.938,PM95xv,JP-CH,285,285,9756,0,1
+JP-1196,Teganuma Shizen Fureai Greenway Prefectural Park,35.8572,140.041,QM05au,JP-CH,425,406,14489,0,0
+JP-1197,Inbanuma Prefectural Park,35.7526,140.184,QM05cs,JP-CH,61,54,1524,0,0
+JP-1198,Hokuso Hananooka Prefectural Park,35.789,140.124,QM05bs,JP-CH,38,38,938,0,0
+JP-1199,Hasunuma Seaside Prefectural Park,35.5887,140.502,QM05go,JP-CH,36,35,1314,0,0
+JP-1200,Chosei no mori Prefectural Park,35.4547,140.267,QM05dk,JP-CH,37,36,980,0,0
+JP-1201,Tateyama Sports Prefectural Park,34.9611,139.853,PM94wx,JP-CH,31,31,788,0,0
+JP-1202,Futtsu Prefectural Park,35.3111,139.803,PM95vh,JP-CH,107,101,2964,0,0
+JP-1203,Yachiyo Prefectural Park,35.7304,140.112,QM05br,JP-CH,52,47,1233,0,0
+JP-1204,Takiyama Nature Prefectural Nature Park,35.7009,139.332,PM95pq,JP-TK,163,156,6998,0,2
+JP-1205,Takao Jinba Prefectural Nature Park,35.6506,139.221,PM95op,JP-TK,185,149,6660,0,5
+JP-1206,Tama Kyuryo Prefectural Nature Park,35.6601,139.41,PM95qp,JP-TK,920,798,36870,0,8
+JP-1207,Sayama Nature Prefectural Nature Park,35.7607,139.438,PM95rs,JP-TK,462,426,17081,0,1
+JP-1208,Hamura Kusabana Kyuryo Prefectural Nature Park,35.7554,139.309,PM95ps,JP-TK,191,162,8365,0,1
+JP-1209,Akigawa Kyuryo Prefectural Nature Park,35.7138,139.273,PM95pr,JP-TK,156,141,6462,0,0
+JP-1211,Kyu Shiba Rikyu Garden Prefectural Park,35.6547,139.758,PM95vp,JP-TK,117,105,1868,0,0
+JP-1212,Kyu-Furukawa Gardens Prefectural Park,35.7422,139.746,PM95ur,JP-TK,44,43,651,0,0
+JP-1213,Kiyosumi Gardens Prefectural Park,35.6807,139.797,PM95vq,JP-TK,154,142,2886,0,0
+JP-1214,Koishikawa-Korakuen Gardens Prefectural Park,35.7054,139.749,PM95uq,JP-TK,98,89,1549,0,0
+JP-1215,Tonogayato Gardens Prefectural Park,35.6986,139.482,PM95rq,JP-TK,122,118,1715,0,0
+JP-1216,Hama-rikyu Gardens Prefectural Park,35.6596,139.763,PM95vp,JP-TK,102,97,1980,0,0
+JP-1217,Mukojima-Hyakkaen Gardens Prefectural Park,35.7241,139.815,PM95vr,JP-TK,53,53,801,0,0
+JP-1218,Rikugi-en Gardens Prefectural Park,35.7332,139.746,PM95ur,JP-TK,60,58,911,0,0
+JP-1219,Aoyama Prefectural Park,35.6633,139.724,PM95up,JP-TK,342,332,7799,0,0
+JP-1220,Akatsuka Prefectural Park,35.7848,139.657,PM95ts,JP-TK,117,112,2731,0,0
+JP-1221,Ueno Prefectural Park,35.7155,139.774,PM95vr,JP-TK,863,764,14836,0,0
+JP-1222,Ukita Prefectural Park,35.6744,139.861,PM95wq,JP-TK,71,57,1104,0,0
+JP-1223,Ukima Prefectural Park,35.7938,139.693,PM95ut,JP-TK,98,77,1771,0,0
+JP-1224,Oizumi-Chuo Prefectural Park,35.775,139.599,PM95ts,JP-TK,109,105,2697,0,0
+JP-1225,Ojima Komatsugawa Prefectural Park,35.6928,139.85,PM95wq,JP-TK,143,109,2429,0,0
+JP-1226,Ogunohara Prefectural Park,35.7512,139.776,PM95vs,JP-TK,190,183,3731,0,0
+JP-1227,Kasai Rinkai Prefectural Park,35.6407,139.86,PM95wp,JP-TK,144,125,2753,0,0
+JP-1228,Kameido Chuo Prefectural Park,35.7005,139.836,PM95wq,JP-TK,88,74,1456,0,0
+JP-1229,Kinuta Prefectural Park,35.6303,139.62,PM95tp,JP-TK,136,126,3658,0,0
+JP-1230,Kiba Prefectural Park,35.6745,139.809,PM95vq,JP-TK,267,234,5189,0,0
+JP-1231,Komazawa Olympic Prefectural Park,35.6257,139.662,PM95tp,JP-TK,151,127,3333,0,0
+JP-1232,Sarue Prefectural Park,35.6901,139.818,PM95vq,JP-TK,134,126,3049,0,0
+JP-1233,Shioiri Prefectural Park,35.7363,139.81,PM95vr,JP-TK,183,165,3045,0,0
+JP-1234,Shiokaze Prefectural Park,35.6238,139.769,PM95vo,JP-TK,145,137,2812,0,0
+JP-1235,Shinozaki Prefectural Park,35.7156,139.898,PM95wr,JP-TK,81,72,1421,0,0
+JP-1236,Shiba Prefectural Park,35.6549,139.748,PM95up,JP-TK,175,158,3150,0,1
+JP-1237,Shakujii Prefectural Park,35.7383,139.599,PM95tr,JP-TK,101,88,2204,0,1
+JP-1238,Johoku-Chuo Prefectural Park,35.7566,139.673,PM95us,JP-TK,374,344,8216,0,0
+JP-1239,Zenpukujigawa Prefectural Park,35.6906,139.632,PM95tq,JP-TK,78,60,1090,0,0
+JP-1240,Zenpukuji Prefectural Park,35.7146,139.591,PM95tr,JP-TK,48,44,683,0,0
+JP-1241,Soshigaya Prefectural Park,35.6546,139.599,PM95tp,JP-TK,42,40,928,0,0
+JP-1242,Daiba Prefectural Park,35.6336,139.772,PM95vp,JP-TK,70,68,1389,0,0
+JP-1243,The Tokyo Rinkai Disaster Prevention Prefectural Park,35.6346,139.797,PM95vp,JP-TK,92,87,1304,0,0
+JP-1244,Toneri Prefectural Park,35.797,139.772,PM95vt,JP-TK,381,370,13997,0,0
+JP-1245,Toyama Prefectural Park,35.7055,139.704,PM95uq,JP-TK,327,270,7308,0,0
+JP-1246,Nakagawa Prefectural Park,35.7753,139.846,PM95ws,JP-TK,130,128,2653,0,0
+JP-1247,Higashi Ayase Prefectural Park,35.771,139.831,PM95vs,JP-TK,125,122,2260,0,0
+JP-1248,Higashi Shirahige Prefectural Park,35.7336,139.814,PM95vr,JP-TK,78,73,1555,0,0
+JP-1249,Hikarigaoka Prefectural Park,35.7666,139.629,PM95ts,JP-TK,475,450,8477,0,1
+JP-1250,Hibiya Prefectural Park,35.6731,139.756,PM95vq,JP-TK,431,381,10216,0,1
+JP-1251,Mizumoto Prefectural Park,35.7869,139.87,PM95ws,JP-TK,306,301,6940,0,0
+JP-1252,Meiji Prefectural Park,35.6791,139.712,PM95uq,JP-TK,129,116,1988,0,0
+JP-1253,Yumenoshima Prefectural Park,35.6511,139.827,PM95vp,JP-TK,201,184,3874,0,0
+JP-1254,Yokoamicho Prefectural Park,35.6992,139.796,PM95vq,JP-TK,125,118,2286,0,0
+JP-1255,Yoyogi Prefectural Park,35.6716,139.696,PM95uq,JP-TK,295,234,5543,0,0
+JP-1256,Rinshinomori Prefectural Park,35.6249,139.703,PM95uo,JP-TK,186,167,4712,0,0
+JP-1257,Roka Koshunen Prefectural Park,35.6617,139.613,PM95tp,JP-TK,68,65,1541,0,1
+JP-1258,Wadabori Prefectural Park,35.6845,139.641,PM95tq,JP-TK,193,179,3718,0,0
+JP-1259,Akirudai Prefectural Park,35.7303,139.3,PM95pr,JP-TK,99,94,2248,0,0
+JP-1260,Inokashira Prefectural Park,35.7,139.576,PM95sq,JP-TK,76,65,1482,0,0
+JP-1261,Oto Prefectural Park,35.6152,139.285,PM95po,JP-TK,113,108,2053,0,0
+JP-1262,Oyamadairi Prefectural Park,35.6062,139.368,PM95qo,JP-TK,119,109,2527,0,0
+JP-1263,Oyamada Prefectural Park,35.5976,139.417,PM95ro,JP-TK,129,110,3395,0,0
+JP-1264,Koganei Prefectural Park,35.7164,139.518,PM95sr,JP-TK,380,326,6627,0,0
+JP-1265,Komiya Prefectural Park,35.6731,139.34,PM95qq,JP-TK,119,114,2751,0,0
+JP-1266,Sakuragaoka Prefectural Park,35.639,139.461,PM95rp,JP-TK,257,244,9185,0,0
+JP-1267,Sayama Prefectural Park,35.7618,139.442,PM95rs,JP-TK,217,198,6173,0,0
+JP-1268,Sayama Sakai Ryokudo Prefectural Park,35.7555,139.444,PM95rs,JP-TK,92,77,1651,0,0
+JP-1269,Sengenyama Prefectural Park,35.68,139.5,PM95sq,JP-TK,127,117,2556,0,1
+JP-1270,Takiyama Prefectural Park,35.7016,139.328,PM95pq,JP-TK,107,100,2539,0,0
+JP-1271,Tamagawa Jyosui Ryokudo Prefectural Park,35.7218,139.358,PM95qr,JP-TK,113,104,2835,0,0
+JP-1272,Naganuma Prefectural Park,35.6382,139.368,PM95qp,JP-TK,138,130,4174,0,2
+JP-1273,Nogawa Prefectural Park,35.6832,139.525,PM95sq,JP-TK,94,85,1665,0,0
+JP-1274,Noyamakita Rokudoyama Prefectural Park,35.7643,139.378,PM95qs,JP-TK,245,213,9988,0,1
+JP-1275,Hachikokuyama Ryokuchi Prefectural Park,35.7698,139.459,PM95rs,JP-TK,208,189,6203,0,0
+JP-1276,Higashifushimi Prefectural Park,35.7287,139.557,PM95sr,JP-TK,405,344,7283,0,0
+JP-1277,Higashimurayama Chuo Prefectural Park,35.7476,139.459,PM95rr,JP-TK,85,75,2060,0,0
+JP-1278,Higashiyamato Prefectural Park,35.7554,139.432,PM95rs,JP-TK,69,65,1613,0,0
+JP-1279,Higashiyamato Minami Prefectural Park,35.7345,139.422,PM95rr,JP-TK,54,48,925,0,0
+JP-1280,Hirayama Joshi Prefectural Park,35.6397,139.383,PM95qp,JP-TK,406,332,18167,0,6
+JP-1281,Fuchunomori Prefectural Park,35.6765,139.492,PM95rq,JP-TK,83,64,1355,0,0
+JP-1282,Musashi Kokubunji Prefectural Park,35.697,139.472,PM95rq,JP-TK,614,567,9440,0,0
+JP-1283,Musashino Prefectural Park,35.6894,139.519,PM95sq,JP-TK,68,61,1126,0,0
+JP-1284,Musashino Chuo Prefectural Park,35.7181,139.556,PM95sr,JP-TK,276,236,5062,0,0
+JP-1285,Musashinonomori Prefectural Park,35.6765,139.523,PM95sq,JP-TK,98,88,1925,0,1
+JP-1286,Ryonan Prefectural Park,35.6488,139.288,PM95pp,JP-TK,81,73,1406,0,0
+JP-1287,Rokusen Prefectural Park,35.7503,139.523,PM95ss,JP-TK,621,510,13894,0,1
+JP-1288,Ogamiyama Prefectural Park,27.0939,142.192,QL17cc,JP-OG,7,5,434,0,0
+JP-1289,Tanzawa Oyama Prefectural Nature Park,35.512,139.26,PM95pm,JP-KN,199,167,5486,0,1
+JP-1290,Jinba Sagamiko Prefectural Nature Park,35.6581,139.154,PM95np,JP-KN,147,123,3213,0,1
+JP-1291,Oku Yugawara Prefectural Nature Park,35.1523,139.095,PM95nd,JP-KN,43,42,991,0,0
+JP-1292,Manazuru Hanto Prefectural Nature Park,35.1461,139.148,PM95nd,JP-KN,59,54,1363,0,0
+JP-1293,Odawara Suwanohara Prefectural Park,35.2825,139.134,PM95ng,JP-KN,48,44,1025,0,0
+JP-1294,Hayama Sangaokayama Prefectural Park,35.2682,139.578,PM95sg,JP-KN,56,48,1120,0,0
+JP-1295,Hayama Prefectural Park,35.2583,139.58,PM95sg,JP-KN,101,95,2591,0,0
+JP-1296,Onshi Hakone Prefectural Park,35.1956,139.026,PM95me,JP-KN,37,35,744,0,0
+JP-1297,Oiso Joyama Prefectural Park,35.3049,139.29,PM95ph,JP-KN,52,48,1031,0,0
+JP-1298,Jogashima Prefectural Park,35.1316,139.625,PM95td,JP-KN,74,63,1929,0,1
+JP-1299,Zama Yatoyama Prefectural Park,35.4867,139.404,PM95ql,JP-KN,150,134,3898,0,1
+JP-1300,Sagami Sansen Prefectural Park,35.4592,139.381,PM95ql,JP-KN,108,100,2870,0,0
+JP-1301,Nanasawa Shinrin Prefectural Park,35.4472,139.301,PM95pk,JP-KN,94,72,1782,0,0
+JP-1302,Shonan Shiomidai Prefectural Park,35.3218,139.438,PM95rh,JP-KN,40,39,705,0,0
+JP-1303,Tsukayama Prefectural Park,35.28,139.641,PM95tg,JP-KN,107,71,1820,0,0
+JP-1304,Hodogaya Prefectural Park,35.4545,139.585,PM95tk,JP-KN,509,441,12678,0,1
+JP-1305,Sagamiko Prefectural Park,35.6125,139.191,PM95oo,JP-KN,48,48,903,0,0
+JP-1306,Higashitakane Shinrin Prefectural Park,35.6043,139.587,PM95to,JP-KN,153,146,4052,0,0
+JP-1307,Shikinomori Prefectural Park,35.5025,139.536,PM95sm,JP-KN,337,318,9105,0,0
+JP-1308,Aikawa Prefectural Park,35.5422,139.256,PM95pn,JP-KN,61,60,1672,0,0
+JP-1309,Hadano Tokawa Prefectural Park,35.403,139.173,PM95oj,JP-KN,50,45,1114,0,0
+JP-1310,Chigasaki Satoyama Prefectural Park,35.3731,139.418,PM95ri,JP-KN,160,149,5300,0,0
+JP-1311,Shonan Coast Prefectural Park,35.3136,139.474,PM95rh,JP-KN,62,56,1548,0,0
+JP-1312,Kannonzaki Prefectural Park,35.256,139.739,PM95ug,JP-KN,70,58,1513,0,0
+JP-1313,Tsukuiko Shiroyama Prefectural Park,35.582,139.282,PM95pn,JP-KN,148,133,3346,0,0
+JP-1314,Tsujido Seaside Prefectural Park,35.3209,139.448,PM95rh,JP-KN,82,77,2045,0,0
+JP-1315,Sagamihara Prefectural Park,35.5312,139.387,PM95qm,JP-KN,331,315,9103,0,0
+JP-1316,Sakaigawa Yusuichi Prefectural Park,35.3907,139.482,PM95rj,JP-KN,154,136,4782,0,2
+JP-1317,Mitsuike Prefectural Park,35.5226,139.661,PM95tm,JP-KN,248,236,7511,0,1
+JP-1318,Akagi Prefectural Park,36.5418,139.191,PM96on,JP-GM,97,85,2668,0,0
+JP-1319,Haruna Prefectural Park,36.4712,138.873,PM96kl,JP-GM,38,35,712,0,0
+JP-1320,Myogi Prefectural Park,36.2865,138.74,PM96ig,JP-GM,21,20,549,0,0
+JP-1321,Shikishima Prefectural Park,36.4142,139.051,PM96mj,JP-GM,36,34,648,0,0
+JP-1322,Gunma no Mori Prefectural Park,36.2979,139.081,PM96mh,JP-GM,48,41,967,0,0
+JP-1323,Kanayama General Prefectural Park,36.3185,139.372,PM96qh,JP-GM,49,44,1375,0,0
+JP-1324,Kannonyama Family Prefectural Park,36.2903,138.993,PM96lg,JP-GM,74,68,2045,0,0
+JP-1325,Tataranuma Prefectural Park,36.2578,139.504,PM96sg,JP-GM,90,82,2958,0,0
+JP-1326,Shibireko Prefectural Nature Park,35.5291,138.517,PM95gm,JP-YN,34,32,1211,0,0
+JP-1327,Minami Alps Koma Prefectural Nature Park,35.5941,138.357,PM95eo,JP-YN,69,62,1796,0,0
+JP-1328,Kose Sports Prefectural Park,35.6222,138.587,PM95ho,JP-YN,55,49,1268,0,0
+JP-1329,Atagoyama Koiki Prefectural Park,35.6724,138.582,PM95gq,JP-YN,32,31,557,0,0
+JP-1330,Sone Kyuryo Prefectural Park,35.5898,138.582,PM95go,JP-YN,43,41,1010,0,0
+JP-1331,Midai Minami Prefectural Park,35.6681,138.455,PM95fq,JP-YN,38,37,996,0,0
+JP-1332,Flower Center Heidi's Village Prefectural Park,35.7809,138.464,PM95fs,JP-YN,29,27,930,0,0
+JP-1333,Fujikawa Craft Prefectural Park,35.4181,138.437,PM95fk,JP-YN,36,31,1042,0,0
+JP-1334,Fujihokuroku Prefectural Park,35.454,138.768,PM95jk,JP-YN,44,43,1477,0,0
+JP-1335,Ontake Prefectural Nature Park,35.9127,137.518,PM85sv,JP-NN,33,30,1177,0,0
+JP-1336,Mibugawa Suikei Prefectural Nature Park,35.8311,138.062,PM95at,JP-NN,72,69,1857,0,0
+JP-1337,Enrei Ojo Prefectural Nature Park,36.0859,138.029,PM96ac,JP-NN,210,199,4883,0,0
+JP-1338,Hijiriyama Kogen Prefectural Nature Park,36.4896,138.065,PM96al,JP-NN,57,55,1728,0,0
+JP-1339,Tenryu Koshibu Suikei Prefectural Nature Park,35.6121,137.988,PM85xo,JP-NN,26,25,971,0,0
+JP-1340,Karasugawa Keikoku Ryokuchi Prefectural Park,36.3135,137.831,PM86vh,JP-NN,28,28,554,0,0
+JP-1341,Matsumotodaira Koiki Prefectural Park,36.1682,137.925,PM86xe,JP-NN,101,94,2331,0,0
+JP-1342,Minami Shinshu Koiki Prefectural Park,35.2496,137.67,PM85uf,JP-NN,30,29,2151,0,0
+JP-1343,Iida Undo Prefectural Park,35.4857,137.8,PM85vl,JP-NN,22,21,668,0,0
+JP-1344,Komaba Prefectural Park,36.2551,138.486,PM96fg,JP-NN,29,29,751,0,0
+JP-1345,Wakasato Prefectural Park,36.6347,138.188,PM96cp,JP-NN,34,34,866,0,0
+JP-1347,Nagano Sports Prefectural Park,36.6591,138.232,PM96cp,JP-NN,28,27,739,0,0
+JP-1348,Senami Sasagawanagare Awashima Prefectural Nature Park,38.423,139.476,PM98rk,JP-NI,44,38,3483,0,0
+JP-1349,Tainai Ninoji Prefectural Nature Park,37.9695,139.514,PM97sx,JP-NI,22,21,980,0,0
+JP-1350,Aganogawa Line Prefectural Nature Park,37.6862,139.457,PM97rq,JP-NI,25,22,818,0,0
+JP-1351,Gozu Renpo Prefectural Nature Park,37.8143,139.358,PM97qt,JP-NI,17,17,1050,0,0
+JP-1352,Nagaoka Higashiyama Yamamotoyama Prefectural Nature Park,37.4228,138.934,PM97lk,JP-NI,15,12,535,0,0
+JP-1353,Okuhayade Awa Sumon Prefectural Nature Park,37.5793,139.147,PM97nn,JP-NI,8,8,450,0,0
+JP-1354,Uonuma Renpo Prefectural Nature Park,37.0143,138.965,PM97la,JP-NI,9,8,315,0,0
+JP-1355,Yoneyama Fukuurahakkei Prefectural Nature Park,37.3427,138.483,PM97fi,JP-NI,25,24,743,0,0
+JP-1356,Naomine Matsunoyama Oike Prefectural Nature Park,37.1745,138.373,PM97ee,JP-NI,31,30,1005,0,0
+JP-1357,Kubiki Prefectural Nature Park,37.1716,138.096,PM97be,JP-NI,26,26,959,0,0
+JP-1358,Hakuba Sanroku Prefectural Nature Park,36.9559,137.961,PM86xw,JP-NI,11,11,351,0,0
+JP-1359,Oyashirazu Koshirazu Prefectural Nature Park,36.9921,137.694,PM86ux,JP-NI,17,17,548,0,0
+JP-1360,Kosado Prefectural Nature Park,38.066,138.55,PM98gb,JP-NI,12,8,464,0,0
+JP-1362,Toyanogata Prefectural Park,37.8802,139.042,PM97mv,JP-NI,23,18,521,0,0
+JP-1363,Shimami Ryokuchi Prefectural Park,37.9703,139.206,PM97ox,JP-NI,21,21,444,0,0
+JP-1364,Shiunji Kinen Prefectural Park,38.0359,139.297,PM98pa,JP-NI,24,21,650,0,0
+JP-1365,Seiro Ryokuchi Prefectural Park,37.9958,139.258,PM97px,JP-NI,23,20,642,0,0
+JP-1366,Niigata Prefectural Botanical Garden Prefectural Park,37.7607,139.113,PM97ns,JP-NI,12,12,356,0,0
+JP-1367,Okutadami Recreation City Prefectural Park,37.1646,138.936,PM97ld,JP-NI,29,29,1002,0,0
+JP-1368,Ogata Mizu to Mori Prefectural Park,37.2309,138.35,PM97ef,JP-NI,16,16,390,0,0
+JP-1369,Asahi Prefectural Nature Park,36.8561,137.675,PM86uu,JP-TY,22,22,657,0,0
+JP-1370,Arimine Prefectural Nature Park,36.4909,137.456,PM86rl,JP-TY,8,8,291,0,0
+JP-1371,Gokayama Prefectural Nature Park,36.4133,136.88,PM86kj,JP-TY,12,12,476,0,0
+JP-1372,Shiraki Mizunashi Prefectural Nature Park,36.4333,137.082,PM86mk,JP-TY,11,11,289,0,0
+JP-1373,Iozen Prefectural Nature Park,36.5364,136.814,PM86jm,JP-TY,40,38,1114,0,0
+JP-1374,Sogatake Prefectural Nature Park,36.7617,137.564,PM86ss,JP-TY,10,10,404,0,0
+JP-1375,Toyama Athletic Recreation Prefectural Park,36.6264,137.197,PM86op,JP-TY,21,18,490,0,0
+JP-1376,Gofuku Prefectural Park,36.6967,137.19,PM86oq,JP-TY,25,25,612,0,0
+JP-1377,Iwase Sports Prefectural Park,36.743,137.239,PM86or,JP-TY,14,14,255,0,0
+JP-1378,Joganjigawa Prefectural Park,36.6943,137.282,PM86pq,JP-TY,17,17,329,0,0
+JP-1379,Kuko Sports Ryokuchi Prefectural Park,36.6467,137.19,PM86op,JP-TY,16,16,349,0,0
+JP-1380,Fuganunga Kansui Prefectural Park,36.7094,137.212,PM86or,JP-TY,18,18,402,0,0
+JP-1381,Shinko no Mori Prefectural Park,36.7689,137.09,PM86ns,JP-TY,14,14,283,0,0
+JP-1382,Taikoyama Land Prefectural Park,36.6915,137.105,PM86nq,JP-TY,12,12,297,0,0
+JP-1383,Yamanaka Dainichisan Prefectural Nature Park,36.2002,136.419,PM86fe,JP-IS,18,18,608,0,0
+JP-1384,Shishiku Tedori Prefectural Nature Park,36.4459,136.648,PM86hk,JP-IS,31,30,780,0,0
+JP-1385,Goishigamine Prefectural Nature Park,36.9205,136.891,PM86kw,JP-IS,19,19,681,0,0
+JP-1386,Hakusan Ichirino Prefectural Nature Park,36.2287,136.766,PM86jf,JP-IS,19,17,511,0,0
+JP-1387,Iozen Prefectural Nature Park,36.5372,136.8,PM86jm,JP-IS,80,70,2831,0,0
+JP-1388,Kenmin Kaihin Prefectural Park,36.5926,136.583,PM86go,JP-IS,30,29,753,0,0
+JP-1389,Kibagata Prefectural Park,36.3671,136.45,PM86fi,JP-IS,28,28,774,0,0
+JP-1390,Hakusanroku Theme Prefectural Park,36.3812,136.613,PM86hj,JP-IS,27,24,672,0,0
+JP-1391,Noto Rekishi Prefectural Park,36.9592,136.971,PM86lx,JP-IS,17,17,489,0,0
+JP-1392,Hokubu Prefectural Park,36.6273,136.693,PM86ip,JP-IS,38,36,943,0,0
+JP-1393,Kanazawajo Prefectural Park,36.5663,136.66,PM86hn,JP-IS,9,7,186,0,0
+JP-1394,Okuutatsuyama Kenmin Prefectural Park,36.5602,136.697,PM86in,JP-IS,41,39,1031,0,0
+JP-1395,Awazu Prefectural Park,36.3549,136.42,PM86fi,JP-IS,20,19,527,0,0
+JP-1396,Matto Seaside Prefectural Park,36.5396,136.533,PM86gm,JP-IS,35,34,972,0,0
+JP-1397,Seibu Ryokuchi Prefectural Park,36.5751,136.603,PM86hn,JP-IS,49,47,1223,0,0
+JP-1398,Tedori Prefectural Park,36.4847,136.479,PM86fl,JP-IS,39,37,1034,0,0
+JP-1399,Honda no Mori Prefectural Park,36.5592,136.662,PM86hn,JP-IS,10,8,146,0,0
+JP-1400,Kenrokuen Prefectural Park,36.5619,136.662,PM86hn,JP-IS,8,5,105,0,0
+JP-1401,Ishikawa Shikou Kinen Prefectural Park,36.5629,136.655,PM86hn,JP-IS,5,5,84,0,0
+JP-1402,Kuratsuki Central Prefectural Park,36.5922,136.625,PM86ho,JP-IS,6,6,155,0,0
+JP-1403,Saigawa Ryokuchi Prefectural Park,36.5429,136.671,PM86in,JP-IS,42,34,896,0,0
+JP-1404,Onominato Ryokuchi Prefectural Park,36.5957,136.598,PM86ho,JP-IS,32,31,780,0,0
+JP-1405,Okuetsu Kogen Prefectural Nature Park,36.0035,136.596,PM86ha,JP-FI,35,35,1097,0,0
+JP-1406,Wakasa no Sato Prefectural Park,35.484,135.786,PM75vl,JP-FI,16,16,468,0,0
+JP-1407,Fukui Shonen Undo Prefectural Park,36.052,136.187,PM86cb,JP-FI,17,15,475,0,0
+JP-1408,Rinkai Chuo Prefectural Park,36.1678,136.112,PM86be,JP-FI,21,19,560,0,0
+JP-1409,Echizen Togei Prefectural Park,35.935,136.06,PM85aw,JP-FI,22,22,668,0,0
+JP-1410,Fukui Toshi Ryokka Shokubutsuen Prefectural Park,36.1061,136.305,PM86dc,JP-FI,34,33,893,0,0
+JP-1411,Wakasa Sogo Prefectural Park,35.5159,135.756,PM75vm,JP-FI,20,19,554,0,0
+JP-1412,Okuetsu Fureai Prefectural Park,35.9653,136.497,PM85fx,JP-FI,15,15,652,0,0
+JP-1413,Trim Park Kanazu Prefectural Park,36.2175,136.25,PM86df,JP-FI,27,26,932,0,0
+JP-1414,Tannan Sogo Prefectural Park,35.9288,136.154,PM85bw,JP-FI,22,20,663,0,0
+JP-1415,Fukui Sogo Prefectural Park,36.1896,136.133,PM86be,JP-FI,19,18,468,0,0
+JP-1416,Sanrihama Kansho Ryokuchi Prefectural Park,36.1857,136.134,PM86be,JP-FI,26,25,901,0,0
+JP-1417,Fukui Joshi Prefectural Park,36.0655,136.221,PM86cb,JP-FI,13,13,456,0,0
+JP-1418,Senbon Matsubara Prefectural Nature Park,35.1461,136.669,PM85id,JP-GF,142,132,3292,0,0
+JP-1419,Ibi Prefectural Nature Park,35.6382,136.487,PM85fp,JP-GF,47,43,2410,0,0
+JP-1420,Okuhida Sugo Nagareha Prefectural Nature Park,36.3082,137.246,PM86oh,JP-GF,24,19,571,0,0
+JP-1421,Utsue Shijuhattaki Prefectural Nature Park,36.1971,137.161,PM86ne,JP-GF,19,19,584,0,0
+JP-1422,Enakyo Prefectural Nature Park,35.4813,137.407,PM85ql,JP-GF,53,51,2580,0,0
+JP-1423,Enasan Prefectural Nature Park,35.4444,137.591,PM85tk,JP-GF,47,41,2216,0,0
+JP-1424,Urakiso Prefectural Nature Park,35.6981,137.442,PM85rq,JP-GF,26,24,1057,0,0
+JP-1425,Ibuki Prefectural Nature Park,35.4185,136.433,PM85fk,JP-GF,42,39,1774,0,0
+JP-1426,Toki Mikuniyama Prefectural Nature Park,35.2546,137.191,PM85og,JP-GF,86,83,3523,0,0
+JP-1427,Kuraiyama Funayama Prefectural Nature Park,36.0379,137.199,PM86oa,JP-GF,19,18,982,0,0
+JP-1428,Okunagaragawa Prefectural Nature Park,35.9595,136.818,PM85jx,JP-GF,54,51,2756,0,0
+JP-1429,Nomugi Prefectural Nature Park,36.0525,137.603,PM86tb,JP-GF,13,13,632,0,0
+JP-1430,Seseragi Keikoku Prefectural Nature Park,36.0262,137.07,PM86ma,JP-GF,17,16,578,0,0
+JP-1431,Amo Prefectural Nature Park,36.2523,136.963,PM86lg,JP-GF,8,8,200,0,0
+JP-1432,Ontakesan Prefectural Nature Park,35.9026,137.464,PM85rv,JP-GF,18,17,585,0,0
+JP-1433,Yoro Prefectural Park,35.2823,136.549,PM85gg,JP-GF,40,35,1323,0,0
+JP-1434,Gifuken Hyakunen Prefectural Park,35.4792,136.87,PM85kl,JP-GF,30,27,873,0,0
+JP-1435,GIFU WORLD ROSE GARDEN Prefectural Park,35.4199,137.096,PM85nk,JP-GF,29,29,977,0,0
+JP-1436,Gifu Memorial Center Prefectural Park,35.4428,136.763,PM85jk,JP-GF,28,27,599,0,0
+JP-1437,Kakamigahara Prefectural Park,35.4247,136.934,PM85lk,JP-GF,27,27,753,0,0
+JP-1438,Gifu World Fresh Water Aquarium Prefectural Park,35.3711,136.809,PM85ji,JP-GF,52,52,1585,0,0
+JP-1439,Gifu Seiryu Satoyama Prefectural Park,35.4746,137.034,PM85ml,JP-GF,38,36,1222,0,0
+JP-1440,Nihondaira Prefectural Nature Park,34.9749,138.466,PM94fx,JP-SZ,312,294,12434,0,0
+JP-1441,Okuoi Prefectural Nature Park,35.1816,138.111,PM95be,JP-SZ,36,35,1181,0,0
+JP-1442,Omaezaki Enshunada Prefectural Nature Park,34.5956,138.226,PM94co,JP-SZ,95,94,3654,0,0
+JP-1443,Hamanako Prefectural Nature Park,34.6951,137.595,PM84tq,JP-SZ,72,67,2928,0,0
+JP-1444,Ashitaka Koiki Prefectural Park,35.1567,138.852,PM95kd,JP-SZ,47,43,1265,0,0
+JP-1445,Mt. Fuji Children's World Prefectural Park,35.2555,138.772,PM95jg,JP-SZ,30,29,995,0,0
+JP-1446,Yoshida Prefectural Park,34.7661,138.285,PM94ds,JP-SZ,61,57,1996,0,0
+JP-1447,Sekijin no Hoshi Prefectural Park,34.6687,137.748,PM84uq,JP-SZ,37,37,1254,0,0
+JP-1448,Hamanako Garden Prefectural Park,34.7139,137.602,PM84tr,JP-SZ,35,34,876,0,0
+JP-1449,Shizuoka Pre. Forest Prefectural Park,34.8461,137.782,PM84vu,JP-SZ,37,37,1369,0,0
+JP-1450,Kusanagi Sports Complex Prefectural Park,34.989,138.429,PM94fx,JP-SZ,104,94,3004,0,0
+JP-1451,Ogasayama Sports Prefectural Park,34.7439,137.969,PM84xr,JP-SZ,53,50,1646,0,0
+JP-1452,Atsumi Hanto Prefectural Nature Park,34.6071,137.097,PM84no,JP-AI,82,70,2566,0,0
+JP-1453,Minami Chita Prefectural Nature Park,34.7478,136.9,PM84kr,JP-AI,187,167,6535,0,0
+JP-1454,Dando Kogen Prefectural Nature Park,35.1443,137.49,PM85rd,JP-AI,49,48,1818,0,0
+JP-1455,Furikusa Keikoku Prefectural Nature Park,35.0769,137.665,PM85tb,JP-AI,33,33,1565,0,0
+JP-1456,Hongusan Prefectural Nature Park,34.9083,137.421,PM84rv,JP-AI,123,102,2978,0,0
+JP-1457,Sakurabuchi Prefectural Nature Park,34.8957,137.506,PM84sv,JP-AI,72,70,1754,0,0
+JP-1458,Ishimakisan Tame Prefectural Nature Park,34.789,137.461,PM84rs,JP-AI,118,74,2763,0,0
+JP-1459,Atsuta Jingu Prefectural Park,35.1309,136.902,PM85kd,JP-AI,335,316,7940,0,0
+JP-1460,Odaka Ryokuchi Prefectural Park,35.0602,136.956,PM85lb,JP-AI,277,263,7459,0,1
+JP-1461,Obata Ryokuchi Prefectural Park,35.2196,136.988,PM85lf,JP-AI,608,601,16071,0,0
+JP-1463,Shinshiro General Prefectural Park,34.9371,137.542,PM84sw,JP-AI,66,63,1702,0,0
+JP-1464,Kisogawa Sobue Ryokuchi Prefectural Park,35.2606,136.706,PM85ig,JP-AI,92,88,2321,0,0
+JP-1465,Owari Koiki Ryokudo Prefectural Park,35.3011,136.956,PM85lh,JP-AI,143,143,4432,0,0
+JP-1466,Aichi Health Village Prefectural Park,34.9987,136.948,PM84lx,JP-AI,226,214,5635,0,0
+JP-1467,Makinogaike Greens Prefectural Park,35.1451,137.014,PM85md,JP-AI,124,121,3783,0,0
+JP-1468,Higashi-mikawa Furusato Prefectural Park,34.8387,137.308,PM84pu,JP-AI,347,324,6198,0,0
+JP-1469,Expo 2005 Aichi Commemorative Prefectural Park,35.1728,137.09,PM85ne,JP-AI,73,69,1585,0,0
+JP-1470,Aburagafuchi Waterside Prefectural Park,34.9067,137.008,PM84mv,JP-AI,450,428,10250,0,0
+JP-1471,Suigo Prefectural Nature Park,35.1304,136.668,PM85id,JP-ME,244,224,6187,0,1
+JP-1472,Ise no Umi Prefectural Nature Park,34.7082,136.523,PM84gq,JP-ME,302,280,5602,0,0
+JP-1473,Akame Ichishikyo Prefectural Nature Park,34.5608,136.268,PM84dn,JP-ME,62,53,1747,0,0
+JP-1474,Kahadakyo Prefectural Nature Park,34.3788,136.21,PM84cj,JP-ME,30,29,1082,0,0
+JP-1475,Okuise Miyagawakyo Prefectural Nature Park,34.2864,136.196,PM84cg,JP-ME,33,31,1256,0,0
+JP-1476,Hokusei Central Prefectural Park,35.065,136.546,PM85gb,JP-ME,80,77,1791,0,0
+JP-1477,Suzuka Seishonen no Mori Prefectural Park,34.8533,136.539,PM84gu,JP-ME,57,54,1056,0,0
+JP-1478,Kameyama Sunshine Prefectural Park,34.8675,136.412,PM84eu,JP-ME,66,62,1313,0,0
+JP-1479,Daibutsuyama Prefectural Park,34.5169,136.654,PM84hm,JP-ME,45,42,1760,0,0
+JP-1480,Kumanonada Rinkai Prefectural Park,34.2173,136.347,PM84ef,JP-ME,23,23,797,0,0
+JP-1481,Isuzu Prefectural Park,34.4638,136.728,PM84il,JP-ME,31,29,803,0,0
+JP-1483,Mikami Tanakami Shigaraki Prefectural Nature Park,35.0505,136.037,PM85ab,JP-SH,54,52,1827,0,0
+JP-1484,Kutsuki Katsuragawa Prefectural Nature Park,35.2466,135.867,PM75wf,JP-SH,28,28,792,0,0
+JP-1485,Koto Prefectural Nature Park,35.2344,136.3,PM85df,JP-SH,41,41,1115,0,0
+JP-1486,Obanagawa Prefectural Park,35.0179,135.861,PM75wa,JP-SH,17,16,409,0,0
+JP-1487,Biwako Bunka Prefectural Park,34.9698,135.94,PM74xx,JP-SH,32,30,928,0,0
+JP-1488,Okubiwa Sports no Mori Prefectural Park,35.4118,136.21,PM85cj,JP-SH,43,40,1023,0,0
+JP-1489,Kogan Ryokuchi Prefectural Park,35.3864,136.238,PM85cj,JP-SH,75,71,2310,0,0
+JP-1490,Kasugayama Prefectural Park,35.1227,135.905,PM75wc,JP-SH,23,23,694,0,0
+JP-1491,Biwako Chikyu Shimin no Mori Prefectural Park,35.1046,135.963,PM75xc,JP-SH,98,85,1784,0,0
+JP-1492,Rurikei Prefectural Nature Park,35.0321,135.403,PM75qa,JP-KY,46,45,1980,0,0
+JP-1493,Hozukyo Prefectural Nature Park,35.0229,135.639,PM75ta,JP-KY,24,24,888,0,0
+JP-1494,Kasagiyama Prefectural Nature Park,34.7534,135.942,PM74xs,JP-KY,12,10,231,0,0
+JP-1495,Arashiyama Prefectural Park,35.0146,135.671,PM75ua,JP-KY,16,15,274,0,0
+JP-1496,Arashiyama Higashi Prefectural Park,35.0099,135.686,PM75ua,JP-KY,13,13,269,0,0
+JP-1497,Kamogawa Prefectural Park,35.0406,135.764,PM75va,JP-KY,24,21,474,0,0
+JP-1498,Fushimiko Prefectural Park,34.925,135.758,PM74vw,JP-KY,25,24,659,0,0
+JP-1499,Rakusai Joka Center Prefectural Park,34.9079,135.708,PM74uv,JP-KY,21,21,685,0,0
+JP-1500,Uji Prefectural Park,34.8891,135.809,PM74vv,JP-KY,12,12,422,0,0
+JP-1501,Yamashiro Sogo Undo Prefectural Park,34.8726,135.802,PM74vu,JP-KY,22,22,739,0,0
+JP-1502,Amanohashidate Prefectural Park,35.5643,135.188,PM75on,JP-KY,23,20,677,0,0
+JP-1503,Tango Eco-Future Prefectural Park,35.6232,135.236,PM75oo,JP-KY,20,18,463,0,0
+JP-1504,Kizugawa Undo Prefectural Park,34.8444,135.797,PM74vu,JP-KY,20,19,567,0,0
+JP-1505,Keihanna Commemorative Prefectural Park,34.7468,135.775,PM74vr,JP-KY,25,25,656,0,0
+JP-1506,Tamba Prefectural Park,35.1654,135.416,PM75qd,JP-KY,40,40,1665,0,0
+JP-1507,Hokusetsu Prefectural Nature Park,34.9326,135.624,PM74tw,JP-OS,42,37,1411,0,0
+JP-1508,Hannan Misaki Prefectural Nature Park,34.3068,135.223,PM74oh,JP-OS,16,15,317,0,0
+JP-1509,Hattori Ryokuchi Prefectural Park,34.7763,135.487,PM74rs,JP-OS,82,60,1603,0,0
+JP-1510,Neyagawa Prefectural Park,34.7613,135.652,PM74ts,JP-OS,27,27,960,0,0
+JP-1511,Hiraoka Prefectural Park,34.674,135.655,PM74tq,JP-OS,42,34,871,0,0
+JP-1512,Ishikawa Kasen Prefectural Park,34.5458,135.619,PM74tn,JP-OS,39,38,1042,0,0
+JP-1513,Oizumi Ryokuchi Prefectural Park,34.5644,135.528,PM74sn,JP-OS,63,59,1917,0,0
+JP-1514,Hamadera Prefectural Park,34.5393,135.439,PM74rm,JP-OS,103,100,2636,0,0
+JP-1515,Rinku Prefectural Park,34.4121,135.295,PM74pj,JP-OS,64,59,1462,0,0
+JP-1516,Tonboike Prefectural Park,34.4301,135.426,PM74rk,JP-OS,33,32,732,0,0
+JP-1517,Sennan Satoumi Prefectural Park,34.3373,135.193,PM74oi,JP-OS,46,43,1269,0,0
+JP-1518,Yamadaike Prefectural Park,34.8219,135.691,PM74ut,JP-OS,26,26,786,0,0
+JP-1519,Mino Prefectural Park,34.847,135.472,PM74ru,JP-OS,24,22,362,0,0
+JP-1520,Fukakita Ryokuchi Prefectural Park,34.7262,135.629,PM74tr,JP-OS,90,88,2645,0,0
+JP-1521,Kyuhoji Ryokuchi Prefectural Park,34.6306,135.578,PM74sp,JP-OS,64,64,1592,0,0
+JP-1522,Suminoe Prefectural Park,34.6113,135.476,PM74ro,JP-OS,190,187,3928,0,0
+JP-1523,Sumiyoshi Prefectural Park,34.6124,135.488,PM74ro,JP-OS,136,133,2649,0,1
+JP-1524,Nishikori Prefectural Park,34.4824,135.572,PM74sl,JP-OS,27,26,657,0,0
+JP-1525,Nagano Prefectural Park,34.4479,135.574,PM74sk,JP-OS,51,47,1012,0,0
+JP-1526,Nishiki no Hama Prefectural Park,34.4363,135.336,PM74qk,JP-OS,27,26,520,0,0
+JP-1527,Izumisano Kyuryo Ryokuchi Prefectural Park,34.3674,135.331,PM74pi,JP-OS,26,26,525,0,0
+JP-1528,Takirenzan Prefectural Nature Park,35.1238,135.242,PM75oc,JP-HG,49,45,1734,0,0
+JP-1529,Inagawa Keikoku Prefectural Nature Park,35.01,135.312,PM75pa,JP-HG,80,78,3419,0,0
+JP-1530,Kiyomizu Tojoko Tachikui Prefectural Nature Park,34.9272,135.068,PM74mw,JP-HG,61,60,1630,0,0
+JP-1531,Asago Gunzan Prefectural Nature Park,35.2338,134.88,PM75kf,JP-HG,14,14,428,0,0
+JP-1532,Onzui Chikusa Prefectural Nature Park,35.2397,134.517,PM75gf,JP-HG,16,16,434,0,0
+JP-1533,Tajima Sangaku Prefectural Nature Park,35.5367,134.629,PM75hm,JP-HG,13,12,409,0,0
+JP-1534,Seiban Kyuryo Prefectural Nature Park,34.892,134.657,PM74hv,JP-HG,52,51,1537,0,0
+JP-1535,Izushi Itoi Prefectural Nature Park,35.3986,134.91,PM75kj,JP-HG,19,16,422,0,0
+JP-1536,Harima Chubu Kyuryo Prefectural Nature Park,34.8403,134.896,PM74ku,JP-HG,44,43,1174,0,0
+JP-1537,Seppiko Mineyama Prefectural Nature Park,35.0633,134.666,PM75hb,JP-HG,16,15,473,0,0
+JP-1538,Kasagatayama Sengamine Prefectural Nature Park,35.0636,134.835,PM75kb,JP-HG,16,15,388,0,0
+JP-1539,Awajishima Prefectural Park,34.576,135.007,PM74mn,JP-HG,22,21,531,0,0
+JP-1540,Arima Fuji Prefectural Park,34.9134,135.224,PM74ov,JP-HG,69,67,1925,0,0
+JP-1542,Akashi Prefectural Park,34.6567,134.994,PM74lp,JP-HG,35,32,653,0,0
+JP-1544,Ako Seaside Prefectural Park,34.7338,134.397,PM74er,JP-HG,28,28,852,0,0
+JP-1545,Takasago Seaside Prefectural Park,34.7347,134.803,PM74jr,JP-HG,22,21,578,0,0
+JP-1546,Kabutoyama Forest Prefectural Park,34.7724,135.335,PM74qs,JP-HG,131,112,2823,0,0
+JP-1547,Mikiyama Forest Prefectural Park,34.7882,134.989,PM74ls,JP-HG,80,77,1938,0,0
+JP-1548,Hyogo Park of the Oriental White Stork Prefectural Park,35.5512,134.854,PM75kn,JP-HG,12,12,289,0,0
+JP-1549,Hitokura Prefectural Park,34.9145,135.419,PM74rv,JP-HG,68,66,3050,0,0
+JP-1550,Tajima Bokujyo Prefectural Park,35.5165,134.488,PM75fm,JP-HG,12,12,400,0,0
+JP-1551,Harima Central Prefectural Park,34.9376,134.939,PM74lw,JP-HG,70,66,1676,0,0
+JP-1552,Ball Park Awaji Prefectural Park,34.4544,134.929,PM74lk,JP-HG,26,25,483,0,0
+JP-1553,Flower Center Prefectural Park,34.9083,134.861,PM74kv,JP-HG,41,40,849,0,0
+JP-1554,Yata Prefectural Nature Park,34.6627,135.737,PM74up,JP-NR,33,33,871,0,0
+JP-1555,Tsukigase Konosan Prefectural Nature Park,34.6696,135.998,PM74xq,JP-NR,35,33,963,0,0
+JP-1556,Yoshinogawa Tsuburo Prefectural Nature Park,34.3994,135.891,PM74wj,JP-NR,176,174,2981,0,0
+JP-1557,Nara Prefectural Park,34.6847,135.843,PM74wq,JP-NR,27,24,486,0,0
+JP-1558,Umami Kyuryo Prefectural Park,34.5626,135.737,PM74un,JP-NR,66,57,1302,0,0
+JP-1559,Obuchiike Prefectural Park,34.708,135.747,PM74uq,JP-NR,41,37,777,0,0
+JP-1560,Mahoroba Kenko Prefectural Park,34.5975,135.783,PM74vo,JP-NR,55,55,1215,0,0
+JP-1561,Tatsuta Prefectural Park,34.6021,135.718,PM74uo,JP-NR,38,38,736,0,0
+JP-1562,Yamato Minzoku Prefectural Park,34.6537,135.753,PM74vp,JP-NR,31,30,576,0,0
+JP-1563,Kashihara Prefectural Park,34.4913,135.792,PM74vl,JP-NR,48,46,826,0,0
+JP-1565,Uda Animal Prefectural Park,34.4891,135.932,PM74xl,JP-NR,19,17,378,0,0
+JP-1566,Nara Palace Site Historical Prefectural Park,34.6866,135.793,PM74vq,JP-NR,49,42,774,0,0
+JP-1567,Koyasan Choishimichi Tamagawakyo Prefectural Nature Park,34.2574,135.651,PM74tg,JP-WK,17,17,386,0,0
+JP-1568,Ryumonzan Prefectural Nature Park,34.2482,135.413,PM74qf,JP-WK,10,10,228,0,0
+JP-1569,Oishi Kogen Prefectural Nature Park,34.1065,135.327,PM74pc,JP-WK,26,23,1193,0,0
+JP-1570,Nishi Arida Prefectural Nature Park,34.0497,135.148,PM74nb,JP-WK,10,10,387,0,0
+JP-1571,Shirasaki Kaigan Prefectural Nature Park,33.977,135.068,PM73mx,JP-WK,9,9,375,0,0
+JP-1572,Enju Kaigan Prefectural Nature Park,33.8903,135.129,PM73nv,JP-WK,16,16,779,0,0
+JP-1573,Jogamori Hokodai Prefectural Nature Park,34.0363,135.508,PM74sa,JP-WK,13,12,270,0,0
+JP-1574,Hatenashi Sanmyaku Prefectural Nature Park,33.9026,135.689,PM73uv,JP-WK,5,5,223,0,0
+JP-1575,Hikigawa Prefectural Nature Park,33.7361,135.573,PM73sr,JP-WK,9,8,237,0,0
+JP-1576,Shiramisan Wadagawakyo Prefectural Nature Park,33.7596,135.878,PM73ws,JP-WK,7,5,156,0,0
+JP-1577,Kozagawa Prefectural Nature Park,33.5453,135.721,PM73un,JP-WK,10,9,346,0,0
+JP-1578,Kimiidera Prefectural Park,34.1665,135.191,PM74od,JP-WK,21,21,530,0,0
+JP-1579,Kasei Prefectural Park,34.2474,135.125,PM74nf,JP-WK,31,29,729,0,0
+JP-1580,Waka Prefectural Park,34.1813,135.174,PM74oe,JP-WK,29,28,983,0,0
+JP-1581,Misasa Togoko Prefectural Nature Park,35.4654,133.891,PM65wl,JP-TT,21,20,602,0,0
+JP-1582,Okuhino Prefectural Nature Park,35.2037,133.314,PM65pe,JP-TT,11,10,426,0,0
+JP-1583,Nishi Inaba Prefectural Nature Park,35.5342,134.007,PM75am,JP-TT,10,10,237,0,0
+JP-1585,Lake Togo Hawai Seaside Prefectural Park,35.4919,133.886,PM65wl,JP-TT,16,15,466,0,0
+JP-1587,Fuse Sports Prefectural Park,35.4991,134.182,PM75cl,JP-TT,19,19,497,0,0
+JP-1589,Kiyomizu Gassan Prefectural Nature Park,35.3612,133.185,PM65oi,JP-SM,12,12,361,0,0
+JP-1590,Oni no Shitaburui Prefectural Nature Park,35.1749,133.018,PM65me,JP-SM,13,13,375,0,0
+JP-1591,Shinjiko Kitayama Prefectural Nature Park,35.4462,132.867,PM65kk,JP-SM,30,23,716,0,0
+JP-1592,Tachikuekyo Prefectural Nature Park,35.2955,132.735,PM65ih,JP-SM,18,18,501,0,0
+JP-1593,Ryuzu Yaedaki Prefectural Nature Park,35.1558,132.809,PM65jd,JP-SM,20,20,960,0,0
+JP-1594,Gokawa Suikei Prefectural Nature Park,35.0409,132.6,PM65ha,JP-SM,26,24,1071,0,0
+JP-1595,Dangyokei Kannondaki Prefectural Nature Park,34.9302,132.472,PM64fw,JP-SM,18,18,1430,0,0
+JP-1596,Senjokei Prefectural Nature Park,34.9208,132.342,PM64ew,JP-SM,16,16,586,0,0
+JP-1597,Hamada Kaigan Prefectural Nature Park,34.9473,132.109,PM64bw,JP-SM,42,35,1601,0,0
+JP-1598,Banryuko Prefectural Nature Park,34.6806,131.807,PM54vq,JP-SM,35,34,1593,0,0
+JP-1599,Aonoyama Prefectural Nature Park,34.4646,131.8,PM54vl,JP-SM,20,18,1063,0,0
+JP-1600,Hamayama Prefectural Park,35.3788,132.707,PM65ij,JP-SM,21,18,390,0,0
+JP-1601,Iwami Seaside Prefectural Park,34.9579,132.144,PM64bw,JP-SM,45,37,1662,0,0
+JP-1602,Manyo Prefectural Park,34.679,131.814,PM54vq,JP-SM,34,33,1391,0,0
+JP-1603,Takahashigawa Joryu Prefectural Nature Park,34.9724,133.584,PM64tx,JP-OY,21,19,589,0,0
+JP-1604,Kibi Shiseki Prefectural Nature Park,34.7285,133.766,PM64vr,JP-OY,48,46,1021,0,0
+JP-1605,Yubara Okutsu Prefectural Nature Park,35.2079,133.732,PM65ue,JP-OY,19,19,742,0,0
+JP-1606,Kibiji Fudoki no Oka Prefectural Nature Park,34.6682,133.782,PM64vq,JP-OY,39,39,720,0,0
+JP-1607,Bisaku Sanchi Prefectural Nature Park,35.122,133.537,PM65sc,JP-OY,9,9,251,0,0
+JP-1608,Kibi Seiryu Prefectural Nature Park,34.8635,133.904,PM64wu,JP-OY,94,74,1955,0,0
+JP-1609,Yoshiigawa Churyu Prefectural Nature Park,34.932,134.212,PM74cw,JP-OY,22,22,784,0,0
+JP-1610,Okayama Prefectural Multipurpose Grounds Prefectural Park,34.6787,133.917,PM64xq,JP-OY,32,31,789,0,0
+JP-1611,Korakuen Prefectural Park,34.6678,133.936,PM64xq,JP-OY,22,22,556,0,0
+JP-1612,Kurashiki Sports Prefectural Park,34.6193,133.805,PM64vo,JP-OY,129,129,2644,0,0
+JP-1613,Mizushima Ryokuchi Prefectural Park,34.5305,133.749,PM64um,JP-OY,110,110,2283,0,0
+JP-1614,Nabarakyo Prefectural Nature Park,34.5643,132.513,PM64gn,JP-HS,9,9,316,0,0
+JP-1615,Yamanokyo Prefectural Nature Park,34.6981,133.368,PM64qq,JP-HS,18,17,643,0,0
+JP-1616,Mikuradake Prefectural Nature Park,34.3092,132.158,PM64bh,JP-HS,13,12,487,0,0
+JP-1617,Chikurinji Yokurayama Prefectural Nature Park,34.4591,132.875,PM64kl,JP-HS,21,20,626,0,0
+JP-1618,Buttsuji Mitsugi Hachimangu Prefectural Nature Park,34.4653,133.02,PM64ml,JP-HS,18,15,441,0,0
+JP-1619,kannosekyo Prefectural Nature Park,34.9971,132.802,PM64jx,JP-HS,13,11,426,0,0
+JP-1620,Hiroshimaken Sogo Ground Prefectural Park,34.3755,132.423,PM64fj,JP-HS,23,22,527,0,0
+JP-1621,Shukkeien Garden Prefectural Park,34.3997,132.467,PM64fj,JP-HS,14,14,252,0,0
+JP-1622,Hiroshima Ryokka Shokubutsu Prefectural Park,34.4355,132.566,PM64gk,JP-HS,19,19,589,0,0
+JP-1623,Sera Kenmin Prefectural Park,34.6245,132.981,PM64lo,JP-HS,13,12,390,0,0
+JP-1624,Miyoshi Prefectural Park,34.7982,132.905,PM64kt,JP-HS,20,19,560,0,0
+JP-1625,Bingo Sports Prefectural Park,34.435,133.177,PM64ok,JP-HS,52,45,1651,0,0
+JP-1626,Chomonkyo Prefectural Nature Park,34.3177,131.569,PM54sh,JP-YC,14,14,891,0,0
+JP-1627,Rakanzan Prefectural Nature Park,34.3504,132.052,PM64ai,JP-YC,20,19,717,0,0
+JP-1628,Iwakisan Prefectural Nature Park,33.9872,132.038,PM63ax,JP-YC,13,12,548,0,0
+JP-1629,Toyota Prefectural Nature Park,34.1767,131.044,PM54me,JP-YC,10,9,431,0,0
+JP-1630,Ishin Hyakunen Prefectural Park,34.1562,131.437,PM54rd,JP-YC,10,10,222,0,0
+JP-1631,Yamaguchi Kirara Expo Memorial Prefectural Park,34.005,131.372,PM54qa,JP-YC,10,9,213,0,0
+JP-1632,Katazoegahama Kaihin Prefectural Park,33.8975,132.362,PM63ev,JP-YC,11,10,384,0,0
+JP-1633,Hagi Wellness Prefectural Park,34.3862,131.422,PM54rj,JP-YC,9,9,364,0,0
+JP-1634,Kameyama Prefectural Park,34.1808,131.474,PM54re,JP-YC,11,10,252,0,0
+JP-1635,Hashikura Prefectural Nature Park,34.049,133.842,PM64wb,JP-TS,8,8,618,0,0
+JP-1636,Dochu Kotsu Prefectural Nature Park,34.092,134.206,PM74cc,JP-TS,9,9,360,0,0
+JP-1637,Oasayama Prefectural Nature Park,34.1861,134.5,PM74ge,JP-TS,17,17,672,0,0
+JP-1638,Okuimiyagawauchidani Prefectural Nature Park,34.1479,134.354,PM74ed,JP-TS,17,16,646,0,0
+JP-1639,Higashisankei Prefectural Nature Park,33.9627,134.511,PM73gx,JP-TS,62,57,4623,0,0
+JP-1640,Chubusankei Prefectural Nature Park,33.9042,134.342,PM73ev,JP-TS,11,10,474,0,0
+JP-1642,Bunkanomori Prefectural Park,34.0397,134.527,PM74ga,JP-TS,17,17,396,0,0
+JP-1643,Kamiyama Shinrin Prefectural Park,34.0225,134.423,PM74fa,JP-TS,24,22,1419,0,0
+JP-1644,Tsukimigaoka Kaihin Prefectural Park,34.1259,134.61,PM74hd,JP-TS,25,23,593,0,0
+JP-1645,Naruto Sogo Undo Prefectural Park,34.1678,134.617,PM74he,JP-TS,17,17,363,0,0
+JP-1646,Nanbu Kenko Undo Prefectural Park,33.8654,134.603,PM73hu,JP-TS,12,11,342,0,0
+JP-1647,Otaki Daisen Prefectural Nature Park,34.1219,134.106,PM74bc,JP-KG,16,15,408,0,0
+JP-1648,Mannoike Prefectural Park,34.1565,133.866,PM64wd,JP-KG,23,17,403,0,0
+JP-1649,Kinbuchi Forest Prefectural Park,34.2406,134.108,PM74bf,JP-KG,58,17,416,0,0
+JP-1650,Kikaku Prefectural Park,34.2527,134.183,PM74cg,JP-KG,17,16,387,0,0
+JP-1651,Toryo Prefectural Park,34.2697,133.748,PM64ug,JP-KG,64,37,1081,0,1
+JP-1652,Kagawa Sports Prefectural Park,34.3651,133.96,PM64xi,JP-KG,20,17,427,0,0
+JP-1653,Kinrin Prefectural Park,34.2864,134.255,PM74dg,JP-KG,18,17,461,0,0
+JP-1654,Kinshako Prefectural Nature Park,33.9342,133.53,PM63sw,JP-EH,33,25,862,0,0
+JP-1655,Okudogo Tamagawa Prefectural Nature Park,33.9333,132.923,PM63lw,JP-EH,15,13,588,0,0
+JP-1656,Saragamine Renpo Prefectural Nature Park,33.7171,132.895,PM63kr,JP-EH,27,27,948,0,0
+JP-1657,Shikoku Karst Prefectural Nature Park,33.4676,132.956,PM63ll,JP-EH,12,12,551,0,0
+JP-1658,Hijikawa Prefectural Nature Park,33.453,132.686,PM63ik,JP-EH,10,10,551,0,0
+JP-1659,Sadamisakihanto Uwakai Prefectural Nature Park,33.3891,132.084,PM63bj,JP-EH,13,11,562,0,0
+JP-1660,Sasayama Prefectural Nature Park,33.0556,132.658,PM63hb,JP-EH,12,11,593,0,0
+JP-1661,Dogo Prefectural Park,33.8482,132.787,PM63ju,JP-EH,15,14,383,0,0
+JP-1662,Ehime Prefectural Sports Complex Prefectural Park,33.7674,132.797,PM63js,JP-EH,16,15,361,0,0
+JP-1663,Nanyo Recreation Toshi Prefectural Park,32.9647,132.553,PM62gx,JP-EH,11,11,480,0,0
+JP-1664,Teisumiyoshi Provincial Park,33.5207,133.755,PM63vm,JP-KC,14,12,421,0,0
+JP-1665,Okumonobe Prefectural Nature Park,33.7635,134.031,PM73as,JP-KC,6,6,118,0,0
+JP-1666,Shiragayama Prefectural Nature Park,33.8066,133.698,PM63ut,JP-KC,6,6,206,0,0
+JP-1667,Yokogurayama Prefectural Nature Park,33.5348,133.203,PM63om,JP-KC,6,6,328,0,0
+JP-1668,Yokonami Prefectural Nature Park,33.4122,133.428,PM63rj,JP-KC,8,8,339,0,0
+JP-1669,Irino Prefectural Nature Park,33.0201,133.014,PM63ma,JP-KC,11,10,548,0,0
+JP-1670,Sukumo Prefectural Nature Park,32.9181,132.688,PM62iw,JP-KC,13,13,561,0,0
+JP-1671,Ryugado Prefectural Nature Park,33.6034,133.745,PM63uo,JP-KC,11,11,363,0,0
+JP-1672,Nakatsu Keikoku Prefectural Nature Park,33.5645,133.11,PM63nn,JP-KC,12,11,425,0,0
+JP-1673,Susakiwan Prefectural Nature Park,33.367,133.259,PM63pi,JP-KC,30,25,2297,0,0
+JP-1674,Okitsu Prefectural Nature Park,33.1548,133.223,PM63od,JP-KC,6,6,366,0,0
+JP-1675,Yasui Keikoku Prefectural Nature Park,33.6689,133.191,PM63oq,JP-KC,6,6,275,0,0
+JP-1676,Shikoku Karst Prefectural Nature Park,33.4657,132.956,PM63ll,JP-KC,12,10,361,0,0
+JP-1677,Kitayama Prefectural Nature Park,33.6007,133.486,PM63ro,JP-KC,16,13,749,0,0
+JP-1678,Yanase Prefectural Nature Park,33.6137,134.098,PM73bo,JP-KC,9,8,461,0,0
+JP-1679,Kajigamori Prefectural Nature Park,33.7584,133.757,PM63vs,JP-KC,21,20,929,0,0
+JP-1680,Washioyama Prefectural Nature Park,33.5291,133.513,PM63sm,JP-KC,26,18,395,0,0
+JP-1681,Kuishiyama Jingamori Prefectural Nature Park,33.6867,133.441,PM63rq,JP-KC,8,8,214,0,0
+JP-1682,Muroto Koiki Prefectural Park,33.2891,134.172,PM73cg,JP-KC,10,9,350,0,0
+JP-1683,Haruno Athletic Recreation Prefectural Park,33.5103,133.502,PM63sm,JP-KC,9,9,158,0,0
+JP-1684,Tosa Seinan Daikibo Prefectural Park,33.0242,133.016,PM63ma,JP-KC,9,8,347,0,0
+JP-1685,Aki Koiki Prefectural Park,33.5228,133.913,PM63wm,JP-KC,6,6,171,0,0
+JP-1686,Noichi Zoological Park of Kochi Prefecture Prefectural Park,33.5704,133.706,PM63un,JP-KC,7,7,142,0,0
+JP-1687,Kochi Prefectural Park,33.5612,133.531,PM63sn,JP-KC,9,9,151,0,0
+JP-1688,Godaisan Prefectural Park,33.5472,133.574,PM63sn,JP-KC,9,9,177,0,0
+JP-1689,Tanezaki Sensho Prefectural Park,33.5036,133.57,PM63sm,JP-KC,8,8,180,0,0
+JP-1690,Kagamino Prefectural Park,33.6189,133.719,PM63uo,JP-KC,8,7,220,0,0
+JP-1691,Kagamikawa Ryokuchi Prefectural Park,33.5544,133.518,PM63sn,JP-KC,5,5,93,0,0
+JP-1692,Kochi Kuko Midori no Hiroba Prefectural Park,33.537,133.681,PM63um,JP-KC,10,10,223,0,0
+JP-1693,Ike Prefectural Park,33.5246,133.589,PM63tm,JP-KC,9,8,166,0,0
+JP-1694,Dazaifu Prefectural Nature Park,33.5526,130.599,PM53hn,JP-FO,26,26,934,0,0
+JP-1695,Chikuho Prefectural Nature Park,33.704,130.911,PM53kq,JP-FO,27,26,1263,0,0
+JP-1696,Chikugogawa Prefectural Nature Park,33.3,130.7,PM53ih,JP-FO,10,9,441,0,0
+JP-1697,Yabegawa Prefectural Nature Park,33.1757,130.77,PM53je,JP-FO,6,6,598,0,0
+JP-1698,Sefuriraizan Prefectural Nature Park,33.4344,130.389,PM53ek,JP-FO,68,63,1698,0,0
+JP-1699,Higashi Prefectural Park,33.6058,130.42,PM53fo,JP-FO,13,10,198,0,0
+JP-1700,Najima Undo Prefectural Park,33.6446,130.425,PM53fp,JP-FO,11,11,355,0,0
+JP-1701,Nishi Prefectural Park,33.5981,130.375,PM53eo,JP-FO,26,23,661,0,0
+JP-1702,Ohori Prefectural Park,33.5861,130.376,PM53eo,JP-FO,19,16,451,0,0
+JP-1703,Tenjin Chuo Prefectural Park,33.5903,130.403,PM53eo,JP-FO,10,9,297,0,0
+JP-1704,Central Prefectural Park,33.8762,130.839,PM53kv,JP-FO,17,17,763,0,0
+JP-1705,Kasuga Prefectural Park,33.527,130.47,PM53fm,JP-FO,25,24,601,0,0
+JP-1706,Chikuho Ryokuchi Prefectural Park,33.6581,130.748,PM53ip,JP-FO,8,8,387,0,0
+JP-1707,Chikugo Regional Prefectural Park,33.1777,130.493,PM53fe,JP-FO,14,11,1010,0,0
+JP-1708,Kurokamiyama Prefectural Nature Park,33.2222,129.909,PM43wf,JP-SG,6,6,356,0,0
+JP-1709,Taradake Prefectural Nature Park,32.977,130.09,PM52bx,JP-SG,6,6,213,0,0
+JP-1710,Tenzan Prefectural Nature Park,33.346,130.135,PM53bi,JP-SG,10,10,458,0,0
+JP-1711,Hachimandake Prefectural Nature Park,33.2823,130.027,PM53ag,JP-SG,6,6,334,0,0
+JP-1712,Sefuri Hokusan Prefectural Nature Park,33.4321,130.251,PM53dk,JP-SG,14,12,564,0,0
+JP-1713,Kawakami Kinryu Prefectural Nature Park,33.3498,130.299,PM53di,JP-SG,13,12,425,0,0
+JP-1714,Yoshinogari Historical Prefectural Park,33.3242,130.384,PM53eh,JP-SG,17,17,520,0,0
+JP-1715,Sagajo Prefectural Park,33.245,130.303,PM53df,JP-SG,8,7,203,0,0
+JP-1716,Shinrin Prefectural Park,33.2402,130.249,PM53cf,JP-SG,7,6,372,0,0
+JP-1717,Taradake Prefectural Nature Park,32.9481,130.088,PM52bw,JP-NS,18,17,887,0,0
+JP-1718,Nomo Hanto Prefectural Nature Park,32.5589,129.78,PM42vn,JP-NS,22,14,409,0,0
+JP-1719,Hokusho Prefectural Park,33.3067,129.664,PM43th,JP-NS,8,7,380,0,0
+JP-1720,Omurawan Prefectural Park,33.0498,129.832,PM43vb,JP-NS,25,16,571,0,0
+JP-1721,Nishisonogi Hanto Prefectural Nature Park,32.8099,129.737,PM42ut,JP-NS,10,8,330,0,0
+JP-1722,Shimabara Hanto Prefectural Nature Park,32.6853,130.131,PM52bq,JP-NS,10,9,201,0,0
+JP-1723,Hirado Prefectural Park,33.3581,129.568,PM43si,JP-NS,7,7,194,0,0
+JP-1724,Tabira Prefectural Park,33.3544,129.576,PM43si,JP-NS,6,6,262,0,0
+JP-1725,Saikaibashi Prefectural Park,33.0512,129.758,PM43vb,JP-NS,12,11,430,0,0
+JP-1726,Nagasaki Sogo Undo Prefectural Park,32.8366,130.04,PM52au,JP-NS,9,8,217,0,0
+JP-1727,Hyakkadai Prefectural Park,32.8155,130.296,PM52dt,JP-NS,11,10,310,0,0
+JP-1728,Kinpozan Prefectural Nature Park,32.8167,130.643,PM52ht,JP-KM,21,18,800,0,0
+JP-1729,Shotaizan Prefectural Nature Park,32.9788,130.514,PM52gx,JP-KM,9,9,468,0,0
+JP-1730,Misumi Oyano Kaihen Prefectural Nature Park,32.607,130.47,PM52fo,JP-KM,18,18,535,0,0
+JP-1731,Ashikita Kaigan Prefectural Nature Park,32.294,130.465,PM52fh,JP-KM,15,14,725,0,0
+JP-1732,Yabe Shuhen Prefectural Nature Park,32.6818,130.994,PM52lq,JP-KM,18,17,1441,0,0
+JP-1733,Itsuki Gokanosho Prefectural Nature Park,32.5386,130.939,PM52lm,JP-KM,23,21,1048,0,0
+JP-1734,Okukuma Prefectural Nature Park,32.3172,131.095,PM52nh,JP-KM,15,15,1605,0,0
+JP-1735,Minamata Koiki Prefectural Park,32.2016,130.379,PM52ee,JP-KM,15,13,625,0,0
+JP-1736,Techno Chuo Ryokuchi Prefectural Park,32.8222,130.844,PM52kt,JP-KM,13,12,530,0,0
+JP-1737,Honmyojiyama Ryokuchi Prefectural Park,32.8221,130.676,PM52it,JP-KM,9,9,272,0,0
+JP-1738,Mannichiyama Ryokuchi Prefectural Park,32.791,130.682,PM52is,JP-KM,14,13,540,0,0
+JP-1739,Kumamoto Athletic Prefectural Park,32.8427,130.789,PM52ju,JP-KM,18,18,810,0,0
+JP-1740,Yatsushiro Sports Prefectural Park,32.5331,130.556,PM52gm,JP-KM,12,11,340,0,0
+JP-1741,Kunisaki Hanto Prefectural Nature Park,33.5643,131.569,PM53sn,JP-OT,28,25,1386,0,0
+JP-1742,Bungo Suido Prefectural Nature Park,33.0702,131.965,PM53xb,JP-OT,28,27,2001,0,0
+JP-1743,Jinkakuji Serikawa Prefectural Nature Park,33.0543,131.456,PM53rb,JP-OT,18,16,1005,0,0
+JP-1744,Tsue Sankei Prefectural Nature Park,33.1299,130.88,PM53kd,JP-OT,64,58,1679,0,0
+JP-1745,Sobo Katamuki Prefectural Nature Park,32.8971,131.605,PM52tv,JP-OT,11,11,504,0,0
+JP-1746,Oita Sports Prefectural Park,33.2008,131.657,PM53te,JP-OT,23,21,664,0,0
+JP-1747,Takaoyama Prefectural Park,33.2116,131.655,PM53tf,JP-OT,13,13,302,0,0
+JP-1748,Osu Sogo Comprehensive Athletic Prefectural Park,33.2513,131.628,PM53tg,JP-OT,17,16,441,0,0
+JP-1749,Sobo Katamuki Prefectural Nature Park,32.8323,131.472,PM52rt,JP-MZ,18,17,1156,0,0
+JP-1750,Osuzu Prefectural Nature Park,32.2878,131.465,PM52rg,JP-MZ,20,16,538,0,0
+JP-1751,Saitobaru Sugiyasukyo Prefectural Nature Park,32.1534,131.365,PM52qd,JP-MZ,22,21,932,0,0
+JP-1752,Mochio Sekinoo Prefectural Nature Park,31.762,130.987,PM51ls,JP-MZ,34,33,777,0,0
+JP-1753,Wanitsuka Prefectural Nature Park,31.7686,131.269,PM51ps,JP-MZ,19,19,1005,0,0
+JP-1754,Yatake Kogen Prefectural Nature Park,32.0853,130.774,PM52jc,JP-MZ,9,8,323,0,0
+JP-1755,Heiwadai Prefectural Park,31.9501,131.416,PM51qw,JP-MZ,25,23,671,0,0
+JP-1756,Sogo Bunka Prefectural Park,31.934,131.419,PM51rw,JP-MZ,22,20,493,0,0
+JP-1757,Miyazaki Prefectural Comprehensive Sports Prefectural Park,31.8274,131.445,PM51rt,JP-MZ,13,13,444,0,0
+JP-1758,Saitobaru Burial Mounds Prefectural Park,32.1187,131.39,PM52qc,JP-MZ,19,19,805,0,0
+JP-1759,Awakigahara Forest Prefectural Park,31.9445,131.467,PM51rw,JP-MZ,31,31,1040,0,0
+JP-1760,Akune Prefectural Nature Park,32.1054,130.176,PM52cc,JP-KS,10,10,197,0,0
+JP-1761,Fukiagehama Kinpozan Prefectural Nature Park,31.521,130.326,PM51dm,JP-KS,10,10,258,0,0
+JP-1762,Imutaike Prefectural Nature Park,31.8174,130.474,PM51ft,JP-KS,21,20,624,0,0
+JP-1763,Bounoma Prefectural Nature Park,31.4217,130.123,PM51bk,JP-KS,10,9,294,0,0
+JP-1764,Sendaigawa Ryuiki Prefectural Nature Park,31.9467,130.463,PM51fw,JP-KS,22,21,1290,0,0
+JP-1765,Takakumayama Prefectural Nature Park,31.486,130.819,PM51jl,JP-KS,30,30,926,0,0
+JP-1766,Osumi Nanbu Prefectural Nature Park,31.0915,130.827,PM51jc,JP-KS,11,10,274,0,0
+JP-1767,Tokara Retto Prefectural Nature Park,29.8592,129.858,PL49wu,JP-KS,2,1,141,0,0
+JP-1768,Yoshino Prefectural Park,31.6318,130.593,PM51hp,JP-KS,8,8,181,0,0
+JP-1769,Taniyama Ryokuchi Prefectural Park,31.5227,130.524,PM51gm,JP-KS,6,6,143,0,0
+JP-1770,Kamoike Prefectural Nature Park,31.5657,130.559,PM51gn,JP-KS,12,11,211,0,0
+JP-1771,Kamoike Ryokuchi Prefectural Park,31.5489,130.559,PM51gn,JP-KS,17,12,337,0,0
+JP-1772,Fukiagehama Kaihin Prefectural Park,31.4365,130.283,PM51dk,JP-KS,7,7,161,0,0
+JP-1773,Osumi Koiki Prefectural Park,31.2942,130.919,PM51lh,JP-KS,24,24,658,0,0
+JP-1774,Ishibashi Kinen Prefectural Park,31.604,130.568,PM51go,JP-KS,16,16,355,0,0
+JP-1775,Hokusatsu Koiki Prefectural Park,31.9028,130.438,PM51fv,JP-KS,8,8,333,0,0
+JP-1776,Fureai Sports Land Prefectural Park,31.5493,130.491,PM51fn,JP-KS,15,15,276,0,0
+JP-1777,Kumejima Prefectural Nature Park,26.3889,126.769,PL36jj,JP-ON,24,20,2777,0,0
+JP-1778,Irabu Prefectural Nature Park,24.8344,125.185,PL24ou,JP-ON,14,13,345,0,0
+JP-1779,Tonaki Prefectural Nature Park,26.3628,127.15,PL36ni,JP-ON,3,3,906,0,0
+JP-1780,Tarama Prefectural Nature Park,24.6637,124.696,PL24ip,JP-ON,8,7,1162,0,0
+JP-1781,Onoyama Prefectural Park,26.2037,127.675,PL36ue,JP-ON,26,23,455,0,0
+JP-1782,Okinawa Comprehensive Athletic Prefectural Park,26.3095,127.823,PL36vh,JP-ON,24,23,465,0,0
+JP-1783,Nago Chuo Prefectural Park,26.5878,127.992,PL36xo,JP-ON,15,13,374,0,0
+JP-1784,Nakagusuku Prefectural Park,26.2881,127.793,PL36vg,JP-ON,36,36,662,0,0
+JP-1785,Urasoe Dai Prefectural Park,26.25,127.729,PL36ug,JP-ON,40,36,672,0,0
+JP-1786,Shurijo Castle Prefectural Park,26.2183,127.715,PL36uf,JP-ON,13,9,253,0,0
+JP-1787,Kaigungo Prefectural Park,26.1857,127.675,PL36ue,JP-ON,13,13,384,0,0
+JP-1788,Peace Memorial Prefectural Park,26.0962,127.724,PL36uc,JP-ON,18,18,439,0,0
+JP-1789,Banna Prefectural Park,24.3747,124.16,PL24bi,JP-ON,10,8,170,0,0
+JP-1790,Isehara Tounoyama Prefectural Park,35.3965,139.276,PM95pj,JP-KN,65,59,1285,0,0
+JP-1791,Yamakita Tsuburano Prefectural Park,35.3697,139.052,PM95mi,JP-KN,56,49,1384,0,0
+JP-1792,Odaiba Marine Prefectural Park,35.6299,139.775,PM95vp,JP-TK,150,140,3037,0,0
+JP-1793,Symbol Promenade Prefectural Park,35.6235,139.775,PM95vo,JP-TK,109,90,1435,0,0
+JP-1794,Aomi-Kita Port Prefectural Park,35.6191,139.774,PM95vo,JP-TK,56,55,894,0,0
+JP-1795,Aomi-Minami Port Prefectural Park,35.6144,139.777,PM95vo,JP-TK,78,74,1223,0,1
+JP-1796,Akatsuki Port Prefectural Park,35.6082,139.791,PM95vo,JP-TK,184,177,4264,0,1
+JP-1797,Aomi Greenway Prefectural Park,35.6214,139.78,PM95vo,JP-TK,76,73,1219,0,0
+JP-1798,Aomi-Chuou Port Prefectural Park,35.6208,139.78,PM95vo,JP-TK,64,61,864,0,0
+JP-1799,Mizu-no-Hiroba Prefectural Park,35.6278,139.788,PM95vp,JP-TK,85,79,1298,0,0
+JP-1800,Ariake Nishi Port Prefectural Park,35.6271,139.794,PM95vp,JP-TK,83,73,1207,0,1
+JP-1801,Ariake Kita Greenway Prefectural Park,35.6378,139.78,PM95vp,JP-TK,49,47,981,0,0
+JP-1802,Ariake Tennis Prefectural Park,35.6354,139.788,PM95vp,JP-TK,132,116,2129,0,0
+JP-1803,Harumibashi Prefectural Park,35.6571,139.791,PM95vp,JP-TK,82,65,1351,0,0
+JP-1804,Higashi Yashio Greenway Prefectural Park,35.6193,139.772,PM95vo,JP-TK,60,56,982,0,0
+JP-1805,Kasai Marine Prefectural Park,35.6387,139.855,PM95wp,JP-TK,60,52,945,0,0
+JP-1806,Tatsumi-no-Mori Seaside Prefectural Park,35.6495,139.813,PM95vp,JP-TK,244,228,3930,0,0
+JP-1807,Shin-kiba Prefectural Park,35.6421,139.823,PM95vp,JP-TK,79,74,1381,0,0
+JP-1808,Tatsumi Greenway Prefectural Park,35.6457,139.813,PM95vp,JP-TK,150,138,2352,0,0
+JP-1809,Yumenoshima Greenway Prefectural Park,35.6477,139.831,PM95vp,JP-TK,104,89,1433,0,0
+JP-1810,Shin-kiba Greenway Prefectural Park,35.6401,139.841,PM95wp,JP-TK,69,65,981,0,0
+JP-1811,Wakasu Seaside Prefectural Park,35.6134,139.836,PM95wo,JP-TK,139,136,3367,0,0
+JP-1812,Tokyo Port Wild Bird Prefectural Park,35.5839,139.761,PM95vo,JP-TK,52,50,847,0,0
+JP-1813,Oi Port Central Seaside Prefectural Park,35.5934,139.75,PM95vo,JP-TK,90,85,1788,0,0
+JP-1814,Jonanjima Seaside Prefectural Park,35.5801,139.786,PM95vn,JP-TK,122,115,2982,0,0
+JP-1815,Shinagawa Kita Port Prefectural Park,35.6304,139.755,PM95vp,JP-TK,48,46,800,0,0
+JP-1816,Container Terminal Prefectural Park,35.6053,139.76,PM95vo,JP-TK,41,40,845,0,1
+JP-1817,Jonanjima Port Prefectural Park,35.5791,139.773,PM95vn,JP-TK,69,67,1497,0,0
+JP-1818,Keihinjima Port Prefectural Park,35.5718,139.76,PM95vn,JP-TK,47,42,838,0,0
+JP-1819,Minato-ga-oka Port Prefectural Park,35.5963,139.763,PM95vo,JP-TK,70,67,1343,0,0
+JP-1820,Tokai Port Prefectural Park,35.5777,139.756,PM95vn,JP-TK,72,66,1297,0,0
+JP-1821,Keihinjima Tsubasa Prefectural Park,35.5701,139.77,PM95vn,JP-TK,108,101,2050,0,0
+JP-1822,Shibaura Minami Port Prefectural Park,35.637,139.76,PM95vp,JP-TK,67,63,1288,0,0
+JP-1823,Keihin Canalside Greenway Prefectural Park,35.5972,139.749,PM95uo,JP-TK,80,73,1190,0,0
+JP-1824,Oi Port Greenway Prefectural Park,35.5997,139.755,PM95vo,JP-TK,41,38,617,0,0
+JP-1825,Tokai Greenway Prefectural Park,35.5772,139.759,PM95vn,JP-TK,45,41,689,0,0
+JP-1826,Jonanjima Greenway Prefectural Park,35.5794,139.781,PM95vn,JP-TK,51,48,796,0,0
+JP-1827,Keihinjima Greenway Prefectural Park,35.5652,139.765,PM95vn,JP-TK,43,41,750,0,0
+JP-1828,Lake Okutama Hotori Prefectural Park,35.7663,139.022,PM95ms,JP-TK,42,42,1367,0,0
+JP-1829,Komine Prefectural Park,35.7197,139.23,PM95or,JP-TK,78,75,2234,0,0
+JP-1830,Oshima Prefectural Park,34.7613,139.434,PM94rs,JP-TK,16,16,1112,0,0
+JP-1831,Takowan Prefectural Park,34.2039,139.152,PM94ne,JP-TK,8,8,656,0,0
+JP-1832,Habushiura Prefectural Park,34.3782,139.273,PM94pj,JP-TK,6,6,753,0,0
+JP-1833,Hachijo Botanical Garden Prefectural Park,33.1106,139.782,PM93vc,JP-TK,11,9,697,0,0
+JP-1834,Chichibu Muse Prefectural Park,35.9962,139.055,PM95mx,JP-ST,49,47,1790,0,0
+JP-1835,Niiza Greenway Prefectural Park,35.7779,139.592,PM95ts,JP-ST,74,68,1622,0,0
+JP-1836,Shinrinkoen Park Walking Road Prefectural Park,36.0471,139.375,PM96qb,JP-ST,39,37,1518,0,0
+JP-1837,Sakitama Greenway Prefectural Park,36.0892,139.48,PM96rc,JP-ST,158,151,3399,0,0
+JP-1838,Hananosato Greenway Prefectural Park,36.094,139.491,PM96rc,JP-ST,108,103,2310,0,0
+JP-1839,Akigase Greenway Prefectural Park,35.8525,139.634,PM95tu,JP-ST,73,72,2318,0,1
+JP-1842,Saitama Prefectural Citizens Health and Welfare Village Prefectural Park,35.8842,139.758,PM95vv,JP-ST,118,113,2559,0,0
+JP-1843,Saitamaken Agricultual and Forestry Prefectural Park,36.1123,139.288,PM96pc,JP-ST,46,46,1831,0,0
+JP-1845,Ikaho Forest Prefectural Park,36.4822,138.912,PM96kl,JP-GM,53,47,1673,0,0
+JP-1846,Akagi Forest Prefectural Park,36.5051,139.155,PM96nm,JP-GM,51,48,1470,0,0
+JP-1847,Akagi Community Forest Prefectural Park,36.5228,139.145,PM96nm,JP-GM,36,33,690,0,0
+JP-1848,Sakuranosato Forest Prefectural Park,36.2827,138.744,PM96ig,JP-GM,22,22,532,0,0
+JP-1849,Sakurayama Forest Prefectural Park,36.1614,139.021,PM96md,JP-GM,27,27,792,0,0
+JP-1850,Mikabo Forest Prefectural Park,36.151,138.863,PM96kd,JP-GM,29,26,770,0,0
+JP-1851,Gunma Forest Park 21st Century Prefectural Park,36.739,139.084,PM96nr,JP-GM,17,17,500,0,0
+JP-1852,Gunma Insect World Forest Prefectural Park,36.436,139.251,PM96pk,JP-GM,32,26,684,0,1
+JP-1854,Oura no Mori Forest Prefectural Park,36.265,139.487,PM96rg,JP-GM,60,55,1440,0,0
+JP-1855,Oneyama Bird Forest Prefectural Park,36.3524,138.738,PM96ii,JP-GM,18,17,354,0,0
+JP-1857,Midorinomura Agricultual and Forestry Prefectural Park,36.0366,138.982,PM96la,JP-ST,39,38,1842,0,0
+JP-1858,Saino-Kuni Fureai Forest Prefectural Park,35.9947,138.801,PM95jx,JP-ST,28,26,641,0,0
+JP-1859,Tochigi Prefectual Forest Prefectural Park,36.8739,139.841,PM96wu,JP-TC,61,57,4149,0,1
+JP-1860,Italian Embassy Villa Memorial Prefectural Park,36.725,139.486,PM96rr,JP-TC,10,10,175,0,0
+JP-1861,British Embassy Villa Memorial Prefectural Park,36.7266,139.486,PM96rr,JP-TC,11,11,174,0,0
+JP-1862,Otosan Prefectural Nature Park,33.7272,135.714,PM73ur,JP-WK,5,5,209,0,0
+JP-1863,Choukai-no-mori Prefectural Park,38.8593,139.98,PM98xu,JP-YT,19,19,773,0,0
+JP-1864,Genryu-no-mori Prefectural Park,37.9256,139.899,PM97ww,JP-YT,11,11,461,0,0
+JP-1865,Kenmin-no-mori Prefectural Park,38.242,140.203,QM08cf,JP-YT,19,19,976,0,0
+JP-1866,Yugaku-no-mori Prefectural Park,38.9127,140.376,QM08ev,JP-YT,16,16,608,0,0
+JP-1867,Yamagata Nature Museum Prefectural Park,38.5044,139.998,PM98xm,JP-YT,23,23,1155,0,0
+JP-1868,Rinkuu-kouen Prefectural Park,38.1361,140.9,QM08kd,JP-MG,71,71,2026,0,0
+JP-1869,Kenmin-no-mori Prefectural Park,38.3215,140.937,QM08lh,JP-MG,27,26,713,0,0
+JP-1870,Forest Park Adatara Prefectural Park,37.5815,140.329,QM07dn,JP-FS,20,20,1062,0,0
+JP-1871,Showa-no-mori Prefectural Park,37.5752,140.07,QM07an,JP-FS,26,25,874,0,0
+JP-1872,Rachihama Bosai Ryokuchi Prefectural Park,37.8871,140.932,QM07lv,JP-FS,21,21,789,0,0
+JP-1873,Haragamaobama Bosai Ryokuchi Prefectural Park,37.8313,140.956,QM07lt,JP-FS,25,24,790,0,0
+JP-1874,Hisanohama Bosai Ryokuchi Prefectural Park,37.1422,141,QM07md,JP-FS,8,8,220,0,0
+JP-1875,Yotsukura Bosai Ryokuchi Prefectural Park,37.0991,140.987,QM07lc,JP-FS,11,11,282,0,0
+JP-1876,Numanouchi Bosai Ryokuchi Prefectural Park,37.0135,140.974,QM07la,JP-FS,14,14,351,0,0
+JP-1877,Usuiso Bosai Ryokuchi Prefectural Park,36.9999,140.979,QM06lx,JP-FS,14,14,273,0,0
+JP-1878,Toyoma Bosai Ryokuchi Prefectural Park,36.9863,140.969,QM06lx,JP-FS,15,15,304,0,0
+JP-1879,Nagasaki Bosai Ryokuchi Prefectural Park,36.9539,140.938,QM06lw,JP-FS,14,14,293,0,0
+JP-1880,Iwama Bosai Ryokuchi Prefectural Park,36.9126,140.818,QM06jv,JP-FS,19,19,575,0,0
+JP-1881,Kenmin-no-mori Prefectural Park,39.7206,140.696,QM09ir,JP-AK,17,17,482,0,0
+JP-1883,Oita Prefecture Museum of History Prefectural Park,33.542,131.361,PM53qn,JP-OT,5,5,166,0,0
+JP-1884,Oita Kenmin no Mori Prefectural Park,33.1594,131.547,PM53sd,JP-OT,21,19,854,0,0
+JP-1885,Oita Agricultural Prefectural Park,33.4331,131.43,PM53rk,JP-OT,8,8,348,0,0
+JP-1886,Expo '70 Commemorative Prefectural Park,34.8112,135.53,PM74st,JP-OS,53,50,1278,0,0
+JP-1887,Kenmin-no-mori Prefectural Park,39.8957,140.965,QM09lv,JP-IW,10,10,430,0,0
+JP-1888,Senganishi Forest Prefectural Park,39.2217,141,QM09mf,JP-IW,33,30,1215,0,0
+JP-1889,Ohokuboyama Forest Prefectural Park,39.1702,141.757,QM09ve,JP-IW,24,22,712,0,0
+JP-1890,Orizumedake Forest Prefectural Park,40.2684,141.373,QN00qg,JP-IW,9,9,543,0,0
+JP-1891,Takatamatsubara Memorial Prefectural Park,39.0069,141.627,QM09ta,JP-IW,21,21,743,0,0
+JP-1892,Ishinomakiminamihama Memorial Prefectural Park,38.4184,141.303,QM08pk,JP-MG,19,19,561,0,0
+JP-1893,Fukushima Memorial Prefectural Park,37.4649,141.031,QM07ml,JP-FS,10,10,589,0,0
+JP-1899,Kasukabe Yumeno-mori Prefectural Park,35.954,139.738,PM95uw,JP-ST,118,115,2839,0,0
+JP-1900,Chiba Prefectural Funabashi Forest Prefectural Park,35.7685,140.058,QM05as,JP-CH,39,38,1188,0,0
+JP-1901,Chiba Prefectural Tonosho Forest Prefectural Park,35.7808,140.676,QM05is,JP-CH,43,39,1436,0,0
+JP-1902,Chiba Prefectural Uchiurayama Forest Prefectural Park,35.1596,140.199,QM05cd,JP-CH,27,26,752,0,0
+JP-1903,Tateyama Wild Bird Sanctuary Prefectural Park,34.9238,139.836,PM94ww,JP-CH,29,28,769,0,0
+JP-1904,Chiba Prefectural Seiwa Forest Prefectural Park,35.1786,140.02,QM05ae,JP-CH,29,29,875,0,0
+JP-1905,Chiba Prefectural Otaki Forest Prefectural Park,35.2824,140.235,QM05cg,JP-CH,29,27,1225,0,0
+JP-1906,Fuefukigawa Fruit Prefectural Park,35.7025,138.665,PM95hq,JP-YN,75,72,2632,0,0
+JP-1907,Midorigaoka Sports Prefectural Park,35.6849,138.557,PM95gq,JP-YN,36,33,908,0,0
+JP-1908,Kamanashigawa Sports Prefectural Park,35.6513,138.507,PM95gp,JP-YN,36,36,983,0,0
+JP-1909,Yamanashi Prefectural Museum of Art Prefectural Park,35.6604,138.538,PM95gp,JP-YN,23,23,509,0,0
+JP-1910,Maizuru Castle Prefectural Park,35.6647,138.571,PM95gp,JP-YN,16,16,328,0,0
+JP-1911,Kofu Chu-ou Prefectural Park,35.66,138.568,PM95gp,JP-YN,12,12,231,0,0
+JP-1912,Kofu Marunouchi Prefectural Park,35.6633,138.567,PM95gp,JP-YN,12,12,208,0,0
+JP-1913,Midai Prefectural Park,35.6685,138.44,PM95fq,JP-YN,31,28,819,0,0
+JP-1914,Kanegawano mori Provincial Forest Prefectural Park,35.6399,138.676,PM95ip,JP-YN,32,29,820,0,0
+JP-1915,Katsuragawa Wellness Prefectural Park,35.6221,138.996,PM95lo,JP-YN,54,51,1912,0,0
+JP-1916,Yamanashi Prefectural Makiba Prefectural Park,35.9257,138.408,PM95ew,JP-YN,30,30,805,0,0
+JP-1917,Kiyosato Okanokouen Prefectural Park,35.9013,138.429,PM95fv,JP-YN,29,28,812,0,0
+JP-1918,Aichiken ryokka center Prefectural Park,35.1587,137.193,PM85od,JP-AI,93,84,2332,0,0
+JP-1919,Kainan Kodomonokuni Prefectural Park,35.0956,136.757,PM85jc,JP-AI,111,108,2583,0,0
+JP-1920,AichiYatomi Yachouen Prefectural Park,35.0488,136.784,PM85jb,JP-AI,110,109,2715,0,0
+JP-1921,Aichi KenminnoMori Prefectural Park,35.007,137.623,PM85ta,JP-AI,54,47,1521,0,0
+JP-1922,Aichiken Forest Prefectural Park,35.2339,137.052,PM85mf,JP-AI,177,174,4780,0,0
+JP-1923,Korogi Athletic Prefectural Park,35.1654,137.049,PM85md,JP-AI,84,84,2283,0,1
+JP-1924,LAGUNA BEACH Prefectural Park,34.8061,137.272,PM84pt,JP-AI,70,65,1929,0,0
+JP-1925,Kaisho Forest Prefectural Park,35.1888,137.111,PM85ne,JP-AI,101,98,2373,0,0
+JP-1926,Aichi Education and Sports Foundation Prefectural Park,35.302,136.846,PM85kh,JP-AI,70,64,2457,0,0
+JP-1927,Jindai Botanical Garden Prefectural Park,35.6715,139.548,PM95sq,JP-TK,86,83,1655,0,0
+JP-1928,Nakato Prefectural Park,35.7616,139.394,PM95qs,JP-TK,37,34,725,0,0
+JP-1929,Takaido Prefectural Park,35.6842,139.604,PM95tq,JP-TK,68,63,1430,0,0
+JP-1930,Niigata Seishonen no Mori Prefectural Park,38.0278,139.502,PM98sa,JP-NI,10,10,478,0,0
+JP-1931,Gozu Kenmin-no-mori Prefectural Park,37.7715,139.363,PM97qs,JP-NI,8,8,426,0,0
+JP-1932,Mitsuke Sugisawa no Mori Prefectural Park,37.5277,138.989,PM97lm,JP-NI,9,9,318,0,0
+JP-1933,Myoko Sanroku Kenmin-no-mori Prefectural Park,36.8573,138.097,PM96bu,JP-NI,10,10,362,0,0
+JP-1934,komorebi no Mori Prefectural Park,38.7872,140.788,QM08js,JP-MG,12,12,577,0,0
+JP-1935,Showa Manyo no Mori Prefectural Park,38.4695,140.881,QM08kl,JP-MG,22,21,1067,0,0
+JP-1936,Jomon no Mori Prefectural Park,38.4393,140.699,QM08ik,JP-MG,13,12,611,0,0
+JP-1937,Forest Park Of Mie Prefectural Park,35.0468,136.479,PM85fb,JP-ME,59,57,1331,0,0
+JP-1938,Ueno Forest Prefectural Park,34.7429,136.149,PM84br,JP-ME,25,25,518,0,0
+JP-1939,Ichinoyanomori Prefectural Park,35.8699,139.912,PM95wu,JP-CH,66,57,1910,0,0
+JP-1940,Kihoku Prefectural Park,34.3139,135.537,PM74sh,JP-WK,10,10,215,0,0
+JP-1941,Wakayama Koutsuu Prefectural Park,34.2035,135.218,PM74oe,JP-WK,13,13,308,0,0
+JP-1942,Ken-ei Fukushi Prefectural Park,34.535,135.784,PM74vm,JP-NR,64,62,984,0,0
+JP-1944,Satsunankaigan Prefectural Nature Park,31.2473,130.433,PM51ff,JP-KS,5,5,210,0,0
+JP-1945,Mishima Prefectural Park,30.7913,130.303,PM50ds,JP-KS,2,2,241,0,0
+JP-1946,Tama Zoological Prefectural Park,35.6496,139.403,PM95qp,JP-TK,44,42,1126,0,0
+JP-1947,Hinohara Tokyo Citizens' Forest Prefectural Park,35.7393,139.029,PM95mr,JP-TK,94,86,2626,0,0
+JP-1948,Okutama Tokyo Citizens' Forest Prefectural Park,35.7768,139.082,PM95ms,JP-TK,40,37,1581,0,0
+JP-1949,Ibaraki Prefectural Okukuji Forest Prefectural Park,36.7649,140.462,QM06fs,JP-IB,14,14,377,0,0
+JP-1950,Ibaraki Prefectural Suigo Forest Prefectural Park,35.9852,140.545,QM05gx,JP-IB,35,35,974,0,0
+JP-1951,Osaka Prefectural Agricultural Prefectural Park,34.3868,135.391,PM74qj,JP-OS,17,17,291,0,0
+JP-1952,Fumin-no-mori Kurondo Enchi Prefectural Park,34.7647,135.705,PM74us,JP-OS,19,19,355,0,0
+JP-1953,Fumin-no-mori Hoshida Enchi Prefectural Park,34.7514,135.686,PM74us,JP-OS,16,15,314,0,0
+JP-1954,Fumin-no-mori Muroike Enchi Prefectural Park,34.7287,135.667,PM74ur,JP-OS,18,18,415,0,0
+JP-1955,Fumin-no-mori Kusaka Enchi Prefectural Park,34.691,135.668,PM74uq,JP-OS,13,13,276,0,0
+JP-1956,Fumin-no-mori Nukata Enchi Prefectural Park,34.6772,135.673,PM74uq,JP-OS,15,15,269,0,0
+JP-1957,Fumin-no-mori Narukawa Enchi Prefectural Park,34.6666,135.666,PM74tp,JP-OS,42,33,621,0,0
+JP-1958,Fumin-no-mori Mizunomi Enchi Provincial Park,34.6375,135.659,PM74tp,JP-OS,73,71,1543,0,0
+JP-1959,Fumin-no-mori Chihaya Enchi Prefectural Park,34.4129,135.677,PM74uj,JP-OS,13,13,223,0,0
+JP-1960,Fumin-no-mori Horigo Enchi Prefectural Park,34.3334,135.324,PM74pi,JP-OS,15,14,316,0,0
+JP-1961,Chiba Port Prefectural Park,35.5991,140.099,QM05bo,JP-CH,207,200,6419,0,0
+JP-1962,Sodegaura Kaihin Prefectural Park,35.4558,139.954,PM95xk,JP-CH,94,89,2805,0,1
+JP-1963,Funabashi Port Shinsui Prefectural Park,35.6882,139.987,PM95xq,JP-CH,39,38,969,0,0
+JP-1964,Shinminato Prefectural Park,35.3656,139.895,PM95wi,JP-CH,66,63,1392,0,0
+JP-1965,Shiohama Prefectural Park,35.3791,139.909,PM95wj,JP-CH,76,75,2160,0,0
+JP-1966,Futtsuminato Prefectural Park,35.3223,139.819,PM95vh,JP-CH,70,69,1877,0,0
+JP-1967,Naikou Prefectural Park,35.3868,139.916,PM95wj,JP-CH,77,74,1743,0,1
+JP-1968,Naikou Kita Prefectural Park,35.3885,139.915,PM95wj,JP-CH,61,60,1513,0,0
+JP-1969,Kazusa Minatoko Kaihin Prefectural Park,35.2241,139.871,PM95wf,JP-CH,55,54,1528,0,0
+JP-1970,Naaraiko Kaihin Prefectural Park,35.706,140.838,QM05kq,JP-CH,51,48,1414,0,0
+JP-1971,Okitsu Port Seashore Prefectural Park,35.1328,140.247,QM05cd,JP-CH,32,32,1097,0,0
+JP-1972,Senba Prefectural Park,36.3682,140.467,QM06fi,JP-IB,27,24,444,0,0
+JP-1973,Kencho Higashi Park SHIBA Prefectural Park,36.3411,140.449,QM06fi,JP-IB,15,14,292,0,0
+JP-1974,Sawatarigawa Ryokuchi Prefectural Park,36.3807,140.447,QM06fj,JP-IB,18,17,301,0,0
+JP-1975,Sakuragawa Ryokuchi Prefectural Park,36.3639,140.444,QM06fi,JP-IB,20,20,359,0,0
+JP-1976,Kitauragawa Ryokuchi Prefectural Park,35.9077,140.116,QM05bv,JP-IB,43,41,1144,0,0
+JP-1977,Geidai Ryokuchi Prefectural Park,35.8838,140.11,QM05bv,JP-IB,24,22,523,0,0
+JP-1978,Akatsuka (JP-IB) Prefectural Park,36.0516,140.131,QM06bb,JP-IB,50,47,895,0,0
+JP-1979,Kasumigaura Comprehensive Prefectural Park,36.0635,140.22,QM06cb,JP-IB,70,67,1688,0,0
+JP-1980,Ibaraki Airport Prefectural Park,36.1766,140.407,QM06ee,JP-IB,32,31,925,0,0
+JP-1981,Gunma Ikoi-no-mori Prefectural Park,36.491,138.936,PM96ll,JP-GM,33,28,710,0,0
+JP-1982,Shizuoka Performing Arts Prefectural Park,34.9809,138.449,PM94fx,JP-SZ,227,219,8381,0,0
+JP-1983,Shizuoka Prefectural Public Forest Prefectural Park,35.2407,138.282,PM95df,JP-SZ,24,24,903,0,0
+JP-1984,Kyoto Botanical Gardens Prefectural Park,35.049,135.763,PM75vb,JP-KY,11,11,287,0,0
+JP-1985,Katsuragawa Sports Prefectural Park,34.9992,135.694,PM74ux,JP-KY,14,11,268,0,0
+JP-1986,Wakagawa Riverside Prefectural Park,34.2046,135.18,PM74oe,JP-WK,19,18,429,0,0
+JP-1987,Wakayama Prefecture Botanical Park Ryokka Center Prefectural Park,34.2858,135.328,PM74pg,JP-WK,14,13,299,0,0
+JP-1988,Negoroyama Genkinomori Prefectural Park,34.2941,135.329,PM74ph,JP-WK,14,14,352,0,0
+JP-1989,Gomadanzan Forest Prefectural Park,34.0406,135.566,PM74sa,JP-WK,11,11,327,0,0
+JP-1990,Wakayama Prefecture Kii-fudoki-no-oka Museum of Archaeology and Folklore Prefectural Park,34.2283,135.23,PM74of,JP-WK,14,13,301,0,0
+JP-1991,Maiko Prefectural Park,34.6308,135.034,PM74mp,JP-HG,26,26,637,0,0
+JP-1992,Amagasaki no Mori Chuo Ryokuchi Prefectural Park,34.6954,135.382,PM74qq,JP-HG,45,40,1130,0,0
+JP-1993,Takarazuka Nishitani no Mori Prefectural Park,34.8984,135.296,PM74pv,JP-HG,64,60,1898,0,0
+JP-1994,Sasayama no Mori Prefectural Park,35.0594,135.361,PM75qb,JP-HG,22,21,850,0,0
+JP-1995,Tamba Namikimichi Chuo Prefectural Park,35.0772,135.157,PM75nb,JP-HG,46,45,1398,0,0
+JP-1996,Awaji Ishi no Neya Ryokuchi Prefectural Park,34.5929,135.001,PM74mo,JP-HG,14,14,311,0,0
+JP-1997,Miki Sogo Bosai Prefectural Park,34.7841,135.049,PM74ms,JP-HG,176,170,4690,0,0
+JP-1998,Nishiina Prefectural Park,34.8008,135.418,PM74rt,JP-HG,42,37,1244,0,0
+JP-1999,Nadayama Ryokuchi Prefectural Park,34.5628,135.007,PM74mn,JP-HG,13,12,226,0,0
+JP-2000,Awaji Hanasajiki Prefectural Park,34.5536,134.978,PM74ln,JP-HG,11,10,204,0,0
+JP-2001,Yashiro Forest Prefectural Park,34.9081,135.04,PM74mv,JP-HG,62,61,1356,0,0
+JP-2002,"Naka,Yachiyo Forest Prefectural Park",35.0281,134.908,PM75ka,JP-HG,15,15,399,0,0
+JP-2003,Yumesaki no Mori Prefectural Park,34.9376,134.664,PM74hw,JP-HG,17,17,399,0,0
+JP-2004,Toga Art Prefectural Park,36.4324,137.043,PM86mk,JP-TY,7,7,223,0,0
+JP-2005,Ishikawa Prefectural Forest,36.6891,136.75,PM86jq,JP-IS,35,35,1465,0,0
+JP-2006,Konan Sports Prefectural Park,36.6326,136.674,PM86ip,JP-IS,32,32,828,0,0
+JP-2007,Notojima Seaside Prefectural Park,37.1486,136.982,PM87ld,JP-IS,9,9,327,0,0
+JP-2008,Yuuhidera Kenmin Nature Garden Prefectural Park,36.5724,136.707,PM86in,JP-IS,20,20,554,0,0
+JP-2009,Ishikawa Kenmin-no-mori Prefectural Park,36.2246,136.456,PM86ff,JP-IS,10,9,300,0,0
+JP-2011,Tottori Sakyu Kodomonokuni Prefectural Park,35.5338,134.224,PM75cm,JP-TT,20,18,443,0,0
+JP-2012,Tottori Hanakairo-Flower Prefectural Park,35.348,133.424,PM65ri,JP-TT,14,14,343,0,0
+JP-2013,Forest Park Tottori Deainomori Prefectural Park,35.4907,134.17,PM75cl,JP-TT,13,13,329,0,0
+JP-2014,Forest Park 21st Century Prefectural Park,35.4168,134.207,PM75ck,JP-TT,11,11,233,0,0
+JP-2015,Tottori Mukibanda Historic Site Prefectural Park,35.462,133.453,PM65rl,JP-TT,14,14,333,0,0
+JP-2016,Miyajima Prefectural Park,34.2736,132.305,PM64dg,JP-HS,17,16,475,0,0
+JP-2017,Ehime Kodomonoshiro Prefectural Park,33.7617,132.797,PM63js,JP-EH,13,13,232,0,0
+JP-2018,Ehime Forest Prefectural Park,33.7501,132.74,PM63is,JP-EH,13,13,441,0,0
+JP-2019,Miyazaki Seaside Prefectural Park,31.9299,131.468,PM51rw,JP-MZ,32,31,1070,0,0
+JP-2020,Miyazaki Prefectural Aoshima Subtropical Botanic Garden Prefectural Park,31.8018,131.47,PM51rt,JP-MZ,16,15,370,0,0
+JP-2021,Lupinus Prefectural Park,32.1711,131.521,PM52se,JP-MZ,14,14,410,0,0
+JP-2022,Kawaminami Yugaku no Mori National Park,32.2434,131.489,PM52rf,JP-MZ,11,10,344,0,0
+JP-2023,Hinamoridai Kenmin Fureai no Mori Prefectural Park,31.9319,130.94,PM51lw,JP-MZ,11,11,426,0,0
+JP-2024,Tomoni Manabu Mori Prefectural Park,31.9918,131.207,PM51ox,JP-MZ,10,10,314,0,0
+JP-2025,The Shigaraki Ceramic Cultural Prefectural Park,34.8857,136.059,PM84av,JP-SH,22,21,647,0,0
+JP-2026,Biwako Kodomonokuni Prefectural Park,35.3204,136.075,PM85ah,JP-SH,16,14,562,0,0
+JP-2027,Shiga Prefecture Kibougaoka Cultural Prefectural Park,35.0543,136.068,PM85ab,JP-SH,22,22,612,0,0
+JP-2028,Omifuji Karyoku Prefectural Park,35.0537,136.044,PM85ab,JP-SH,22,22,458,0,0
+JP-2029,Hinomine Omiko Regional Prefectural Park,34.031,134.587,PM74ha,JP-TS,47,42,2358,0,0
+JP-2030,Naruto Uchinoumi Prefectural Park,34.21,134.597,PM74hf,JP-TS,23,23,587,0,0
+JP-2031,Asutamu Land Tokushima Prefectural Park,34.153,134.441,PM74fd,JP-TS,12,12,316,0,0
+JP-2032,Tokushima Prefectural Sanagouchi Ikimonofureainosato Prefectural Park,33.9687,134.414,PM73ex,JP-TS,6,6,337,0,1
+JP-2033,Takamaruyama Sennennomori Prefectural Park,33.8818,134.332,PM73dv,JP-TS,4,4,189,0,0
+JP-2034,Kuramoto Prefectural Park,34.0748,134.514,PM74gb,JP-TS,12,12,270,0,0
+JP-2035,Shikoku Saburo No Sato Prefectural Park,34.0422,134.002,PM74ab,JP-TS,8,8,445,0,0
+JP-2036,Tokushima Prefectural Dejima Wild Bird Garden Prefectural Park,33.9594,134.672,PM73ix,JP-TS,64,62,1789,0,0
+JP-2037,Shinmachigawa Prefectural Park,34.0769,134.544,PM74gb,JP-TS,10,10,203,0,0
+JP-2038,Imperial Palace Outer Garden National Government Park,35.6802,139.758,PM95vq,JP-TK,627,569,15421,0,0
+JP-2039,Kyoto Gyoen National Government Park,35.0234,135.763,PM75va,JP-KY,18,17,397,0,0
+JP-2040,Shinjuku Gyoen National Government Park,35.6852,139.71,PM95uq,JP-TK,157,146,3211,0,0
+JP-2041,Donguri Land Prefectural Park,34.219,134.075,PM74af,JP-KG,15,14,232,0,0
+JP-2042,Sanuki Kodomonokuni Prefectural Park,34.2121,134.017,PM74af,JP-KG,15,14,279,0,0
+JP-2043,Sakaide Kansyo Ryokuchi Prefectural Park,34.3245,133.832,PM64vh,JP-KG,22,21,450,0,0
+JP-2044,Setoohashi kinenkouen Prefectural Park,34.3514,133.826,PM64vi,JP-KG,29,24,580,0,0
+JP-2045,Kagawayosui Memorial Prefectural Park,34.0992,133.765,PM64vc,JP-KG,34,30,961,0,0
+JP-2046,Kozai Nishichiku Kowan Ryokuchi Prefectural Park,34.3579,133.996,PM64xi,JP-KG,23,20,590,0,0
+JP-2047,Sanuki Airport Prefectural Park,34.2209,134.015,PM74af,JP-KG,14,13,238,0,0
+JP-2048,Koutougawa Prefectural Park,34.3248,134.01,PM74ah,JP-KG,23,23,573,0,0
+JP-2049,Olive Prefectural Park,34.4729,134.274,PM74dl,JP-KG,12,12,459,0,0
+JP-2050,Dokigawa Prefectural Park,34.254,133.836,PM64wg,JP-KG,35,32,971,0,0
+JP-2051,Ritsurin Garden Prefectural Park,34.3297,134.044,PM74ah,JP-KG,13,13,320,0,0
+JP-2052,Ohno Odaiba Prefectural Park,36.617,136.606,PM86ho,JP-IS,31,31,785,0,0
+JP-2053,Aomori Prefectural Sport Prefectural Park,40.8063,140.707,QN00it,JP-AO,25,24,627,0,0
+JP-2054,Iwate Prefectural Sports Prefectural Park,39.7362,141.119,QM09nr,JP-IW,20,19,537,0,0
+JP-2055,Fureai Ryokuchi Prefectural Park,40.1978,140.36,QN00ee,JP-AK,14,13,435,0,0
+JP-2056,Toyama Nature Museum Prefectural Park,36.6391,137.082,PM86mp,JP-TY,12,12,313,0,0
+JP-2057,Yatyou no sono Prefectural Park,36.6603,137.104,PM86np,JP-TY,6,6,186,0,0
+JP-2058,Ranjyou no mori Prefectural Park,36.6366,137.047,PM86mp,JP-TY,13,13,379,0,0
+JP-2059,Toyama 21st Century Forest Prefectural Park,36.428,137.084,PM86nk,JP-TY,8,8,231,0,0
+JP-2060,Arimine Shinrin Bunka Prefectural Park,36.4915,137.459,PM86rl,JP-TY,6,6,243,0,0
+JP-2061,Botanic Gardens of Toyama Prefectural Park,36.6628,137.181,PM86op,JP-TY,9,9,207,0,0
+JP-2062,Kencho Mae Prefectural Park,36.6964,137.211,PM86oq,JP-TY,7,7,149,0,0
+JP-2063,Rinkai Bird Prefectural Park,36.7823,137.105,PM86ns,JP-TY,14,13,279,0,0
+JP-2064,Minami Suiro Ryokuchi Prefectural Park,36.7631,137.113,PM86ns,JP-TY,11,11,290,0,0
+JP-2065,lumberyard Ryokuchi Prefectural Park,36.7702,137.097,PM86ns,JP-TY,12,12,228,0,0
+JP-2066,Kaikou monument Ryokuchi Prefectural Park,36.7749,137.113,PM86ns,JP-TY,13,13,276,0,0
+JP-2067,Genki no mori Prefectural Park,36.776,137.128,PM86ns,JP-TY,13,13,316,0,0
+JP-2068,Ariake Shinsui Seaside Prefectural Park,35.6432,139.796,PM95vp,JP-TK,77,72,1287,0,0
+JP-2069,Harumi Greenway Prefectural Park,35.6506,139.779,PM95vp,JP-TK,59,56,1432,0,0
+JP-2070,Harumi Port Prefectural Park,35.6483,139.771,PM95vp,JP-TK,97,90,2592,0,0
+JP-2071,National Ainu National Government Park,42.5599,141.365,QN02qn,JP-HK,11,10,290,0,0
+JP-2072,Marine Park Nezugaseki Prefectural Park,38.5566,139.545,PM98sn,JP-YT,19,19,704,0,0
+JP-2073,Yamizo Kenmin Recreation Prefectural Park,36.6993,140.073,QM06aq,JP-TC,29,27,828,0,0
+JP-2074,Nerima-joshi Prefectural Park,35.7463,139.642,PM95tr,JP-TK,156,146,3020,0,0
+JP-2075,Umi-no-Mori Prefectural Park,35.6067,139.809,PM95vo,JP-TK,45,43,1688,0,0
+JP-2076,Kaiwomaru Prefectural Park,36.78,137.108,PM86ns,JP-TY,15,15,314,0,0
+JP-2077,Tatsunokuchi Kyuuryou Prefectural Park,36.4381,136.546,PM86gk,JP-IS,18,17,776,0,0
+JP-2078,Jyumoku Prefectural Park,36.431,136.641,PM86hk,JP-IS,19,19,619,0,0
+JP-2079,Higashi Prefectural Park,36.6284,136.639,PM86hp,JP-IS,7,7,180,0,0
+JP-2080,Minato Prefectural Park,36.6063,136.616,PM86ho,JP-IS,8,8,182,0,0
+JP-2081,Goroujima Prefectural Park,36.617,136.624,PM86ho,JP-IS,7,7,205,0,0
+JP-2082,Chikaokaryokuchi Prefectural Park,36.6121,136.628,PM86ho,JP-IS,22,22,570,0,0
+JP-2083,Minato syou Prefectural Park,37.0489,136.977,PM87lb,JP-IS,6,6,124,0,0
+JP-2084,Biwan Prefectural Park,37.0483,136.982,PM87lb,JP-IS,8,8,224,0,0
+JP-2085,Nanao Marine Prefectural Park,37.0485,136.97,PM87lb,JP-IS,10,10,378,0,0
+JP-2086,Togakushi Forest Botanical Garden Prefectural Park,36.752,138.077,PM96as,JP-NN,17,17,522,0,0
+JP-2087,Ikuhisa Prefectural Park,36.0823,136.222,PM86cb,JP-FI,18,18,526,0,0
+JP-2088,Fukui Undou Prefectural Park,36.0517,136.184,PM86cb,JP-FI,20,18,615,0,0
+JP-2089,Tamba-no-Mori Prefectural Park,35.1222,135.072,PM75mc,JP-HG,17,16,384,0,0
+JP-2090,Maruyamagawa Prefectural Park,35.6339,134.826,PM75jp,JP-HG,13,12,322,0,0
+JP-2091,Kunimi-no-Mori Prefectural Park,34.986,134.523,PM74gx,JP-HG,14,14,397,0,0
+JP-2092,Shimane Prefecutural Furusato Forest Prefectural Park,35.3859,132.894,PM65kj,JP-SM,20,19,517,0,0
+JP-2093,Okayama Prefectural Forest,35.2809,133.878,PM65wg,JP-OY,7,7,207,0,0
+JP-2094,Yamaguchi Prefectural Seminar Prefectural Park,34.0604,131.436,PM54rb,JP-YC,9,8,145,0,0
+JP-2095,Kirarahama Nature Observation Prefectural Park,34.0205,131.379,PM54qa,JP-YC,8,8,230,0,0
+JP-2096,Hokigamine Forest Prefectural Park,33.6691,133.68,PM63uq,JP-KC,7,7,280,0,0
+JP-2097,Kannourako Kaigan Ryokuchi Prefectural Park,33.5429,134.294,PM73dn,JP-KC,8,7,384,0,0
+JP-2098,Teiko Kaigan Ryokuchi Prefectural Park,33.5348,133.752,PM63vm,JP-KC,7,7,278,0,0
+JP-2099,Hijima Kotsu Prefectural Park,33.5734,133.551,PM63sn,JP-KC,8,7,135,0,0
+JP-2100,Shiouji Kenmin No Mori Prefectural Park,33.5343,130.519,PM53gm,JP-FO,13,12,506,0,0
+JP-2101,Yasu Kogen Kinen No Mori Prefectural Park,33.4914,130.658,PM53hl,JP-FO,7,6,170,0,0
+JP-2102,Hadomisaki Kaihin Prefectural Park,33.5507,129.855,PM43wn,JP-SG,9,9,356,0,0
+JP-2103,Nagasaki Kotsu Prefectural Park,32.7786,129.856,PM42ws,JP-NS,9,9,189,0,0
+JP-2104,Amami Prefectural Park,28.4172,129.694,PL48uk,JP-KS,3,3,220,0,0
+JP-2105,Aichi Children's World Prefectural Park,34.7924,137.158,PM84nt,JP-AI,48,47,1843,0,0
+JP-2106,Showa-no-mori Prefectural Park,35.1704,137.199,PM85oe,JP-AI,103,98,2843,0,0
+JP-2107,Hidakasanmyaku-Erimo-Tokachi National Park,42.4067,142.918,QN12lj,JP-HK,8,7,276,0,0
+JP-2108,Chikatsu Asuka Fudoki-No-Oka Historical Prefectural Park,34.5017,135.641,PM74tm,JP-OS,12,12,319,0,0
+JP-2109,Garden of the Diet Front Park,35.6767,139.748,PM95uq,JP-TK,25,22,894,0,0
+JP-2110,The Kochi Prefectural Makino Botanical Garden Prefectural Park,33.5483,133.579,PM63sn,JP-KC,2,2,147,0,0
