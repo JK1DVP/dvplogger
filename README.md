@@ -54,6 +54,7 @@ idf.py build flash monitor<br>
 すれば、ビルドして書き込みまでできるはずです。
 
 [注意] 本システムのメインCPUのプログラムはmini 版とwide版でビルドを分けることが必要です。
+
 ビルド前に
 
 dvplogger/main/decl.h に<br>
@@ -69,8 +70,12 @@ cd dvplogger_ext<br>
 idf.py build<br>
 することにより、dvplogger_ext にapp0.bin , bootload.bin, parttio.bin, spiffs.bin のそれぞれシンボリックリンク先の実態ができていると思います。
 これをdvplogger のWebサーバーにアクセスし、DVPloggerのSDメモリにアップロードをしてください。
-そのうえで、dvploggerのターミナル接続(idf.py monitorなどでやると良いでしょう）から、flashersd app0 boot part spiffs [Enter]とコマンドを打つことで、サブCPUへのflash書き込みができるようになっています。
+そのうえで、dvploggerのターミナル接続(idf.py monitorなどでやると良いでしょう）から、<br>
+flashersd app0 boot part spiffs [Enter]<br>
+とコマンドを打つことで、サブCPUへのflash書き込みができるようになっています。
 
 また、古い版のサブCPUプログラム（最低限の機能を実装）はSDへのアップロードなしに、flasher コマンドで書き込めるようにしておきましたので、不都合がある場合は、試してみてください。
 
-プログラムを書き換えた場合には、restart_dvploggerコマンドで再起動することをおすすめします。
+プログラムを書き換えた場合には、<br>
+restart_dvplogger<br>
+コマンドで再起動することをおすすめします。
