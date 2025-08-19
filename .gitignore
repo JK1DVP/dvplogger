@@ -1,0 +1,16 @@
+# 除外: Arduino-ESP32本体
+dvplogger/components/arduino/*
+dvplogger/arduino-esp32/*
+
+# 含める: arduinoディレクトリ自体と libraries 以下
+!dvplogger/components/arduino/libraries/
+!dvplogger/components/arduino/CMakeLists.txt
+!dvplogger/components/arduino/libraries/**
+
+dvplogger/arduino-esp32/tools/sdk/*
+dvplogger/arduino-esp32/tools/esptool/*
+dvplogger/arduino-esp32/tools/xtensa-esp32-elf/*
+
+# 念のため不要なビルド生成物も
+dvplogger/build/
+dvplogger_ext/build/
