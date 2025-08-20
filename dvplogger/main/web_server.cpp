@@ -947,7 +947,7 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
   if (state.finished) {
     console->println("state.finished reached");
     String footer = "";
-    if (state.type!=2) { // not adif
+    if (state.type!=2 && state.type!=3) { // not adif
       footer += "---- end of file ";
       footer += state.isCurrent ? "(current)" : state.fname;
       footer += " -----\n";
@@ -1030,6 +1030,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <p><a href="/sotahelp">/sotahelp</a> SOTA 最寄り検索/ログ簡単アップロード</p>
 <p><a href="/settings">/settings</a> View/Edit Logger Settings</p>
 <p><a href="/rigs">/rigs</a> View/Edit RIG Settings</p>
+<p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_250819.pdf">Manual DVPlogger_manual_250819.pdf</a></p>
 <p><a href="/op">/op</a> Web Opeartion Window</p>
 
   <p><h1>File Upload</h1></p>

@@ -678,8 +678,13 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
   char tmpbuf[200];
   int len;
   //1.  No                : 1
-  sprintf(tmpbuf,"%s,",qso->entry.seqnr);
-  strcat(buf,tmpbuf);  
+  //  sprintf(tmpbuf,"%s,",qso->entry.seqnr);
+  //  strcat(buf,tmpbuf);
+
+  //4.  相手局コールサイン     : JA1ZLO
+  sprintf(tmpbuf,"%s,",qso->entry.hiscall);
+  strcat(buf,tmpbuf);
+  
   //2.  交信日             : 2025/06/15
   //3.  交信時刻           : 1330
   //<QSO_DATE:8>20230611
@@ -697,13 +702,9 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
 	  utc_tm.tm_year+1900, utc_tm.tm_mon + 1, utc_tm.tm_mday);
   strcat(buf,tmpbuf);
   //<TIME_ON:4>0016  
-  sprintf(tmpbuf,"%02d%02d,",utc_tm.tm_hour, utc_tm.tm_min);
+  sprintf(tmpbuf,"%02d:%02dJ,",utc_tm.tm_hour, utc_tm.tm_min);
   strcat(buf,tmpbuf);
 
-
-  //4.  相手局コールサイン     : JA1ZLO
-  sprintf(tmpbuf,"%s,",qso->entry.hiscall);
-  strcat(buf,tmpbuf);
   //5.  送信RST           : 599
   //<RST_SENT:2>59
   sprintf(tmpbuf,"%s,",qso->entry.sentrst);
@@ -715,79 +716,69 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
   strcat(buf,tmpbuf);
   //7.  周波数（MHz）      : 7
   //<BAND:2>2m
-  int tmp,ret;
-  tmp=1;
-  ret=sscanf(qso->entry.band,"%d",&tmp);
-  sprintf(tmpbuf,"%s,",band_str[tmp-1]);
+  float tmp;
+  int ret;
+  ret=sscanf(qso->entry.freq,"%f",&tmp);
+  sprintf(tmpbuf,"%.5f,",tmp/1000000.0);
   strcat(buf,tmpbuf);
   //8.  モード             : CW
   //<MODE:2>FM
   sprintf(tmpbuf,"%s,",qso->entry.opmode);
   strcat(buf,tmpbuf);
-  //9.  相手の名前         : Taro
-  //10. 相手のQTH         : Tokyo
+  // code  blank
+  // gl    blank
   //11. QSL送受           : J   （J:発行済 / N:未発行 / W:希望）
-  strcat(buf,",,,,");      
-  //12. メモ              : POTA JA-0001
-  //<COMMENT>
-  if (strlen(qso->entry.remarks)>0) {
-    sprintf(tmpbuf,"\*%s\*,",qso->entry.remarks);
-    strcat(buf,tmpbuf);
-  } else {
-    strcat(buf,",");
-  }
+  char *p;
 
-  //13. 交信種別           : 通常
-  //14. 運用場所           : 埼玉県秩父市
-  //15. 備考              : Field Day
-  //16. 出力              : 5W
-  //17. QSL送付日         : 2025/06/16
-  //18. QSL受領日         : 2025/06/20
-  //19. JCC              : 1101
-  //20. JCG              : 13002
-  //21. グリッドロケータ     : PM95RQ
-  //22. 都道府県           : 埼玉県
-  //23. 市区郡            : 秩父市
-  strcat(buf,",,,,,,,,,,,,,");        
-  //24. 自局コールサイン     : JK1DVP/1
-  //
-  sprintf(tmpbuf,"%s,",qso->entry.mycall);
-  strcat(buf,tmpbuf);
-  //25. QSLカード印刷      : Y
-  //26. 電子QSL           : Y
-  //27. カード印刷済        : N
-  //28. クラブ名           : JARL
-  //29. 移動運用地         : 秩父市道の駅
-  //30. 天気              : 晴れ
-  //31. 運用開始時刻        : 1230
-  //32. 運用終了時刻        : 1530
-  //33. リグ              : FT-818ND
-  //34. アンテナ           : モービルホイップ
-  //35. ログ種別           : POTA
-  //36. コンテスト名        : FD
-  strcat(buf,",,,,,,,,,,,,,");          
-  //37. 送信ナンバー        : 11H
-  // STX_STRING
-  if (strlen(qso->entry.sentexch)>0) {
-    sprintf(tmpbuf,"%s,",qso->entry.sentexch);
-    strcat(buf,tmpbuf);    
+  if ((p=strstr(qso->entry.remarks,"JARL"))!=NULL) {
+    strcat(buf,",,J,");
+  } else if ((p=strstr(qso->entry.remarks,"hQSL"))!=NULL) {
+    strcat(buf,",,H,");
   } else {
-    strcat(buf,",");
+    strcat(buf,",,,");
   }
-
-  //38. 受信ナンバー        : 13S
-  // SRX_STRING
-  if (strlen(qso->entry.rcvexch)>0) {
-    sprintf(tmpbuf,"%s,",qso->entry.rcvexch);
-    strcat(buf,tmpbuf);    
-  } else {
-    strcat(buf,",");
+  // Hisname    blank
+  // QTH        blank
+  strcat(buf,",,");
+  
+  // Remarks1  --> received_exchange % Op Location J: POTA_MY: SOTA_MY: args from Remarks mycall %
+  strcat(buf,"\"");  
+  strcat(buf,qso->entry.rcvexch);
+  strcat(buf," %");
+  if ((p=parse_strings(qso->entry.remarks,"J:"))!=NULL) {
+    strcat(buf,"JCC/JCG:");
+    strcat(buf,p);
+    strcat(buf," ");    
   }
-  //39. DXCCエンティティ   : JA
-  //40. IOTA             : AS-007
-  //41. CQゾーン          : 25
-  //42. ITUゾーン         : 45
-  //43. 記念局
+  
+  if ((p=parse_strings(qso->entry.remarks,"POTA_MY:"))!=NULL) {
+    strcat(buf,"POTA_MY:");
+    strcat(buf,p);
+    strcat(buf," ");    
+  }
+  
+  if ((p=parse_strings(qso->entry.remarks,"SOTA_MY:"))!=NULL) {
+    strcat(buf,"SOTA_MY:");
+    strcat(buf,p);
+    strcat(buf," ");    
+  }
+  strcat(buf,qso->entry.mycall);
+  strcat(buf,"%\",");
+      
+  // Remarks2  --> % contest_name % Remarks Sent_exchange
+  // 0 ???
+  // hamloguser or not
+  strcat(buf,"\"");
+  if (strlen(plogw->contest_name+2)>0) {
+    strcat(buf,"%");
+    strcat(buf,plogw->contest_name+2);
+    strcat(buf,"% ");    
+  }
+  strcat(buf,qso->entry.sentexch);
+  strcat(buf," ");
+  strcat(buf,qso->entry.remarks);
+  strcat(buf,"\",");
+  // JM1LDV/1,25/08/16,22:23J,599,599,7.01502,CW,CODE,GL,J,HisName,QTH,Remarks1,Remarks2,0,
   strcat(buf,"\n");
 }
 
