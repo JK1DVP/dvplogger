@@ -28,8 +28,8 @@
 // HWVER=1 ver 2024
 // HWVER=2 ver 2024 mod for PSRAM, KEY1 moved to main IO2, subcpu update possible
 // HWVER=3 CAT RX/TX swapped on the board 
-//#define JK1DVPLOG_HWVER 1
-#define JK1DVPLOG_HWVER 3
+#define JK1DVPLOG_HWVER 1
+//#define JK1DVPLOG_HWVER 3
 //#define JK1DVPLOG_HWVER 2
 #define JK1DVPLOG_VERSION_STRING "ver 25/8/19"
 #if JK1DVPLOG_HWVER >= 2
