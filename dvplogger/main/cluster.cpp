@@ -84,10 +84,6 @@ static constexpr size_t CLUSTER_RX_CHUNK   = 256;       // 受信側一時バッ
 void handleData_cluster(void *arg, AsyncClient *client, void *data, size_t len)
 {
   //	console->printf("\n data received from %s \n", client->remoteIP().toString().c_str());
-  if (verbose & 16) {
-    plogw->ostream->print("C:");
-    plogw->ostream->write((uint8_t *)data, len);
-  }
 
   if (cluster.stat == 5) {
     //
@@ -232,7 +228,8 @@ void cluster_io_init() {
         configASSERT(s_cluster_rx_sb != nullptr);
         // パーサタスク（ネットワークより少し低い〜同等の優先度でOK）
         xTaskCreatePinnedToCore(cluster_worker_task, "cluster_worker",
-                                6144, nullptr, 9, nullptr, tskNO_AFFINITY);
+				//                         6144, nullptr, 9, nullptr, tskNO_AFFINITY);
+				6144, nullptr, 4, nullptr, tskNO_AFFINITY);				
     }
 }
 
@@ -372,7 +369,8 @@ void get_info_cluster(const char *ssrc) {
     return;
   }
   // check contest frequency if contest_id != 0 , cqww  3
-  if (plogw->contest_id != 0 && plogw->contest_id != 3 && plogw->contest_id != 15) {
+  //  if (plogw->contest_id != 0 && plogw->contest_id != 3 && plogw->contest_id != 15) {
+  if (!is_international_contest()) {
     // check contest frequency
     if (!in_contest_frequency(ifreq)) {
       if (verbose & 16) {

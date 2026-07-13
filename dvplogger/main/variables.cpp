@@ -36,6 +36,7 @@
 // usb task free memory
 int usb_task_memory_watermark=0;
 int kbdtype=0;
+bool f_cardkey_present=1;
 
 int main_loop_revs=0;
 File f;
@@ -66,7 +67,7 @@ const char *modetype_str[4] = { "*", "CW", "PH", "DG" };
 /// call buffer
 struct logwindow logw;
 struct logwindow *plogw;
-
+int f_spiram;
 struct disp disp;
 struct disp *dp;
 struct sat_info sat_info[N_SATELLITES];
@@ -100,8 +101,6 @@ struct bandmap bandmap[N_BAND];
 int bandmap_mask = 0;  // suppress updating bandmap from telnet cluster if the corresponding bit 1<<(bandid-1) is set
 struct bandmap_disp bandmap_disp;
 
-struct dupechk *dupechk=NULL;
-
 int display_type=0; // 0 1.3" display 1 2.4" display 2 1.3" but flipped 
 //#if JK1DVPLOG_HWVER >= 3
 //int display_type=1; // 0 1.3" display 1 2.4" display 2 1.3" but flipped 
@@ -121,4 +120,6 @@ int rtcadj_count = 0;
 //int callhistf_stat = 0;  // 0 not open 1 open for reading 2 open for writing
 char qsologfn[20];    // qso log filename (append)
 char callhistfn[20];  // call history file to read
+int callhist_at=0; // 0: MAIN, 1: SUBCPU
+int dupechk_at=0; // 0: MAIN, 1: SUBCPU 2:this is SUBCPU
 

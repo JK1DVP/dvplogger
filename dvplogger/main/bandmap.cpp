@@ -141,11 +141,12 @@ int find_on_freq_bandmap(int bandid, unsigned int freq, int tolerance) {
     dfreq = p->freq - freq;
     if (dfreq < 0) dfreq = -dfreq;
     if (dfreq < tolerance) {
-      p->flag |= BANDMAP_ENTRY_FLAG_ONFREQ;
-      if (ret == -1) ret = i;
+      //      p->flag |= BANDMAP_ENTRY_FLAG_ONFREQ;
+      //if (ret == -1) ret = i;
       //		return i; // return with the first entry that satisfy criteria
+      return i;
     } else {
-      p->flag &= ~BANDMAP_ENTRY_FLAG_ONFREQ;
+      //      p->flag &= ~BANDMAP_ENTRY_FLAG_ONFREQ;
     }
   }
   return ret;
@@ -287,37 +288,178 @@ void set_current_rig_priority() {
 
 // choose appropriate radio for the bandid
 // return -1 not found any radio else chosen target radio
+int find_appropriate_radio(int bandid)
+{
+    if (bandid < 1 || bandid >= N_BAND) {
+        return -1;
+    }
 
-int find_appropriate_radio(int bandid) {
+    const int band_bit = 1 << (bandid - 1);
+    const int focused = so2r.focused_radio();
+
+    int normal_on_band = -1;
+    int normal_priority = -1;
+    int normal_fallback = -1;
+
+    int manual_on_band = -1;
+    int manual_priority = -1;
+    int manual_fallback = -1;
+
+    for (int i = 0; i < 3; i++) {
+        struct radio *radio = &radio_list[i];
+
+        if (!radio->enabled) {
+            continue;
+        }
+
+        /* This radio cannot operate on the requested band. */
+        if ((radio->band_mask & band_bit) != 0) {
+            continue;
+        }
+
+        const bool manual = is_manual_rig(radio);
+        const bool on_band = (radio->bandid == bandid);
+        const bool priority =
+            ((radio->band_mask_priority & band_bit) != 0);
+
+        if (!manual) {
+            /*
+             * A CAT-controlled radio already operating on the requested
+             * band is the best choice.
+             */
+            if (on_band) {
+                if (i == focused) {
+                    return i;
+                }
+                if (normal_on_band < 0) {
+                    normal_on_band = i;
+                }
+                continue;
+            }
+
+            if (priority && normal_priority < 0) {
+                normal_priority = i;
+            }
+
+            if (i == focused) {
+                /*
+                 * Remember the focused normal radio, but do not return yet:
+                 * another normal radio may already be on the requested band.
+                 */
+                normal_fallback = i;
+            } else if (normal_fallback < 0) {
+                normal_fallback = i;
+            }
+        } else {
+            /*
+             * Manual radios are fallback candidates only.
+             */
+            if (on_band && manual_on_band < 0) {
+                manual_on_band = i;
+            }
+
+            if (priority && manual_priority < 0) {
+                manual_priority = i;
+            }
+
+            if (manual_fallback < 0) {
+                manual_fallback = i;
+            }
+        }
+    }
+
+    if (normal_on_band >= 0) {
+        return normal_on_band;
+    }
+
+    if (normal_priority >= 0) {
+        return normal_priority;
+    }
+
+    if (normal_fallback >= 0) {
+        return normal_fallback;
+    }
+
+    if (manual_on_band >= 0) {
+        return manual_on_band;
+    }
+
+    if (manual_priority >= 0) {
+        return manual_priority;
+    }
+
+    return manual_fallback;
+}
+
+int find_appropriate_radio_bak(int bandid) {
+  console->println("find_appropriate_radio()");
   struct radio *radio;
-  int i ;
+  /*  int i ;
   i = so2r.focused_radio();
   radio = &radio_list[i];
   // first check current selected radio
   if (((1 << (bandid - 1)) & radio->band_mask) == 0) {
+    console->print("keep current radio, band_mask=");
+    console->print(radio->band_mask);
+    console->print(",bandid=");
+    console->println(bandid);
     // no problem keep the radio
     return i;
-  }
-  console->println("find_appropriate_radio(): check current radio band_mask OK");
-  // seek radios and find the priotized radio
-  int tmp1;
-  tmp1 = -1;
-  for ( i = 2; i >= 0; i--) {
+  */
+  int i;
+  int tmp_mask;
+  int focused_radio;
+  int fallback_radio;
+
+  tmp_mask = (1 << (bandid - 1));
+  focused_radio = so2r.focused_radio();
+
+  // First, prefer a radio which is already operating on the requested band.
+  // This avoids keeping the currently focused radio just because its
+  // band_mask allows every band.
+  for (i = 2; i >= 0; i--) {
     if (!radio_list[i].enabled) continue;
-    int tmp_mask;
-    tmp_mask = (1 << (bandid - 1));
+    radio = &radio_list[i];
+    if ((radio->bandid == bandid) && ((tmp_mask & radio->band_mask) == 0)) {
+      return i;
+    }
+  }
+
+  // If no radio is already on this band, keep the focused radio when it can
+  // operate on the requested band.
+  radio = &radio_list[focused_radio];
+  if (radio->enabled && ((tmp_mask & radio->band_mask) == 0)) {
+    return focused_radio;  
+  }
+ 
+  //  console->println("find_appropriate_radio(): check current radio band_mask OK");
+  //  // seek radios and find the priotized radio
+  //  int tmp1;
+  //  tmp1 = -1;
+  //  for ( i = 2; i >= 0; i--) {
+
+  // Otherwise, seek radios and find a prioritized radio.
+  fallback_radio = -1;
+  for (i = 2; i >= 0; i--) {
+    if (!radio_list[i].enabled) continue;
+    //    int tmp_mask;
+    //    tmp_mask = (1 << (bandid - 1));
     radio = &radio_list[i];
     if ((tmp_mask & radio->band_mask) == 0) {
       // consider this radio
-      if ((tmp_mask & radio->band_mask_priority) == 1) {
+      console->print("consider this radio");console->println(i);
+      //      if ((tmp_mask & radio->band_mask_priority) == 1) {
+      if ((tmp_mask & radio->band_mask_priority) != 0) {
         // this is prioritized radio
         return i;
       } else {
-        tmp1 = i;
+	//        tmp1 = i;
+	fallback_radio = i;
       }
     }
   }
-  return tmp1;
+  //  return tmp1;
+  return fallback_radio;
 }
 
 
@@ -423,14 +565,14 @@ void pick_entry_bandmap() {
   // check if selected_radio do not have bandmask bit set
   int tmp;
   tmp = freq2bandid(bandmap_disp.on_cursor_freq);
-  if (!select_appropriate_radio(tmp)) {
+  if (!select_appropriate_radio(tmp)) {  // これをpick したbandid で運用されているradio が選ばれるはずがそうなっていない。26/7/8
     if (!plogw->f_console_emu) {      
       plogw->ostream->print("no appropriate rig for bandid");
       plogw->ostream->println(tmp);
     }
     return;
   }
-  radio = so2r.radio_selected();
+  radio = so2r.radio_selected(); 
   if (!plogw->f_console_emu) {    
     console->println("pick_entry_bandmap()");
     console->println(bandmap_disp.on_cursor_station);
@@ -575,15 +717,18 @@ int new_entry_bandmap(int bandid,int nmax) {
   // bandmap[idx].nentry += 5; // make it smaller increment to debug
   struct bandmap_entry *p;
   //  p = (struct bandmap_entry *)realloc(bandmap[idx].entry, sizeof(struct bandmap_entry) * bandmap[idx].nentry); // original
-#ifdef PSRAM_EXISTS
+  //#ifdef PSRAM_EXISTS
+  if (f_spiram) {
   //  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)>sizeof(struct bandmap_entry) * bandmap[idx].nentry ) {
   p = (struct bandmap_entry *)heap_caps_realloc(bandmap[idx].entry, sizeof(struct bandmap_entry) * bandmap[idx].nentry,MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); // try to allocate from heap
   //  p = (struct bandmap_entry *)realloc(bandmap[idx].entry, sizeof(struct bandmap_entry) * bandmap[idx].nentry); // original    
   //  } else {
-#else
-  p = (struct bandmap_entry *)realloc(bandmap[idx].entry, sizeof(struct bandmap_entry) * bandmap[idx].nentry); // original    
+  //#else
+  } else {
+    p = (struct bandmap_entry *)realloc(bandmap[idx].entry, sizeof(struct bandmap_entry) * bandmap[idx].nentry); // original    
   //  }
-#endif
+    //#endif
+  }
   if (p != NULL) {
     // success reallocation
     if (verbose & 16) plogw->ostream->println(" realloc ok ");

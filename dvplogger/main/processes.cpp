@@ -38,10 +38,11 @@
 #include "main.h"
 #include "processes.h"
 #include "cw_keying.h"
+#include "esp32_flasher.h"
+#include "mcp_interface.h"
 #include "log.h"
 
-
-enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att};
+enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att,Power};
 void send_query_civ(enum QueryCIVType type,struct radio *radio) {
   switch(type) {
   case Freq:		send_freq_query_civ(radio);break;//0
@@ -52,6 +53,7 @@ void send_query_civ(enum QueryCIVType type,struct radio *radio) {
   case Id:	      send_identification_query_civ(radio);  // 5
   case Preamp:		send_preamp_query_civ(radio);break;   //7 
   case Gps:		send_gps_query_civ(radio); break; 
+  case Power:   send_power_query_civ(radio); break;
   }
 }
 
@@ -72,11 +74,13 @@ void interval_process() {
 	plogw->ostream->println(so2r.sequence_stat());
       }
     }
+
     if (bandmap_disp.f_update) {
       upd_display_bandmap();
       bandmap_disp.f_update = 0;
     }
-
+    upd_display_info();// update info_display (when timer==0)
+    
     for (int i = 0; i < N_RADIO; i++) {
       if (!unique_num_radio(i)) continue;
       radio = &radio_list[i];
@@ -114,12 +118,12 @@ void interval_process() {
 	    case 8:send_query_civ(Mode,radio); break;       // 6
 	    case 9:send_query_civ(Smeter,radio); break;	    
 	    case 10:send_query_civ(Att,radio); break;       // 6
-	    case 11:send_query_civ(Gps,radio); break;       // 6	      
-	    query_item++;
-	    if (query_item >= 12) query_item = 0;
-			
-	    break;
+	    case 11:send_query_civ(Gps,radio); break;       // 6	    
+	    case 12:send_query_civ(Power,radio); break;
 	    }
+	    query_item++;
+	    if (query_item >= 13) query_item = 0;
+	    break;
 	  }
 	} else {
 	  // show signal 
@@ -147,10 +151,11 @@ void interval_process() {
 	    case 9:send_query_civ(Smeter,radio); break;	    
 	    case 10:send_query_civ(Att,radio); break;       // 6
 	    case 11:send_query_civ(Gps,radio); break;       // 6	      
-	      query_item++;
-	      if (query_item >= 12) query_item = 0;
-	      break;
+	    case 12:send_query_civ(Power,radio); break;
 	    }
+	    query_item++;
+	    if (query_item >= 13) query_item = 0;
+	    break;
 	  }
 	}
       }
@@ -189,6 +194,26 @@ void interval_process() {
     //    Serial.println(receive_civport_count);
 
     receive_civport_count=0;
+    if (plogw->autopoweroff) {
+      plogw->count_autopoweroff++;
+      if (verbose&4) {
+	console->print("count_autopoweroff=");console->print(plogw->count_autopoweroff);
+	console->print(" autopoweroff=");console->println(plogw->autopoweroff);
+      }
+      if (plogw->autopoweroff< plogw->count_autopoweroff) {
+	// power down
+	sprintf(dp->lcdbuf,"Auto powerdown\nafter %d sec \ninactive.\n",plogw->count_autopoweroff);
+	console->print(dp->lcdbuf);
+	upd_display_info_flash(dp->lcdbuf);
+	
+	// subcpu put to reset state
+	//	mcp_write_pin(reset_trigger_mcp_pin, 0);
+	mcp_write_pin(15, 0);	
+	// main cpu deep sleep
+	esp_deep_sleep(3600000000UL); // 1 hr deep sleep 
+      }
+    }
+    
     timeout_second = millis() + 1000;
 
     if (verbose & VERBOSE_MEM) {
@@ -218,14 +243,32 @@ void interval_process() {
   }
 
   if (timeout_cat < millis()) {
+    for (int i = 0; i < N_RADIO; i++) {
+      if (!unique_num_radio(i)) continue;
 
+      radio = &radio_list[i];
+
+      if (!radio->enabled || radio->rig_spec == NULL) {
+	continue;
+      }
+
+      if (radio->rig_spec->cat_type == 0) {
+	// ICOM CI-V
+	receive_civport(radio);
+      } else {
+	// Yaesu / Kenwood / other ASCII CAT
+	receive_cat_data(radio);
+      }
+    }
+
+    /*    
     for (int i = 0; i < N_RADIO; i++) {
       if (!unique_num_radio(i)) continue;
       radio = &radio_list[i];
       //      console->print(i);      
       receive_cat_data(radio);
     }
-
+    */
     timeout_cat = millis() + 50;
   }
 
@@ -248,6 +291,9 @@ void interval_process() {
     
     
   }
+
+
+  
 }
 
 

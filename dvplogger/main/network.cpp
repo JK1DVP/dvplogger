@@ -232,7 +232,6 @@ int check_wifi() {
       sprintf(dp->lcdbuf, "check_wifi()\nrun()");
       upd_display_info_flash(dp->lcdbuf);
       
-      //      if (wifiMulti.run() == WL_CONNECTED) {
       if (ESPWMAP.handle() == WL_CONNECTED) {      
 	sprintf(dp->lcdbuf, "check_wifi()\nConnected.\n%s",WiFi.localIP().toString().c_str());
 	upd_display_info_flash(dp->lcdbuf);

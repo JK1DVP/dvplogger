@@ -102,11 +102,41 @@ int multi_check(char *s,int bandid) {   // s: exch (such as in plogw->recv_exch 
   return multi_check_option(s,bandid,0);
 }
 
+int check_kennai(char *s,int len) // if *s shows kennai stations in the current contest return 1 else 0
+{
+    char exch_head[10];char multi_ken[10];
+    int ken_number;
+    ken_number=(plogw->multi_type & 0xff00)>>8;
+    if (ken_number>=100) {
+      sprintf(multi_ken,"%03d",ken_number);
+    } else {
+      sprintf(multi_ken,"%02d",ken_number);
+    }
+    //    plogw->ostream->print("ken:");
+    //    plogw->ostream->println(multi_ken);
+    *exch_head='\0';
+    strncat(exch_head,s,len);
+    //    plogw->ostream->print("exch_ken:");
+    //    plogw->ostream->println(exch_head);
+    if (strncmp(exch_head,multi_ken,strlen(multi_ken))==0) {
+      // contest kennai stations just search for acag entries
+      // let the later multi check routine do the job
+      return 1;
+    } else {
+      // contest kengai stations
+      // special search for the later ACAG entry (allja entries)
+      return 0;
+
+    }
+}
+
 int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in plogw->recv_exch +2)
   // now option is not used
   // check multi for the bandid
 
-  if (bandid<=0|| bandid>N_BAND) return 0;
+  if (bandid<=0|| bandid>N_BAND) return -1;
+  //if (bandid<=0|| bandid>N_BAND) return 0;  
+
   if (multi_list.multi[bandid-1] == NULL) return 0;
   char exch_buf[10];
   int len;
@@ -116,10 +146,80 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
     Serial.print("multi_type=");
     Serial.println(plogw->multi_type);
   }
-  switch (plogw->multi_type) {
+  int idx_multi_start=0; // start index to search target multiplier
+  int idx_multi_end=multi_list.n_multi[bandid-1]; // start index to search target multiplier
+  if (plogw->contest_id == 18) {
+    //    plogw->ostream->println("contest_id == 18");
+    idx_multi_end=MULTI_ACAG_ALLJA_OFS;
+  }
+  switch (plogw->multi_type &0xff) {
   case MULTI_TYPE_NORMAL: // multi same as number
   case MULTI_TYPE_CQWW: // multi same as number     
   case MULTI_TYPE_JARL_PWR_NOMULTICHK: // jarl contest power_code but no multi-check performed (like ACAG)
+    break;
+  case MULTI_TYPE_KENNAI_KJ:
+    // check KenJin stations
+    if (len>=2) {
+      if (strncasecmp(s+len-2,"KJ",2)==0) { // tailing with KJ
+	len-=2;
+	if (check_kennai(s,len)) {
+	  //      plogw->ostream->println("kennai");      
+	  idx_multi_end=MULTI_ACAG_ALLJA_OFS;
+	  break;
+	} else {
+	  return -1; // Kengai and KJ NG
+	}
+      } else {
+	// ken number contests
+	if (check_kennai(s,len)) {
+	  //      plogw->ostream->println("kennai");      
+	  idx_multi_end=MULTI_ACAG_ALLJA_OFS;
+	} else {
+	  //      plogw->ostream->println("kengai");
+	  idx_multi_start=MULTI_ACAG_ALLJA_OFS;
+	}
+	break;
+      }
+    }
+    break;
+  case MULTI_TYPE_KENNAI:
+    // ken number contests
+    if (check_kennai(s,len)) {
+      //      plogw->ostream->println("kennai");      
+      idx_multi_end=MULTI_ACAG_ALLJA_OFS;
+    } else {
+      //      plogw->ostream->println("kengai");
+      idx_multi_start=MULTI_ACAG_ALLJA_OFS;
+    }
+    break;
+  case MULTI_TYPE_KENGAI_KJ:
+    // check KenJin stations
+    if (len>2) {
+      if (strncasecmp(s+len-2,"KJ",2)==0) { // tailing with KJ
+	len-=2;
+      }
+    }
+  case MULTI_TYPE_KENGAI:
+    // ken number contests
+    if (check_kennai(s,len)) {
+      //      plogw->ostream->println("kennai");
+      idx_multi_end=MULTI_ACAG_ALLJA_OFS;
+    } else {
+      return -1;
+    }
+    break;
+  case MULTI_TYPE_AA: // all chrs should be numeric
+    tmp=0;
+    for (int i=0;i<len;i++) {
+      if (!isdigit(s[i])) {
+	tmp=1;
+	break;
+      }
+    }
+    if (tmp==0) {
+      return 0;
+    }
+    return -1;
     break;
   case MULTI_TYPE_JARL_PWR: // jarl contest: ignore last character (power code)
     if (verbose & 1) printf("JARL contest\n");
@@ -142,7 +242,7 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
     len--;
     break;
   case MULTI_TYPE_ARRLDX: //  US W/VE stations send a signal report and their state or province. 
-                         //  DX stations send a signal report and power as a number or abbreviation.
+    //  DX stations send a signal report and power as a number or abbreviation.
     if (isdigit(s[0])|| (s[0]=='K')) {
       return 0; // allow starting by a number or K (killo)
     }
@@ -191,19 +291,18 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
       }
       return -1;
     }
-
     break;
-  }
 
-  //  log_d(VERBOSE_UI,"%s",s);
-  //  log_d(VERBOSE_UI,":len=");
-  //  log_d(VERBOSE_UI,"%d\n",len);
+  }
 
   if (len < 1) return -1;
   *exch_buf = '\0';
   strncat(exch_buf, s, len);
-  for (int i = 0; i < multi_list.n_multi[bandid-1]; i++) {
-    //    log_d(VERBOSE_UI,"mul :%s: exch :%s:\n",multi_list.multi->mul[i],exch_buf);
+  //  plogw->ostream->print("idx_multi_start:");  
+  //  plogw->ostream->println(idx_multi_start);
+  //  plogw->ostream->print("idx_multi_end:");  
+  //  plogw->ostream->println(idx_multi_end); 
+  for (int i = idx_multi_start; i < idx_multi_end; i++) {
     if (strcmp(multi_list.multi[bandid-1]->mul[i], exch_buf) == 0) {
       // hit
       //      log_d(VERBOSE_UI,"hit %d\n",i);      

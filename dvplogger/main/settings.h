@@ -23,7 +23,7 @@
 #define FILE_SETTINGS_H
 
 #include <vector>
-#define N_SETTINGS_DICT 41
+#define N_SETTINGS_DICT 45
 // --- 型定義 ---
 #define DICT_VALUE_TYPE_CHARPTR   0
 #define DICT_VALUE_TYPE_INT       1

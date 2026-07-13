@@ -28,10 +28,12 @@
 // HWVER=1 ver 2024
 // HWVER=2 ver 2024 mod for PSRAM, KEY1 moved to main IO2, subcpu update possible
 // HWVER=3 CAT RX/TX swapped on the board 
-#define JK1DVPLOG_HWVER 1
-//#define JK1DVPLOG_HWVER 3
+//#define JK1DVPLOG_HWVER 1
+#define JK1DVPLOG_HWVER 3
 //#define JK1DVPLOG_HWVER 2
-#define JK1DVPLOG_VERSION_STRING "ver 25/8/19"
+//#define JK1DVPLOG_VERSION_STRING "ver 25/8/19"
+#define JK1DVPLOG_VERSION_STRING "ver 25/12/19"
+
 #if JK1DVPLOG_HWVER >= 2
 #define PSRAM_EXISTS
 #define SERIAL2_BAUD 3000000
@@ -88,7 +90,7 @@
 #define LEN_SATNAME_WINDOW 8
 #define LEN_RIG_NAME 20
 //#define LEN_RIG_SPEC_STR 40
-#define LEN_RIG_SPEC_STR 280
+#define LEN_RIG_SPEC_STR 240
 #define LEN_POWER_WINDOW 13
 #define LEN_CWMSG_WINDOW 30
 #define LEN_EMAIL_ADDR_WINDOW 40
@@ -104,7 +106,7 @@
 #define LOG_SandP 0
 
 //#define N_RIG 9
-#define N_RIG 18
+#define N_RIG 19
 //#define N_RIG 5
 // number of radios in operation so3r = 3 
 #define N_RADIO 3
@@ -122,13 +124,13 @@
 //#define N_BAND 14 // 1.9 -  (number of band + 1 (0) )
 #define N_BAND 17 // 1.9 -  (number of band + 1 (0) )
 //#define N_MULTI 310 // Kantou
-#define N_MULTI 1346 // ACAG
+#define N_MULTI (1346+14+47) // ACAG + ALLJA
 
 #define NBANDMODE (N_BAND*2)
 #define NMODEID 7
 
 //#define N_CONTEST 25
-#define N_CONTEST 26
+#define N_CONTEST 45
 
 
 
@@ -169,7 +171,7 @@ struct rig {
   int civport_baud; // baudrate of the civport if nonzero if negative flip polarity
   int cwport; // cw output port 0/1
   int rig_type ; // 0 IC-705 1 IC-9700 2 FT-991  3 QCX mini 4 Manual
-  int pttmethod; // how to ptt 0 port 0/1, 2... civ
+  int pttmethod; // how to ptt 0 port 0/1, 2... civ/cat
   int rig_spec_idx; // index number of the rig specification
   char rig_identification[6]; // rig identification number (although cat control share the same protocol (Yaesu/Kenwood/Icom) behavior of each rig differs, so receive ID by ID; command (yaesu) and store them here.)
   int transverter_enable[NMAX_TRANSVERTER];
@@ -250,8 +252,11 @@ struct radio {
 
   char callsign_prev[LEN_CALL_WINDOW + 3]; // store callsign checked previously
 
+  int f_romaji; // romaji to kana conversion 
+  int idx_cursor; // index of cursor x
   int f_qsl; // 0 N(OQSL) 1:J(arl) 2:hQSL
-
+  int power; // rig power
+  int power_bak ; // save original power setting when tune
   char tm_loaded[20]; // time of the QSO loaded from SD
   int seqnr_loaded; // sequential number of the QSO loaded from SD
   char opmode_loaded[6];
@@ -272,12 +277,13 @@ struct radio {
   int att,preamp; // preamp and attenetour status 
 
   int ptr_curr;  // which is currently editing 0: callsign, 1: recv_exch 2: sent_exch 3:recv_rst, 4:sent_rst 5:freq 6: opmode 7: my_callsign
-
+  int f_recall_freq_mode_filt;
   char callsign_previously_sent[LEN_CALL_WINDOW + 3]; // check sent callsign on ; button and if the callsign changed after last sent, resend call before TU
 
   int keyer_mode; // 1 key type sent to cw send buffer 0 sent to current editing buffer
-
+  
   int f_freqchange_pending; // set when frequency change attempt from program is ongoing
+  int f_freqchange_program;
   int freq_change_count;
   int bandid; // bandid for the current frequency from 1
   int bandid_prev;
@@ -335,7 +341,8 @@ struct radio {
   int enabled ; // enabled cat communication
   int f_civ_response_expected;
   int civ_response_timer;
-
+  int cat_status; // general purpose variable for cat operation (for example FT817 needs to remember what response is expected)
+    
   // buffer for radio control ci-v and cat
   char *bt_buf;
   int r_ptr = 0, w_ptr = 0;
@@ -361,7 +368,7 @@ struct antenna {
 
 struct logwindow {
   Stream *ostream ; // Serial or tcp stream to print infos .
-
+  //  int spiram;
   char relay[2]; // antenna relay status 
   char f_antalt; // if 1 alternate antenna relay upon receiving rig signal strength of f_antalt readings.
   int  antalt_count;
@@ -374,6 +381,9 @@ struct logwindow {
   int show_qso_interval; // if set show qso_interval second
   int qso_interval_timer;
   float lat,lon,elev; // station location
+
+  int autopoweroff; // auto power off after speficied second in autopoweroff 0 will not poweroff
+  int count_autopoweroff; // incremental counter to auto power off any key input will reset counter 
 
   // voice player
   bool f_playing=0;
@@ -493,7 +503,7 @@ struct logwindow {
   int cw_pts; // points for cw qsos
   int inner_pts; // points for inner stations
   int contest_band_mask; // workable band in this contest ( changing this also reflected to bandmap_mask  (, need reverse bits ), ), this mask also affects switch_bands in ui.c, but not for frequency change on the rig side.
-  char contest_name[10 + 3]; // contest name
+  char contest_name[20 + 3]; // contest name
   int contest_id; // contest id number
   int multi_type; // multiplier type 1 JARL contest with power code  0 other  3 JARL contest power code but not check multi(ACAG) 2 UEC 4 multi check ignoring the last character (for JA8 contest)
   int seqnr; // sequential number of the QSO
@@ -653,20 +663,36 @@ struct bandmap_disp {
   char on_cursor_station[LEN_CALLSIGN+1];
 
 };
-
 // callsign of existing QSOs
 //#define NMAXQSO 1500
-#define NMAXQSO 1200
+//#define NMAXQSO 1200
+//#define NMAXQSO 50
+//#define NMAXQSO_MAINCPU 300
+#define NMAXQSO_MAINCPU 500
+#define NMAXQSO_SUBCPU 1300
 //#define NMAXQSO 200
 
 // dupe check link for each band/mode
 struct dupechk {
-  char callsign[NMAXQSO][LEN_CALLSIGN+1];
-  char exch[NMAXQSO][LEN_EXCH+1]; // exchange in the previous contact
+  //  char callsign[NMAXQSO][LEN_CALLSIGN+1];
+  //  char exch[NMAXQSO][LEN_EXCH+1]; // exchange in the previous contact
+  //  byte bandmode[NMAXQSO]; // band and mode identity for each callsign
+  char (*callsign)[LEN_CALLSIGN+1];
+  char (*exch)[LEN_EXCH+1]; // exchange in the previous contact
+  byte *bandmode; // band and mode identity for each callsign  
   int ncallsign; // number of currently registered callsigns
+  int nmaxqso; // <= NMAXQSO
+  int dupechk_at ; // 0:main cpu 1:I am main cpu and query to sub cpu 2: I am subcpu
+  int dupechk_status ; // 0: default 1: sent dupe check query 2:receiving query results  (この変数の状態でnetwork へのdupe query を制御)
+  uint32_t dupechk_timeout; // timeout to check dupe check query
+  int dupechk_dupe; // response/result
+  uint16_t dupechk_query_id; // monotonically increasing request id
+  int dupechk_getexch; // response contains an exchange
+  char dupechk_exch[LEN_EXCH+1]; // exchange returned by subcpu
+  //  int dupechk_radio; // radio in which dupe check request is issued
   // if CW,SSB both OK contest bandid will be capital for phone
-  byte bandmode[NMAXQSO]; // band and mode identity for each callsign
 };
+
 // call history lookup table
 #define NMAXCALLHIST 2000
 //int nmaxcallhist=NMAXCALLHIST;

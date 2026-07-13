@@ -30,6 +30,7 @@ extern int cluster_port ;
 #define NCHR_CLUSTER_RINGBUF 1024
 extern char cluster_buf[NCHR_CLUSTER_RINGBUF];
 extern struct cluster cluster;
+int is_international_contest();
 void print_cluster_info(struct bandmap_entry *entry, int bandid, int idx );
 void get_info_cluster(const char *s) ;
 void upd_bandmap_cluster(const char *s);

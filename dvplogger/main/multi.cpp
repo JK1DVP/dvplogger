@@ -27,6 +27,15 @@
 
 #include "multi.h"
 
+struct multi_item multi_aatest = {
+  {
+    "VALID",""
+  },
+  {
+    "VALID",""
+  }
+};
+
 struct multi_item multi_test_line = {
   {
     "FC", "KB", "KD",  "HM",  "TZ",
@@ -264,6 +273,74 @@ const struct multi_item multi_cqzones = {
   }
 };
 
+const struct multi_item multi_aomori_out = {
+  {
+  "0201","0202","0203","0204","0205",
+  "0206",  "0207","0208","0209","0210",
+  "0211","0212","0213","0214","0215",
+  "0216","0217","0218","0219","0220",
+  "0221"	,"0222","0223","0224","0225",
+  "0226",  "0227","0228","0229","0230",  
+  "0231",  "0232","0233","0234","0235",
+  "0236",  "0237","0238","0239","0240",""
+  },{
+  "青森市","弘前市","八戸市",		"黒石市","五所川原市",
+  "十和田市",	"三沢市","むつ市","つがる市","平川市",
+  "野辺地町",	"七戸町","おいらせ町","六戸町","横浜町",
+  "東北町","六ケ所村","板柳町","中泊町","鶴田町",
+  "三戸町",	"五戸町","田子町","南部町","階上町",
+  "新郷村",	"大間町","東通村","風間浦村","佐井村",
+  "西目屋村","鰺ヶ沢町","深浦町","平内町","外ヶ浜町",
+"今別町","蓬田村","藤崎町","大鰐町","田舎館村",""
+  }
+};
+
+const struct multi_item multi_aomori_int = {
+  {
+  "0201","0202","0203","0204","0205",
+  "0206",  "0207","0208","0209","0210",
+  "0211","0212","0213","0214","0215",
+  "0216","0217","0218","0219","0220",
+  "0221"	,"0222","0223","0224","0225",
+  "0226",  "0227","0228","0229","0230",  
+  "0231",  "0232","0233","0234","0235",
+  "0236",  "0237","0238","0239","0240",
+    "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+    "111", "112", "113", "114",
+     "03", "04", "05", "06", "07",
+    "08",  "09",
+    "10",    "11", "12", "13", "14", "15", "16", "17",
+    "18", "19",    "20", "21",
+    "22", "23",	"24", "25", "26", "27",
+    "28", "29",    "30",
+    "31", "32", "33", "34", "35",
+    "36", "37", "38", "39",
+    "40", "41", "42", "43",
+    "44", "45", "46", "47" , "48", ""
+  
+  },{
+    "青森市",	"弘前市","八戸市",		"黒石市","五所川原市",
+  "十和田市",	"三沢市","むつ市","つがる市","平川市",
+  "野辺地町",	"七戸町","おいらせ町","六戸町","横浜町",
+  "東北町","六ケ所村","板柳町","中泊町","鶴田町",
+  "三戸町",	"五戸町","田子町","南部町","階上町",
+  "新郷村",	"大間町","東通村","風間浦村","佐井村",
+  "西目屋村","鰺ヶ沢町","深浦町","平内町","外ヶ浜町",
+"今別町","蓬田村","藤崎町","大鰐町","田舎館村",
+    "Soya", "Rumoi", "Kamikawa", "Okhotsk", "Sorachi", "Ishikari", "Nemuro", "Shiribeshi", "Tokachi", "Kushiro", "Hidaka", "Iburi", "Hiyama", "Oshima",
+    "Iwate", "Akita", "Yamagata", "Miyagi", "Fukushima",
+    "Niigata",    "Nagano",
+    "Tokyo", "Kanagawa", "Chiba", "Saitama", "Ibaraki", "Tochigi", "Gunma", "Yamanashi",
+    "Shizuoka", "Gifu", "Aichi", "Mie",
+    "Kyoto", "Shiga", "Nara", "Osaka",    "Wakayama", "Hyogo",
+    "Toyama", "Fukui", "Ishikawa",
+    "Okayama", "Shimane", "Yamaguchi",    "Tottori", "Hiroshima",
+    "Kagawa", "Tokushima", "Ehime", "Kochi",
+    "Fukuoka", "Saga", "Nagasaki", "Kumamoto",
+    "Oita", "Miyazaki", "Kagoshima", "Okinawa", "Ogasawara", ""
+  }
+};
+
 const struct multi_item multi_allja = {
   {
     "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
@@ -406,8 +483,191 @@ const struct multi_item multi_yntest = {
   }
 };
 
+const struct multi_item multi_ja8out = {
+  {
+    "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+    "111", "112", "113", "114", ""
+  },
+  {
+    "Soya", "Rumoi", "Kamikawa", "Okhotsk", "Sorachi", "Ishikari", "Nemuro", "Shiribeshi", "Tokachi", "Kushiro", "Hidaka", "Iburi", "Hiyama", "Oshima", ""
+  }
+};
 
-const struct multi_item multi_ja8int = {
+const struct multi_item multi_okhotskout = {
+  {
+    "0108", "0111", "0119", "01005B", "01005D", "01005E", "01036A", "01036B", "01036C", "01070D",
+    "01070E", "01070F", "01070H", "01070I","01070J","01048A","01048B","01048C",
+    "101", "102", "103", "105", "106", "107", "108", "109", "110",
+    "111", "112", "113", "114",
+    "02", "03", "04", "05", "06", "07",
+    "08",  "09",
+    "10",    "11", "12", "13", "14", "15", "16", "17",
+    "18", "19",    "20", "21",
+    "22", "23",	"24", "25", "26", "27",
+    "28", "29",    "30",
+    "31", "32", "33", "34", "35",
+    "36", "37", "38", "39",
+    "40", "41", "42", "43",
+    "44", "45", "46", "47" , "48", ""
+  },
+  {
+    "KitamiC", "AbashiriC", "MonbetuC", "TsubetuT", "BihoroT", "OozoraT", "KiyosatoT", "KoshimizuT", "SyariT", "EngaruT", "OtakeT", "OkibeT", "TakigamiT", "NishiOkibeV","YubetsuT","OtoinepuT","OkidoT","SaromaT",
+    "Soya", "Rumoi", "Kamikawa", "Sorachi", "Ishikari", "Nemuro", "Shiribeshi", "Tokachi", "Kushiro", "Hidaka", "Iburi", "Hiyama", "Oshima",
+    "Aomori", "Iwate", "Akita", "Yamagata", "Miyagi", "Fukushima",
+    "Niigata",    "Nagano",
+    "Tokyo", "Kanagawa", "Chiba", "Saitama", "Ibaraki", "Tochigi", "Gunma", "Yamanashi",
+    "Shizuoka", "Gifu", "Aichi", "Mie",
+    "Kyoto", "Shiga", "Nara", "Osaka",    "Wakayama", "Hyogo",
+    "Toyama", "Fukui", "Ishikawa",
+    "Okayama", "Shimane", "Yamaguchi",    "Tottori", "Hiroshima",
+    "Kagawa", "Tokushima", "Ehime", "Kochi",
+    "Fukuoka", "Saga", "Nagasaki", "Kumamoto",
+    "Oita", "Miyazaki", "Kagoshima", "Okinawa", "Ogasawara", ""
+  }
+};
+
+const struct multi_item multi_okhotskint = {
+  {
+    "0108", "0111", "0119", "01005B", "01005D", "01005E", "01036A", "01036B", "01036C", "01070D",
+    "01070E", "01070F", "01070H", "01070I","01070J","01048A","01048B","01048C",""
+  },
+  {
+    "KitamiC", "AbashiriC", "MonbetuC", "TsubetuT", "BihoroT", "OozoraT", "KiyosatoT", "KoshimizuT", "SyariT", "EngaruT", "OtakeT", "OkibeT", "TakigamiT", "NishiOkibeV","YubetsuT","OtoinepuT","OkidoT","SaromaT", ""
+  }
+};
+
+const struct multi_item multi_ja5out = {
+  {
+  "3601", "3602", "3603", "3604", "3605", "3606", 
+"3607", "3608", "36001", "36003", "36004", "36005", "36006", "3701", "3702", "3703", 
+"3704", "3705", "3706", "3707", "3708", "37002", "37004", "37005", "37006", "37007", 
+"37008", "37009", "37010", "3801", "3802", "3803", "3804", "3805", "3806", "3807", 
+"3810", "3813", "3814", "3815", "38001", "38003", "38005", "38006", "38007", "38010", 
+"38012", "3901", "3902", "3903", "3904", "3905", "3907", "3908", "3909", "3910", 
+"3911", "3912", "39001", "39002", "39004", "39005", "39006", "39007",""
+},
+  {
+    "Takamatsu C", "Marugame C", "Sakaide C", "Zentsuji C", "Kan'onji C", "Sanuki C", 
+    "Higashikagawa C", "Mitoyo C", "Ayauta G", "Kagawa G", "Kita G", "Shozu G", "Nakatado G", "Tokushima C", "Naruto C", "Komatsushima C", 
+    "Anan C", "Yoshinogawa C", "Awa C", "Mima C", "Miyoshi C", "Itano G", "Kaifu G", "Katsuura G", "Naka G", "Myozai G", 
+    "Myodo G", "Mima G", "Miyoshi G", "Matsuyama C", "Imabari C", "Uwajima C", "Yawatahama C", "Niihama C", "Saijo C", "Ozu C", 
+    "Iyo C", "Shikokuchuo C", "Seiyo C", "Toon C", "Iyo G", "Ochi G", "Kamiukena G", "Kita G", "Kitauwa G", "Nishiuwa G", 
+    "Minamiuwa G", "Kochi C", "Muroto C", "Aki C", "Tosa C", "Susaki C", "Sukumo C", "Tosashimizu C", "Nankoku C", "Shimanto C", 
+    "Konan C", "Kami C", "Agawa G", "Aki G", "Takaoka G", "Tosa G", "Nagaoka G", "Hata G",""
+  }
+};
+
+const struct multi_item multi_ja5int = {
+  {
+"3601", "3602", "3603", "3604", "3605", "3606", 
+"3607", "3608", "36001", "36003", "36004", "36005", "36006", "3701", "3702", "3703", 
+"3704", "3705", "3706", "3707", "3708", "37002", "37004", "37005", "37006", "37007", 
+"37008", "37009", "37010", "3801", "3802", "3803", "3804", "3805", "3806", "3807", 
+"3810", "3813", "3814", "3815", "38001", "38003", "38005", "38006", "38007", "38010", 
+"38012", "3901", "3902", "3903", "3904", "3905", "3907", "3908", "3909", "3910", 
+"3911", "3912", "39001", "39002", "39004", "39005", "39006", "39007",
+    "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+    "111", "112", "113", "114",
+    "02", "03", "04", "05", "06", "07",
+    "08",  "09",
+    "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19",    "20", "21",
+    "22", "23",	"24", "25", "26", "27",
+    "28", "29",    "30",
+    "31", "32", "33", "34", "35",
+    "40", "41", "42", "43",
+    "44", "45", "46", "47" , "48", ""
+  },
+  {
+    "Takamatsu C", "Marugame C", "Sakaide C", "Zentsuji C", "Kan'onji C", "Sanuki C", 
+    "Higashikagawa C", "Mitoyo C", "Ayauta G", "Kagawa G", "Kita G", "Shozu G", "Nakatado G", "Tokushima C", "Naruto C", "Komatsushima C", 
+    "Anan C", "Yoshinogawa C", "Awa C", "Mima C", "Miyoshi C", "Itano G", "Kaifu G", "Katsuura G", "Naka G", "Myozai G", 
+    "Myodo G", "Mima G", "Miyoshi G", "Matsuyama C", "Imabari C", "Uwajima C", "Yawatahama C", "Niihama C", "Saijo C", "Ozu C", 
+    "Iyo C", "Shikokuchuo C", "Seiyo C", "Toon C", "Iyo G", "Ochi G", "Kamiukena G", "Kita G", "Kitauwa G", "Nishiuwa G", 
+    "Minamiuwa G", "Kochi C", "Muroto C", "Aki C", "Tosa C", "Susaki C", "Sukumo C", "Tosashimizu C", "Nankoku C", "Shimanto C", 
+    "Konan C", "Kami C", "Agawa G", "Aki G", "Takaoka G", "Tosa G", "Nagaoka G", "Hata G",
+    "Soya", "Rumoi", "Kamikawa", "Okhotsk", "Sorachi", "Ishikari", "Nemuro", "Shiribeshi", "Tokachi", "Kushiro", "Hidaka", "Iburi", "Hiyama", "Oshima",
+    "Aomori", "Iwate", "Akita", "Yamagata", "Miyagi", "Fukushima",
+    "Niigata",    "Nagano",
+    "Tokyo", "Kanagawa", "Chiba", "Saitama", "Ibaraki", "Tochigi", "Gunma", "Yamanashi",
+    "Shizuoka", "Gifu", "Aichi", "Mie",
+    "Kyoto", "Shiga", "Nara", "Osaka",    "Wakayama", "Hyogo",
+    "Toyama", "Fukui", "Ishikawa",
+    "Okayama", "Shimane", "Yamaguchi",    "Tottori", "Hiroshima",
+    "Fukuoka", "Saga", "Nagasaki", "Kumamoto",
+    "Oita", "Miyazaki", "Kagoshima", "Okinawa", "Ogasawara", ""
+  }
+};
+
+const struct multi_item multi_iburihidakaint = {
+  // 111 hidaka  saru-G/hidaka-T saru-G/Hiratori-T Niikappu-G/Nikappu-T urakawa-G/urakawa-T samani-G/samani-T
+  //              horiizumi-G/erimo-T hidaka-G/shinhidaka-T
+  //  112 iburi   muroran-c tomakomai-c noboribetu-c date-c usu-G/sobetu-T siraoi-G/siraoi-T yufutu-G/atuma-T abuta-G/toyako-T yufutu-G/abira-T yufutu-G/mukawa-T
+  {
+    // 111 hidaka   saru-G/hidaka-T,saru-G/Hiratori-T Niikappu-G/Nikappu-T urakawa-G/urakawa-T samani-G/samani-T
+    "01031","01052","01013","01030",
+  //              horoizumi-G/erimo-T hidaka-G/shinhidaka-T
+    "01064","01080",
+  //  112 iburi   muroran-c tomakomai-c noboribetu-c date-c usu-G/sobetu-T siraoi-G/siraoi-T yufutu-G/atuma-T,yufutu-G/abira-T,yufutu-G/mukawa-T abuta-G/toyako-T 
+    "0105","0113","0130","0133","01011","01037","01073","01007",
+    "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+    "113", "114",
+    "02", "03", "04", "05", "06", "07",
+    "08",  "09",
+    "10",    "11", "12", "13", "14", "15", "16", "17",
+    "18", "19",    "20", "21",
+    "22", "23",	"24", "25", "26", "27",
+    "28", "29",    "30",
+    "31", "32", "33", "34", "35",
+    "36", "37", "38", "39",
+    "40", "41", "42", "43",
+    "44", "45", "46", "47" , "48", ""
+  },
+  {
+    // 111 hidaka   saru-G/hidaka-T,saru-G/Hiratori-T Niikappu-G/Nikappu-T urakawa-G/urakawa-T samani-G/samani-T
+    "Saru-G","Niikappu-G","Urakawa-G","Samani-G",
+  //              horoizumi-G/erimo-T hidaka-G/shinhidaka-T
+    "Horoizumi-G","Hidaka-G",
+  //  112 iburi   muroran-c tomakomai-c noboribetu-c date-c usu-G/sobetu-T siraoi-G/siraoi-T yufutu-G/atuma-T,yufutu-G/abira-T,yufutu-G/mukawa-T abuta-G/toyako-T
+    "muroran-c","tomakomai-c","noboribetu-c","date-c", "usu-G","siraoi-G","yufutu-G","abuta-G",
+    "Soya", "Rumoi", "Kamikawa", "Okhotsk", "Sorachi", "Ishikari", "Nemuro", "Shiribeshi", "Tokachi", "Kushiro", "Hiyama", "Oshima",
+    "Aomori", "Iwate", "Akita", "Yamagata", "Miyagi", "Fukushima",
+    "Niigata",    "Nagano",
+    "Tokyo", "Kanagawa", "Chiba", "Saitama", "Ibaraki", "Tochigi", "Gunma", "Yamanashi",
+    "Shizuoka", "Gifu", "Aichi", "Mie",
+    "Kyoto", "Shiga", "Nara", "Osaka",    "Wakayama", "Hyogo",
+    "Toyama", "Fukui", "Ishikawa",
+    "Okayama", "Shimane", "Yamaguchi",    "Tottori", "Hiroshima",
+    "Kagawa", "Tokushima", "Ehime", "Kochi",
+    "Fukuoka", "Saga", "Nagasaki", "Kumamoto",
+    "Oita", "Miyazaki", "Kagoshima", "Okinawa", "Ogasawara", ""
+  }
+};
+
+const struct multi_item multi_iburihidakaout = {
+  {
+    // 111 hidaka   saru-G/hidaka-T,saru-G/Hiratori-T Niikappu-G/Nikappu-T urakawa-G/urakawa-T samani-G/samani-T
+    "01031","01052","01013","01030",
+  //              horoizumi-G/erimo-T hidaka-G/shinhidaka-T
+    "01064","01080",
+  //  112 iburi   muroran-c tomakomai-c noboribetu-c date-c usu-G/sobetu-T siraoi-G/siraoi-T yufutu-G/atuma-T,yufutu-G/abira-T,yufutu-G/mukawa-T abuta-G/toyako-T 
+    "0105","0113","0130","0133","01011","01037","01073","01007",
+    ""
+  },
+  {
+    // 111 hidaka   saru-G/hidaka-T,saru-G/Hiratori-T Niikappu-G/Nikappu-T urakawa-G/urakawa-T samani-G/samani-T
+    "Saru-G","Niikappu-G","Urakawa-G","Samani-G",
+  //              horoizumi-G/erimo-T hidaka-G/shinhidaka-T
+    "Horoizumi-G","Hidaka-G",
+  //  112 iburi   muroran-c tomakomai-c noboribetu-c date-c usu-G/sobetu-T siraoi-G/siraoi-T yufutu-G/atuma-T,yufutu-G/abira-T,yufutu-G/mukawa-T abuta-G/toyako-T
+    "muroran-c","tomakomai-c","noboribetu-c","date-c", "usu-G","siraoi-G","yufutu-G","abuta-G",
+    ""
+  }
+};
+
+  
+/*
+  const struct multi_item multi_ja8int = {
   {
 "101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "202", "203", "204", "205", "206", "207", "208", "209", "210", "211", "212", "213", "214", "215", "216", "217", "218", "219", "220", "221", "222", "223", "224", "225", "226", "227", "228", "229", "230", "231", "233", "234", "235", "236", "303", "304", "331", "332", "333", "334", "337", "343", "345", "346", "347", "361", "362", "363", "364", "367", "370", "371", "391", "392", "393", "394", "395", "396", "397", "398", "399", "400", "401", "402", "403", "404", "405", "406", "407", "408", "409", "423", "424", "425", "427", "428", "429", "430", "431", "432", "433", "434", "436", "437", "438", "452", "453", "454", "455", "456", "457", "458", "459", "460", "461", "462", "463", "464", "465", "468", "469", "470", "471", "472", "481", "482", "483", "484", "485", "486", "487", "511", "512", "513", "514", "516", "517", "518", "519", "520", "543", "544", "545", "546", "547", "549", "550", "552", "555", "559", "560", "561", "562", "563", "564", "571", "575", "578", "581", "584", "585", "586", "601", "602", "604", "607", "608", "609", "610", "631", "632", "633", "634", "635", "636", "637", "638", "639", "641", "642", "643", "644", "645", "646", "647", "648", "649", "661", "662", "663", "664", "665", "667", "668", "691", "692", "693", "694", 
     "02", "03", "04", "05", "06", "07", "08", "09", "10",
@@ -427,3 +687,4 @@ const struct multi_item multi_ja8int = {
   }
 };
  
+*/

@@ -23,5 +23,6 @@
 #define FILE_MAIN_H
 void localip_to_string(char *buf);
 void print_wifiinfo();
+void request_memstat_main_subcpu();
 //extern xTaskHandle gxHandle_USBloop;
 #endif

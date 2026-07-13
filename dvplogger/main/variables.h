@@ -26,7 +26,9 @@ extern int  display_type; // 0 1.3" display 1 2.4" display
 extern int usb_task_memory_watermark;
 extern int kbdtype;
 extern int main_loop_revs;
+extern bool f_cardkey_present;
 extern union qso_union_tag qso;  // data is delimited by space in the file
+extern int f_spiram;
 //#include "DS3231.h"
 #include "RTClib.h"
 extern class DateTime rtctime, ntptime;
@@ -90,5 +92,6 @@ extern int rtcadj_count;
 extern int callhistf_stat ;  // 0 not open 1 open for reading 2 open for writing
 extern char qsologfn[20];    // qso log filename (append)
 extern char callhistfn[20];  // call history file to read
+extern int callhist_at; // 0: MAIN, 1: SUBCPU
 
 #endif

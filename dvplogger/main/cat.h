@@ -32,14 +32,15 @@
 #define RIG_TYPE_YAESU 2 // FTDX10 and FT991A
 #define RIG_TYPE_KENWOOD 3 // QCX_MINI and TS-2000 etc 
 #define RIG_TYPE_MANUAL 4 // manual rig
-//#define RIG_TYPE_YAESU_FTDX3000 5
-//#define RIG_TYPE_IC7300 6  // IC7300  ( may be OK with IC705 by receiving ID)
+#define RIG_TYPE_ELECRAFT_KX 6
 
 #define CAT_TYPE_CIV 0
 #define CAT_TYPE_YAESU_NEW 1
 #define CAT_TYPE_KENWOOD 2
 #define CAT_TYPE_NOCAT 3
 #define CAT_TYPE_YAESU_OLD 4  // FT3000
+#define CAT_TYPE_ELECRAFT_KX 5  // elecraft
+#define CAT_TYPE_YAESU_FT817 6  // FT817
 
 
 struct catmsg_t {  // data structure to exchange cat/ci-v data by freertos queue
@@ -78,6 +79,7 @@ void send_civ_buf(Stream *civport);
 void send_cat_cmd(struct radio *radio, char *cmd);
 void receive_cat_data(struct radio *radio) ;
 int freq_width_mode(char *opmode);
+void set_power(struct radio *radio, int power) ;
 void set_scope_mode(struct radio *radio,int mode);
 void set_scope() ;
 void send_rit_setting(struct radio *radio, int rit, int xit) ;
@@ -95,6 +97,7 @@ void send_rotator_command_civ(byte *cmds, int n) ;
 void send_ptt_query_civ(struct radio *radio) ;
 void send_preamp_query_civ(struct radio *radio) ;
 void send_identification_query_civ(struct radio *radio) ;
+void send_power_query_civ(struct radio *radio);
 void send_att_query_civ(struct radio *radio) ;
 void send_smeter_query_civ(struct radio *radio) ;
 void set_frequency(int freq, struct radio *radio) ;
@@ -102,10 +105,13 @@ void set_mode_nonfil(const char *opmode, struct radio *radio) ;
 void set_mode(const char *opmode, byte filt, struct radio *radio) ;
 
 void get_cat_kenwood(struct radio *radio) ;
+void get_cat_elecraft(struct radio *radio) ;
+void get_cat_ft817(struct radio *radio) ;
 void get_cat(struct radio *radio) ;
 void conv_smeter(struct radio *radio) ;
 void smeter_postprocess(struct radio *radio);
 struct radio *search_civ_address(int civaddr);
+int check_and_set_frequency(struct radio *radio, unsigned long freq);
 void get_civ(struct radio *radio) ;
 void print_civ(struct radio *radio) ;
 void print_cat(struct radio *radio) ;

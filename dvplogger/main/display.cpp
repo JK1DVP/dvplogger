@@ -26,6 +26,7 @@
 #include "Arduino.h"
 #include "decl.h"
 #include "variables.h"
+#include "edit_buf.h"
 #include <U8g2lib.h>
 #ifdef U8X8_HAVE_HW_SPI
 #include <SPI.h>
@@ -62,24 +63,28 @@ uint8_t *dispbuf_r, *dispbuf_l;
 
 #define WCOL_STR "                 "
 void display_cw_buf_lcd(char *buf) {
-
-#define LCD_CW_POSY (24 + 13 + 13)
+  int LCD_CW_POSY ;
+  LCD_CW_POSY=dp->hcol[0]*4;
+  //#define LCD_CW_POSY (24 + 13 + 13)
   strncpy(dp->lcdbuf, buf, 20);
   //  sprintf(lcdbuf, "%-20s", buf);
   //  plogw->ostream->println(lcdbuf);
   u8g2_r->setDrawColor(0);
-  u8g2_r->drawBox(0, LCD_CW_POSY, dp->wcol, dp->hcol[0]);
+  //  u8g2_r->drawBox(0, LCD_CW_POSY, dp->wcol, dp->hcol[0]);
+  u8g2_r->drawBox(0,LCD_CW_POSY , dp->wcol, dp->hcol[0]+1);
   u8g2_r->setDrawColor(1);
-  u8g2_r->drawStr(0, LCD_CW_POSY, dp->lcdbuf);
+  //  u8g2_r->drawStr(0, LCD_CW_POSY, dp->lcdbuf);
+  u8g2_r->drawUTF8(0, LCD_CW_POSY , dp->lcdbuf);  
   // under line according to the radio
   switch (so2r.msg_tx_radio()) {
   case 0: // radio 0
     break;
-  case 2: // radio 2
-    u8g2_r->drawHLine(0, LCD_CW_POSY+8, 128);
-    break;
   case 1: // radio 1
-    u8g2_r->drawHLine(0, LCD_CW_POSY+10,128);
+    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*10/10, 128);
+    break;
+  case 2: // radio 2
+    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*9/10, 128);    
+    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*10/10, 128);
     break;
   }
   u8g2_r->sendBuffer();  // transfer internal memory to the display
@@ -112,9 +117,10 @@ void display_printStr(char *s, byte ycol) {
     // select left
     select_left_display();
     u8g2_l->setDrawColor(0);
-    u8g2_l->drawBox(0, (ycol - 10) * dp->hcol[1], dp->wcol, dp->hcol[1]);
+    u8g2_l->drawBox(0, (ycol - 10) * dp->hcol[1]+1, dp->wcol, dp->hcol[1]);
     u8g2_l->setDrawColor(1);
-    u8g2_l->drawStr(0, (ycol - 10) * dp->hcol[1], s);
+    //    u8g2_l->drawStr(0, (ycol - 10) * dp->hcol[1], s);
+    u8g2_l->drawUTF8(0, (ycol - 10) * dp->hcol[1], s);    
     if (plogw->f_console_emu) {
       char buf[20], buf1[40];
       sprintf(buf, "\033[%d;%dH", ycol - 10 + 1, 0);
@@ -127,9 +133,10 @@ void display_printStr(char *s, byte ycol) {
   } else {
     select_right_display();
     u8g2_r->setDrawColor(0);
-    u8g2_r->drawBox(0, ycol * dp->hcol[0], dp->wcol, dp->hcol[0]);
+    u8g2_r->drawBox(0, ycol * dp->hcol[0]+1, dp->wcol, dp->hcol[0]);
     u8g2_r->setDrawColor(1);
-    u8g2_r->drawStr(0, ycol * dp->hcol[0], s);
+    //    u8g2_r->drawStr(0, ycol * dp->hcol[0], s);
+    u8g2_r->drawUTF8(0, ycol * dp->hcol[0], s);    
     if (plogw->f_console_emu) {
       char buf[20], buf1[40];
       sprintf(buf, "\033[%d;%dH", ycol + 1, 40);
@@ -310,9 +317,11 @@ void upd_display_stat() {
     }
   }
 
-  sprintf(dp->lcdbuf, "%-4s %1s %-3s %-3s%c%c",
+  sprintf(dp->lcdbuf, "%-4s %1s%1s %-3s%-3s%c%c",
           statstr,
           radio->keyer_mode == 1 ? ( f_cw_code_type == 1 ? "J": "K" ): (f_cw_code_type ==1? "j":" "),
+	  //	  ((radio->f_romaji) == 1 && (radio->ptr_curr==6)) ? "R":" ",
+	  ((radio->f_romaji) == 1 ) ? "R":" ",
           radio->cq[radio->modetype] == LOG_CQ ? "CQ" : "S&P",
           plogw->sat == 1 ? "Sat" : "",
 	  radio->f_qsl==0 ? ' ':(radio->f_qsl==1 ? 'J': (radio->f_qsl==2 ? 'h': ' ')),
@@ -347,9 +356,6 @@ void upd_display_put_lcdbuf(char *s, int cursor, int wsize, int lcdpos) {
   } else {
     ofs = 0;
   }
-  // sprintf(dp->lcdbuf,"%-s", s+ofs);
-  //strncpy(dp->lcdbuf + lcdpos, s + ofs, wsize);
-  // overwrite
   char *p0, *p1;
   p0 = dp->lcdbuf + lcdpos;
   p1 = s + ofs;
@@ -357,7 +363,7 @@ void upd_display_put_lcdbuf(char *s, int cursor, int wsize, int lcdpos) {
     if (*p1 == '\0') break;
     *p0++ = *p1++;
   }
-  //plogw->ostream->print("ofs:");plogw->ostream->println(ofs);
+
 }
 
 
@@ -407,10 +413,11 @@ void upd_cursor() {
           x = plogw->sent_exch[1] * 8 + 8 * 9;
           break;
         case 6:  // remarks
-          x = upd_cursor_calc(radio->remarks[1], 16);
-	  if (radio->remarks[1]< strlen(radio->remarks+2)) {
-	    cursor_char=(radio->remarks+2)[(int)radio->remarks[1]];
-	  }
+	  //          x = upd_cursor_calc(radio->remarks[1], 16);
+	  //	  if (radio->remarks[1]< strlen(radio->remarks+2)) {
+	  //	    cursor_char=(radio->remarks+2)[(int)radio->remarks[1]];
+	  //	  }
+	  x=radio->idx_cursor *8;
           break;
         case 7:  // satellite name
           x = plogw->sat_name[1] * 8;
@@ -455,7 +462,6 @@ void upd_cursor() {
         case 40:  // contest_name
           x = upd_cursor_calc(plogw->contest_name[1], 16);
           break;
-
         default:
           return;
       }
@@ -526,6 +532,13 @@ void upd_display() {
       //sprintf(dp->lcdbuf, "%-s", radio->cw_msg[radio->ptr_curr - 10] + 2);
       upd_display_put_lcdbuf(plogw->rtty_msg[radio->ptr_curr - 30] + 2, plogw->rtty_msg[radio->ptr_curr - 30][1], 16, 0);
     } else {
+      //      int pre_s = 0, pre_l = 0, caret = 0;
+      char composed[256];
+      int ps_b, pl_b, caret_b;
+      int ps_c, pl_c, caret_c;
+      int total_cols;
+      int colL,caret_local;
+      
       switch (radio->ptr_curr) {
         case 0:  // callsign
         case 1:  // my exch
@@ -548,8 +561,37 @@ void upd_display() {
           upd_display_put_lcdbuf(plogw->sent_exch + 2, plogw->sent_exch[1], 7, 8 + 1);
           break;
         case 6:  // editing remarks
-          //sprintf(dp->lcdbuf, "%-s", plogw->remarks + 2);
-          upd_display_put_lcdbuf(radio->remarks + 2, radio->remarks[1], 16, 0);
+	  //	  compose_line_with_preedit((const char*)radio->remarks, &g_pre,
+	  //				    dp->lcdbuf, sizeof(dp->lcdbuf),
+	  //				    &pre_s, &pre_l, &caret);
+	  //          upd_display_put_lcdbuf(radio->remarks + 2, radio->remarks[1], 16, 0);
+	  compose_line_with_preedit_cjk((const char*)radio->remarks, &g_pre,
+	  			    composed,sizeof(composed),
+				    &ps_b,&pl_b,&caret_b,
+				    &ps_c,&pl_c,&caret_c,
+				    &total_cols);
+
+	  console->print("total_cols:");
+	  console->print(total_cols);	  
+	  console->print(" caret_c:");
+	  console->print(caret_c);	  
+	  console->print(" caret_b:");
+	  console->println(caret_b);	  
+	  //	  window_line_by_columns_caret_cjk(composed, total_cols, caret_c,
+	  //					   15, 13,
+	  //					   dp->lcdbuf, sizeof(dp->lcdbuf),
+	  //					   &colL, &caret_local);
+
+	  window_from_caret_simple_cjk(
+				       composed, total_cols, caret_c,
+				       15, 12,
+				       dp->lcdbuf,sizeof(dp->lcdbuf),
+				       &colL, &caret_local       );
+	  radio->idx_cursor=caret_local;	  
+	  console->print(" colL:");
+	  console->print(colL);	  
+	  console->print(" caret_local:");
+	  console->println(caret_local);	  
           break;
         case 7:  // editing satellite name
           sprintf(dp->lcdbuf, "%-s", plogw->sat_name + 2);
@@ -630,72 +672,6 @@ void right_display_clearBuffer()
   u8g2_r->clearBuffer();  // clear the internal memory
 }
 
-#ifdef notdef
-void reset_display() {
-  dp = &disp;  
-  switch(display_type) {
-  case 0: // 1.3" display
-    u8g2_r=&u8g2_r_1;
-    u8g2_l=&u8g2_l_1;
-    display_flip=1; // 1.3" display
-    break;
-  case 1: // 2.4" display
-    u8g2_r=&u8g2_r_2;
-    u8g2_l=&u8g2_l_2;
-    display_flip=0; // 1.3" display
-    break;
-  }
-  
-  u8g2_r->begin();
-  if (display_swap) {
-    u8g2_r->setI2CAddress(0x3c * 2); // flip
-  } else {
-    u8g2_r->setI2CAddress(0x3d * 2); //non flip
-  }
-  
-  select_right_display();
-  u8g2_r->initDisplay();
-  if (display_flip) {  
-    u8g2_r->setFlipMode(1);
-  }
-  u8g2_r->clearDisplay();
-  u8g2_r->setPowerSave(0);
-  u8g2_r->clearBuffer();  // clear the internal memory
-  u8g2_r->setFont(u8g2_font_8x13_mf);
-  dp->hcol[0] = u8g2_r->getFontAscent() - u8g2_r->getFontDescent();
-  plogw->ostream->print("u8g2_r hcol =");
-  plogw->ostream->println(dp->hcol[0]);
-  u8g2_r->setFontRefHeightExtendedText();
-  u8g2_r->setFontPosTop();
-
-  u8g2_l->begin();
-  if (display_swap) {
-    u8g2_l->setI2CAddress(0x3d * 2);   // flip    
-  } else {
-    u8g2_l->setI2CAddress(0x3c * 2); // non flip
-  }
-  
-  select_left_display();
-  u8g2_l->initDisplay();
-
-  if (display_flip) {  
-    u8g2_l->setFlipMode(1);
-  }
-  u8g2_l->clearDisplay();
-  u8g2_l->setPowerSave(0);
-  u8g2_l->clearBuffer();  // clear the internal memory
-  u8g2_l->setFont(u8g2_font_t0_11_mf);
-  //  u8g2_l->setFont(u8x8_font_5x7_f);
-  u8g2_l->setFontRefHeightExtendedText();
-  u8g2_l->setFontPosTop();
-
-  dp->hcol[1] = u8g2_l->getFontAscent() - u8g2_l->getFontDescent();
-  plogw->ostream->print("u8g2_l hcol =");
-  plogw->ostream->println(dp->hcol[1]);
-  //  w = u8g2_r->getStrWidth(lcdbuf);
-
-}
-#endif
 
 void init_display() {
   dp = &disp;
@@ -727,6 +703,7 @@ void init_display() {
   //  display_flip=0; // 2.4" display
 
   u8g2_r->begin();
+
   if (display_swap) {
     u8g2_r->setI2CAddress(0x3c * 2); // flip
   } else {
@@ -736,16 +713,20 @@ void init_display() {
   plogw->ostream->println("getBufferSize=");
   plogw->ostream->print(u8g2_r->getBufferSize());
   dispbuf_r = (uint8_t *)malloc(u8g2_r->getBufferSize());
+
+
   select_right_display();
 
   u8g2_r->initDisplay();
+  u8g2_r->enableUTF8Print(); // for japanese printing       
   if (display_flip) {  
     u8g2_r->setFlipMode(1);
   }
   u8g2_r->clearDisplay();
   u8g2_r->setPowerSave(0);
   u8g2_r->clearBuffer();  // clear the internal memory
-  u8g2_r->setFont(u8g2_font_8x13_mf);
+  //  u8g2_r->setFont(u8g2_font_8x13_mf);
+  u8g2_r->setFont(u8g2_font_unifont_t_japanese1);
   dp->hcol[0] = u8g2_r->getFontAscent() - u8g2_r->getFontDescent();
   plogw->ostream->print("u8g2_r hcol =");
   plogw->ostream->println(dp->hcol[0]);
@@ -753,6 +734,7 @@ void init_display() {
   u8g2_r->setFontPosTop();
 
   u8g2_l->begin();
+
   if (display_swap) {
     u8g2_l->setI2CAddress(0x3d * 2);   // flip    
   } else {
@@ -763,7 +745,7 @@ void init_display() {
 
   select_left_display();
   u8g2_l->initDisplay();
-
+  u8g2_l->enableUTF8Print(); // for japanese printing     
   if (display_flip) {  
     u8g2_l->setFlipMode(1);
   }
@@ -771,7 +753,8 @@ void init_display() {
   u8g2_l->setPowerSave(0);
   u8g2_l->clearBuffer();  // clear the internal memory
   //  u8g2_l->setFont(u8g2_font_8x13_tf);
-  u8g2_l->setFont(u8g2_font_t0_11_mf);
+  //  u8g2_l->setFont(u8g2_font_t0_11_mf); // normally this is used
+  u8g2_l->setFont(u8g2_font_b12_t_japanese1); // experimental japanese font  
   //  u8g2_l->setFont(u8x8_font_5x7_f); // narrowr
   u8g2_l->setFontRefHeightExtendedText();
   u8g2_l->setFontPosTop();
@@ -782,8 +765,10 @@ void init_display() {
   //  w = u8g2_r->getStrWidth(lcdbuf);
   dp->wcol = 128;  // the whole line
 
-  u8g2_l->drawStr(0, 0, "JK1DVP log");
-  u8g2_l->drawStr(0, 13, "Initializing");
+  u8g2_l->drawStr(0, 0, "DVPlogger");
+  //  u8g2_l->drawStr(0, 13, "Initializing");
+  u8g2_l->drawUTF8(0, 13, "初期化中...");
+  console->println("初期化中...");
   u8g2_l->drawStr(0, 23, JK1DVPLOG_VERSION_STRING);  
 
   u8g2_l->sendBuffer();  // transfer internal memory to the display
@@ -900,8 +885,8 @@ void upd_display_info_signal()
       strcat(dp->lcdbuf, buf);
     }
   }
-	  if (strlen(radio->remarks+2))
-		strcat(dp->lcdbuf,radio->remarks+2);
+  if (strlen(radio->remarks+2))
+    strcat(dp->lcdbuf,radio->remarks+2);
   plogw->ostream->println(dp->lcdbuf);
 }
 
@@ -1215,6 +1200,7 @@ void upd_display_info_qso(int option) {
       // copy into edit bufferes
       set_qsodata_from_qso_entry();
       radio->qsodata_loaded = 1;
+      
       break;
   }
 end:
@@ -1230,13 +1216,28 @@ end:
 
 
 void upd_display_info() {
+  if (info_disp.timer != 0) {
+    if (verbose &4) {
+      console->print("upd_display_info():timer=");
+      console->println(info_disp.timer);
+    }
+    return;
+  } else {
+    info_disp.timer=-1;
+    if (verbose &4) {
+      console->print("upd_display_info():display;");
+      console->print(info_disp.show_info);      
+    }
+  }
+    
   select_left_display();
   u8g2_l->clearBuffer();  // clear the internal memory
   if (plogw->f_console_emu) {
     clear_display_emu(1);
   }
 
-  // the following should be executed after timeout
+  // the following should be executed after timeout (expiration of info_disp.timer becomes 0 )
+  // once after displaying, info_disp.timer is set to -1 and no repeated displaying occurs (one shot) unless the time is not set again.
   //  if (info_disp.show_info != info_disp.show_info_prev) {
   //  info_disp.show_info = info_disp.show_info_prev;
   //	// go back to previous item   after showing info temporarilly
@@ -1292,8 +1293,11 @@ void upd_disp_info_qso_entry() {
   display_printStr(dp->lcdbuf, 12);  // line3 his
   sprintf(dp->lcdbuf, "%-8s %3s %-s", qso.entry.mycall, qso.entry.sentrst, qso.entry.sentexch);
   display_printStr(dp->lcdbuf, 13);            // line 4 my
-  strncpy(dp->lcdbuf, qso.entry.remarks, 16);  // line 5 remarks
+  //  strncpy(dp->lcdbuf, qso.entry.remarks, 16);  // line 5 remarks ( single line can show 21 characters )
+  utf8_slice_by_columns_cjk(qso.entry.remarks, 0, 21,dp->lcdbuf, sizeof(dp->lcdbuf));  // line 5 remarks  
   display_printStr(dp->lcdbuf, 14);            // line 5 remarks
+  utf8_slice_by_columns_cjk(qso.entry.remarks, 21, 21+21,dp->lcdbuf, sizeof(dp->lcdbuf));// line 6 Remarks (cont.)
+  display_printStr(dp->lcdbuf, 15);            
 }
 
 
@@ -1313,9 +1317,11 @@ void upd_display_bandmap() {
   if (verbose & 4)  console->println("upd_display_bandmap()");
   int bandid;
   bandid = radio->bandid_bandmap;
-  if (verbose & 128) {
-    plogw->ostream->print("bandid bandmap=");
-    plogw->ostream->println(bandid);
+  if (verbose & 64) {
+    plogw->ostream->print("bandid_bandmap=");
+    plogw->ostream->print(bandid);
+    plogw->ostream->print("radio->bandid=");
+    plogw->ostream->println(radio->bandid);
   }
   if (bandid == 0) {
     console->println("upd_display_bandmap bandid==0");
@@ -1338,12 +1344,13 @@ void upd_display_bandmap() {
     clear_display_emu(1);
   }
   // place the on the frequency bandmap entry on the top if exists
-  int i_onfreq;
+
   int f_worked;
 
   f_worked = 0;
   // print on frequency station on top every time if we have
-  i_onfreq = find_on_freq_bandmap(radio->bandid, radio->freq, 100/FREQ_UNIT);
+  int onfreq_bandid = radio->bandid;
+  int i_onfreq = find_on_freq_bandmap(radio->bandid, radio->freq, 100/FREQ_UNIT);
   idx = radio->bandid - 1;
   if ((i_onfreq != -1) && (idx >= 0)) {
     bandmap_disp.f_onfreq = 1;
@@ -1351,10 +1358,9 @@ void upd_display_bandmap() {
     strncpy(bandmap_disp.on_freq_station, p->station, 10);
     bandmap_disp.on_freq_modeid = p->mode;
 
-
     // check if already worked this station
     //    if (dupe_check_nocallhist(p->station, bandid * 4 + modetype[p->mode], plogw->mask)) {
-    if (dupe_check_nocallhist(p->station, bandmode_param(radio->bandid,modetype[p->mode]), plogw->mask)) {    
+    if (dupe_check_nocallhist(p->station, bandmode_param(radio->bandid,modetype[p->mode]), plogw->mask)) {
       // already worked
       f_worked = 1;
       if (!plogw->f_console_emu) {
@@ -1429,11 +1435,11 @@ void upd_display_bandmap() {
 
         continue;
       }
-      if (p->flag & BANDMAP_ENTRY_FLAG_ONFREQ) {
+      //      if (p->flag & BANDMAP_ENTRY_FLAG_ONFREQ) {
+      if (bandid == onfreq_bandid && i == i_onfreq) {
         if (verbose & 64) {
           plogw->ostream->print("O");
         }
-
         continue;
       }
       if (p->flag & BANDMAP_ENTRY_FLAG_WORKED) {
@@ -1477,12 +1483,13 @@ void upd_display_bandmap() {
 
         if (count - bandmap_disp.top_column[idx] >= 5 + bandmap_disp.f_onfreq) {
           if (verbose & 64) plogw->ostream->println("break");
-          break;  // could not show more than this
+          break;  // may not show more than this
         }
         p = bandmap[idx].entry + i;
         if (*p->station == '\0') continue;
         // check if on the freq flag
-        if (p->flag & BANDMAP_ENTRY_FLAG_ONFREQ) {
+	//        if (p->flag & BANDMAP_ENTRY_FLAG_ONFREQ) {
+	if (bandid == onfreq_bandid && i == i_onfreq) {
           if (verbose & 64) {
             plogw->ostream->print((String)p->station);
             plogw->ostream->print(" f=");

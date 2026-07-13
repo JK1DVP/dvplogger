@@ -41,6 +41,7 @@
 // mode change send band scope width! --> inplemented need to test
 
 #include "Arduino.h"
+#include "main.h"
 #include "decl.h"
 #include "variables.h"
 #include "so2r.h"
@@ -60,6 +61,7 @@
 #include "misc.h"
 #include "cluster.h"
 #include "callhist.h"
+#include "callhist_remote.h"
 #include <hidboot.h>
 #include "SD.h"
 #include "contest.h"
@@ -68,6 +70,7 @@
 #include "sd_files.h"
 #include "cmd_interp.h"
 #include "network.h"
+#include "main.h"
 #include "zserver.h"
 #include "cty_chk.h"
 #include "iambic_keyer.h"
@@ -269,6 +272,8 @@ void send_single_char_radio(struct radio *radio,char c)
 }
 
 void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
+
+  plogw->count_autopoweroff=0; // reset auto powerdown counter
   //  verbose=1;
   if (verbose & 1) {
     plogw->ostream->print("Key=<");
@@ -546,9 +551,20 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	return;
 	}
     */
-    if (key == 0x17) {  // Alt-T tx/rx toggle ptt
+    if (key == 0x17) {  // Alt-T tx/rx toggle ptt --> tune command
+      if (radio->ptt==0) {
+	if (radio->power >0) {
+	  radio->power_bak = radio->power;
+	}
+	set_power(radio, 8);
+      }
       radio->ptt = 1 - radio->ptt;
       set_ptt_rig(radio, radio->ptt);
+      if (radio->ptt==0) {
+	if (radio->power_bak >0) {
+	  set_power(radio, radio->power_bak);
+	}
+      }
       return;
     }
     if (key == 0x1b) {  // Alt-X transverter toggle
@@ -596,6 +612,13 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	// from s&p to cq
 	radio->cq[radio->modetype] = LOG_CQ;
       }
+
+      if (radio->cq[radio->modetype]== LOG_CQ) {
+	console->println("CQ");
+      } else {
+	console->println("SandP");	
+      }
+	
       // update cq_bank so that new frequency in cq state is recovered 
       radio->cq_bank[radio->bandid][radio->modetype]=radio->cq[radio->modetype];
       // recall previous memory of S&P
@@ -610,6 +633,13 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
       right_display_sendBuffer();
       bandmap_disp.f_update = 0;
       upd_display_bandmap();
+      upd_display();
+      if (radio->cq[radio->modetype]== LOG_CQ) {
+	console->println("CQ");
+      } else {
+	console->println("SandP");	
+      }
+      
       return;
     }
     if (key == 0x04) {  // Alt-A show next aos
@@ -729,6 +759,8 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
     if (key == 0x2c) {
       // Alt-Space pick spot on the bandmap cursor
       pick_entry_bandmap();
+      // ＊＊＊＊bandmap_bandidがどのradio のものであろうと、運用中のradio のうち選択されたバンドの運用中のものがあれば、そちらのradio のs&p に選んだ局、周波数、局名をセットし、focused radioをそちらにスイッチすべきである。
+      //そうしないと、複数のradio が同じバンドに設定されてしまうこととなる。現状は今のradio にセットしてしまっている。
       //      // dupe check here
       //      plogw->ostream->print("dupechk here");      
       //      if (dupe_check(radio->callsign + 2, bandmode(), plogw->mask, 1)) {  // cw/ssb both ok ... 0xff cw/ssb not ok 0xff-3
@@ -1047,7 +1079,19 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	plogw->ostream->print(dp->lcdbuf);	
 	break;
 	/// qso entry display related
-      case 0x0d:  //ctrl-j to show current qso entry
+	//      case 0x0d:  //ctrl-j to show current qso entry --> remap to ctrl-i
+      case 0x0d:  // ctrl-j to toggle romaji conv
+	switch (radio->f_romaji) {
+	case 0: // non romaji
+	  radio->f_romaji=1;
+	  g_pre.s[0]='\0';g_pre.len=0;//clear preedit 
+	  break;
+	case 1: // in romaji -> notify flush_preedit()
+	  radio->f_romaji=2; break;
+	}
+	upd_display();
+	break;
+      case 0x0c:  //ctrl-i to show current qso entry --> remap from ctrl-j
 	upd_display_info_qso(0);
 	break;
       case 0x13:;  // ctrl-p to show previous qso entry
@@ -1076,6 +1120,7 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	  plogw->ostream->println("qso SD-> edit");
 	}
 	upd_display_info_qso(1);
+	upd_display();
 	break;
 
       case 0x2f: // Ctrl-'[' toggle partial check flag
@@ -1099,6 +1144,7 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	  plogw->ostream->print("mask:");
 	  plogw->ostream->println(plogw->mask);
 	}
+	sync_dupechk_mask_subcpu(plogw->mask);
 	upd_display_info_contest_settings(radio);
 	break;
       case 0x1f:  // ctrl-2  // switch contest
@@ -1120,7 +1166,7 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	break;
 
 
-      case 0x21:  // ctrl-4 callhistory search toggle
+      case 0x21: {  // ctrl-4 callhistory search toggle
 	if (plogw->enable_callhist) {
 	  plogw->enable_callhist = 0;
 	} else {
@@ -1132,14 +1178,17 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	}
 	sprintf(dp->lcdbuf, "callhist en:%d\nStart.\n", plogw->enable_callhist);
 	upd_display_info_flash(dp->lcdbuf);
-	int n;
+	int n = 0;
 	if (plogw->enable_callhist) {
 	  if (!plogw->f_console_emu) plogw->ostream->println("open callhist");
-	  //	  n=read_callhist_list("/23FD.PCK");
-	  n=read_callhist_list(callhistfn);	  
-	  print_callhist_list((const char **)callhist_list,n);
-	  
-	  //	  open_callhist();
+	  if (callhist_at == 1) {
+	    if (load_callhist_subcpu(callhistfn)) {
+	      n = get_callhist_subcpu_count();
+	    }
+	  } else {
+	    n = read_callhist_list(callhistfn);
+	    print_callhist_list((const char **)callhist_list, n);
+	  }
 	} else {
 	  if (!plogw->f_console_emu) plogw->ostream->println("close callhist");
 	  //	  close_callhist();
@@ -1147,18 +1196,25 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	sprintf(dp->lcdbuf, "callhist en:%d\nDone.\n", plogw->enable_callhist);
 	upd_display_info_flash(dp->lcdbuf);
 	break;
+      }
 
       case 0x22:  // ctrl-5 radio_mode switch
 	switch (so2r.radio_mode) {
 	case 0:  // current so1r
+	  {
 	  so2r.radio_mode = SO2R::RADIO_MODE_SAT;
+	  }
 	  break;
 
 	case 1:  // sat wro radio
+	  {
 	  so2r.radio_mode = SO2R::RADIO_MODE_SO2R;
+	  }
 	  break;
 	case 2:  // so2r
+	  {
 	  so2r.radio_mode = SO2R::RADIO_MODE_SO1R;
+	  }
 	  break;
 	}
 	sprintf(dp->lcdbuf, "radio_mode =%d\n%s\n", so2r.radio_mode, (so2r.radio_mode == SO2R::RADIO_MODE_SO1R) ? "SO1R" : (so2r.radio_mode == SO2R::RADIO_MODE_SAT) ? "SAT 0 TX 1 RX "
@@ -1199,6 +1255,7 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
     /////////////////////////////////////////////////////////////////////
     // no modifier keys
     // check with special keys
+    
     switch (key) {
     case 0x28:  // Enter
       process_enter(0);
@@ -1374,6 +1431,10 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	}
 	// other alphabetical / numerical keys
 	//  OnKeyPressed(c);
+	//	plogw->ostream->println("ptr_curr:");
+	//	plogw->ostream->print(radio->ptr_curr);	
+	//	plogw->ostream->println("*");
+	
 	switch (radio->keyer_mode) {
 	case 0:
 	  if ((radio->ptr_curr == 0)||(radio->ptr_curr == 1) ) { // 25/3/23 same response in call/exchange ; 
@@ -1484,9 +1545,51 @@ void function_keys(uint8_t key, uint8_t c) {
 }
 
 
+void print_off_contest()
+{
+  sprintf(dp->lcdbuf, "OFF Contest = %d\n",plogw->f_off_contest);
+  if (plogw->f_off_contest) {
+    strcat(dp->lcdbuf,"No Dupe/Multi/Score\n");
+  } else {
+    strcat(dp->lcdbuf,"Contest:");
+    strcat(dp->lcdbuf,plogw->contest_name+2);
+    strcat(dp->lcdbuf,"\n");    
+  }
+  upd_display_info_flash(dp->lcdbuf);
 
+}
 
+void set_contest_from_name()
+{
+    search_contest_id_from_name() ;
+    switch(plogw->multi_type) {
+    case MULTI_TYPE_NORMAL:      sprintf(buf,"NORMAL"); break;
+    case MULTI_TYPE_CQWW:        sprintf(buf,"NORMAL/CQWW"); break;      
+    case MULTI_TYPE_JARL_PWR:    sprintf(buf,"JARL PWR"); break;      
+    case MULTI_TYPE_UEC:    sprintf(buf,"UEC"); break;      
+    case MULTI_TYPE_JARL_PWR_NOMULTICHK:    sprintf(buf,"JARL PWR \nNOMULTICHK"); break;      
+    case MULTI_TYPE_NOCHK_LASTCHR:    sprintf(buf,"IGN LASTCHR"); break;      
+    case MULTI_TYPE_GL_NUMBERS:    sprintf(buf,"GL/NUMBER"); break;      
+    case MULTI_TYPE_ARRLDX:    sprintf(buf,"ARRLDX"); break; 
+    case MULTI_TYPE_ARRL10M:    sprintf(buf,"ARRL10M"); break;
+    case MULTI_TYPE_AA:    sprintf(buf,"AllAsia"); break;         
+    default:sprintf(buf,"N/A"); break;
+    }
+    
+    sprintf(dp->lcdbuf, "contest \n%s\nselected.\nD:%s\nMult:%s",plogw->contest_name+2,plogw->mask == 0xff ? "OK C/P" : "NG C/P",buf);
+    
+    upd_display_info_flash(dp->lcdbuf);
+  
+}
 
+// true if current contest checks multiplier validity
+int check_multi_contest()
+{
+  //  console->print(plogw->contest_name+2);  
+  if (strncasecmp(plogw->contest_name+2,"NOMULTI",7)==0) return 0;
+  //if (strncasecmp(plogw->contest_name+2,"AAtest",6)==0) return 0;
+  return 1;
+}
 
 // 入力欄でEnter を押したときの処理
 void process_enter(int option) {
@@ -1516,25 +1619,29 @@ void process_enter(int option) {
   // 21/11/7 Enter will also be processed similarly in keyer mode
   switch (radio->ptr_curr) {
   case 1:  // number entry
-    // check multipliers
-    int ret;
-    radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
-    if (strncasecmp(plogw->contest_name+2,"NOMULTI",7)!=0) {
-      if (radio->multi == -1) {
-	// not valid multipliers
-	if (!plogw->f_console_emu) plogw->ostream->println("not valid multiplier");
-	upd_display();
-	upd_display_info_contest_settings(radio);
-	break;
+    if (!plogw->f_off_contest) {        
+      // check multipliers
+      int ret;
+      radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
+      //   plogw->ostream->println("contest multi checking0");
+      if (check_multi_contest()) {
+	//plogw->ostream->println("contest multi checking");
+	if (radio->multi == -1) {
+	  // not valid multipliers
+	  if (!plogw->f_console_emu) plogw->ostream->println("not valid multiplier");
+	  upd_display();
+	  upd_display_info_contest_settings(radio);
+	  break;
+	}
       }
-    }
 
-    // ESM
-    if (plogw->f_esm==1) {
-      if (radio->cq[radio->modetype] == LOG_SandP && option!=1) {
-	// ESM && S&P -- > send exchange
-	if (!so2r.send_exch(radio)) return; // this need to be done for the previously focused radio
-	// 2bsiq delay so set flag and return
+      // ESM
+      if (plogw->f_esm==1) {
+	if (radio->cq[radio->modetype] == LOG_SandP && option!=1) {
+	  // ESM && S&P -- > send exchange
+	  if (!so2r.send_exch(radio)) return; // this need to be done for the previously focused radio
+	  // 2bsiq delay so set flag and return
+	}
       }
     }
     
@@ -1546,58 +1653,67 @@ void process_enter(int option) {
     if (verbose&4) 	{
       if (!plogw->f_console_emu) plogw->ostream->println("print_qso_log() finished");
     }
-
-    // reset qso_interval_timer
-    plogw->qso_interval_timer =0;
-
-    if (!radio->dupe) {
-      // update statistics in score
-      score.worked[radio->modetype == LOG_MODETYPE_CW ? 0 : 1][radio->bandid - 1]++;
-      entry_dupechk(so2r.radio_qso_process());
-    }
-    plogw->seqnr_band[radio->bandid-1]++;
-    if (verbose&4) 	{
-      if (!plogw->f_console_emu) plogw->ostream->println("dupechk entered");
-    }
-
-    entry_multiplier(so2r.radio_qso_process());
-    if (verbose&4) 	{
-    if (!plogw->f_console_emu) plogw->ostream->println("multi entered ");
-    }
-
-    // check bandmap and update flags
-    int idx;
-    idx = search_bandmap(radio->bandid, radio->callsign + 2, modeid_string(radio->opmode));
-    if (idx != -1) {
-      //
-      struct bandmap_entry *p;
-      p = bandmap[radio->bandid - 1].entry + idx;
-      p->flag |= BANDMAP_ENTRY_FLAG_WORKED;
-      console->print("search_bandmap found the station in");console->println(idx);
-    } else {
-      console->println("search_bandmap didn't find the station ");
-    }
-
-    // bandmap update
-    if (radio->cq[radio->modetype] == LOG_SandP) {
-      if (strlen(radio->callsign + 2) > 3) {
-	register_current_callsign_bandmap();
-      }
-    }
-
-    // send TU
-    if (option == 0 && ((plogw->f_esm==0) || (plogw->f_esm==1 && (radio->cq[radio->modetype] == LOG_CQ)))) {    
-      so2r.send_tu();
-      if (verbose&4) console->println("end of tu");      
-    }
-    so2r.print_sequence_mode();
     
-    if (verbose&4) 	{
-      if (!plogw->f_console_emu) plogw->ostream->println("bandmap updated  ");
+    if (!plogw->f_off_contest) {              
+      // reset qso_interval_timer
+      plogw->qso_interval_timer =0;
+
+
+      if (!radio->dupe) {
+	// update statistics in score
+	score.worked[radio->modetype == LOG_MODETYPE_CW ? 0 : 1][radio->bandid - 1]++;
+	entry_dupechk(so2r.radio_qso_process());
+      }
+
+      plogw->seqnr_band[radio->bandid-1]++;
+
+      if (verbose&4) 	{
+	if (!plogw->f_console_emu) plogw->ostream->println("dupechk entered");
+      }
+      
+      entry_multiplier(so2r.radio_qso_process());
+      if (verbose&4) 	{
+	if (!plogw->f_console_emu) plogw->ostream->println("multi entered ");
+      }
+
+      // check bandmap and update flags
+      int idx;
+      idx = search_bandmap(radio->bandid, radio->callsign + 2, modeid_string(radio->opmode));
+      if (idx != -1) {
+	//
+	struct bandmap_entry *p;
+	p = bandmap[radio->bandid - 1].entry + idx;
+	p->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+	console->print("search_bandmap found the station in");console->println(idx);
+      } else {
+	console->println("search_bandmap didn't find the station ");
+      }
+
+      // bandmap update
+      if (radio->cq[radio->modetype] == LOG_SandP) {
+	if (strlen(radio->callsign + 2) > 3) {
+	  register_current_callsign_bandmap();
+	}
+      }
+
+      // send TU
+      if (option == 0 && ((plogw->f_esm==0) || (plogw->f_esm==1 && (radio->cq[radio->modetype] == LOG_CQ)))) {    
+	so2r.send_tu();
+	if (verbose&4) console->println("end of tu");      
+      }
+      so2r.print_sequence_mode();
+    
+      if (verbose&4) 	{
+	if (!plogw->f_console_emu) plogw->ostream->println("bandmap updated  ");
+      }
+
+      upd_display_info_contest_settings(so2r.radio_qso_process());
+    } else {
+      sprintf(dp->lcdbuf, "OFF Contest=%d !!!\nNo Dupe/Multi/Score\nperformed.",plogw->f_off_contest);
+      upd_display_info_flash(dp->lcdbuf);
     }
-
-    upd_display_info_contest_settings(so2r.radio_qso_process());
-
+      
+    
     // prepare new log entry
     //    new_log_entry();
     if (verbose&4)     {
@@ -1687,6 +1803,7 @@ void process_enter(int option) {
     console->print(" and rig_spec_str is ");
     console->println(radio->rig_spec_str+2);
     }
+	// select_rig assume rig_spec_idx does not change, but in this flow, name may be changed.... 25/9/21
     select_rig(radio);
     if (verbose&4) {
     console->print("After select_rig(), Now edit rig name is ");
@@ -1705,25 +1822,7 @@ void process_enter(int option) {
     reconnect_zserver();
     break;
   case 40: // contest_name
-    search_contest_id_from_name() ;
-
-    switch(plogw->multi_type) {
-    case MULTI_TYPE_NORMAL:      sprintf(buf,"NORMAL"); break;
-    case MULTI_TYPE_CQWW:        sprintf(buf,"NORMAL/CQWW"); break;      
-    case MULTI_TYPE_JARL_PWR:    sprintf(buf,"JARL PWR"); break;      
-    case MULTI_TYPE_UEC:    sprintf(buf,"UEC"); break;      
-    case MULTI_TYPE_JARL_PWR_NOMULTICHK:    sprintf(buf,"JARL PWR \nNOMULTICHK"); break;      
-    case MULTI_TYPE_NOCHK_LASTCHR:    sprintf(buf,"IGN LASTCHR"); break;      
-    case MULTI_TYPE_GL_NUMBERS:    sprintf(buf,"GL/NUMBER"); break;      
-    case MULTI_TYPE_ARRLDX:    sprintf(buf,"ARRLDX"); break;      
-    case MULTI_TYPE_ARRL10M:    sprintf(buf,"ARRL10M"); break;
-    default:sprintf(buf,"N/A"); break;
-    }
-    
-    sprintf(dp->lcdbuf, "contest \n%s\nselected.\nD:%s\nMult:%s",plogw->contest_name+2,plogw->mask == 0xff ? "OK C/P" : "NG C/P",buf);
-    
-    upd_display_info_flash(dp->lcdbuf);
-    
+    set_contest_from_name();
     break;
     
   case 0:  // callsign entry
@@ -1829,6 +1928,13 @@ void process_enter(int option) {
       clear_buf(radio->callsign);      
       break;
     }
+    if(strncmp(radio->callsign+2,"POWER",5)==0) {
+      if (sscanf(radio->callsign+2+5,"%d",&tmp)==1) {
+	set_power(radio,tmp);
+      }
+      clear_buf(radio->callsign);            
+      break;
+    }
     
     if (strcmp(radio->callsign + 2, "NEWQSOLOG") == 0) {
       // create new QSO log
@@ -1836,6 +1942,18 @@ void process_enter(int option) {
       clear_buf(radio->callsign);
       break;
     }
+    if(strncmp(radio->callsign+2,"AUTOOFF",7)==0) {
+      if (sscanf(radio->callsign+2+7,"%d",&tmp)==1) {
+	plogw->autopoweroff=tmp;
+      } else {
+	//	plogw->autopoweroff=0;
+      }
+      sprintf(dp->lcdbuf, "AUTOOFF=%d sec\n",plogw->autopoweroff);
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    
     if (strcmp(radio->callsign+2,"LOADRIGS")==0) {
       load_rigs("RIGS");
       clear_buf(radio->callsign);      
@@ -1964,11 +2082,19 @@ void process_enter(int option) {
       clear_buf(radio->callsign);
       break;
     }
+    if (strcmp(radio->callsign + 2, "MEMSTAT") == 0) {
+      request_memstat_main_subcpu();
+      clear_buf(radio->callsign);
+      break;
+    }
+
     if (strcmp(radio->callsign + 2, "MAKEDUPE") == 0) {
       init_score();
       //      init_multi();
       clear_multi_worked();      
-      init_dupechk();
+      //      init_dupechk(NMAXQSO,0);
+      init_dupechk_maincpu();
+      reset_dupechk_subcpu();
       sprintf(dp->lcdbuf, "Reading Log\nfor MAKEDUPE...\n");
       upd_display_info_flash(dp->lcdbuf);
       read_qso_log(READQSO_MAKEDUPE);
@@ -1984,7 +2110,28 @@ void process_enter(int option) {
       clear_buf(radio->callsign);      
       break;
     }
-      
+    
+    if (strcmp(radio->callsign+2,"OFFCONTEST")==0) {
+      // toggle on/off contest flag
+      plogw->f_off_contest=1;
+      print_off_contest();
+      clear_buf(radio->callsign);      
+      break;
+    }
+    if (strcmp(radio->callsign+2,"ONCONTEST")==0) {
+      // toggle on/off contest flag
+      plogw->f_off_contest=0;
+      print_off_contest();
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strncmp(radio->callsign+2,"CONTEST",7)==0) {
+      strcpy(plogw->contest_name+2, radio->callsign+2+7);
+      set_contest_from_name();
+      clear_buf(radio->callsign);
+      break;
+    }
     if (strncmp(radio->callsign + 2, "KEY", 3) == 0) {
       // change rigspec radio->rig_spec->cwport
       int tmp, tmp1;
@@ -2098,6 +2245,10 @@ void process_enter(int option) {
       }
       break;
     }
+    if (strncmp(radio->callsign+2,"DEBUG",5)==0) {
+      so2r.debug=1-so2r.debug;
+      break;
+    }
     if (strcmp(radio->callsign+2,"ALTCQ")==0) {
       // alt cq
       so2r.sequence_mode(SO2R::SO2R_ALTCQ);
@@ -2116,16 +2267,53 @@ void process_enter(int option) {
       clear_buf(radio->callsign);      
       break;
     }
-    
-    if (strncmp(radio->callsign + 2, "CALLHIST", 8) == 0) {
-      set_callhistfn(radio->callsign + 10);
+
+     
+
+    if (strcmp(radio->callsign + 2, "CALLHISTMAIN") == 0) {
+      callhist_at = 0;
       plogw->enable_callhist = 1;
-      //      open_callhist();
-      read_callhist_list(callhistfn);
-      if (!plogw->f_console_emu) plogw->ostream->println("callhist");
+      int n = read_callhist_list(callhistfn);
+      plogw->ostream->printf("Call History location: MAIN CPU, entries=%d\n", n);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Call History\n%s\n%d entries\nAt %s\n%s",
+               callhistfn, n, f_spiram ? "MAIN-PSRAM" : "MAIN-RAM",
+               n > 0 ? "Enabled" : "Load failed");
+      upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
     }
+    if (strcmp(radio->callsign + 2, "CALLHISTSUB") == 0) {
+      callhist_at = 1;
+      plogw->enable_callhist = 1;
+      int n = load_callhist_subcpu(callhistfn) ? get_callhist_subcpu_count() : 0;
+      plogw->ostream->printf("Call History location: SUB CPU, entries=%d\n", n);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Call History\n%s\n%d entries\nAt SUBCPU\n%s",
+               callhistfn, n, n > 0 ? "Enabled" : "Load failed");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    
+    if (strncmp(radio->callsign + 2, "CALLHIST", 8) == 0) {
+      // The Callsign field does not accept spaces, so an optional filename
+      // starts immediately after CALLHIST.
+      const char *arg = radio->callsign + 10; // CALLHIST + filename, no space
+      if (*arg != '\0') set_callhistfn((char *)arg);
+      plogw->enable_callhist = 1;
+      int n = (callhist_at == 1) ? (load_callhist_subcpu(callhistfn) ? get_callhist_subcpu_count() : 0)
+	: read_callhist_list(callhistfn);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Call History\n%s\n%d entries\nAt %s\n%s",
+               callhistfn, n, callhist_at ? "SUBCPU" : (f_spiram ? "MAIN-PSRAM" : "MAIN-RAM"),
+               n > 0 ? "Enabled" : "Load failed");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    
     if (strcmp(radio->callsign + 2, "LISTDIR") == 0) {
       listDir(SD, "/", 0);
       clear_buf(radio->callsign);
@@ -2308,10 +2496,7 @@ void process_enter(int option) {
     break;
   }
   upd_display();
-  // break;
 
-  //          case 1:
-  //            append_cwbuf(c); break;
 }
 
 int check_edit_mode()  // CW key input and Remarks  return 1 (insert) else return 0 (overwrite edit)
@@ -2338,11 +2523,11 @@ int check_edit_mode()  // CW key input and Remarks  return 1 (insert) else retur
 
 
 int ptr_curr_req_uppercase(struct radio *radio) {
-    if ((radio->ptr_curr != 6) && (radio->ptr_curr != 20) &&(radio->ptr_curr != 21) && (radio->ptr_curr != 22) && (radio->ptr_curr != 23) && (radio->ptr_curr != 25) && (radio->ptr_curr != 26) && (radio->ptr_curr != 27) && (radio->ptr_curr != 28) && (radio->ptr_curr != 29) && (radio->ptr_curr != 40) )   {
-      return 1;
-    } else {
-      return 0;
-    }
+  if ((radio->ptr_curr != 6) && (radio->ptr_curr != 20) &&(radio->ptr_curr != 21) && (radio->ptr_curr != 22) && (radio->ptr_curr != 23) && (radio->ptr_curr != 25) && (radio->ptr_curr != 26) && (radio->ptr_curr != 27) && (radio->ptr_curr != 28) && (radio->ptr_curr != 29) && (radio->ptr_curr != 40) )   {
+    return 1;
+  } else {
+    return 0;
+  }
   
 }
 
@@ -2357,10 +2542,10 @@ int ptr_curr_req_nospace(struct radio *radio) {
       && (radio->ptr_curr != 9)
       ) {
     // JCC allow space
-      return 1;
-    } else {
-      return 0;
-    }
+    return 1;
+  } else {
+    return 0;
+  }
 }
 
 int ptr_curr_req_callsign_exch_chr(struct radio *radio) {
@@ -2508,7 +2693,7 @@ void logw_handler(char key, char c)
     //plogw->ostream->println("chk");
     // other character change to upper case
     // list ptr_curr in which cases matters 
-      // not cluster address (need small characters to allow input )
+    // not cluster address (need small characters to allow input )
     if (ptr_curr_req_uppercase(radio)) {
       if (c >= 'a' && c <= 'z') c += 'A' - 'a';
     }
@@ -2530,10 +2715,27 @@ void logw_handler(char key, char c)
     }
     if (!isPrintable(c)) return;
     //plogw->ostream->println("chk1");
-    if (check_edit_mode()) {
-      insert_buf(c, pwin);  // insert to buffer in cw msg edit mode
+    if (radio->ptr_curr == 6) {
+      switch(radio->f_romaji) {
+      case 0:
+	insert_buf(c, pwin);  // insert to buffer in cw msg edit mode
+	break;
+      case 1:
+	romaji_input_char(c,pwin);
+	break;
+      case 2:
+	flush_preedit(pwin);
+	insert_buf(c,pwin);
+	radio->f_romaji=0;
+	g_pre.s[0]='\0';g_pre.len=0; // clear preedit
+	break;
+      } 
     } else {
-      overwrite_buf(c, pwin);  // overwriting is more appropriate than insert in logging
+      if (check_edit_mode()) {
+	insert_buf(c, pwin);  // insert to buffer in cw msg edit mode
+      } else {
+	overwrite_buf(c, pwin);  // overwriting is more appropriate than insert in logging
+      }
     }
     // activity in log window leads to memorize frequency if S&P
     if (radio->cq[radio->modetype] == LOG_SandP) {
@@ -2544,37 +2746,37 @@ void logw_handler(char key, char c)
   }
 
   
-    // on-demand processes after editing
-    switch (radio->ptr_curr) {
-    case 0:  // call sign window
-      if (strlen(radio->callsign + 2) >= 5) {
-	// dupecheck
-	if (dupe_check(radio,radio->callsign + 2, bandmode(radio), plogw->mask, 0)) {  // cw/ssb both ok ... 0xff cw/ssb not ok 0xff-3
-	  radio->dupe = 1;
-	  // duped callsign and frequency is registered in the bandmap in S&P //(only for phone?)
-	  //	  if (radio->modetype==LOG_MODETYPE_PH) {
-	  if (radio->cq[radio->modetype] == LOG_SandP) {
-	    register_current_callsign_bandmap();
-	  }
-	} else {
-	  radio->dupe = 0;
+  // on-demand processes after editing
+  switch (radio->ptr_curr) {
+  case 0:  // call sign window
+    if (strlen(radio->callsign + 2) >= 5) {
+      // dupecheck
+      if (dupe_check(radio,radio->callsign + 2, bandmode(radio), plogw->mask, 0)) {  // cw/ssb both ok ... 0xff cw/ssb not ok 0xff-3
+	radio->dupe = 1;
+	// duped callsign and frequency is registered in the bandmap in S&P //(only for phone?)
+	//	  if (radio->modetype==LOG_MODETYPE_PH) {
+	if (radio->cq[radio->modetype] == LOG_SandP) {
+	  register_current_callsign_bandmap();
 	}
+      } else {
+	radio->dupe = 0;
+      }
 
-      }
-      // partial check if appricable
-      ui_perform_partial_check(radio);
-      
-      
-      break;
-    case 1:  // recv_exch
-      if (strlen(radio->recv_exch + 2) >= 1) {
-	radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
-	if (radio->multi >= 0) {
-	  upd_display_info_contest_settings(radio);
-	}
-      }
-      break;
     }
+    // partial check if appricable
+    ui_perform_partial_check(radio);
+      
+      
+    break;
+  case 1:  // recv_exch
+    if (strlen(radio->recv_exch + 2) >= 1) {
+      radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
+      if (radio->multi >= 0) {
+	upd_display_info_contest_settings(radio);
+      }
+    }
+    break;
+  }
 
 
   upd_display();
@@ -2584,6 +2786,7 @@ void 	check_call_show_dx_entity_info(struct radio *radio) {
   if (strlen(radio->callsign+2)>2) {
     switch (plogw->multi_type) {
     case MULTI_TYPE_CQWW:
+    case MULTI_TYPE_AA:
       show_entity_info(radio->callsign+2);
       break;
     }
@@ -2877,7 +3080,7 @@ void print_help(int option) {
 
     break;
   case 1:  // on the callsign enter
-    sprintf(dp->lcdbuf, "SATELLITE\nNEW/READ/MAIL/\nDUMPQSOLOG\nMAKEDUPE,LISTDIR\nSAVE/LOAD\n");
+    sprintf(dp->lcdbuf, "SATELLITE\nNEW/READ/MAIL/\nDUMPQSOLOG\nMAKEDUPE,MEMSTAT\nLISTDIR,SAVE/LOAD\n");
     break;
   case 2:  // Ctrl
     sprintf(dp->lcdbuf, "C-r,c,s:Rem,Cl,RST\nC-f:Rem->Mul,-v:Tgl_Voice\nC-j,p,n,o:Cur,Prev,Next,Last\nC-1,2:C/PDupe,Contest\nC-3,t,y:MaskBandmap,MultiShow\n");

@@ -30,6 +30,7 @@
 #include "display.h"
 #include "callhist.h"
 #include "callhist_fd.h"
+#include "callhist_mem.h"
 #include "settings.h"
 #include "so2r.h"
 
@@ -38,59 +39,12 @@
 // two pass process to first investigate the file content and decide number of entry and size of memory then read contents allocating memory by malloc (psram?)
 
 
-// following is to read callhist_list from file 
-int size_callhist_list=500;
-// callhist_list is an array of character string and the last string is ""
-char **callhist_list=NULL;
-char *callhist_list_mem=NULL;
-int n_callhist_list=0;
-
-int release_callhist_list_contents()
-{
-  for (int i=0;i<n_callhist_list;i++) {
-    if (callhist_list[i]!=NULL) {
-      free(callhist_list[i]);
-      callhist_list[i]=NULL;
-    }
-  }
-  n_callhist_list=0;
-  return 1;
-}
-
-
-int init_callhist_list()
-{
-
-  //  callhist_list=NULL;
-  //  callhist_list_mem=NULL;
-  n_callhist_list=0;
-  // initialize with zero callhist_list
-  // free if already allocated something
-  if (callhist_list!=NULL) free(callhist_list);    
-  if (callhist_list_mem!=NULL) free(callhist_list_mem);
-  callhist_list_mem=(char *)malloc(sizeof(char)*1);
-  callhist_list=(char **)malloc(sizeof(char *)*(1));
-  callhist_list[0]=callhist_list_mem;
-  *callhist_list_mem='\0';
-  return 1;
-  
-  /*  if (callhist_list!=NULL) {
-    release_callhist_list_contents();
-  } else {
-    callhist_list = (char **)malloc(sizeof(char **)*size_callhist_list);
-    if (callhist_list!=NULL) {
-      for (int i=0;i<size_callhist_list;i++) callhist_list[i]=NULL;
-    } else {
-      return 0;
-    }
-  }
-  n_callhist_list=0;
-  return 1;
-  */
-  
-}
 
 //char *last_item = "";
+
+static size_t callhist_memory_bytes = 0;
+static bool callhist_loaded = false;
+static bool callhist_in_psram = false;
 
 int read_callhist_list(char *fn)
 {
@@ -105,7 +59,7 @@ int read_callhist_list(char *fn)
   }
   char buf[128];
   char *ptmp,*pcallhist_list;
-  static int memsize=0;
+  int memsize=0;
   n_callhist_list=0;
   console->print("counting callhist file ");
   console->print(fn);
@@ -122,31 +76,61 @@ int read_callhist_list(char *fn)
   // allcate memory
 
 
-#ifndef PSRAM_EXISTS
-  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)-(sizeof(char)*memsize+10+sizeof(char*)*(n_callhist_list+3)) < 60000 ) {
-    console->printf("not enough heap memory %ud\n",heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    sprintf(dp->lcdbuf, "no enough mem\n%ud\n",heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    upd_display_info_flash(dp->lcdbuf);
-    n_callhist_list=0;
-    return n_callhist_list;    
-  }
+  //#ifndef PSRAM_EXISTS
+  if (!f_spiram) {
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)-(sizeof(char)*memsize+10+sizeof(char*)*(n_callhist_list+3)) < 60000 ) {
+      console->printf("not enough heap memory %ud\n",heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      sprintf(dp->lcdbuf, "no enough mem\n%ud\n",heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      upd_display_info_flash(dp->lcdbuf);
+      n_callhist_list=0;
+      return n_callhist_list;    
+    }
 
-#endif
+  //#endif
+  }
     
   if (callhist_list!=NULL) free(callhist_list);    
   if (callhist_list_mem!=NULL) free(callhist_list_mem);
   
-#ifdef PSRAM_EXISTS
-  callhist_list_mem = (char *)heap_caps_malloc(sizeof(char) * memsize+10, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  callhist_list=(char **)heap_caps_malloc(sizeof(char *)*(n_callhist_list+3),MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#else
-  callhist_list_mem=(char *)malloc(sizeof(char)*memsize+10);
-  callhist_list=(char **)malloc(sizeof(char *)*(n_callhist_list+3));
-#endif
+  //#ifdef PSRAM_EXISTS
+  if (f_spiram) {
+    callhist_list_mem = (char *)heap_caps_malloc(sizeof(char) * memsize+10, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    callhist_list=(char **)heap_caps_malloc(sizeof(char *)*(n_callhist_list+3),MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    //#else
+  } else {
+    callhist_list_mem=(char *)malloc(sizeof(char)*memsize+10);
+    callhist_list=(char **)malloc(sizeof(char *)*(n_callhist_list+3));
+    //#endif
+  }
+
+  if (callhist_list_mem == NULL || callhist_list == NULL) {
+    console->println("failed to allocate Call History memory");
+    if (callhist_list_mem != NULL) free(callhist_list_mem);
+    if (callhist_list != NULL) free(callhist_list);
+    callhist_list_mem = NULL;
+    callhist_list = NULL;
+    n_callhist_list = 0;
+    callhist_memory_bytes = 0;
+    callhist_loaded = false;
+    callhist_in_psram = false;
+    return 0;
+  }
+
+  callhist_memory_bytes = (size_t)memsize + 10 +
+                          sizeof(char *) * (n_callhist_list + 3);
+  callhist_in_psram = f_spiram != 0;
   // reopen and construct callhist_list and callhist_list_mem
   inf=SD.open (fn,FILE_READ);
   if (!inf) {
     printf("failed to open %s for callhist_list\n",fn);
+    free(callhist_list_mem);
+    free(callhist_list);
+    callhist_list_mem = NULL;
+    callhist_list = NULL;
+    n_callhist_list = 0;
+    callhist_memory_bytes = 0;
+    callhist_loaded = false;
+    callhist_in_psram = false;
     return 0;
   }
   ptmp=callhist_list_mem;
@@ -164,6 +148,7 @@ int read_callhist_list(char *fn)
   //  *callhist_list++=ptmp;
   callhist_list[n]=ptmp;
   strcpy(ptmp,""); // terminate
+  callhist_loaded = true;
 
   return n_callhist_list;
 }
@@ -178,125 +163,7 @@ void print_callhist_list(const char **callhist_list,int n)
     console->println(callhist_list[i]);    
   }
 }
-//const char *exch_callhist(const char *callsign_exch)
-//{
-//  char *s;
-//  s=(char *)(callsign_exch);
-//  while (*s) {
-//    if (*s++==' ') return s;
-//  }
-//  return s;
-//}
-
-char callhist_call_ret[20];
-char *callhist_call(const char *callsign)
-{
-  // return with callsign before / 
-  char *s,*s1,*ret;
-  int count;  count=0;
-  ret=callhist_call_ret;
-  *ret='\0';
-  s1=ret;
-  s=(char *)callsign;
-  while (*s && (count<20)) {
-    if (*s==' ') {
-      *s1='\0';
-      break;
-    }
-    *s1++=*s++;
-    count++;
-  }
-  *s1='\0';
-  return ret;
-}
-
-char callsign_body_ret[20];
-char *callsign_body(const char *callsign)
-{
-  // return with callsign before / 
-  char *s,*s1,*ret;
-  int count;  count=0;
-  ret=callsign_body_ret;
-  *ret='\0';
-  s1=ret;
-  s=(char *)callsign;
-  while (*s && (count<20)) {
-    if (*s=='/') {
-      *s1='\0';
-      break;
-    }
-    *s1++=*s++;
-    count++;
-  }
-  *s1='\0';
-  return ret;
-}
-
-char *exch_callhist(const char *callsign)
-{
-  char *s;
-  s=(char *)callsign;
-  // search for ' '
-  while (*s) {
-    if (*s==' ') {
-      s++;break;
-    }
-    s++;
-  }
-  while (*s) {
-    if (*s==' ') s++;
-    else break;
-  }
-  return s;
-} 
-
-int count_callhist(const char **callhist_list)
-{
-  int count;
-  count=0;
-  if (callhist_list==NULL) return count;
-  while (1) {
-    if (callhist_list[count]==NULL) break;
-    printf("count %d callhist_list %s\n",count,callhist_list[count]);    
-    if (*callhist_list[count]!='\0') {
-      count++;
-    } else {
-      break;
-    }
-  }
-  return count;
-}
-
-// search callhist_list and set to exch_history
-int search_callhist_list_exch(const char **callhist_list,const char *callsign, int match_body,char **exch_history) {
-  struct radio *radio;
-  radio = so2r.radio_selected();
-  *exch_history=NULL;
-  
-  const char *callsign1;
-  if (match_body) {
-    callsign1 = callsign_body(callsign);
-  } else {
-    callsign1=callsign;
-  }
-  int i=0;
-  int ret;
-  while (1) {
-    if (*callhist_list[i]=='\0') return -1;
-    
-    ret=strcmp(callhist_call(callhist_list[i]),callsign1);
-    if (ret==0) {
-      // match ! 
-      *exch_history=exch_callhist(callhist_list[i]);
-      return i;
-    }
-    if (ret>0) {  // no longer match 
-      return -1;
-    }
-    i++;
-  }
-}
-
+#ifdef notdef
 int search_callhist_list(const char **callhist_list,const char *callsign, int match_body) {
   struct radio *radio;
   radio = so2r.radio_selected();
@@ -328,7 +195,8 @@ int search_callhist_list(const char **callhist_list,const char *callsign, int ma
     i++;
   }
 }
-
+#endif
+///// following is OLD callhist system which consults SD memory file each time look up
 
 
 File callhistf;          // call history file
@@ -352,13 +220,16 @@ void init_callhist() {
     printf("freed callhist\r\n");
   }
   //  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)>sizeof(struct callhist) * nmaxcallhist ) {
-#ifdef PSRAM_EXISTS
+  //#ifdef PSRAM_EXISTS
+  if (f_spiram) {
     callhist = (struct callhist *)heap_caps_malloc(sizeof(struct callhist) * nmaxcallhist, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); 
     printf("callhist allocated by heap_caps_malloc() SPIRAM\r\n");
-#else //  } else {
+    //#else //  } else {
+  } else { 
     callhist = (struct callhist *)malloc(sizeof(struct callhist) * nmaxcallhist);
     printf("callhist allocated by malloc()\r\n");     
-#endif //  }
+    //#endif //  }
+  }
   
   ncallhist = 0;
   plogw->ostream->println("init_callhist()");
@@ -567,15 +438,51 @@ void release_callhist() {
   callhist = NULL;
 }
 void set_callhistfn(char *fn) {
-  if (*fn == '\0') {
-    strcpy(callhistfn, "/ch");
-  } else {
-    strcpy(callhistfn, "/");
-    strcat(callhistfn, fn);
-  }
-  strcat(callhistfn, ".pck");
+  if (fn == NULL || *fn == '\0') return;
+
+  const char *name = fn;
+  if (*name == '/') name++;
+
+  size_t len = strlen(name);
+  bool has_pck = len >= 4 && strcasecmp(name + len - 4, ".pck") == 0;
+  snprintf(callhistfn, sizeof(callhistfn), has_pck ? "/%s" : "/%s.pck", name);
+
   plogw->ostream->print("callhistfn=");
   plogw->ostream->println(callhistfn);
+}
+
+void show_callhist_status() {
+  const char *status;
+  if (!plogw->enable_callhist) {
+    status = "Disabled";
+  } else if (!callhist_loaded) {
+    status = "Not loaded";
+  } else {
+    status = "Enabled";
+  }
+
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "Call History\n"
+           "File %s\n"
+           "%d entries %uKB\n"
+           "%s %s",
+           callhistfn, n_callhist_list,
+           (unsigned int)((callhist_memory_bytes + 1023) / 1024),
+           callhist_in_psram ? "PSRAM" : "Internal", status);
+  upd_display_info_flash(dp->lcdbuf);
+
+  plogw->ostream->println("Call History Status");
+  plogw->ostream->print("File      : ");
+  plogw->ostream->println(callhistfn);
+  plogw->ostream->print("Entries   : ");
+  plogw->ostream->println(n_callhist_list);
+  plogw->ostream->print("Memory    : ");
+  plogw->ostream->print((unsigned int)callhist_memory_bytes);
+  plogw->ostream->println(" bytes");
+  plogw->ostream->print("RAM       : ");
+  plogw->ostream->println(callhist_in_psram ? "PSRAM" : "Internal");
+  plogw->ostream->print("Status    : ");
+  plogw->ostream->println(status);
 }
 
 void write_callhist(char *s) {

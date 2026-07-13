@@ -33,7 +33,6 @@ void loader_port_reset_target_func() ;
 void loader_port_enter_bootloader_func() ;
 int flash_bin_file_streaming(const char *filepath, uint32_t flash_address);
 void flash_file_to_partition(const char *filepath) ;
-
   
 #ifdef __cplusplus
 }

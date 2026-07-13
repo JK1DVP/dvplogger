@@ -27,6 +27,7 @@
 #include "decl.h"
 #include "variables.h"
 #include "callhist.h"
+#include "callhist_remote.h"
 #include "qso.h"
 #include "dupechk.h"
 #include "ui.h"
@@ -53,7 +54,108 @@
 #include "dac-adc.h"
 #include "mcp_interface.h"
 #include "morse_decoder_simple.h"
+#include "mux_transport.h"
+#include "usb_host.h"
 int cmd_interp_state = 0;
+
+struct terminal_help_entry {
+  const char *command;
+  const char *description;
+};
+
+static const terminal_help_entry terminal_help_entries[] = {
+  {"help", "show this command list"},
+  {"emu", "enter terminal screen emulation; EXITEMU exits"},
+  {"verbose[n]", "toggle verbose output, or set verbose bit mask n"},
+  {"loadsat", "load saved satellite information"},
+  {"savesat", "save satellite information"},
+  {"satellite", "load/update TLE data"},
+  {"nextaos", "calculate and display upcoming AOS"},
+  {"decoder", "start CW decoder"},
+  {"decoderstop", "stop CW decoder"},
+  {"play <text>", "speech synthesis output"},
+  {"playcw<text>", "send text using tone CW"},
+  {"playwpm<n>", "set tone CW speed in WPM"},
+  {"playq", "show current audio/CW playback queue"},
+  {"newqsolog", "start a new QSO.TXT log"},
+  {"makedupe", "rebuild dupe/multiplier data from QSO.TXT"},
+  {"dumpqso[n]", "dump current raw QSO log, or backup log n"},
+  {"readqso", "print QSO.TXT in importable text format"},
+  {"dumpcur", "dump the currently selected QSO record"},
+  {"dumptop", "dump the first QSO record"},
+  {"dumpnext", "dump the next QSO record"},
+  {"dumpprev", "dump the previous QSO record"},
+  {"dumplast", "dump the last QSO record"},
+  {"dump <n>", "dump QSO record number n"},
+  {"listdir", "list files in the microSD root directory"},
+  {"DX de ...", "inject a cluster spot line"},
+  {"status", "show radio status"},
+  {"setstninfo <call>", "set target station information"},
+  {"switch_radio <n>", "switch radio n to the next rig definition"},
+  {"enable_radio <n>", "enable/disable radio n"},
+  {"focus <n>", "change the focused radio"},
+  {"switch_bands", "switch selected radio to the next available band"},
+  {"set_rig <name>", "set selected radio by rig definition name"},
+  {"show_summary", "show QSO summary"},
+  {"show_bandmap", "show bandmap"},
+  {"show_multi", "show multiplier list"},
+  {"contest_id <n>", "select contest definition number n"},
+  {"save[name]", "save settings, optionally under name"},
+  {"load[name]", "load settings, optionally from name"},
+  {"settings", "show all current settings"},
+  {"assign <name> <value>", "assign one setting value"},
+  {"post_assign", "apply settings after assign operations"},
+  {"callhist_enable", "toggle Call History search"},
+  {"callhist_status", "show current Call History status"},
+  {"callhist_open [file]", "set/open a Call History file"},
+  {"callhist_set [file]", "receive Call History entries until 'end'"},
+  {"callhist_search", "interactive Call History search; 'end' exits"},
+  {"mem", "show Main CPU memory information"},
+  {"memstat", "show Main/Sub CPU memory and dupe status"},
+  {"submem", "alias of memstat"},
+  {"addap <ssid> <password>", "add a Wi-Fi access point"},
+  {"time [yyyy-mm-ddThh:mm:ss]", "show or set RTC time"},
+  {"ntp_stat", "show NTP status"},
+  {"disptype0", "select original 1.3-inch OLED"},
+  {"disptype1", "select 2.4-inch OLED"},
+  {"disptype2", "select mini 1.3-inch OLED"},
+  {"reset_display", "reinitialize the display"},
+  {"muxtrans", "request transition to MUXTRANS communication"},
+  {"flashersd [boot part app spiffs]", "flash selected Sub CPU images from microSD"},
+  {"flasher", "flash the minimum Sub CPU firmware"},
+  {"subcpu_halt", "hold the Sub CPU in reset"},
+  {"reset_settings", "remove saved settings files"},
+  {"restart_dvplogger", "restart the Main CPU"},
+  {"usb_desc", "show USB device descriptors"},
+  {"serial", "show serial-port allocation"},
+  {"send <text>", "send text directly to Serial2"},
+  {"i2c_scan", "scan the I2C bus"},
+  {"kbread", "show CardKB key codes; Fn+BS exits"},
+  {"adcstat", "show ADC statistics"},
+  {"gpio<n> <value>", "write MCP GPIO port n"},
+  {"cp2105stat", "show CP2105 port status"},
+  {"cp2105port0 / cp2105port1", "select CP2105 CAT port"},
+  {"cp2105baud0 <baud>", "set CP2105 port 0 baud rate"},
+  {"cp2105baud1 <baud>", "set CP2105 port 1 baud rate"},
+  {"cp2105debug", "toggle CP2105 TX/RX debug dump"},
+  {"cp2105send0 <text>", "send raw text through CP2105 port 0"},
+  {"cp2105send1 <text>", "send raw text through CP2105 port 1"},
+  {"ANT0<n> / ANT1<n>", "set antenna relay 0/1 state"},
+  {"ANTALT[n]", "enable antenna alternation after n receptions"},
+  {"SIGNAL", "toggle periodic signal/antenna/azimuth display"},
+  {"ROT...", "rotator commands: EN, TYPE, NORTH, SOUTH, TR, AZ, STEP, SWEEP"}
+};
+
+static void print_terminal_help()
+{
+  plogw->ostream->println("Available Commands:");
+  const size_t n = sizeof(terminal_help_entries) / sizeof(terminal_help_entries[0]);
+  for (size_t i = 0; i < n; ++i) {
+    plogw->ostream->print(terminal_help_entries[i].command);
+    plogw->ostream->print(" - ");
+    plogw->ostream->println(terminal_help_entries[i].description);
+  }
+}
 // command interpreter
 // callhist_set
 // dumpqsolog
@@ -181,6 +283,20 @@ void cmd_interp(char *cmd) {
 	console->print("started morse decoder");
 	break;
       }
+
+      if (strcmp(cmd, "cp2105debug") == 0) {
+	CP2105toggleDebug();
+	break;
+      }
+      if (strncmp(cmd, "cp2105send0 ", 12) == 0) {
+	CP2105sendRaw(0, cmd + 12);
+	return;
+      }
+
+      if (strncmp(cmd, "cp2105send1 ", 12) == 0) {
+	CP2105sendRaw(1, cmd + 12);
+	return;
+      }      
       
       if (strcmp(cmd, "emu") == 0) {
         // enter into console terminal emulation mode
@@ -238,6 +354,46 @@ void cmd_interp(char *cmd) {
 	USB_desc();
 	break;
       }
+      if (strcmp(cmd,"cp2105stat")==0) {
+	CP2105status();
+	break;
+      }
+      if (strcmp(cmd,"cp2105port0")==0 || strcmp(cmd,"cp2105port1")==0) {
+	CP2105selectPort(cmd[strlen(cmd)-1]-'0');
+	break;
+      }
+      if (strncmp(cmd,"cp2105baud0 ",12)==0 || strncmp(cmd,"cp2105baud1 ",12)==0) {
+	uint8_t port = cmd[10]-'0';
+	uint32_t baud = strtoul(cmd+12, NULL, 10);
+	if (!CP2105setBaud(port, baud)) console->println("CP2105 baud setting failed");
+	break;
+      }
+
+      if (strcmp(cmd,"kbread")==0) {
+	while(1) {
+	  Wire.requestFrom(0x5F, 1);
+	  while(Wire.available())	  {
+	    char c = Wire.read(); // receive a byte as characterif
+	    if (c != 0) {
+	      if (c==0x8b) { // Fn+BS exit from kbread
+		console->println("exit from kbread");
+		goto end_kb;
+	      }
+	      console->print("cardkb:");
+	      if (isprint(c)) {
+		console->print(c);
+		console->print(":");		
+	      } else {
+		console->print(":");
+	      }
+	      console->println(c, HEX);
+	    }
+	  }
+	  delay(10);
+	}
+      end_kb:
+	break;
+      }
 
       if (strcmp(cmd,"ntp_stat")==0) {
 	print_ntpstatus();
@@ -265,6 +421,10 @@ void cmd_interp(char *cmd) {
       	break;
       }
 
+      if (strcmp(cmd,"submem")==0 || strcmp(cmd,"memstat")==0) {
+        request_memstat_main_subcpu();
+        break;
+      }
       if (strcmp(cmd,"subcpu_halt")==0) {
 	// keep subcpu reset pin low to halt subcpu
 	//const uint8_t reset_trigger_mcp_pin = 15;
@@ -345,10 +505,7 @@ void cmd_interp(char *cmd) {
         break;
       }
       if (strcmp(cmd, "help") == 0) {
-        // show help of commands
-        plogw->ostream->println("Available Commands:");
-        plogw->ostream->println("emu (entering terminal emulation EXITEMU to end)/verbose[num]\nhelp (show this)\nloadsat/nextaos/satellite\n\n// QSO log commands\nnewqsolog (start new log QSO.TXT)\nmakedupe (dupe/multi check from QSO.TXT)\ndumpqso[num](dump raw qso file [num] if read backup files\nreadqso (read log QSO.txt in ctestwin txt imporable format)\nlistdir (show directory content)\n\n// CLUSTER commands\nDx de (push cluster information)\n\n// RADIO remote control commands\nsetstninfo{Callsign} (set target to work station information)\nstatus (get status of the radios)\nswitch_radio {radio#}/enable_radio {radio#}\nfocus {radio#} (change focused radio)\n\n// SETTINGS commands\nsave[name] (save settings)\nload[name]\nsettings (show settings information)\nassign{variable_name} {value} (assign settings variables)\npost_assign (perform post assignment tasks)\n\n// CALLHISTORY commands\ncallhist_set [callhist_filename] (start setting callhist information,input lines of callsign exchange,end will end setting.\ncallhist_open [callhist_fn] (set callhist filename and open)\ncallhist_search (start callhist search, input callsign to search, end will end search session.)\n\n// MAINTENANCE commands\ngpio[port] [value](write mcp gpio port)\nreset_settings/restart_dvplogger\nadcstat (show adc statistics)\n");
-
+        print_terminal_help();
         break;
       }
       if (strncmp("callhist_set", cmd, 12) == 0) {
@@ -548,7 +705,16 @@ void cmd_interp(char *cmd) {
         }
         if (plogw->enable_callhist) {
           if (!plogw->f_console_emu) plogw->ostream->println("open callhist");
-          open_callhist();
+          int n = 0;
+          if (callhist_at == 1) {
+            if (load_callhist_subcpu(callhistfn)) {
+              n = get_callhist_subcpu_count();
+            }
+          } else {
+            n = read_callhist_list(callhistfn);
+          }
+          plogw->ostream->printf("callhist at=%s entries=%d\n",
+                                 callhist_at ? "SUBCPU" : "MAIN", n);
         } else {
           if (!plogw->f_console_emu) plogw->ostream->println("close callhist");
           close_callhist();
@@ -605,7 +771,9 @@ void cmd_interp(char *cmd) {
         init_score();
 	//        init_multi();
 	clear_multi_worked();
-        init_dupechk();
+	//        init_dupechk(NMAXQSO,0);
+	init_dupechk_maincpu();
+	reset_dupechk_subcpu();
         read_qso_log(READQSO_MAKEDUPE);
         break;
       }
@@ -655,6 +823,10 @@ void cmd_interp(char *cmd) {
 	break;
       }
 
+      if (strcmp("callhist_status", cmd) == 0) {
+        show_callhist_status();
+        break;
+      }
       if (strncmp("callhist_open", cmd, 13) == 0) {
         if (cmd[13] == ' ') {
           set_callhistfn(cmd + 14);

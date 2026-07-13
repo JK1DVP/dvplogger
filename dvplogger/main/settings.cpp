@@ -122,6 +122,7 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, radio_mode);
 REGISTER_SETTING_AUTO(settings_dict, plogw, sequence_mode);
 
 REGISTER_SETTING_AUTO(settings_dict, , callhistfn);
+REGISTER_SETTING_AUTO(settings_dict, , callhist_at);
 REGISTER_SETTING_OFFSET(settings_dict, plogw, power_code, 2, DICT_VALUE_TYPE_CHARARRAY);
 REGISTER_SETTING_OFFSET(settings_dict, plogw, zserver_name, 2, DICT_VALUE_TYPE_CHARARRAY);
 REGISTER_SETTING_OFFSET(settings_dict, plogw, my_name, 2, DICT_VALUE_TYPE_CHARARRAY);
@@ -270,6 +271,16 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "callhist_at";
+  settings_dict[n_settings_dict].value = (void *)&callhist_at;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "dupechk_at";
+  settings_dict[n_settings_dict].value = (void *)&dupechk->dupechk_at;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+  
   settings_dict[n_settings_dict].name = "power_code";
   settings_dict[n_settings_dict].value = (void *)&plogw->power_code + 2;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
@@ -332,6 +343,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
 
   settings_dict[n_settings_dict].name = "show_qso_interval";
   settings_dict[n_settings_dict].value = (void *)&plogw->show_qso_interval;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "autopoweroff";
+  settings_dict[n_settings_dict].value = (void *)&plogw->autopoweroff;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
   
@@ -449,7 +465,18 @@ int load_settings(char *fn) {
   set_rig_from_name(&radio_list[1]);
   set_rig_from_name(&radio_list[2]);
 
-
+  /*
+  switch (dupechk->dupechk_at) {
+  case 0:
+  default:
+    init_dupechk_maincpu();
+    break;
+  case 1:
+    init_dupechk_subcpu();    
+    break;
+  }
+  */
+  
   if (display_type!=display_type_bak) {
     console->print("initializing display =");
     console->println(display_type);

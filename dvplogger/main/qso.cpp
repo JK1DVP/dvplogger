@@ -59,7 +59,8 @@ void init_qsofiles() {
 void init_qso() {
   init_qsofiles();
   init_score();
-  init_dupechk();
+  //  init_dupechk(NMAXQSO,0);
+  init_dupechk_maincpu();
   init_callhist();
 }
 
@@ -72,6 +73,33 @@ void makedupe_qso_entry() {
   //plogw->ostream->println("makedupe_qso_entry()");
 
   if (qso.entry.type[0] != 'Q') return;
+
+  // check if we makedupe this entry or not
+  // if Remarks contains C:- entry, not do makedupe
+  //      ..             C:name and name is not the same as current contest_name, not do makedupe
+  char *p;
+  char tmpbuf[200];
+  strcpy (tmpbuf,qso.entry.remarks);
+  if ((p=parse_strings(tmpbuf,"C:"))!=NULL) {
+    if (strcmp(p,"-")==0) {
+      // off the contest
+      if (verbose&4) {
+	console->println("off the contest");
+      }
+      return ;
+    } else {
+      if (strcasecmp(p,plogw->contest_name+2)!=0) {
+	if (verbose&4) {
+	  char buf[100];
+	  strcpy(buf,p);
+	  console->print(buf);console->print(" not match current contest:");
+	  console->println(plogw->contest_name+2);
+	}
+	return;
+      }
+    }
+  }
+  
   // set bandid and modetype according to what is written in the log (needed in dupe checking)
   int bandid, modetype;
   int bandmode;
@@ -93,68 +121,35 @@ void makedupe_qso_entry() {
 
   // const char *modetype_str[4] = {"*", "CW", "PH", "DG"};
   // plogw->ostream->println("makedupe_qso_entry()");
-  if (!dupe_check_nocallhist(qso.entry.hiscall, bandmode, plogw->mask)) {
-    if (dupechk->ncallsign < NMAXQSO) {
-      //
-      int i;
-      i = dupechk->ncallsign;  // add to the last
-      strcpy(dupechk->callsign[i], qso.entry.hiscall);
-      strcpy(dupechk->exch[i], qso.entry.rcvexch);
-      dupechk->bandmode[i] = bandmode;
-      dupechk->ncallsign++;
-
-      // update statistics in score
+  if (dupechk->dupechk_at == 1) {
+    // MAKEDUPE bulk mode: do not query and wait for every QSO.
+    // The subcpu rejects duplicates and returns score totals at the end.
+    entry_makedupe_subcpu_data(qso.entry.hiscall, qso.entry.rcvexch, bandmode);
+  } else if (!dupe_check_nocallhist(qso.entry.hiscall, bandmode, plogw->mask)) {
+    if (dupechk->ncallsign < dupechk->nmaxqso) {
+      entry_dupechk_data(qso.entry.hiscall, qso.entry.rcvexch, bandmode);
       score.worked[modetype == LOG_MODETYPE_CW ? 0 : 1][bandid - 1]++;
-
-      // seqnr update
-      if (isdigit(*qso.entry.seqnr)) {
-        int seqnr;
-        seqnr = atoi(qso.entry.seqnr);
-        if (seqnr <= 3000) {
-          if (plogw->seqnr < seqnr) {
-            plogw->seqnr = seqnr + 1;
-          }
-        }
-      }
-
-      if (verbose & 1) {
-        plogw->ostream->print(qso.entry.hiscall);
-        plogw->ostream->print(" b ");
-        plogw->ostream->print(bandid);
-        plogw->ostream->print(" m ");
-        plogw->ostream->print(modetype);
-        plogw->ostream->print(" exch ");
-        plogw->ostream->print(qso.entry.rcvexch);
-        plogw->ostream->print(" added  #");
-        plogw->ostream->println(dupechk->ncallsign);
-      }
-
     } else {
       plogw->ostream->println(" dupechk overflow ");
     }
+  } else if (verbose & 1) {
+    plogw->ostream->print(qso.entry.hiscall);
+    plogw->ostream->println(" already in dupechk");
+  }
 
-    //	entry_dupechk();
-  } else {
-    //
-    if (verbose & 1) {
-      plogw->ostream->print(qso.entry.hiscall);
-      plogw->ostream->print(" b ");
-      plogw->ostream->print(bandid);
-      plogw->ostream->print(" m ");
-      plogw->ostream->print(modetype);
-      plogw->ostream->println(" already in dupechk");
-    }
+  // The maximum serial number is independent of duplicate elimination.
+  if (isdigit(*qso.entry.seqnr)) {
+    int seqnr = atoi(qso.entry.seqnr);
+    if (seqnr <= 3000 && plogw->seqnr < seqnr) plogw->seqnr = seqnr + 1;
   }
 
 
-  //	plogw->ostream->println("makedupe1");
   // multi check and entry multi
   int found;
   found = 0;
   int multi;
 
   if (*multi_list.multi != NULL) {
-    //	plogw->ostream->println("makedupe");
     int len;
     char rcvexch[10];
     len = strlen(qso.entry.rcvexch);
@@ -269,6 +264,9 @@ void read_qso_log(int option) {
   int count;
   count = 0;
 
+  if ((option & READQSO_MAKEDUPE) && dupechk->dupechk_at == 1)
+    begin_makedupe_subcpu(plogw->mask);
+
   while (1) {
     if (!qsologf.seek(pos)) {
       if (!plogw->f_console_emu) plogw->ostream->println("file seek failed");
@@ -328,6 +326,9 @@ void read_qso_log(int option) {
   }
 
 end:
+  if ((option & READQSO_MAKEDUPE) && dupechk->dupechk_at == 1)
+    finish_makedupe_subcpu();
+
   sprintf(dp->lcdbuf, "Reading QSO\nFinished\nPos=%d\n",pos);
 
   upd_display_info_flash(dp->lcdbuf);
@@ -547,7 +548,9 @@ void create_new_qso_log() {
   open_qsolog();
 
   // reset  dupe check
-  init_dupechk();
+  //  init_dupechk(NMAXQSO,0);
+  init_dupechk_maincpu();
+  reset_dupechk_subcpu();
   init_score();
   //
 
@@ -1148,6 +1151,18 @@ void make_qsolog_entry() {
         strcat(qso.entry.remarks, " ");
       }
       radio->smeter_stat = 0;  // end reading s-meter
+    }
+    if (plogw->f_off_contest) {
+      // write contest name with C: prefix, if not NOMULTI
+      // if f_off_contest, C:- is written
+      strcat(qso.entry.remarks,"C:- ");
+    } else {
+      if (strlen(plogw->contest_name+2)>0) {
+	if (strcmp(plogw->contest_name+2,"NOMULTI")!=0) {
+	  sprintf(buf,"C:%s ",plogw->contest_name+2);
+	  strcat(qso.entry.remarks,buf);
+	}
+      }
     }
     switch(radio->f_qsl) {
     case 1: // JARL

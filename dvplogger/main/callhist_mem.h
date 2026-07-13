@@ -19,3 +19,17 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#ifndef FILE_CALLHIST_MEM_H
+#define FILE_CALLHIST_MEM_H
+extern int size_callhist_list;
+extern char **callhist_list;
+extern char *callhist_list_mem;
+extern int n_callhist_list;
+int release_callhist_list_contents();
+int init_callhist_list();
+char *callhist_call(const char *callsign);
+char *callsign_body(const char *callsign);
+char *exch_callhist(const char *callsign);
+int count_callhist(const char **callhist_list);
+int search_callhist_list_exch(const char **callhist_list,const char *callsign, int match_body,char **exch_history) ;
+#endif

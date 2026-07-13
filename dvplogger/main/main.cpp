@@ -83,10 +83,12 @@
 #include "esp32_flasher.h"
 #include <SoftwareSerial.h>
 #include "callhist.h"
+#include "callhist_remote.h"
+#include "callhist_mem.h"
 #include "esp_heap_caps.h"
 #include "morse_decoder_simple.h"
 #include "esp_intr_alloc.h"
-
+#include "cardkey.h"
 
 void usb_loop_task(void *arg)
 {
@@ -109,15 +111,155 @@ void usb_loop_setup()
 Stream *console; 
 
 
+void request_memstat_main_subcpu()
+{
+  if (f_mux_transport) {
+    const char *request = "memstat";
+    mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
+                           (unsigned char *)request, strlen(request));
+    console->println("requested main/sub CPU memory status");
+  } else {
+    console->println("MUXTRANS is not active");
+    sprintf(dp->lcdbuf, "MEMSTAT\nMUXTRANS inactive\n");
+    upd_display_info_flash(dp->lcdbuf);
+  }
+}
+
 // main board message received
 void receive_pkt_handler_main_brd(struct mux_packet *packet)
 {
   // packet->buf: data
   // packet->idx: number of data
   // message from ext board
-  char buf[100];
-  console->println("receive_pkt_handler_main_brd(()");
-  if (strncmp(packet->buf,"playq:",6)==0) {
+  char buf[256];
+  if (verbose &4) console->println("receive_pkt_handler_main_brd()");  
+  if (strncmp(packet->buf,"chdone:",7)==0 ||
+      strncmp(packet->buf,"chack:",6)==0) {
+    size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
+    memcpy(buf, packet->buf, n); buf[n] = '\0';
+    process_callhist_control_response_main(buf);
+  } else if (strncmp(packet->buf,"dupepr:",7)==0) {
+    size_t n = min((size_t)(packet->idx - 7), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 7, n);
+    buf[n] = '\0';
+    process_dupechk_partial_response_maincpu(buf);
+  } else if (strncmp(packet->buf, "memstat:", 8) == 0) {
+    unsigned int sub_free8, sub_min8, sub_largest8;
+    unsigned int sub_internal, sub_spiram;
+    unsigned int sub_nmaxqso, sub_ncallsign;
+
+    if (packet->idx < 8) {
+      console->println("invalid subcpu memstat packet");
+      return;
+    }
+
+    size_t len = min((size_t)(packet->idx - 8), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 8, len);
+    buf[len] = '\0';
+
+    int n = sscanf(buf,
+                   "%u|%u|%u|%u|%u|%u|%u",
+                   &sub_free8, &sub_min8, &sub_largest8,
+                   &sub_internal, &sub_spiram,
+                   &sub_nmaxqso, &sub_ncallsign);
+
+    if (n == 7) {
+      unsigned int main_free8 =
+          heap_caps_get_free_size(MALLOC_CAP_8BIT);
+      unsigned int main_min8 =
+          heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+      unsigned int main_largest8 =
+          heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      unsigned int main_internal =
+          heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      unsigned int main_spiram =
+          heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+      console->printf(
+          "maincpu heap: free=%u min=%u largest=%u "
+          "internal=%u spiram=%u\n",
+          main_free8, main_min8, main_largest8,
+          main_internal, main_spiram);
+      console->printf(
+          "subcpu heap: free=%u min=%u largest=%u "
+          "internal=%u spiram=%u dupe=%u/%u\n",
+          sub_free8, sub_min8, sub_largest8,
+          sub_internal, sub_spiram,
+          sub_ncallsign, sub_nmaxqso);
+
+      sprintf(dp->lcdbuf,
+              "MEM M%u S%u D%u\n"
+              "CPU  Free Min Max\n"
+              "MAIN %u %u %u\n"
+              "SUB  %u %u %u\n"
+              "INT  %u     %u\n"
+              "PS   %u     %u\n",
+              (unsigned int)dupechk->nmaxqso,
+              sub_nmaxqso,
+              sub_ncallsign,
+              main_free8 / 1024,
+              main_min8 / 1024,
+              main_largest8 / 1024,
+              sub_free8 / 1024,
+              sub_min8 / 1024,
+              sub_largest8 / 1024,
+              main_internal / 1024,
+              sub_internal / 1024,
+              main_spiram / 1024,
+              sub_spiram / 1024);
+
+      upd_display_info_flash(dp->lcdbuf);
+    } else {
+      console->print("invalid subcpu memstat response: ");
+      console->println(buf);
+    }
+    return;
+  } else if (strncmp(packet->buf,"duper:",6)==0) {
+    unsigned int query_id;
+    int is_dupe, has_exch;
+    char exch[LEN_EXCH + 1] = "";
+
+    size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
+    memcpy(buf, packet->buf, n);
+    buf[n] = '\0';
+
+    if (sscanf(buf + 6, "%u %d %d %10s",
+               &query_id, &is_dupe, &has_exch, exch) == 4) {
+      if (dupechk->dupechk_status == 1 &&
+          query_id == dupechk->dupechk_query_id) {
+        dupechk->dupechk_dupe = is_dupe ? 1 : 0;
+        dupechk->dupechk_getexch = has_exch ? 1 : 0;
+        if (has_exch && strcmp(exch, "-") != 0) {
+          strncpy(dupechk->dupechk_exch, exch, LEN_EXCH);
+          dupechk->dupechk_exch[LEN_EXCH] = '\0';
+        } else {
+          dupechk->dupechk_exch[0] = '\0';
+        }
+        dupechk->dupechk_status = 0;
+      } else if (verbose & 4) {
+        console->println("ignored stale duper response");
+      }
+    } else {
+      console->println("invalid duper response");
+    }
+  } else if (strncmp(packet->buf,"dupebulk0:",10)==0 ||
+             strncmp(packet->buf,"dupebulk1:",10)==0) {
+    int group = packet->buf[8] - '0';
+    size_t n = min((size_t)(packet->idx - 10), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 10, n);
+    buf[n] = '\0';
+    process_makedupe_score_maincpu(buf, group);
+  } else if (strncmp(packet->buf,"dupereset:",10)==0) {
+    notify_dupechk_subcpu_reset();
+    console->println("subcpu dupe database cleared");
+  } else if (strncmp(packet->buf,"duped:",6)==0) {
+    // dupe database status
+    size_t n = min((size_t)(packet->idx - 6), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 6, n);
+    buf[n] = '\0';
+    console->print("received duped=");
+    console->println(buf);
+  } else if (strncmp(packet->buf,"playq:",6)==0) {
     // response to 'playq' command, playq: with currently playing string
     console->print("Now playing:");
     strncpy(buf,packet->buf+6,packet->idx-6);
@@ -166,11 +308,17 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
   }
 }
 
+void check_spiram()
+{
+  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM)>0) f_spiram=1; else f_spiram=0;
+
+}
+
 void setup()
 {
 
   init_logwindow();
-
+  check_spiram();
   radio_list[0].bt_buf = (char *)malloc(sizeof(char) * 256);
   radio_list[1].bt_buf = (char *)malloc(sizeof(char) * 256);
   radio_list[2].bt_buf = (char *)malloc(sizeof(char) * 256);
@@ -180,16 +328,13 @@ void setup()
 
   Serial.println("mcp port init");
 
-
   init_mux_serial();
   init_cat_serialport();
-
   
   pinMode(21, INPUT_PULLUP);
   pinMode(22, INPUT_PULLUP);
 
   init_callhist_list();
-  
   
   // subcpu start
 
@@ -213,12 +358,15 @@ void setup()
   init_display();
 
 
+  /*
+   * Create the CAT USB queues before starting the USB task.
+   * usb_loop_task() calls ACMprocess(), which accesses these queues.
+   */
+  init_cat_usb();
 
   init_usb();
-  delay(500);
-  usb_loop_setup(); // start usb task  
-  //  adafruit_usbhost_setup();
-  init_cat_usb();
+  usb_loop_setup(); // start USB polling task
+  // adafruit_usbhost_setup();  
   
   so2r.set_rx(so2r.rx());
   so2r.set_tx(so2r.tx());  
@@ -258,12 +406,14 @@ void setup()
   
   init_webserver();
 
+  init_cardkey();   
+
   // multiplexed data transport between boards through a serial port
   f_mux_transport=0;
   mux_transport=Mux_transport();
   mux_transport.mux_stream=&Serial2;
   mux_transport.debug_stream=console;
-  //  mux_transport.debug=1;
+  mux_transport.debug=1;
   mux_transport.debug=0;  
   mux_transport.set_port_handler(MUX_PORT_CAT2_MAIN,receive_pkt_handler_cat2);
   mux_transport.set_port_handler(MUX_PORT_CAT3_MAIN,receive_pkt_handler_cat3);
@@ -274,7 +424,32 @@ void setup()
   // go mux
   Serial2.print("\r\ngo_mux\r\n");
   f_mux_transport=1;
+
+  /*
+   * callhist_at is restored by load_settings().  Load the configured
+   * Call History after MUXTRANS is available, because SUBCPU mode needs
+   * the inter-CPU control channel.
+   */
+  if (callhist_at != 0 && callhist_at != 1) {
+    console->printf("invalid callhist_at=%d; using MAIN CPU\n", callhist_at);
+    callhist_at = 0;
+  }
+  if (plogw->enable_callhist) {
+    int n = 0;
+    if (callhist_at == 1) {
+      delay(100);  // allow the SUB CPU MUX command handler to become ready
+      if (load_callhist_subcpu(callhistfn)) {
+        n = get_callhist_subcpu_count();
+      }
+    } else {
+      n = read_callhist_list(callhistfn);
+    }
+    console->printf("startup callhist: file=%s at=%s entries=%d\n",
+                    callhistfn, callhist_at ? "SUBCPU" : "MAIN", n);
+  }
 }
+
+
 
 void check_Serial2()
 {
@@ -303,6 +478,12 @@ void loop() {
   decoder.morse_decode_task(); // called in main loop
   decoder.monitor_task(); // morse decoder display task 
 
+
+  // cardkey
+  if (f_cardkey_present) {
+    cardkey_process();
+  }
+  
   // check iambic_keyer
   if (verbose & 2048) {
     while (uxQueueMessagesWaiting(xQueuePaddle)){

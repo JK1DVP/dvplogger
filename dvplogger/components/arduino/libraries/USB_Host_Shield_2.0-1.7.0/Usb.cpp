@@ -466,8 +466,59 @@ void USB::Task(void) //USB state machine
         bool lowspeed = false;
 
         MAX3421E::Task();
+	/*
+	 * Some USB devices are already connected when the MAX3421E starts.
+	 * In that case the initial connection-detect interrupt may be missed,
+	 * leaving the state machine in WAIT_FOR_DEVICE forever.
+	 *
+	 * While waiting for a device, periodically resample D+/D- and update
+	 * the bus state so that enumeration can start without requiring the
+	 * user to unplug/replug the USB device.
+	 */
+	
+	static uint32_t last_startup_probe = 0;
 
-        tmpdata = getVbusState();
+	if (usb_task_state == USB_DETACHED_SUBSTATE_WAIT_FOR_DEVICE) {
+	    uint32_t now = millis();
+
+	    if ((uint32_t)(now - last_startup_probe) >= 250) {
+		last_startup_probe = now;
+
+		regWr(rHCTL, bmSAMPLEBUS);
+
+		uint32_t probe_started = millis();
+
+		while (!(regRd(rHCTL) & bmSAMPLEBUS)) {
+		    if ((uint32_t)(millis() - probe_started) >= 10) {
+			USB_HOST_SERIAL.println(
+			    "USB SAMPLEBUS timeout"
+			);
+			break;
+		    }
+		}
+
+		busprobe();
+	    }
+	}
+
+	tmpdata = getVbusState();
+
+	/*
+	static uint32_t debug_last = 0;
+
+	if (millis() - debug_last >= 1000) {
+	    debug_last = millis();
+
+	    USB_HOST_SERIAL.print(
+		"REAL USB::Task file=" __FILE__
+		" state=0x"
+	    );
+	    USB_HOST_SERIAL.print(usb_task_state, HEX);
+
+	    USB_HOST_SERIAL.print(" vbus=0x");
+	    USB_HOST_SERIAL.println(tmpdata, HEX);
+	    }
+	*/	
 
         /* modify USB task state if Vbus changed */
         switch(tmpdata) {
@@ -476,18 +527,36 @@ void USB::Task(void) //USB state machine
                         lowspeed = false;
                         break;
                 case SE0: //disconnected
-                        if((usb_task_state & USB_STATE_MASK) != USB_STATE_DETACHED)
-                                usb_task_state = USB_DETACHED_SUBSTATE_INITIALIZE;
-                        lowspeed = false;
-                        break;
+		  if((usb_task_state & USB_STATE_MASK) != USB_STATE_DETACHED) {
+		    USB_HOST_SERIAL.print(		    
+					  "USB::Task SE0: returning to INITIALIZE from 0x"
+							    );
+		    USB_HOST_SERIAL.println(usb_task_state, HEX);
+		    
+		    usb_task_state = USB_DETACHED_SUBSTATE_INITIALIZE;
+		  }
+		  lowspeed = false;
+		  break;
                 case LSHOST:
 
                         lowspeed = true;
-                        //intentional fallthrough
+
+			//			USB_HOST_SERIAL.print("USB::Task LSHOST state=0x");
+			//			USB_HOST_SERIAL.println(usb_task_state, HEX);
+			
+			// intentional fallthrough			
                 case FSHOST: //attached
                         if((usb_task_state & USB_STATE_MASK) == USB_STATE_DETACHED) {
-                                delay = (uint32_t)millis() + USB_SETTLE_DELAY;
-                                usb_task_state = USB_ATTACHED_SUBSTATE_SETTLE;
+			  USB_HOST_SERIAL.print(
+						"USB::Task attached: state 0x"
+						);
+			  USB_HOST_SERIAL.print(usb_task_state, HEX);
+			  
+			  delay = (uint32_t)millis() + USB_SETTLE_DELAY;
+			  usb_task_state = USB_ATTACHED_SUBSTATE_SETTLE;
+			  
+			  USB_HOST_SERIAL.print(" -> 0x");
+			  USB_HOST_SERIAL.println(usb_task_state, HEX);
                         }
                         break;
         }// switch( tmpdata

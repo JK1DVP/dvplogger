@@ -135,8 +135,6 @@ void emulate_keyboard(char c) {
   int ret;
 
 
-
-
   static MODIFIERKEYS modkey;
 
 

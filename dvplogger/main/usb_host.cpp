@@ -29,6 +29,7 @@
 #include "usb_host.h"
 
 #include <cdcftdi.h>  // serial adapter
+#include <cp2105.h>
 #include <hidboot.h>
 #include <usbhub.h>
 #include <BTHID.h>
@@ -46,7 +47,7 @@
 
 USB Usb;
 USBHub Hub(&Usb);  // 使用するハブの数だけ定義しておく
-USBHub          Hub2(&Usb);
+USBHub Hub2(&Usb);
 
 void print_hex(int v, int num_places);
 void printintfdescr( uint8_t* descr_ptr );
@@ -492,10 +493,185 @@ uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
 
 ACMAsyncOper AsyncOper;
 ACM Acm(&Usb, &AsyncOper);
+CP2105 Cp2105(&Usb);
+static uint8_t cp2105_cat_port = 0;
 
 
+static bool cp2105_debug = false;
+
+static void dump_cp2105_data(const char *direction,
+                             uint8_t port,
+                             const uint8_t *data,
+                             uint16_t len)
+{
+    console->printf("CP2105 %s port%u len=%u HEX:",
+                    direction, port, len);
+
+    for (uint16_t i = 0; i < len; i++) {
+        console->printf(" %02X", data[i]);
+    }
+
+    console->print(" ASCII:\"");
+
+    for (uint16_t i = 0; i < len; i++) {
+        char c = static_cast<char>(data[i]);
+        if (c >= 0x20 && c <= 0x7e)
+            console->print(c);
+        else
+            console->print('.');
+    }
+
+    console->println("\"");
+}
+
+bool CP2105selectPort(uint8_t port) {
+  if (port >= CP2105::PORTS) return false;
+  cp2105_cat_port = port;
+  console->printf("CP2105 CAT port=%u\n", cp2105_cat_port);
+  return true;
+}
+
+bool CP2105setBaud(uint8_t port, uint32_t baudrate) {
+  if (!Cp2105.isReady() || port >= CP2105::PORTS || baudrate == 0) return false;
+  uint8_t rcode = Cp2105.ConfigurePort(port, baudrate);
+  console->printf("CP2105 port %u baud %lu rcode=0x%02x\n",
+                  port, (unsigned long)baudrate, rcode);
+  return rcode == 0;
+}
+
+void CP2105status() {
+  console->printf("CP2105 ready=%d addr=0x%02x CATport=%u\n",
+                  Cp2105.isReady() ? 1 : 0,
+                  Cp2105.GetAddress(), cp2105_cat_port);
+  for (uint8_t port = 0; port < CP2105::PORTS; port++) {
+    console->printf(" port%u ready=%d if=%u IN=%u/%u OUT=%u/%u baud=%lu%s\n",
+                    port, Cp2105.portReady(port) ? 1 : 0,
+                    Cp2105.interfaceNumber(port),
+                    Cp2105.inEndpoint(port), Cp2105.inMaxPacket(port),
+                    Cp2105.outEndpoint(port), Cp2105.outMaxPacket(port),
+                    (unsigned long)Cp2105.baudRate(port),
+                    port == cp2105_cat_port ? " CAT" : "");
+  }
+}
+
+void CP2105process() {
+  if (!Cp2105.isReady() || !Cp2105.portReady(cp2105_cat_port)) return;
+
+  struct catmsg_t catmsg;
+  while (uxQueueMessagesWaiting(xQueueCATUSBTx)) {
+    if (xQueueReceive(xQueueCATUSBTx, &catmsg, 0) == pdTRUE) {
+
+      if (cp2105_debug) {
+	dump_cp2105_data("TX",
+			 cp2105_cat_port,
+			 reinterpret_cast<uint8_t *>(catmsg.buf),
+			 catmsg.size);
+      }
+
+      uint8_t rcode =
+	Cp2105.SndData(cp2105_cat_port,
+		       catmsg.size,
+		       reinterpret_cast<uint8_t *>(catmsg.buf));
+
+      if (rcode && rcode != hrNAK) {
+	console->printf("CP2105 TX error port%u rcode=0x%02X\n",
+			cp2105_cat_port, rcode);
+	// break; //?
+      }
+ 
+      /*      uint8_t rcode = Cp2105.SndData(cp2105_cat_port, catmsg.size,
+                                    reinterpret_cast<uint8_t *>(catmsg.buf));
+      if (rcode && rcode != hrNAK) {
+        ErrorMessage<uint8_t>(PSTR("CP2105 SndData"), rcode);
+        break;
+      }
+      */
+    }
+  }
+
+  uint8_t buf[64];
+  uint16_t rcvd = Cp2105.inMaxPacket(cp2105_cat_port);
+  if (rcvd == 0 || rcvd > sizeof(buf)) rcvd = sizeof(buf);
+  
+  uint8_t rcode = Cp2105.RcvData(cp2105_cat_port, &rcvd, buf);
+
+  if (rcode && rcode != hrNAK) {
+    console->printf("CP2105 RX error port%u rcode=0x%02X\n",
+                    cp2105_cat_port, rcode);
+    return;
+  }
+
+  if (rcvd) {
+    if (cp2105_debug) {
+      dump_cp2105_data("RX",
+		       cp2105_cat_port,
+		       buf,
+		       rcvd);
+    }
+
+    catmsg.size = min((uint16_t)sizeof(catmsg.buf), rcvd);
+    memcpy(catmsg.buf, buf, catmsg.size);
+    xQueueSend(xQueueCATUSBRx, &catmsg, 0);
+  }
+ 
+  /*  if (rcode && rcode != hrNAK) {
+    ErrorMessage<uint8_t>(PSTR("CP2105 RcvData"), rcode);
+    return;
+  }
+  if (rcvd) {
+    catmsg.size = min((uint16_t)sizeof(catmsg.buf), rcvd);
+    memcpy(catmsg.buf, buf, catmsg.size);
+    xQueueSend(xQueueCATUSBRx, &catmsg, 0);
+    if (verbose & 1) {
+      console->printf("CP2105 port%u received %u bytes\n",
+                      cp2105_cat_port, catmsg.size);
+    }
+  }
+  */
+}
+
+
+
+void CP2105toggleDebug()
+{
+    cp2105_debug = !cp2105_debug;
+    console->printf("CP2105 debug=%d\n",
+                    cp2105_debug ? 1 : 0);
+}
+bool CP2105sendRaw(uint8_t port, const char *text)
+{
+    if (!text ||
+        !Cp2105.isReady() ||
+        !Cp2105.portReady(port)) {
+        return false;
+    }
+
+    uint16_t len = strlen(text);
+
+    dump_cp2105_data(
+        "RAW-TX",
+        port,
+        reinterpret_cast<const uint8_t *>(text),
+        len);
+
+    uint8_t rcode =
+        Cp2105.SndData(
+            port,
+            len,
+            reinterpret_cast<uint8_t *>(
+                const_cast<char *>(text)));
+
+    console->printf("CP2105 raw port%u rcode=0x%02X\n",
+                    port, rcode);
+
+    return rcode == 0;
+}
 
 void ACMprocess() {
+  if (Cp2105.isReady()) {
+    CP2105process();
+    return;
+  }
   // IC-705,IC-905 operation
   uint8_t rcode;
   int ret;
@@ -1034,17 +1210,63 @@ void KbdRptParser::PrintKey(uint8_t m, uint8_t key) {
 
 HIDBoot<USB_HID_PROTOCOL_KEYBOARD> HidKeyboard(&Usb);
 KbdRptParser Prs,Prs1;
+void init_usb()
+{
+    Prs1.init_extKbd();
 
-void init_usb() {
+    /*
+     * Power-cycle an already-connected USB device.
+     * This emulates unplugging and reconnecting it.
+     */
+    Usb.vbusPower(vbus_off);
+    delay(1500);
+
+    Usb.vbusPower(vbus_on);
+    delay(1000);
+
+    int8_t ret = Usb.Init(1500);
+
+    Serial.printf(
+		  "Usb.Init(1500) returned %d, vbus=%02x\n",
+		  ret,
+		  Usb.getVbusState()
+		  );
+
+    if (ret == -1) {
+      plogw->ostream->println("OSC did not start.");
+    }
+ 
+    //    int8_t ret = Usb.Init();
+    //    Serial.printf("Usb.Init() returned %d\n", ret);
+    //    if (ret == -1) {
+    //        plogw->ostream->println("OSC did not start.");
+    //    }
+
+    HidKeyboard.SetReportParser(0, &Prs);
+
+    bthid.SetReportParser(KEYBOARD_PARSER_ID, &Prs);
+    bthid.setProtocolMode(USB_HID_BOOT_PROTOCOL);
+
+    plogw->ostream->print(
+        F("\r\nHID Bluetooth Library Started")
+    );
+}
+void init_usb_bak() {
 
   // external keyboard on the extension board handler 
   Prs1.init_extKbd();
-  
-  if (Usb.Init() == -1)
-    plogw->ostream->println("OSC did not start.");
-  delay(500);
-  HidKeyboard.SetReportParser(0, &Prs);
 
+  // Wait before sampling the USB bus.
+
+
+  int ret;
+  if ((ret=Usb.Init()) == -1) 
+    console->printf("Usb.Init() returned %d\n", ret);
+  
+  if (ret == -1)  
+    plogw->ostream->println("OSC did not start.");
+  
+  HidKeyboard.SetReportParser(0, &Prs);
   
   bthid.SetReportParser(KEYBOARD_PARSER_ID, &Prs);
   //  bthid.SetReportParser(MOUSE_PARSER_ID, &mousePrs);
@@ -1058,8 +1280,86 @@ void init_usb() {
   plogw->ostream->print(F("\r\nHID Bluetooth Library Started"));
 
 }
+void loop_usb()
+{
+    static uint8_t previous_state = 0xff;
+    static uint8_t previous_vbus = 0xff;
+    static uint32_t last_report = 0;
 
-void loop_usb() {
+    Usb.Task();
+
+    uint8_t state = Usb.getUsbTaskState();
+    uint8_t vbus = Usb.getVbusState();
+
+    if (state != previous_state || vbus != previous_vbus) {
+        Serial.printf(
+            "USB: state 0x%02x -> 0x%02x, "
+            "vbus 0x%02x -> 0x%02x, ACM=%d\n",
+            previous_state,
+            state,
+            previous_vbus,
+            vbus,
+            Acm.isReady()
+        );
+
+        previous_state = state;
+        previous_vbus = vbus;
+    }
+
+    /*
+    if (millis() - last_report >= 1000) {
+        last_report = millis();
+
+        Serial.printf(
+            "USB heartbeat: state=0x%02x vbus=0x%02x ACM=%d\n",
+            state,
+            vbus,
+            Acm.isReady()
+        );
+    }
+    */
+}
+
+void loop_usb_bak1()
+{
+    static uint8_t previous_state = 0xff;
+    static uint32_t last_report = 0;
+    static uint32_t task_count = 0;
+
+    Usb.Task();
+    task_count++;
+
+    uint8_t state = Usb.getUsbTaskState();
+
+    if (state != previous_state) {
+        Serial.printf(
+            "USB state changed: 0x%02x -> 0x%02x, ACM ready=%d\n",
+            previous_state,
+            state,
+            Acm.isReady()
+        );
+        previous_state = state;
+    }
+
+    /*
+     * Print periodically even when the state does not change.
+     * This also confirms that usb_loop_task() is alive.
+     */
+    /*
+    if (millis() - last_report >= 1000) {
+        last_report = millis();
+
+        Serial.printf(
+            "USB heartbeat: count=%lu state=0x%02x ACM=%d\n",
+            (unsigned long)task_count,
+            state,
+            Acm.isReady()
+        );
+    }
+    */
+}
+
+void loop_usb_bak() {
     Usb.Task();
 }
 

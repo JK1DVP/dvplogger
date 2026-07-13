@@ -118,11 +118,14 @@ int is_manual_rig(struct radio *radio) {
 // set frequency to radio
 void set_frequency_rig_radio(unsigned int freq, struct radio *radio) {
   if (!radio->enabled) return;
+
+  radio->f_freqchange_program = 1;
   // check manual radio
   if (radio->rig_spec->cat_type == 3) {
     // manual rig
     set_frequency(freq, radio);
     radio->f_freqchange_pending=0;
+    radio->f_freqchange_program=0;
     return;
   }
 
@@ -176,8 +179,6 @@ void send_head_civ(struct radio *radio) {
 }
 
 void send_tail_civ(struct radio *radio) {
-
-    
   // tail part sending
   add_civ_buf((byte)0xfd);
   //  send_civ_buf(radio->rig_spec->civport); // previously 
@@ -196,37 +197,47 @@ void set_ptt_rig(struct radio *radio, int on) {
   }
   
   switch (radio->rig_spec->cat_type) {
-    case 0:  // ci-v
+  case CAT_TYPE_CIV:  // icom ci-v
+    send_head_civ(radio);
+    add_civ_buf((byte)0x1c);  //
+    add_civ_buf((byte)0x00);  //
 
-      send_head_civ(radio);
-      add_civ_buf((byte)0x1c);  //
+    if (on) {
+      add_civ_buf((byte)0x01);  //
+
+    } else {
       add_civ_buf((byte)0x00);  //
-
-      if (on) {
-        add_civ_buf((byte)0x01);  //
-
-      } else {
-        add_civ_buf((byte)0x00);  //
-      }
-      send_tail_civ(radio);
-      break;
-      //    case 1:  // cat
+    }
+    send_tail_civ(radio);
+    break;
+    //    case 1:  // cat
   case CAT_TYPE_YAESU_NEW:  // Yaesu
   case CAT_TYPE_YAESU_OLD:
-      
-      if (on) {
-        send_cat_cmd(radio, "TX1;");
-      } else {
-        send_cat_cmd(radio, "TX0;");
-      }
-      break;
-    case 2:  // kenwood cat ( QCX special command and not of Kenwood general)
-      if (on) {
-        send_cat_cmd(radio, "TQ1;");
-      } else {
-        send_cat_cmd(radio, "TQ0;");
-      }
-      break;
+    if (on) {
+      send_cat_cmd(radio, "TX1;");
+    } else {
+      send_cat_cmd(radio, "TX0;");
+    }
+    break;
+  case CAT_TYPE_YAESU_FT817:
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy      
+    if (on) {
+      add_civ_buf((byte)0x08); // dummy      
+    } else {
+      add_civ_buf((byte)0x88); // dummy      	
+    }
+    send_civ_buf_radio(radio);
+    break;
+  case CAT_TYPE_KENWOOD:  // kenwood cat ( QCX special command and not of Kenwood general)
+    if (on) {
+      send_cat_cmd(radio, "TQ1;");
+    } else {
+      send_cat_cmd(radio, "TQ0;");
+    }
+    break;
   }
 
   // if CW mode  also key on / off
@@ -248,12 +259,13 @@ void set_ptt_rig(struct radio *radio, int on) {
     }
   }
 }
+
 void send_voice_memory(struct radio *radio, int num)
 // num 0 cancel send 1  F1 CQ  2 F2 number 3 F3 TU  4 F4 CALLSIGN 5 F5 CALL+NUM
 {
   char buf[10];
   switch (radio->rig_spec->cat_type) {
-    case 0:
+  case CAT_TYPE_CIV:  // icom ci-v
       if (!plogw->f_console_emu) {
         plogw->ostream->print("voice ");
         plogw->ostream->println(num);
@@ -267,7 +279,6 @@ void send_voice_memory(struct radio *radio, int num)
       //    case 1:  // cat
   case CAT_TYPE_YAESU_NEW:  // Yaesu
   case CAT_TYPE_YAESU_OLD:
-      
       sprintf(buf, "PB0%d;", num);
       send_cat_cmd(radio, buf);
       break;
@@ -379,6 +390,7 @@ void send_civ_buf(Stream *civport) {
   }
   clear_civ_buf();
 }
+
 
 
 void send_cat_cmd(struct radio *radio, char *cmd) {
@@ -516,6 +528,45 @@ int freq_width_mode(char *opmode)
       return span;
 }
 
+void set_power(struct radio *radio, int power)  // power value is in W
+{
+  char buf[40];
+  int max_power=50;
+
+  switch(radio->rig_spec->cat_type) {
+  
+  case CAT_TYPE_CIV:
+    // icom	    
+    switch (radio->rig_spec->rig_type) {
+    case RIG_TYPE_ICOM_IC7300:  // IC-7300  ... almost the same as IC705 except for preamp gain in 50MHz
+      max_power=50;
+      break;
+    case RIG_TYPE_ICOM_IC705:  // IC-705
+      max_power=10;
+      break;
+    case RIG_TYPE_ICOM_IC9700:  // IC-9700
+      max_power=50;
+      break;
+    }
+    power=power*255/max_power; // normalize power
+    if (power>255) power=255;
+    if (power<0) power=0;
+    send_head_civ(radio);
+    add_civ_buf((byte)0x14);
+    add_civ_buf((byte)0x0a);
+    add_civ_buf((byte)dec2bcd(power/100));
+    add_civ_buf((byte)dec2bcd(power%100));
+    send_tail_civ(radio);
+    break;
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
+  case CAT_TYPE_KENWOOD:
+    sprintf(buf, "PC%03d;", power);      
+    send_cat_cmd(radio, buf);
+    break;
+  }
+}
+
 void set_scope() {
   int mode;
   struct radio *radio;
@@ -529,7 +580,7 @@ void set_scope_mode(struct radio *radio,int mode) {
   char buf[40];  
   span=0;
   switch (radio->rig_spec->cat_type) {
-    case 0:  // icom
+  case CAT_TYPE_CIV:  // icom ci-v
 
       send_head_civ(radio);
       add_civ_buf((byte)0x27);
@@ -593,10 +644,10 @@ void send_rit_setting(struct radio *radio, int rit, int xit) {
       sprintf(buf, "CF000%c%c000;", (rit == 1) ? '1' : '0', (xit == 1) ? '1' : '0');
       send_cat_cmd(radio, buf);
       return;
-    case CAT_TYPE_KENWOOD:
-      // kenwood TS480
-      return;
-    case CAT_TYPE_CIV:  // icom ci-v
+  case CAT_TYPE_KENWOOD:
+    // kenwood TS480
+    return;
+  case CAT_TYPE_CIV:  // icom ci-v
       send_head_civ(radio);
       add_civ_buf((byte)0x21);  // RIT
       add_civ_buf((byte)0x01);  //  on/off
@@ -674,6 +725,7 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) {
   int type;
   type = radio->rig_spec->cat_type;
   char buf[30];
+  byte bytebuf[4];
   switch (type) {
   case CAT_TYPE_YAESU_NEW: // FTDX3000  etc 
     if (freq < 0) return;
@@ -691,11 +743,29 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) {
       sprintf(buf, "FA%011lld;", ((long long)freq*FREQ_UNIT));
       send_cat_cmd(radio, buf);
       return;
-    case CAT_TYPE_NOCAT:
+  case CAT_TYPE_NOCAT:
       return;
+  case CAT_TYPE_YAESU_FT817:
+    // use civ_buf to construct binary command data and send
+    freq = freq / (100/FREQ_UNIT);  // 10 Hz
+    bytebuf[3]=dec2bcd(freq % 100);
+    freq = freq / 100;  // 1kHz
+    bytebuf[2]=dec2bcd(freq % 100);
+    freq = freq / 100;  // 100kHz
+    bytebuf[1]=dec2bcd(freq % 100);
+    freq = freq / 100;  // 10MHz
+    bytebuf[0]=dec2bcd(freq % 100);
+    clear_civ_buf();
+    add_civ_buf(bytebuf[0]); // freq 10M
+    add_civ_buf(bytebuf[1]); // freq 100k
+    add_civ_buf(bytebuf[2]); // freq 1k
+    add_civ_buf(bytebuf[3]); // freq 10Hz
+    add_civ_buf((byte)0x01);     // Set Frequency command
+    send_civ_buf_radio(radio);
+    return;
   }
 
-  // plogw->ostream->print("send_freq_set_civ()"); plogw->ostream->println(freq);
+
   if (freq <= 0) {
     // ignore
     if (!plogw->f_console_emu) plogw->ostream->println("<0, ignore sending freq");
@@ -736,7 +806,8 @@ void send_mode_set_civ(const char *opmode, int filnr) {
   }
 
   switch (radio->rig_spec->cat_type) {
-    case 1:
+  case CAT_TYPE_YAESU_NEW: // FTDX3000  etc
+  case CAT_TYPE_YAESU_OLD:    
       // cat
       switch (mode) {
         case 0:  // LSB
@@ -770,7 +841,43 @@ void send_mode_set_civ(const char *opmode, int filnr) {
           break;
       }
       break;
-    case 2:
+  case CAT_TYPE_YAESU_FT817:
+    // use civ_buf to construct binary command data and send
+    clear_civ_buf();
+      // cat
+      switch (mode) {
+        case 0:  // LSB
+	  add_civ_buf((byte)0x00);
+          break;
+        case 1:  // USB
+	  add_civ_buf((byte)0x01);
+          break;
+        case 2:  // AM
+	  add_civ_buf((byte)0x04);
+          break;
+        case 3:  // CW
+	  add_civ_buf((byte)0x02);
+          break;
+        case 4:  // RTTY-LSB
+	  add_civ_buf((byte)0x0A);
+          break;
+        case 5:  // FM
+	  add_civ_buf((byte)0x08);
+          break;
+        case 7:  // CW-R
+	  add_civ_buf((byte)0x03);
+          break;
+      default:
+	  add_civ_buf((byte)0x0A);
+	break;
+      }
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x07);     // Set Operating Mode
+    send_civ_buf_radio(radio);
+    break;
+  case CAT_TYPE_KENWOOD:
       // kenwood TS-480
       switch (mode) {
         case 3:                         // CW
@@ -803,7 +910,7 @@ void send_mode_set_civ(const char *opmode, int filnr) {
           break;
       }
       break;
-    case 0:
+  case CAT_TYPE_CIV:  // icom ci-v
       send_head_civ(radio);
       add_civ_buf((byte)0x06);  // Frequency !
       add_civ_buf((byte)mode);  // mode data
@@ -819,13 +926,25 @@ void send_freq_query_civ(struct radio *radio) {
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
-    case 1:
-    case 2:
-      //      console->print("*");
-      send_cat_cmd(radio, "IF;");
-      return;
-    case 3:
-      return;
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:      
+  case CAT_TYPE_KENWOOD:
+    //      console->print("*");
+    send_cat_cmd(radio, "IF;");
+    return;
+  case CAT_TYPE_YAESU_FT817:
+    // use civ_buf to construct binary command data and send
+    clear_civ_buf();
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x03);     // Read Frequency and Mode Status
+    send_civ_buf_radio(radio);
+    radio->cat_status=0x30;
+    return;
+  case CAT_TYPE_NOCAT:
+    return;
   }
   // icom
   // query frequency
@@ -846,12 +965,14 @@ void send_mode_query_civ(struct radio *radio) {
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
-    case 1:  // yaesu cat
-      send_cat_cmd(radio, "IF;");
-      return;
-    case 2:
-    case 3:
-      return;
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:      
+    send_cat_cmd(radio, "IF;");
+    return;
+  case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_YAESU_FT817:
+  case CAT_TYPE_NOCAT:    
+    return;
   }
   // icom
   // mode frequency
@@ -917,10 +1038,24 @@ void send_ptt_query_civ(struct radio *radio) {
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
-    case 1:
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:      
       send_cat_cmd(radio, "TX;");
       return;
-    case 2:  // do nothing  and get status from IF query result
+  case CAT_TYPE_YAESU_FT817:
+    // use civ_buf to construct binary command data and send
+    clear_civ_buf();
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0xF7);     // Read TX status
+    radio->cat_status=0x20;    // set reading TX status
+    send_civ_buf_radio(radio);
+    return;
+  case CAT_TYPE_KENWOOD:            
+    // do nothing  and get status from IF query result
+  case CAT_TYPE_NOCAT:                
       return;
   }
 
@@ -943,11 +1078,13 @@ void send_gps_query_civ(struct radio *radio) {
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
-    case 1:
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
+  case CAT_TYPE_YAESU_FT817:    
       return;
-    case 2:
+  case CAT_TYPE_KENWOOD:
       return;
-    case 3:  // manual radio do nothing
+  case CAT_TYPE_NOCAT:  // manual radio do nothing
       return;
   }
   send_head_civ(radio);
@@ -963,12 +1100,16 @@ void send_preamp_query_civ(struct radio *radio) {
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
-    case 1:
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
+
+
       send_cat_cmd(radio, "PA0;");
       return;
-    case 2:
+  case CAT_TYPE_YAESU_FT817:
+  case CAT_TYPE_KENWOOD:    
       return;
-    case 3:  // manual radio do nothing
+    case CAT_TYPE_NOCAT:  // manual radio do nothing
       return;
   }
 
@@ -985,12 +1126,14 @@ void send_identification_query_civ(struct radio *radio) {
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
-    case 1:
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
       send_cat_cmd(radio, "ID;");  //0670 FT991A
       return;
-    case 2:
+  case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_YAESU_FT817:        
       return;
-    case 3:  // manual radio do nothing
+    case CAT_TYPE_NOCAT:  // manual radio do nothing
       return;
   }
 
@@ -1003,18 +1146,44 @@ void send_identification_query_civ(struct radio *radio) {
   radio->civ_response_timer = 50;  // 0.1 s wait for (any) response
 }
 
+void send_power_query_civ(struct radio *radio) {
+  if (!radio->enabled) return;
+  int type;
+  type = radio->rig_spec->cat_type;
+  switch (type) {
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
+  case CAT_TYPE_KENWOOD:    
+      send_cat_cmd(radio, "PC;");
+      return;
+  case CAT_TYPE_YAESU_FT817:        
+      return;
+    case CAT_TYPE_NOCAT:  // manual radio do nothing
+      return;
+  }
+
+  send_head_civ(radio);
+  add_civ_buf((byte)0x14);  // 
+  add_civ_buf((byte)0x0A);  // power query 
+  send_tail_civ(radio);
+  radio->f_civ_response_expected = 1;
+  radio->civ_response_timer = 50;  // 0.1 s wait for (any) response
+}
+
 
 void send_att_query_civ(struct radio *radio) {
   if (!radio->enabled) return;
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
-    case 1:
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
       send_cat_cmd(radio, "RA0;");
       return;
-    case 2:
+  case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_YAESU_FT817:        
       return;
-    case 3:  // manual radio do nothing
+    case CAT_TYPE_NOCAT:  // manual radio do nothing
       return;
   }
 
@@ -1032,11 +1201,23 @@ void send_smeter_query_civ(struct radio *radio) {
   type = radio->rig_spec->cat_type;
   
   switch (type) {
-  case 1: // yeasu
-  case 2: // kenwood
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
+  case CAT_TYPE_KENWOOD:
     send_cat_cmd(radio, "SM0;");
     return;
-  case 3:  // manual radio do nothing
+  case CAT_TYPE_YAESU_FT817:
+    // use civ_buf to construct binary command data and send
+    clear_civ_buf();
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0x00); // dummy
+    add_civ_buf((byte)0xE7);     // Read RX status
+    radio->cat_status=0x10;    // set reading RX status
+    send_civ_buf_radio(radio);
+    return;
+  case CAT_TYPE_NOCAT:  // manual radio do nothing
     return;
   }
 
@@ -1060,6 +1241,7 @@ void set_frequency(int freq, struct radio *radio) {
     if (radio->freq_target == freq) {
       // frequency set to rig completed
       radio->f_freqchange_pending = 0;
+      radio->f_freqchange_program = 0;
       radio->freqchange_timer = 0;
       radio->freqchange_retry = 0;
       radio->freq = radio->freq_target;
@@ -1074,6 +1256,7 @@ void set_frequency(int freq, struct radio *radio) {
           set_frequency_rig(radio->freq_target);
         } else {
           radio->f_freqchange_pending = 0;  // abandon
+	  radio->f_freqchange_program = 0; 
           radio->freqchange_retry = 0;
 	  if (verbose & 16) plogw->ostream->println("freq_change akirameru");	  
           return;
@@ -1085,7 +1268,7 @@ void set_frequency(int freq, struct radio *radio) {
 
     if (freq!=radio->freq) {
       // frequency changed
-      if (radio->freq_change_count==0) {
+      if (radio->freq_change_count==0 && !is_manual_rig(radio) ) {
 	radio->freq_change_count++;
 	console->print("set_frequency():ignore change freq=");
 	console->print(freq);
@@ -1124,7 +1307,9 @@ void set_frequency(int freq, struct radio *radio) {
 
 	
       if (plogw->sat == 0) {
-        if (radio->cq[radio->modetype]) {
+	//        if (radio->cq[radio->modetype]) {
+	//if (radio->cq[radio->modetype] && !radio->f_recall_freq_mode_filt) {
+	if (radio->cq[radio->modetype] && !radio->f_freqchange_program) {
           // frequency change in CQ and non-sat detected
           // save previous frequency to memorize as cq frequency
           radio->freqbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype] = radio->freq_prev;
@@ -1138,7 +1323,7 @@ void set_frequency(int freq, struct radio *radio) {
 	    if (verbose&16) console->println("dupe and display");
             upd_display();
           }
-        }
+	}
         // update bandmap display
         //upd_display_bandmap();
         bandmap_disp.f_update = 1;  // just request update flag (updated in interval jobs
@@ -1188,6 +1373,7 @@ void set_frequency(int freq, struct radio *radio) {
         }
       }
     }
+    radio->f_recall_freq_mode_filt = 0;    
   }
 }
 
@@ -1213,8 +1399,8 @@ void set_mode(const char *opmode, byte filt, struct radio *radio) {
 }
 
 
-// analyze cmdbuf as Kenwood Cat response
-void get_cat_kenwood(struct radio *radio) {
+// analyze cmdbuf as Elecraft KX line 
+void get_cat_elecraft(struct radio *radio) {
 
   if (!radio->enabled) return;
   int len;
@@ -1225,17 +1411,39 @@ void get_cat_kenwood(struct radio *radio) {
 
   //plogw->ostream->println(radio->cmdbuf);
   if (verbose&VERBOSE_CAT) {
-    plogw->ostream->print("get_cat_kenwood() l=");
+    plogw->ostream->print("get_cat_elecraft() l=");
     plogw->ostream->print(len);
     plogw->ostream->print(":");            
     print_cat_cmdbuf(radio);
   }
-  
+  /*
+    kenwoodと同じ？
+  IF (Transceiver Information; GET only)
+  012345678901234567890123456789
+  IF12345678901     +yyyyrx 00tmvspbd1 ;
+RSP format: IF[f]*****+yyyyrx*00tmvspbd1*; where the fields are defined as follows:
+[f] Operating frequency, excluding any RIT/XIT offset (11 digits; see FA command format)
+* represents a space (BLANK, or ASCII 0x20)
++ either "+" or "-" (sign of RIT/XIT offset)
+yyyy RIT/XIT offset in Hz (range is -9999 to +9999 Hz when computer-controlled)
+r 1 if RIT is on, 0 if off
+x 1 if XIT is on, 0 if off
+t 1 if the K3 is in transmit mode, 0 if receive
+m operating mode (see MD command)
+v receive-mode VFO selection, 0 for VFO A, 1 for VFO B
+s 1 if scan is in progress, 0 otherwise
+p 1 if the transceiver is in split mode, 0 otherwise
+b Basic RSP format: always 0; K2 Extended RSP format (K22): 1 if present IF response
+is due to a band change; 0 otherwise
+d Basic RSP format: always 0; K3 Extended RSP format (K31): DATA sub-mode,
+if applicable (0=DATA A, 1=AFSK A, 2= FSK D, 3=PSK D)
+The fixed-value fields (space, 0, and 1) are provided for syntactic compatibility with existing software.
+								      */
   if (strncmp(radio->cmdbuf, "IF", 2) == 0) {
     // information
     if (len!=38) {
       if (!plogw->f_console_emu) {      
-	plogw->ostream->print("!IF kenwood len ignored: ");
+	plogw->ostream->print("!IF elecraft len ignored: ");
 	plogw->ostream->println(len);
       }
       return;
@@ -1337,6 +1545,147 @@ void get_cat_kenwood(struct radio *radio) {
     upd_display();
   }
 }
+
+
+// analyze cmdbuf as Kenwood Cat response
+void get_cat_kenwood(struct radio *radio) {
+
+  if (!radio->enabled) return;
+  int len;
+  len=strlen(radio->cmdbuf);
+
+  int tmp;
+  int filt;
+
+  //plogw->ostream->println(radio->cmdbuf);
+  if (verbose&VERBOSE_CAT) {
+    plogw->ostream->print("get_cat_kenwood() l=");
+    plogw->ostream->print(len);
+    plogw->ostream->print(":");            
+    print_cat_cmdbuf(radio);
+  }
+  
+  if (strncmp(radio->cmdbuf, "IF", 2) == 0) {
+    // information
+    if (len!=38) {
+      if (!plogw->f_console_emu) {      
+	plogw->ostream->print("!IF kenwood len ignored: ");
+	plogw->ostream->println(len);
+      }
+      return;
+    }
+
+    if (verbose & 1) plogw->ostream->print("IF received");
+    freq = 0;
+    //
+    for (int i = 0; i < 11-(FREQ_UNIT==10 ? 1 : 0 ); i++) {
+	freq *= 10;
+	freq += radio->cmdbuf[i + 2] - '0';
+    }
+
+    check_and_set_frequency(radio,freq);
+    /*
+    // check frequency range of the TRX
+    //    if (freq <= 1800000UL/FREQ_UNIT || freq >= 1100000000UL) {    
+    if (freq2bandid(freq)==0) {    
+      if (!plogw->f_console_emu) {      
+	plogw->ostream->print("faulty freq =");
+	plogw->ostream->print(freq);
+	plogw->ostream->println(" ignored b");
+      }
+      return;
+    }
+    set_frequency(freq, radio);
+    */
+    // set mode
+    switch (radio->cmdbuf[29]) {
+      case '1':  // LSB
+        sprintf(opmode, "LSB");
+        break;
+      case '2':  // USB
+        sprintf(opmode, "USB");
+        break;
+      case '3':  // CW
+        sprintf(opmode, "CW");
+        break;
+      case '4':  // FM
+        sprintf(opmode, "FM");
+        break;
+      case '5':  // AM
+        sprintf(opmode, "AM");
+        break;
+      case '6':  // RTTY-LSB
+        sprintf(opmode, "RTTY");
+        break;
+      case '7':  // CW-R
+        sprintf(opmode, "CW-R");
+        break;
+      case '9':  // RTTY-USB
+        sprintf(opmode, "RTTY-R");
+        break;
+      case '8':  // DATA-R
+      case 'A':  // DATA-FM
+      case 'B':  // FM-NB
+        sprintf(opmode, "Other");
+        break;
+        break;
+    }
+    filt = 1;
+    //  if (radio->rig_idx == 0) {
+    radio->filt = filt;
+    //  }
+
+    //   if (radio->rig_idx == 0) {
+
+    set_mode(opmode, filt, radio);
+    //    }
+    // check tx/rx status
+    radio->ptt_stat_prev = radio->ptt_stat;
+    if (radio->cmdbuf[28] == '1') {
+      // TX
+      radio->ptt_stat = 1;
+    } else {
+      radio->ptt_stat = 0;
+    }
+    //    check_repeat_function();
+    //    sequence_manager_tx_status_updated();
+    so2r.onTx_stat_update();
+  } else if (strncmp(radio->cmdbuf,"PC",2)==0) {
+    // power
+    tmp=radio->cmdbuf[2] -'0';
+    tmp=tmp*10+(radio->cmdbuf[3]-'0');
+    tmp=tmp*10+(radio->cmdbuf[4]-'0');
+    radio->power=tmp;
+    if (verbose & VERBOSE_CAT) {
+      plogw->ostream->println(radio->cmdbuf);
+      plogw->ostream->print("power:");
+      plogw->ostream->println(radio->power);
+    }
+  } else if (strncmp(radio->cmdbuf, "SM", 2) == 0) {
+    // read meter
+    // could be HEX ?
+    // QCX case 5 digit hex number
+    // kenwood TS-480 case, could be HEX 4 digit number
+    tmp = 0;
+    for (int i = 0; i < 5; i++) {
+      tmp *= 10;
+      tmp += radio->cmdbuf[i + 2] - '0';
+    }
+
+    radio->smeter = tmp;
+    conv_smeter(radio);
+    smeter_postprocess(radio);
+    //   }
+
+  } else {
+    return;
+  }
+  if (radio->rig_idx == so2r.focused_radio()) {
+    //    if (radio->rig_idx == plogw->focused_radio) {
+    upd_display();
+  }
+}
+
 
 void print_cat_cmdbuf(struct radio *radio)
 {
@@ -1509,7 +1858,17 @@ void get_cat(struct radio *radio) {
 	plogw->ostream->println(radio->att);
       }
     }
-
+  } else if (strncmp(radio->cmdbuf,"PC",2)==0) {
+    // power
+    tmp=radio->cmdbuf[2] -'0';
+    tmp=tmp*10+(radio->cmdbuf[3]-'0');
+    tmp=tmp*10+(radio->cmdbuf[4]-'0');
+    radio->power=tmp;
+    if (verbose & VERBOSE_CAT) {
+      plogw->ostream->println(radio->cmdbuf);
+      plogw->ostream->print("power:");
+      plogw->ostream->println(radio->power);
+    }
   } else if (strncmp(radio->cmdbuf, "PA", 2) == 0) {
     // PRE-AMP
     radio->preamp = radio->cmdbuf[3] - '0';
@@ -1539,6 +1898,11 @@ void get_cat(struct radio *radio) {
     upd_display();
   }
 }
+
+
+
+
+
 
 void conv_smeter(struct radio *radio) {
   if (plogw->show_smeter == 2) {
@@ -1743,6 +2107,90 @@ void smeter_postprocess(struct radio *radio)
 }
 
 
+void get_cat_ft817(struct radio *radio) {
+  if (!radio->enabled) return;
+  int tmp;
+  int filt;
+  
+  switch (radio->cat_status&0xf0) {
+  case 0x10: // RX status
+    radio->smeter=radio->cmdbuf[0]&0xf; // smeter
+    conv_smeter(radio);
+    smeter_postprocess(radio);
+    // others ignore 
+    break;
+  case 0x20: // TX status
+    radio->ptt_stat_prev = radio->ptt_stat;
+    if (radio->cmdbuf[0]&0x80) {
+      radio->ptt_stat =1;
+    } else {
+      if ((radio->ptt_stat == 1) || (radio->ptt_stat == 2)) {
+        // previously sending
+        radio->ptt_stat = 2;
+      } else {
+        radio->ptt_stat = 0;  // receiving
+      }
+    }
+    so2r.onTx_stat_update();
+    // others ignore
+    break;
+  case 0x30: // awaiting Freq & Mode status
+    freq=0;
+    freq=freq+bcd2dec(radio->cmdbuf[0]); // 100/10M
+    freq=freq*100+bcd2dec(radio->cmdbuf[1]); // 1M/100k
+    freq=freq*100+bcd2dec(radio->cmdbuf[2]); // 10/1k
+    freq=freq*100+bcd2dec(radio->cmdbuf[3]); // 100/10Hz
+    freq=freq*(10/FREQ_UNIT);
+    check_and_set_frequency(radio,freq);
+    // set mode
+    switch (radio->cmdbuf[4]) {
+      case 0x00:  // LSB
+        sprintf(opmode, "LSB");
+        break;
+      case 0x01:  // USB
+        sprintf(opmode, "USB");
+        break;
+      case 0x02:  // CW
+        sprintf(opmode, "CW");
+        break;
+      case 0x08:  // FM
+        sprintf(opmode, "FM");
+        break;
+      case 0x04:  // AM
+        sprintf(opmode, "AM");
+        break;
+      case 0x03:  // CW-R
+        sprintf(opmode, "CW-R");
+        break;
+      case 0x06:  // WFM
+        sprintf(opmode, "Other");
+        break;
+    default:
+        sprintf(opmode, "Other");
+        break;
+    }
+    filt = 1;
+    radio->filt = filt;
+    set_mode(opmode, filt, radio);
+
+    // reset cat status
+    radio->cat_status=0;
+    break;
+    
+  default: // ignore
+    radio->cat_status=0;
+    return ;
+    break;
+  }
+
+  if (radio->rig_idx == so2r.focused_radio()) {
+
+    upd_display();
+  }
+  
+}
+
+
 struct radio *search_civ_address(int civaddr)
 {
   // search the civ address from enabled raddios and return with radio pointer or NULL
@@ -1808,6 +2256,33 @@ int civ_check_size(struct radio *radio, int size, const char *type) {
   return 0;
 }
 
+
+
+int check_and_set_frequency(struct radio *radio, unsigned long freq) {
+    if (freq2bandid(freq)==0) {
+      if (!plogw->f_console_emu) {      
+	plogw->ostream->print("faulty freq =");
+	plogw->ostream->print(freq);
+	plogw->ostream->println(" ignored a");
+      }
+      return 0;
+    }
+    // check transverter frequency
+    radio->transverter_in_use = 0;
+    for (int i = 0; i < NMAX_TRANSVERTER; i++) {
+      if (radio->rig_spec->transverter_freq[i][0] == 0) break;
+      if (!radio->rig_spec->transverter_enable[i]) continue;
+      if ((freq >= radio->rig_spec->transverter_freq[i][2]) && (freq <= radio->rig_spec->transverter_freq[i][3])) {
+	// transverter frequency
+	freq = freq + (radio->rig_spec->transverter_freq[i][0] - radio->rig_spec->transverter_freq[i][2]);
+	radio->transverter_in_use = 1;
+	break;
+      }
+    }
+    // store to rig information
+    set_frequency(freq, radio);
+    return 1;
+}
 // 現在 CI-V バスが単一のリグ占有の前提となっているので、上手くハンドリング
 // できないと考えられる。civport_shared[]に共有しているradio のリストを定義する等して、ここで他のradio の受信処理も行うのが適切？
 
@@ -1885,7 +2360,7 @@ void get_civ(struct radio *radio) {
   radio->civ_response_timer = 0;
   switch (radio->cmdbuf[4]) {
   case 0:  // frequency
-  case 3:
+  case CAT_TYPE_NOCAT:
     // check size
     if (!civ_check_size(radio,11,"Freq")) break; // permit size=34, 8
     // check postamble (FD)
@@ -1898,7 +2373,8 @@ void get_civ(struct radio *radio) {
     freq = freq * 100 + bcd2dec(radio->cmdbuf[6]);
     freq = freq * (100/FREQ_UNIT) + bcd2dec(radio->cmdbuf[5])/FREQ_UNIT;
 
-
+    check_and_set_frequency(radio,freq);
+    /*    
     //    console->print("Freq received=");
     //    console->println(freq);
     // check frequency range of the TRX
@@ -1929,8 +2405,8 @@ void get_civ(struct radio *radio) {
     //
 
     set_frequency(freq, radio);
+*/
 
-    //      lcd.setCursor(0, 0);
     break;
   case 0x11:  // ATT
     // check size
@@ -1980,6 +2456,20 @@ void get_civ(struct radio *radio) {
       plogw->ostream->println(radio->rig_spec->rig_identification);
     }
     break;
+  case 0x14:
+    switch (radio->cmdbuf[5]) {
+    case 0x0A: // power 
+      //		  if (!civ_check_size(radio,) break; // 
+      tmp = bcd2dec(radio->cmdbuf[6]);
+      tmp = tmp * 100 + bcd2dec(radio->cmdbuf[7]);
+      radio->power = tmp; 
+      if (verbose&VERBOSE_CAT) {
+	console->print("power civ:");
+	console->println(radio->power);
+      }
+      break;
+    }
+    break;
   case 0x15:  //
     // check subcmd
     switch (radio->cmdbuf[5]) {
@@ -1987,7 +2477,7 @@ void get_civ(struct radio *radio) {
       // check size
       if (!civ_check_size(radio,9,"S")) break; // permit size=34, 8      
       // check postamble (FD)
-      if (!civ_check_postamble(radio,"GPS")) break;	
+      if (!civ_check_postamble(radio,"S")) break;	
 
       // read s-meter
       tmp = bcd2dec(radio->cmdbuf[6]);
@@ -2326,7 +2816,8 @@ void receive_civport_interrupt(struct radio *radio) {
     if (radio->rig_spec->civport == NULL) return;
     //    if ((radio->rig_spec->civport == &Serial3)|| (radio->rig_spec->civport) == &Serial4) return; // software serial ports does not read in Ticker call
     if ((radio->rig_spec->civport == &Serial3)) return; // software serial ports does not read in Ticker call    
-    receive_civport(radio);    
+    //    receive_civport(radio); // stopped receiving serial in interrupt because reading serial in both interrupt and loop result in  corrupted order of data. 25/9/22 
+    
   }
 }
 
@@ -3427,6 +3918,18 @@ void init_rigspec() {
   rig_spec[17].transverter_freq[0][0] = 0;
   //  rig_spec[17].band_mask = ~0b1111111 ;//0x780;
   rig_spec[17].band_mask = ~(0b111111111|BAND_MASK_WARC);//0x600;  
+
+  strcpy(rig_spec[18].name , "FT-817"); // FT-817
+  rig_spec[18].cat_type = CAT_TYPE_YAESU_FT817;  // cat
+  rig_spec[18].civaddr = 0;
+  rig_spec[18].civport_num=3; 
+  rig_spec[18].civport_reversed=1; // normal
+  rig_spec[18].civport_baud = 4800;      // default
+  rig_spec[18].cwport = 1;  // 
+  rig_spec[18].rig_type = RIG_TYPE_YAESU;
+  rig_spec[18].pttmethod = 2;
+  rig_spec[18].transverter_freq[0][0] = 0;
+  rig_spec[18].band_mask = ~(0b111111111|BAND_MASK_WARC);
   
 }
 
@@ -3752,10 +4255,13 @@ void load_rigs(char *fn)
 }
 
 void init_radio(struct radio *radio, const char *rig_name) {
-
+  radio->f_freqchange_program=0;
+  radio->f_romaji=0;
   radio->antenna=-1; // not connected -1
   radio->f_qsl=0;
   radio->smeter_stat = 0;
+  radio->power =0;
+  radio->power_bak =0;  
   radio->smeter = 0;
   radio->smeter_peak = SMETER_MINIMUM_DBM;
   radio->bandid = 0;
@@ -3773,6 +4279,7 @@ void init_radio(struct radio *radio, const char *rig_name) {
   radio->smeter_azimuth[3] = -1;
   radio->f_smeter_record_ready = 0;
   radio->freq_change_count=0;
+  radio->cat_status=0;
 
   radio->bandid_bandmap = 0;
 
@@ -3951,15 +4458,23 @@ void civ_process() {
 	get_civ(radio);
 	break;
 	//        case 1:  // yaesu
+      case CAT_TYPE_YAESU_FT817:
+	get_cat_ft817(radio);
+	//	print_cat_ft817(radio);
+	break;
       case CAT_TYPE_YAESU_NEW:  // Yaesu
       case CAT_TYPE_YAESU_OLD:
 	get_cat(radio);
 	print_cat(radio);
 	break;
-      case 2:  //kenwood
+      case CAT_TYPE_KENWOOD:  //kenwood
 	get_cat_kenwood(radio);
 	print_cat(radio);
 	break;
+	  case CAT_TYPE_ELECRAFT_KX: // elecraft
+	  get_cat_elecraft(radio);
+	  print_cat(radio);
+	  break;
       }
       clear_civ(radio);
     }
@@ -4007,29 +4522,50 @@ int receive_civ(struct radio *radio) {
     radio->cmdbuf[radio->cmd_ptr++] = c;
 
     switch (radio->rig_spec->cat_type) {
-      case 0:  // icom civ
-        if (c == 0xfd) return 1;
-        else return 0;
-        break;
-	//      case 1:  // yaesu
-  case CAT_TYPE_YAESU_NEW:  // Yaesu
-  case CAT_TYPE_YAESU_OLD:
+    case CAT_TYPE_CIV:  // icom civ
+      if (c == 0xfd) return 1;
+      else return 0;
+      break;
+    case CAT_TYPE_YAESU_FT817:
+      radio->cat_status++;      
+      switch (radio->cat_status&0xf0) {
+      case 0x10: // awaiting RX status
+	return 1;
+	break;
+      case 0x20: // awiating TX status
+	return 1;
+	break;
+      case 0x30: // awaiting Freq & Mode status
+	if ((radio->cat_status&0xf) ==5) {
+	  // 5 bytes received
+	  return 1;
+	} else {
+	  return 0;
+	}
+	break;
+      default: // ignore
+	return 0;
+	break;
+      }	
+      break;
+    case CAT_TYPE_YAESU_NEW:  // Yaesu
+    case CAT_TYPE_YAESU_OLD:
 	
-        if (c == ';') {
-	  // term
-	  radio->cmdbuf[radio->cmd_ptr]='\0';
-	  return 1;
-	}
-        else return 0;
-        break;
-      case 2:  // kenwood
-        if (c == ';') {
-	  // term
-	  radio->cmdbuf[radio->cmd_ptr]='\0';	  
-	  return 1;
-	}
-        else return 0;
-        break;
+      if (c == ';') {
+	// term
+	radio->cmdbuf[radio->cmd_ptr]='\0';
+	return 1;
+      }
+      else return 0;
+      break;
+    case CAT_TYPE_KENWOOD:  // kenwood
+      if (c == ';') {
+	// term
+	radio->cmdbuf[radio->cmd_ptr]='\0';	  
+	return 1;
+      }
+      else return 0;
+      break;
     }
   }
   return 0;
@@ -4284,6 +4820,9 @@ void recall_freq_mode_filt(struct radio *radio) {
     radio->filtbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype] = filt;
   }
   //set_frequency(freq, radio);  // this should be performed from civ receive process not to be forced? 23/4/23
+  //  set_frequency_rig(freq);
+  
+  radio->f_recall_freq_mode_filt = 1;
   set_frequency_rig(freq);
   //    int modenum, filt;
   modenum = radio->modebank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];

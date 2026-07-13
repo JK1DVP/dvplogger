@@ -26,6 +26,7 @@
 //#define N_MULTI 1346
 #include "Arduino.h"
 #include "multi.h"
+
 const struct multi_item multi_acag = {
    {
      
@@ -163,7 +164,20 @@ const struct multi_item multi_acag = {
 "4616", "4617", "4618", "4619", "4620", "4621", "4622", "4623", "4624", "4625", 
 "4626", "46001", "46003", "46005", "46006", "46008", "46009", "46010", "46011", "4701", 
 "4704", "4706", "4708", "4709", "4710", "4711", "4712", "4713", "4714", "4715", 
-"47001", "47002", "47003", "47004", "47005", ""
+"47001", "47002", "47003", "47004", "47005",
+// from here allja entries
+    "101", "102", "103", "104", "105", "106", "107", "108", "109", "110",
+    "111", "112", "113", "114",
+    "02", "03", "04", "05", "06", "07",
+    "08",  "09",
+    "10",    "11", "12", "13", "14", "15", "16", "17",
+    "18", "19",    "20", "21",
+    "22", "23",	"24", "25", "26", "27",
+    "28", "29",    "30",
+    "31", "32", "33", "34", "35",
+    "36", "37", "38", "39",
+    "40", "41", "42", "43",
+    "44", "45", "46", "47" , "48", ""
 },
 {
 "Sapporo C Chuo K", "Sapporo C Kita K", "Sapporo C Higashi K", "Sapporo C Shiroishi K", "Sapporo C Toyohira K", "Sapporo C Minami K", "Sapporo C Nishi K", "Sapporo C Atsubetsu K", "Sapporo C Teine K", "Sapporo C Kiyota K", 
@@ -300,7 +314,19 @@ const struct multi_item multi_acag = {
     "Satsumasendai C", "Hioki C", "Soo C", "Kirishima C", "Ichikikushikino C", "Minamisatsuma C", "Shibushi C", "Amami C", "Minamikyushu C", "Isa C", 
     "Aira C", "Aira G", "Izumi G", "Oshima G", "Kagoshima G", "Kimotsuki G", "Kumage G", "Satsuma G", "Soo G", "Naha C", 
     "Ishigaki C", "Ginowan C", "Nago C", "Urasoe C", "Itoman C", "Okinawa C", "Tomigusuku C", "Uruma C", "Miyakojima C", "Nanjo C", 
-    "Kunigami G", "Shimajiri G", "Nakagami G", "Miyako G", "Yaeyama G", ""
+    "Kunigami G", "Shimajiri G", "Nakagami G", "Miyako G", "Yaeyama G",
+    // from here allja entries
+    "Soya", "Rumoi", "Kamikawa", "Okhotsk", "Sorachi", "Ishikari", "Nemuro", "Shiribeshi", "Tokachi", "Kushiro", "Hidaka", "Iburi", "Hiyama", "Oshima",
+    "Aomori", "Iwate", "Akita", "Yamagata", "Miyagi", "Fukushima",
+    "Niigata",    "Nagano",
+    "Tokyo", "Kanagawa", "Chiba", "Saitama", "Ibaraki", "Tochigi", "Gunma", "Yamanashi",
+    "Shizuoka", "Gifu", "Aichi", "Mie",
+    "Kyoto", "Shiga", "Nara", "Osaka",    "Wakayama", "Hyogo",
+    "Toyama", "Fukui", "Ishikawa",
+    "Okayama", "Shimane", "Yamaguchi",    "Tottori", "Hiroshima",
+    "Kagawa", "Tokushima", "Ehime", "Kochi",
+    "Fukuoka", "Saga", "Nagasaki", "Kumamoto",
+    "Oita", "Miyazaki", "Kagoshima", "Okinawa", "Ogasawara", ""
   }
 };
 

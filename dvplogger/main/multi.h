@@ -35,6 +35,13 @@
 #define MULTI_TYPE_ARRL10M 7 //
 #define MULTI_TYPE_CQWW 8 // CQWW contest same as MULTI_TYPE_NORMAL but indicates this is DX contest to show entity information
 #define MULTI_TYPE_KCWA 9 // check only head two letters 
+#define MULTI_TYPE_AA 10 // check only head two letters 
+#define MULTI_TYPE_KENGAI 11 // JARL Ken type contest  multi_type & 0xff00 >> 8 will give ken number
+#define MULTI_TYPE_KENNAI 12 // JARL Ken type contest  multi_type & 0xff00 >> 8 will give ken number
+#define MULTI_TYPE_KENGAI_KJ 13 // JARL Ken type contest  multi_type & 0xff00 >> 8 will give ken number and allow KenJin stations
+#define MULTI_TYPE_KENNAI_KJ 14 // JARL Ken type contest  multi_type & 0xff00 >> 8 will give ken number and allow KenJin stations 
+#define MULTI_ACAG_ALLJA_OFS 1345  //  allja multi beyond the index 
+
 
 struct multi_item {
   const char *mul[N_MULTI];
@@ -54,6 +61,7 @@ struct multi_list {
 
 //extern struct multi_item multi_arrl;
 extern struct multi_item multi_test_line ;
+extern struct multi_item multi_aatest ;
 extern const struct multi_item multi_musashino_line;
 extern const struct multi_item multi_hswas ;
 extern const struct multi_item multi_kcj;
@@ -66,11 +74,20 @@ extern const struct multi_item multi_kantou;
 extern const struct multi_item multi_allja;
 extern const struct multi_item multi_knint;
 extern const struct multi_item multi_yk;
-extern const struct multi_item multi_ja8int;
+extern const struct multi_item multi_ja8out;
 extern const struct multi_item multi_yntest;
 extern const struct multi_item multi_acag;
 extern const struct multi_item multi_arrldx;
 extern const struct multi_item multi_arrl10m;
 extern const struct multi_item multi_tki;
+extern const struct multi_item multi_okhotskint;
+extern const struct multi_item multi_okhotskout;
+extern const struct multi_item multi_ja5int;
+extern const struct multi_item multi_ja5out;
+extern const struct multi_item multi_aomori_int;
+extern const struct multi_item multi_aomori_out;
+extern const struct multi_item multi_iburihidakaout;
+extern const struct multi_item multi_iburihidakaint;
+
 
 #endif

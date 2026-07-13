@@ -354,7 +354,7 @@ bool dupe_check(struct radio *radio,char *call, byte bandmode, byte mask, bool c
     }
     // The large QSO history lives on the subcpu, but the ordinary
     // call-history table remains on the main CPU.
-    if (!ret && f_callhist && callhist_check && plogw->enable_callhist && callhist_at == 0) {
+    if (!ret && f_callhist && callhist_check && plogw->enable_callhist) {
       if (search_callhist_getexch(call, getexch)) f_getexch = 1;
     }
   } else {

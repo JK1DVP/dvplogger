@@ -124,6 +124,12 @@ extern KbdRptParser Prs,Prs1;
 
 void USB_desc(); // print usb descriptors
 void ACMprocess() ;
+void CP2105process();
+void CP2105status();
+bool CP2105selectPort(uint8_t port);
+bool CP2105setBaud(uint8_t port, uint32_t baudrate);
+void CP2105toggleDebug();
+bool CP2105sendRaw(uint8_t port, const char *text);
 void init_usb();
 void loop_usb();
 void usb_send_civ_buf() ;

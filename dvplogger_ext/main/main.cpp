@@ -21,6 +21,7 @@
 
 
 #include "Arduino.h"
+#include "esp_heap_caps.h"
 
 #include <Wire.h>
 #include "Ticker.h"
@@ -65,10 +66,14 @@ SoftwareSerial Serial3;
 #include "BluetoothSerial.h"
 //#include "dac_playback.h"
 #include "main.h"
+//#include "decl.h"
+#include "dupechk.h"
+#include "callhist_remote.h"
 
 
 Ticker serial_reader;
 
+Stream *console;
 
 String device_name = "ESP32-BT";
 
@@ -94,6 +99,7 @@ int cat2_reversed=1;
 
 int cat3_baud=38400;
 int cat3_reversed=1;
+int f_spiram=0;
 
 void read_serial_ports() // read serialports and buffer
 {
@@ -195,8 +201,28 @@ void key_control(char *cmd)
 void control_pkt_handler(struct mux_packet *packet)
 {
   int ret;
-  char buf[100];
+  char buf[256];
   // check content
+  if (strncmp(packet->buf,"memstat",7)==0) {
+    size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t min8 = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    size_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    snprintf(buf, sizeof(buf), "memstat:%u|%u|%u|%u|%u|%u|%u",
+             (unsigned int)free8,
+             (unsigned int)min8,
+             (unsigned int)largest8,
+             (unsigned int)free_internal,
+             (unsigned int)free_spiram,
+	     (unsigned int)get_dupechk_nmaxqso(),
+	     (unsigned int)get_dupechk_ncallsign()	     
+	     );
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)buf, strlen(buf));
+    return;
+  }
   if (strncmp(packet->buf,"go_no_mux",9)==0) {
     f_mux_transport=0;
     return;
@@ -218,6 +244,70 @@ void control_pkt_handler(struct mux_packet *packet)
   if (strncmp(packet->buf,"cwbuf",5)==0) {
     // control cw/phone sending buffer
     cwbuf_control(packet->buf+5);
+    return;
+  }
+  if (strncmp(packet->buf,"chreset",7)==0) {
+    process_callhist_reset_subcpu(packet->buf + 7);
+    return;
+  }
+  // "chend" also begins with "che", so handle the longer command first.
+  if (strncmp(packet->buf,"chend",5)==0) {
+    process_callhist_end_subcpu();
+    return;
+  }
+  if (strncmp(packet->buf,"che",3)==0) {
+    size_t n = min((size_t)(packet->idx - 3), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 3, n); buf[n] = '\0';
+    process_callhist_entry_subcpu(buf);
+    return;
+  }
+  if (strncmp(packet->buf,"dupemask",8)==0) {
+    int mask = atoi(packet->buf + 8);
+    if (mask >= 0 && mask <= 255)
+      set_dupechk_mask_subcpu((unsigned char)mask);
+    return;
+  }
+  if (strncmp(packet->buf,"dupebulkbegin",13)==0) {
+    begin_makedupe_bulk_subcpu((unsigned char)atoi(packet->buf + 13));
+    return;
+  }
+  if (strncmp(packet->buf,"dupebulkend",11)==0) {
+    finish_makedupe_bulk_subcpu();
+    return;
+  }
+  if (strncmp(packet->buf,"dupeb",5)==0) {
+    size_t n = min((size_t)(packet->idx - 5), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 5, n);
+    buf[n] = '\0';
+    entry_makedupe_bulk_subcpu(buf);
+    return;
+  }
+  if (strncmp(packet->buf,"dupereset",9)==0) {
+    init_dupechk_subcpu();
+    const char *response = "dupereset:ok";
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)response, strlen(response));
+    return;
+  }
+  if (strncmp(packet->buf,"dupee",5)==0) { // dupe entry
+    size_t n = min((size_t)(packet->idx - 5), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 5, n);
+    buf[n] = '\0';
+    entry_dupechk_subcpu(buf);
+    return;
+  }
+  if (strncmp(packet->buf,"dupep",5)==0) { // partial callsign check
+    size_t n = min((size_t)(packet->idx - 5), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 5, n);
+    buf[n] = '\0';
+    process_dupechk_partial_query_subcpu(buf);
+    return;
+  }
+  if (strncmp(packet->buf,"dupec",5)==0) { // dupe check
+    size_t n = min((size_t)(packet->idx - 5), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 5, n);
+    buf[n] = '\0';
+    process_dupechk_query_subcpu(buf);
     return;
   }
   // setting cat2 parameter
@@ -252,6 +342,7 @@ void control_pkt_handler(struct mux_packet *packet)
 }
 
 void setup() {
+
   Serial1.setRxBufferSize(512);
   Serial1.begin(115200, SERIAL_8N1, 16, 17); // for ch9350
   
@@ -261,6 +352,9 @@ void setup() {
   SerialBT.begin(device_name);  //Bluetooth device name
   //SerialBT.deleteAllBondedDevices(); // Uncomment this to delete paired devices; Must be called after begin
   Serial.printf("The device with name \"%s\" is started.\nNow you can pair it with Bluetooth!\n", device_name.c_str());
+
+  console=&Serial;
+  
   count=0;count1=0;
 
 
@@ -276,8 +370,9 @@ void setup() {
 
   Serial3.begin(cat3_baud,SWSERIAL_8N1,CATRX,CATTX,cat3_reversed,95,0);
   Serial3.enableIntTx(0); // disable interrupt diuring transmitting signal
+
+  init_dupechk_subcpu();
   
-    
   mux_transport=Mux_transport();
   mux_transport.mux_stream=&Serial;
   mux_transport.set_port_handler(MUX_PORT_EXT_BRD_CTRL,control_pkt_handler);

@@ -33,7 +33,9 @@
 #include "zserver.h"
 #include "dupechk.h"
 #include "callhist_fd.h"
-#include "callhist.h"
+//#include "callhist.h"
+#include "callhist_remote.h"
+#include "callhist_mem.h"
 #include "misc.h"
 #include "processes.h"
 #include "so2r.h"
@@ -266,6 +268,8 @@ void init_logwindow() {
   plogw->show_qso_interval=0;
   plogw->qso_interval_timer=0;
 
+  plogw->autopoweroff=60;
+  plogw->count_autopoweroff=0;
 
   //  init_sequence_manager();
 
@@ -310,7 +314,7 @@ void init_logwindow() {
   plogw->tcp_cmdbuf_len = NCHR_TCP_CMD;
   memset(plogw->tcp_cmdbuf, '\0', NCHR_TCP_CMD + 1);
 
-  plogw->f_off_contest=-1; // default off the contest flag
+  plogw->f_off_contest=0; // default off the contest flag 
   
   plogw->mask = 0xff;  // cw/ssb both ok ... 0xff cw/ssb not ok 0xff-3
   //plogw->bandid_bandmap = 0;
@@ -581,7 +585,7 @@ int exch_partial_check(struct radio *radio,char *exch,unsigned char bandmode,uns
   }
   // end of dupechk search
 
-  if (callhist_check) {
+  if (callhist_check && callhist_at == 0) {
     // callhist_list search
     char *callsign;    
     int i=0;
@@ -654,6 +658,54 @@ int exch_partial_check(struct radio *radio,char *exch,unsigned char bandmode,uns
 
 
 // partial string search by call and obtain list of possible callsign and exchanges with callhist_list or dupechk entries, and dupe
+static int dupe_partial_check_local(const char *call,
+                                    unsigned char bandmode,
+                                    unsigned char mask,
+                                    struct check_entry_list *entry_list)
+{
+  const int len = strlen(call);
+
+  for (int i = 0; i < dupechk->ncallsign; i++) {
+    const char *callsign = dupechk->callsign[i];
+    if (strstr(callsign, call) == NULL) continue;
+
+    struct check_entry *entry = &entry_list->entryl[entry_list->nentry];
+    entry->flag = CHECK_ENTRY_FLAG_DUPECHECK_LIST;
+    strcpy(entry->callsign, callsign);
+    strcpy(entry->exch, dupechk->exch[i]);
+    entry->bandmode = dupechk->bandmode[i];
+
+    if (len == strlen(callsign)) {
+      entry->flag |= CHECK_ENTRY_FLAG_EXACT_MATCH;
+      if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
+        entry->flag |= CHECK_ENTRY_FLAG_DUPE;
+        entry_list->dupe++;
+      }
+    }
+
+    entry_list->nentry++;
+    if ((entry_list->nentry >= 10) ||
+        (entry_list->nentry >= entry_list->nmax_entry)) {
+      break;
+    }
+  }
+
+  return entry_list->nentry;
+}
+
+static int dupe_partial_check_history(const char *call,
+                                      unsigned char bandmode,
+                                      unsigned char mask,
+                                      struct check_entry_list *entry_list)
+{
+  if (dupechk->dupechk_at == 1) {
+    return query_dupechk_partial_subcpu(call, bandmode, mask, entry_list);
+  }
+
+  return dupe_partial_check_local(call, bandmode, mask, entry_list);
+}
+
+// partial string search by call and obtain list of possible callsign and exchanges with callhist_list or dupechk entries, and dupe
 int dupe_partial_check(const char *call,unsigned char bandmode,unsigned char mask, int callhist_check,struct check_entry_list *entry_list)
 {
   struct check_entry *entry;
@@ -666,45 +718,22 @@ int dupe_partial_check(const char *call,unsigned char bandmode,unsigned char mas
   if (verbose&4) {
     console->print("dupe_partial_check(): bandmode=");console->println(bandmode,HEX);
   }
-  
-  // check all qso in dupechk
-  for (int i = 0; i < dupechk->ncallsign; i++) {
-    entry=&entry_list->entryl[entry_list->nentry];
-    entry->flag=0;
-    callsign=dupechk->callsign[i];
-    part=strstr(callsign,call);
-    if (part!=NULL) { // substring call found in target callsign in dupechk list
-      strcpy(entry->callsign,callsign);
-      strcpy(entry->exch,dupechk->exch[i]);
-      entry->bandmode=dupechk->bandmode[i];
-      entry->flag|=CHECK_ENTRY_FLAG_DUPECHECK_LIST;
-      entry_list->nentry++;
-      if (len == strlen(callsign)) {
-	// exact match
-	entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
-	if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
-	  // dupe = worked
-	  entry->flag|=CHECK_ENTRY_FLAG_DUPE;
-	  entry_list->dupe++;
-	} 
-      }
-      // number of found entry in range?
-      if ((entry_list->nentry>=10)|| (entry_list->nentry>=entry_list->nmax_entry)) {
-	//
-	if (entry_list->nentry<=entry_list->cursor) {
-	  entry_list->cursor=entry_list->nentry-1;
-	}
-	if (entry_list->cursor<0) {
-	  entry_list->cursor=0;
-	}
-	
-	return entry_list->nentry; // end of search
-      }
+
+  // Search the QSO history using the database owner.  The remainder of this
+  // function merges those results with the call history database on main CPU.
+  dupe_partial_check_history(call, bandmode, mask, entry_list);
+
+  if ((entry_list->nentry >= 10) ||
+      (entry_list->nentry >= entry_list->nmax_entry)) {
+    if (entry_list->nentry <= entry_list->cursor) {
+      entry_list->cursor = entry_list->nentry - 1;
     }
+    if (entry_list->cursor < 0) entry_list->cursor = 0;
+    return entry_list->nentry;
   }
   // end of dupechk search
 
-  if (callhist_check) {
+  if (callhist_check && callhist_at == 0) {
     // callhist_list search
     int i=0;
     char callsign_exch[20],*exch;
@@ -739,11 +768,6 @@ int dupe_partial_check(const char *call,unsigned char bandmode,unsigned char mas
 	    if (len == strlen(callsign)) {
 	      // exact match
 	      entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
-	      if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
-		// dupe = worked
-		entry->flag|=CHECK_ENTRY_FLAG_DUPE;
-		entry_list->dupe ++;
-	      } 
 	    }
 	    // number of found entry in range?
 	    if ((entry_list->nentry>=10)|| (entry_list->nentry>=entry_list->nmax_entry)) {
@@ -771,6 +795,8 @@ int dupe_partial_check(const char *call,unsigned char bandmode,unsigned char mas
   }
   return entry_list->nentry;  // not dupe
 }
+
+
 // ESP32のRAM帯域ざっくり判定（必要なら調整）
 static inline bool is_valid_ram_ptr(const void* p) {
     uintptr_t a = (uintptr_t)p;

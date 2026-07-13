@@ -48,23 +48,32 @@ public:
   enum QsoStat {SendCQ,StandBy,SendCall, SendCallExch, SendExch, SendTU }; // status of ongoing QSO in each radio direction for the next action
 
   // SequenceStat 遷移
-  // msg radio set to the focused radio when Enter pressed   
+  // 
+  // msg radio set to the focused radio when Enter pressed (action being taken)
   // SO2R_CQSandP
-  //   Default -- (need send message) - Sending_Msg - (PTT ON->OFF or CW finished ) - Sendning_Msg_Finished - Default
+  //   focus alternate when Sending_Msg 
+  //   Default -- (need send message) - Sending_Msg - (PTT ON->OFF or CW finished ) - Sendning_Msg_Finished - set focus to msg_radio - Default
   // SO2R_Repeat_Func
   //   (if QSOstat = SendCQ)  -- (Send CQ) - Sending_Msg (TX in msg radio, RX in other radio ) - (PTT ON->OFF or CW finished ) - Sendning_Msg_Finished
   //  -(RX and focus to msg radio) -(start timer) Timer_Started - TimerExpired -- (Response term finished)
   //  (QSOstat is set SendCQ when SendTU is sent finished.)
   //   (if QSOstat not SendCQ) - (keep Default)
+  // SO2R_ALTCQ
+  //   (if QSOstat of msg_radio is SendCQ) Send CQ - focus on the other radio - Sending_Msg_Finished - set focus to msg radio and msg_radio goes to the other radio
+  //                               SendTU and send tu then Sending_msg_finished then set SendCQ on the msg_radio and msg_radio goes to the other radio
   // QsoStat 遷移 what to do next
-  //  CQ    SendCQ - SendCallExch - SendTU - SendCQ pattern
-  //  S&P   SendCall - SendExch (based on where the cursor is in )
+  //  focused_radio がCQ でcall欄 でenter 何も入力されていない場合SendCQ  なにか入力されていたら SendCallExchに遷移 exchange 欄で有効なナンバーが入力されてenter が押されたらSendTUに遷移
+  // TUが送出終わったら- SendCQ pattern
+  //  focused radio がS&P  call欄が入力 SendCall - exchge有効が入力 SendExch 
+
   
 private:
   
   int tx_;   // transmit radio 
   int rx_;   // receive  radio
-  int stereo_; // status of stereo 
+  int stereo_; // status of stereo
+
+
   
   enum SequenceMode sequence_mode_;  // sequencing mode 
   //  int f_sequence_stat_;     // control variable for sequencing
@@ -99,13 +108,15 @@ public:
   SO2R() : tx_(0), rx_(0),stereo_(0),sequence_mode_(Manual),sequence_stat_(Default), qso_stat_{SendCQ,SendCQ,SendCQ}, sequence_stat_changed_(0),
 	   msg_tx_radio_(0),f_chgstat_tx_(0),f_chgstat_rx_(0),
 	   repeat_timer_(0),repeat_timer_set_(3000),msg_key_(0),repeat_cq_radio_(-1),focused_radio_(0),focused_radio_prev_(0),
-	   timeout_monitor(0),queue_monitor_status(0),
+	   timeout_monitor(0),queue_monitor_status(0),debug(0),
 	   radio_mode(0)
 
   {
 
 
   }
+
+  bool debug;  
   int radio_mode ; // radio_mode formerly in decl.h plogw
 
   void set_timeout_monitor(int interval)
@@ -243,6 +254,80 @@ public:
 
   }
 
+  void show_status_lcd() {
+    // show so2r related status on LCD if
+    if (debug) {
+      char buf[100];
+      *dp->lcdbuf = '\0';
+      switch (radio_mode) {
+      case RADIO_MODE_SO1R:
+	strcpy(buf,"SO1R");break;
+      case RADIO_MODE_SO2R:
+	strcpy(buf,"SO2R");break;
+      case RADIO_MODE_SAT:
+	strcpy(buf,"SAT");break;
+      }
+      switch (sequence_mode()) {
+      case Manual:
+	strcat(buf," Manual");break;
+      case Repeat_Func:
+	strcat(buf," Rep");break;
+      case SO2R_Repeat_Func:
+	strcat(buf," 2R_Rep");break;	
+      case SO2R_CQSandP:
+	strcat(buf," 2R_CQSP");break;		
+      case SO2R_ALTCQ:
+	strcat(buf," 2R_ALT");break;			
+      case SO2R_2BSIQ:
+	strcat(buf," 2R_2BS");break;
+      }
+      switch (sequence_stat()) {
+      case Default:
+	strcat(buf," Default\n");break;
+      case Sending_Msg:
+	strcat(buf," Sending_Msg\n");break;	
+      case Sending_Msg_Finished:
+	strcat(buf," Sending_Msg_Fin\n");break;		
+      case Timer_Started:
+	strcat(buf," Timer_Started\n");break;		
+      case Timer_Expired:
+	strcat(buf," Timer_Expired\n");break;			
+      case Timer2_Started:
+	strcat(buf," Timer2_Started\n");break;				
+      case Timer2_Expired:
+	strcat(buf," Timer2_Expired\n");break;				
+      }
+      strcat(buf,"QSO:");      
+      for (int i=0;i<3;i++) {
+	switch (qso_stat(i)) {
+	case SendCQ:
+	  strcat(buf," SendCQ");break;
+	case StandBy:
+	  strcat(buf," Stby");break;	  
+	case SendCall:
+	  strcat(buf," SCall");break;	  	  
+	case SendCallExch:
+	  strcat(buf," SCallExch");break;	  	  	  
+	case SendExch:
+	  strcat(buf," SExch");break;	  	  	  	  
+	case SendTU:
+	  strcat(buf," STU");break;
+	}
+      }
+      sprintf(dp->lcdbuf,"%s\nt:%d r:%d seq_chg:%d\nm_tx_r:%d q_proc_r:%d\nchg_t:%d _r:%d\nfoc:%d f_prv:%d\n",
+	      buf,
+	      tx_,rx_,
+	      sequence_stat_changed_,
+	      msg_tx_radio_,
+	      qso_process_radio_,
+	      f_chgstat_tx_,
+	      f_chgstat_rx_,
+	      focused_radio_,focused_radio_prev_
+	      );
+      upd_display_info_flash(dp->lcdbuf);
+    }
+  }
+
   void send_tu() {
     struct radio *radio;
     radio=radio_selected();
@@ -371,19 +456,24 @@ public:
     // monitoring SO2R status and control
     // switch RX
     if (f_chgstat_rx_ != 0) {
+      show_status_lcd();      
       focused_radio_prev_ = focused_radio_;
       focused_radio_ = f_chgstat_rx_ - 1; 
       set_rx(f_chgstat_rx_ - 1);
       f_chgstat_rx_ = 0;
+      show_status_lcd();
     }
     // switch TX
     if (f_chgstat_tx_ != 0) {
+      show_status_lcd();      
       set_tx(f_chgstat_tx_ - 1);
       f_chgstat_tx_ = 0;
+      show_status_lcd();
     }
     
     // watch f_sequence_stat_ changes and control sequence jobs
     if (sequence_stat_changed_) {
+      show_status_lcd();      
       sequence_stat_changed_= 0;
       
       switch (sequence_stat_) {
@@ -401,6 +491,7 @@ public:
 	onTimerExpiration();
 	break;
       }
+      show_status_lcd();      
     }
 
     // if voice / tone key from sub cpu, check queue and print result (in mux handler)
@@ -419,6 +510,7 @@ public:
 	}
 	break;
       }
+      show_status_lcd();      
     }
   }
 
@@ -913,7 +1005,7 @@ public:
     }
     phone_switch_management();
     upd_display();
-    bandmap_disp.f_update = 1;
+    // bandmap_disp.f_update = 1; // this switch band map too often so better not switch
   }
 
   int repeat_cq_radio()

@@ -53,9 +53,10 @@ const struct contest_definition contest_defs[N_CONTEST+1] = {
   // id , name     , CW_PH_DUPE, cw_pts,multi_type, multi1 ,multi_start/end band,   multi2 ... 
   { 0,"NOMULTI"    ,CW_PH_DUPE_OK,1,MULTI_TYPE_NORMAL,&multi_acag,-1,-1,       NULL,-1,-1 },
   { 8,"JANoPwr"    ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_allja,-1,-1,NULL,-1,-1 },  
-  { 7,"AllJA"      ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL  ,&multi_allja,-1,-1,NULL,-1,-1 },
-  {18,"ACAG"       ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL  ,&multi_acag, 1,13,NULL,-1,-1 },
-  {19,"FD"         ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL  ,&multi_allja, 1,10,&multi_acag,11,-1 },
+  { 7,"AllJA"      ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL_PWR  ,&multi_allja,-1,-1,NULL,-1,-1 },
+  {18,"ACAG"       ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL_PWR  ,&multi_acag, 1,13,NULL,-1,-1 },
+  {19,"FD"         ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL_PWR  ,&multi_allja, 1,10,&multi_acag,11,-1 },
+  {30,"6D"         ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL_PWR  ,&multi_allja, 1,10,&multi_acag,11,-1 }, 
   { 3,"CQWW"       ,CW_PH_DUPE_NG,1,MULTI_TYPE_CQWW,&multi_cqzones,-1,-1,NULL,-1,-1 },
   {15,"ARRLDX"     ,CW_PH_DUPE_NG,1,MULTI_TYPE_ARRLDX ,&multi_arrldx, -1,-1,NULL,-1,-1 },
   {20,"ARRL10m"    ,CW_PH_DUPE_OK,1,MULTI_TYPE_ARRL10M,&multi_arrl10m, -1,-1,NULL,-1,-1 },    
@@ -75,12 +76,42 @@ const struct contest_definition contest_defs[N_CONTEST+1] = {
   {23,"TOKAIQSO"   ,CW_PH_DUPE_OK,1,MULTI_TYPE_NORMAL,&multi_tki,-1,-1,NULL,-1,-1 },
   {24,"UEC_VUS"    ,CW_PH_DUPE_OK,2,MULTI_TYPE_NORMAL,&multi_allja, -1,-1,&multi_acag,8,13 },    // * OK to QSO in AM,FM,SSB,CW
   //  {20,"MusashinoL" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_musashino_line, -1,-1,NULL,-1,-1 },
-  {14,"Ja8Int"     ,CW_PH_DUPE_NG,1,MULTI_TYPE_NOCHK_LASTCHR,&multi_ja8int, -1,-1,NULL,-1,-1 },
+  {14,"Ja8Int"     ,CW_PH_DUPE_NG,1,MULTI_TYPE_NOCHK_LASTCHR,&multi_allja, -1,-1,NULL,-1,-1 },
+  {28,"Ja8Out"     ,CW_PH_DUPE_NG,1,MULTI_TYPE_NOCHK_LASTCHR,&multi_ja8out, -1,-1,NULL,-1,-1 },
   { 9,"ACAGnochk"  ,CW_PH_DUPE_NG,1,MULTI_TYPE_JARL_PWR_NOMULTICHK  ,NULL,-1,-1,NULL,-1,-1 },
+  {25,"AAtest"     ,CW_PH_DUPE_NG,1,MULTI_TYPE_AA,&multi_aatest,-1,-1,  NULL,-1,-1 },
+  {27,"ShimaneAllJAOut",CW_PH_DUPE_OK,1,(MULTI_TYPE_KENGAI | (32<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 32 is SHimane Ken number    
+  {26,"ShimaneAllJAInt",CW_PH_DUPE_OK,1,(MULTI_TYPE_KENNAI | (32<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 32 is SHimane Ken number
+  {29,"Tochigi",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_acag,-1,-1,  NULL,-1,-1 }, 
+  {31,"OkhotskOut" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_okhotskout,-1,-1,NULL,-1,-1 },      
+  {32,"OkhotskInt" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_okhotskint,-1,-1,NULL,-1,-1 },
+  {33,"JA5Out" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_ja5out,-1,-1,NULL,-1,-1 },      
+  {34,"JA5Int" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_ja5int,-1,-1,NULL,-1,-1 },
+  {35,"Shiga",CW_PH_DUPE_NG,1,(MULTI_TYPE_KENGAI | (23<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 23 is Shiga Ken number
+  {36,"AomoriInt",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_aomori_int,-1,-1,  NULL,-1,-1 }, 
+  {41,"AomoriOut",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_aomori_out,-1,-1,  NULL,-1,-1 }, 
+  {38,"IburiHidakaOut",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_iburihidakaout,-1,-1,  NULL,-1,-1 }, 
+  {37,"IburiHidakaInt",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_iburihidakaint,-1,-1,  NULL,-1,-1 }, 
+  {39,"KagoshimaOut",CW_PH_DUPE_OK,1,(MULTI_TYPE_KENGAI_KJ | (46<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 46 is Kagoshima Ken number
+  {40,"KagoshimaInt",CW_PH_DUPE_OK,1,(MULTI_TYPE_KENNAI_KJ | (46<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 46 is Kagoshima Ken number
   { -1,""         ,0   ,0,0,NULL,-1,-1,NULL,-1,-1  }
 };
 //  { 0,"NOMULTI"   ,CW_PH_DUPE_NG,1,0,&multi_test_line,-1,-1,NULL,-1,-1 }, 
-  
+
+
+int is_international_contest()
+{
+  switch(plogw->contest_id) {
+  case 0: // no multi
+  case 3: // cqww
+  case 15:// arrl1x
+  case 20:// arrl10m
+  case 25: // AA
+    return 1;
+  default:
+    return 0;
+  }
+}
 //const char *contest_names[N_CONTEST+1] = {"NOMULTI", "TAMAGAWA", "TOKYOUHF","CQWW", "Saitama-Int", "KCJ", "KantoUHF","AllJA","JA No PWR","ACAG(no multi)","KanagawaInt","Yokohama","UEC contest","Tsurumigawa","JA8(int)contest","ARRL int'l","HSWAScontest","YN contest", "ACAG(multi chk)","FD","MusashinoLine",""};
 //const int contest_ids[N_CONTEST+1] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,-1};
 
@@ -122,6 +153,7 @@ void set_contest_id() {
       strcpy(plogw->contest_name+2,contest_defs[i].name);
       
       plogw->mask=contest_defs[i].mask;
+      sync_dupechk_mask_subcpu(plogw->mask);
       plogw->multi_type=contest_defs[i].multi_type;
       plogw->cw_pts=contest_defs[i].cw_pts;
       // set multi

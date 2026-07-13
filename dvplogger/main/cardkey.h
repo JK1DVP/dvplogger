@@ -18,4 +18,13 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-
+// Copyright (c) 2021-2024 Eiichiro Araki
+// SPDX-FileCopyrightText: 2025 2021-2025 Eiichiro Araki
+//
+// SPDX-License-Identifier: GPL-2.0-or-later
+#ifndef FILE_CARDKEY_H
+#define FILE_CARDKEY_H
+void emulate_keyboard_cardkey(char c);
+void cardkey_process();
+void init_cardkey();
+#endif

@@ -37,10 +37,11 @@ int ui_send_exch(struct radio *radio);
 void send_single_char_radio(struct radio *radio,char c);
 void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c);
 //void function_keys(uint8_t key, MODIFIERKEYS modkey, uint8_t c) ;
+
 void function_keys(uint8_t key, uint8_t c) ;
 int ui_perform_partial_check(struct radio *radio);
 int ui_perform_exch_partial_check(struct radio *radio);
-
+void set_contest_from_name();
 void process_enter(int option) ;
 int check_edit_mode() ; // CW key input and Remarks  return 1 (insert) else return 0 (overwrite edit)
 void logw_handler(char key, char c);
