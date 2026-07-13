@@ -27,6 +27,7 @@
 #include "display.h"
 #include "log.h"
 #include "so2r.h"
+#include "user_contest_md.h"
 
 struct multi_list multi_list;
 
@@ -153,6 +154,8 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
     idx_multi_end=MULTI_ACAG_ALLJA_OFS;
   }
   switch (plogw->multi_type &0xff) {
+  case MULTI_TYPE_USER_MD:
+    return user_md_multi_check(s, bandid);
   case MULTI_TYPE_NORMAL: // multi same as number
   case MULTI_TYPE_CQWW: // multi same as number     
   case MULTI_TYPE_JARL_PWR_NOMULTICHK: // jarl contest power_code but no multi-check performed (like ACAG)

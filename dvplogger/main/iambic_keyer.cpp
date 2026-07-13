@@ -223,10 +223,13 @@ void iambic_keyer_handler() {
   // This state machine translates paddle input into DITS and DAHs and keys the transmitter.
   paddle= get_Paddle();
 
-  // report paddle status
-  paddle_queue.paddle=paddle;
-  paddle_queue.voltage=paddle_voltage;
-  xQueueSend(xQueuePaddle, &paddle_queue, 0);
+  // The keyer state machine uses paddle directly.  This queue is only for
+  // diagnostics, so retain only the latest sample using a one-entry queue
+  if (xQueuePaddle != NULL) {
+    paddle_queue.paddle = paddle;
+    paddle_queue.voltage = paddle_voltage;
+    xQueueOverwrite(xQueuePaddle, &paddle_queue);
+  }
   
   switch (g_keyerState) {
     case IDLE:

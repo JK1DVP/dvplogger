@@ -65,6 +65,7 @@
 #include <hidboot.h>
 #include "SD.h"
 #include "contest.h"
+#include "user_contest_md.h"
 #include "keyboard.h"
 #include "satellite.h"
 #include "sd_files.h"
@@ -1223,19 +1224,19 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	break;
 
 	// multi display
-      case 0x17:  // ctrl-t , (ctrl-y ) multi list page up and down and display
-	info_disp.multi_ofs -= 4;
-	if (info_disp.multi_ofs < 0) info_disp.multi_ofs = 0;
-	upd_display_info_contest_settings(radio);
-	break;
+      case 0x17:  // ctrl-t: selected multiplier worked status on each band
+        radio->multi = multi_check_option(radio->recv_exch + 2, radio->bandid, 1);
+        upd_display_info_multi_bands(radio);
+        break;
 
-      case 0x1c:  // ctrl-y
-	info_disp.multi_ofs += 4;
-	if (*multi_list.multi != NULL) {
-	  if (info_disp.multi_ofs >= multi_list.n_multi[radio->bandid-1]) info_disp.multi_ofs = multi_list.n_multi[radio->bandid-1] - 1;
-	}
-	upd_display_info_contest_settings(radio);
-	break;
+      case 0x1c:  // ctrl-y: nearby multipliers on the current band
+        radio->multi = multi_check_option(radio->recv_exch + 2, radio->bandid, 1);
+        upd_display_info_multi_nearby(radio);
+        break;
+
+      case 0x1b:  // ctrl-x: contest summary and nearby band status
+        upd_display_info_contest_band_nearby(radio);
+        break;
 	// score summary
       case 0x18:  // ctrl-u    to work number of stations and worked stations/multis page show
 	if (info_disp.show_info == INFO_DISP_SUMMARY &&  info_disp.timer > 2000) { 
@@ -1561,6 +1562,10 @@ void print_off_contest()
 
 void set_contest_from_name()
 {
+    if (is_user_md_contest_name(plogw->contest_name + 2)) {
+      start_user_md_contest(plogw->contest_name + 2);
+      return;
+    }
     search_contest_id_from_name() ;
     switch(plogw->multi_type) {
     case MULTI_TYPE_NORMAL:      sprintf(buf,"NORMAL"); break;
@@ -2085,6 +2090,35 @@ void process_enter(int option) {
     if (strcmp(radio->callsign + 2, "MEMSTAT") == 0) {
       request_memstat_main_subcpu();
       clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "LISTQSOFILE") == 0) {
+      clear_buf(radio->callsign);
+      list_qso_backup_files();
+      break;
+    }
+
+    if (strncmp(radio->callsign + 2, "SWITCHLOG", 9) == 0) {
+      const char *arg = radio->callsign + 2 + 9;
+      bool valid = strlen(arg) == 3;
+      for (int i = 0; valid && i < 3; i++) {
+        if (arg[i] < '0' || arg[i] > '9') valid = false;
+      }
+
+      if (!valid) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "Usage:\nSWITCHLOGnnn");
+        upd_display_info_flash(dp->lcdbuf);
+        clear_buf(radio->callsign);
+        break;
+      }
+
+      int backup_number = (arg[0] - '0') * 100
+                        + (arg[1] - '0') * 10
+                        + (arg[2] - '0');
+      clear_buf(radio->callsign);
+      switch_qso_log(backup_number);
       break;
     }
 
@@ -2772,7 +2806,7 @@ void logw_handler(char key, char c)
     if (strlen(radio->recv_exch + 2) >= 1) {
       radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
       if (radio->multi >= 0) {
-	upd_display_info_contest_settings(radio);
+	upd_display_info_multi_bands(radio);
       }
     }
     break;

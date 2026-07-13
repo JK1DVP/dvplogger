@@ -40,6 +40,7 @@
 #include "so2r.h"
 #include "log.h"
 #include "contest.h"
+#include "user_contest_md.h"
 
 
 AsyncWebServer web_server(80);
@@ -1313,7 +1314,7 @@ const char oppage_html[] PROGMEM =R"rawliteral(
 </div>
 <div class="form-container">
         <label>Contest:</label>
-   <input type="text" id="edit_13" data-index="13" size="15"> <!-- contest_name 0 -->
+   <input type="text" id="edit_13" data-index="13" size="20"> <!-- contest_name 0 -->
     </div>
  <div class="form-container" id="cwkeyingDisplay"></div> <!-- CW keying ticker display -->
     <p>Band map test</p>
@@ -1950,8 +1951,13 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
 	  }
 	  break;
 	case 13: // contest name
-	  strncpy(plogw->contest_name+2,value.c_str(),10-1);
-	  search_contest_id_from_name() ;
+	  strncpy(plogw->contest_name+2,value.c_str(),LEN_CONTEST_NAME);
+          plogw->contest_name[2 + LEN_CONTEST_NAME] = '\0';
+          if (is_user_md_contest_name(plogw->contest_name + 2)) {
+            start_user_md_contest(plogw->contest_name + 2);
+          } else {
+	    search_contest_id_from_name();
+          }
 	  strcpy(response_string,"OK");
 	  break;
 	}

@@ -32,6 +32,7 @@
 #include "display.h"
 #include "contest.h"
 #include "so2r.h"
+#include "user_contest_md.h"
 
 
 struct contest_definition {
@@ -141,6 +142,11 @@ void search_contest_id_from_name()
 
 
 void set_contest_id() {
+  if (plogw->contest_id == USER_MD_CONTEST_ID &&
+      is_user_md_contest_name(plogw->contest_name + 2)) {
+    start_user_md_contest(plogw->contest_name + 2);
+    return;
+  }
   // set contest information based on contest_id referreing to the contest_defs 
   // find entry in contest_defs
   for (int i=0;i<N_CONTEST;i++) {

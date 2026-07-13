@@ -40,6 +40,7 @@
 #define MULTI_TYPE_KENNAI 12 // JARL Ken type contest  multi_type & 0xff00 >> 8 will give ken number
 #define MULTI_TYPE_KENGAI_KJ 13 // JARL Ken type contest  multi_type & 0xff00 >> 8 will give ken number and allow KenJin stations
 #define MULTI_TYPE_KENNAI_KJ 14 // JARL Ken type contest  multi_type & 0xff00 >> 8 will give ken number and allow KenJin stations 
+#define MULTI_TYPE_USER_MD 15 // CTESTWIN .MD user-defined multiplier
 #define MULTI_ACAG_ALLJA_OFS 1345  //  allja multi beyond the index 
 
 

@@ -519,6 +519,533 @@ void close_qsolog() {
   }
 }
 
+
+
+enum qso_file_op_state_t {
+  QSO_FILE_OP_IDLE = 0,
+  QSO_FILE_OP_DIR_OPEN,
+  QSO_FILE_OP_DIR_NEXT,
+  QSO_FILE_OP_LIST_PREPARE,
+  QSO_FILE_OP_LIST_OPEN,
+  QSO_FILE_OP_LIST_SCAN_FIRST,
+  QSO_FILE_OP_LIST_SCAN_LAST,
+  QSO_FILE_OP_SWITCH_VALIDATE,
+  QSO_FILE_OP_SWITCH_CLOSE_CURRENT,
+  QSO_FILE_OP_SWITCH_RENAME_CURRENT,
+  QSO_FILE_OP_SWITCH_OPEN_COPY,
+  QSO_FILE_OP_SWITCH_COPY,
+  QSO_FILE_OP_SWITCH_PREPARE_REBUILD,
+  QSO_FILE_OP_SWITCH_REBUILD,
+  QSO_FILE_OP_SWITCH_FINISH,
+  QSO_FILE_OP_ERROR
+};
+
+struct qso_file_op_context_t {
+  qso_file_op_state_t state;
+  int requested_number;
+  int scan_number;
+  int latest_number;
+  int backup_numbers[6];
+  int backup_count;
+  int backup_index;
+  bool directory_for_switch;
+  unsigned int directory_entries_seen;
+  uint32_t last_progress_ms;
+  int saved_number;
+  int shown;
+  char result_buf[360];
+  size_t result_used;
+  size_t record_index;
+  size_t record_count;
+  bool have_first;
+  bool have_last;
+  bool current_log_saved;
+  bool bulk_started;
+  char source_name[20];
+  char saved_name[20];
+  char candidate_name[20];
+  char first_tm[18];
+  char last_tm[18];
+  File file;
+  File root;
+  File src;
+  File dst;
+};
+
+static qso_file_op_context_t qso_file_op = { QSO_FILE_OP_IDLE };
+
+static void close_qso_file_op_files() {
+  if (qso_file_op.file) qso_file_op.file.close();
+  if (qso_file_op.root) qso_file_op.root.close();
+  if (qso_file_op.src) qso_file_op.src.close();
+  if (qso_file_op.dst) qso_file_op.dst.close();
+}
+
+static void reset_qso_file_op_context() {
+  close_qso_file_op_files();
+  qso_file_op.state = QSO_FILE_OP_IDLE;
+  qso_file_op.requested_number = 0;
+  qso_file_op.scan_number = 0;
+  qso_file_op.latest_number = -1;
+  qso_file_op.saved_number = -1;
+  for (int i = 0; i < 6; ++i) qso_file_op.backup_numbers[i] = -1;
+  qso_file_op.backup_count = 0;
+  qso_file_op.backup_index = 0;
+  qso_file_op.directory_for_switch = false;
+  qso_file_op.directory_entries_seen = 0;
+  qso_file_op.last_progress_ms = 0;
+  qso_file_op.shown = 0;
+  qso_file_op.result_buf[0] = '\0';
+  qso_file_op.result_used = 0;
+  qso_file_op.record_index = 0;
+  qso_file_op.record_count = 0;
+  qso_file_op.have_first = false;
+  qso_file_op.have_last = false;
+  qso_file_op.current_log_saved = false;
+  qso_file_op.bulk_started = false;
+  qso_file_op.source_name[0] = '\0';
+  qso_file_op.saved_name[0] = '\0';
+  qso_file_op.candidate_name[0] = '\0';
+  qso_file_op.first_tm[0] = '\0';
+  qso_file_op.last_tm[0] = '\0';
+}
+
+static void finish_qso_file_op() {
+  reset_qso_file_op_context();
+}
+
+static void fail_qso_file_op(const char *message) {
+  close_qso_file_op_files();
+  if (qso_file_op.bulk_started) {
+    finish_makedupe_subcpu();
+    qso_file_op.bulk_started = false;
+  }
+
+  if (qso_file_op.current_log_saved) {
+    SD.remove(qsologfn);
+    SD.rename(qso_file_op.saved_name, qsologfn);
+    qso_file_op.current_log_saved = false;
+  }
+  open_qsolog();
+  char display_buf[96];
+  snprintf(display_buf, sizeof(display_buf), "QSO file error\n%.40s", message);
+  upd_display_info_flash(display_buf);
+  reset_qso_file_op_context();
+}
+
+
+static int qsobak_number_from_name(const char *name) {
+  if (name == NULL) return -1;
+  const char *base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  if (strncasecmp(base, "qsobak.", 7) != 0) return -1;
+  if (!isdigit((unsigned char)base[7]) ||
+      !isdigit((unsigned char)base[8]) ||
+      !isdigit((unsigned char)base[9]) || base[10] != '\0') return -1;
+  return (base[7] - '0') * 100 + (base[8] - '0') * 10 + (base[9] - '0');
+}
+
+static void remember_qsobak_number(int number) {
+  if (number < 0 || number > 999) return;
+  int pos = 0;
+  while (pos < qso_file_op.backup_count &&
+         qso_file_op.backup_numbers[pos] > number) pos++;
+  if (pos < qso_file_op.backup_count &&
+      qso_file_op.backup_numbers[pos] == number) return;
+  int limit = qso_file_op.backup_count < 6 ? qso_file_op.backup_count : 5;
+  for (int i = limit; i > pos; --i)
+    qso_file_op.backup_numbers[i] = qso_file_op.backup_numbers[i - 1];
+  if (pos < 6) {
+    qso_file_op.backup_numbers[pos] = number;
+    if (qso_file_op.backup_count < 6) qso_file_op.backup_count++;
+  }
+}
+
+static void show_qso_file_op_progress(bool force) {
+  uint32_t now = millis();
+  if (!force && (uint32_t)(now - qso_file_op.last_progress_ms) < 500) return;
+  qso_file_op.last_progress_ms = now;
+
+  char progress[96];
+  switch (qso_file_op.state) {
+    case QSO_FILE_OP_DIR_OPEN:
+      snprintf(progress, sizeof(progress),
+               "%s\nOpening SD directory",
+               qso_file_op.directory_for_switch ? "SWITCHLOG" : "LISTQSOFILE");
+      break;
+    case QSO_FILE_OP_DIR_NEXT:
+      snprintf(progress, sizeof(progress),
+               "%s\nDirectory scan: %u\nQSOBAK found: %d",
+               qso_file_op.directory_for_switch ? "SWITCHLOG" : "LISTQSOFILE",
+               qso_file_op.directory_entries_seen,
+               qso_file_op.directory_for_switch ?
+                 (qso_file_op.latest_number >= 0 ? 1 : 0) : qso_file_op.backup_count);
+      break;
+    case QSO_FILE_OP_LIST_PREPARE:
+    case QSO_FILE_OP_LIST_OPEN:
+      snprintf(progress, sizeof(progress),
+               "LISTQSOFILE\nOpening %03d\n%d/6 displayed",
+               qso_file_op.scan_number, qso_file_op.shown);
+      break;
+    case QSO_FILE_OP_LIST_SCAN_FIRST:
+      snprintf(progress, sizeof(progress),
+               "LISTQSOFILE %03d\nFirst QSO %u/%u\n%d/6 displayed",
+               qso_file_op.scan_number,
+               (unsigned int)qso_file_op.record_index,
+               (unsigned int)qso_file_op.record_count,
+               qso_file_op.shown);
+      break;
+    case QSO_FILE_OP_LIST_SCAN_LAST:
+      snprintf(progress, sizeof(progress),
+               "LISTQSOFILE %03d\nLast QSO %u/%u\n%d/6 displayed",
+               qso_file_op.scan_number,
+               (unsigned int)qso_file_op.record_index,
+               (unsigned int)qso_file_op.record_count,
+               qso_file_op.shown);
+      break;
+    case QSO_FILE_OP_SWITCH_VALIDATE:
+      snprintf(progress, sizeof(progress), "SWITCHLOG%03d\nChecking source",
+               qso_file_op.requested_number);
+      break;
+    case QSO_FILE_OP_SWITCH_CLOSE_CURRENT:
+    case QSO_FILE_OP_SWITCH_RENAME_CURRENT:
+      snprintf(progress, sizeof(progress), "SWITCHLOG%03d\nSaving current log",
+               qso_file_op.requested_number);
+      break;
+    case QSO_FILE_OP_SWITCH_OPEN_COPY:
+    case QSO_FILE_OP_SWITCH_COPY:
+      snprintf(progress, sizeof(progress), "SWITCHLOG%03d\nCopying QSO log",
+               qso_file_op.requested_number);
+      break;
+    case QSO_FILE_OP_SWITCH_PREPARE_REBUILD:
+    case QSO_FILE_OP_SWITCH_REBUILD:
+      snprintf(progress, sizeof(progress),
+               "SWITCHLOG%03d\nRebuild %u/%u",
+               qso_file_op.requested_number,
+               (unsigned int)qso_file_op.record_index,
+               (unsigned int)qso_file_op.record_count);
+      break;
+    case QSO_FILE_OP_SWITCH_FINISH:
+      snprintf(progress, sizeof(progress), "SWITCHLOG%03d\nFinishing",
+               qso_file_op.requested_number);
+      break;
+    default:
+      return;
+  }
+  upd_display_info_flash(progress);
+}
+
+static void append_qso_backup_line(int number) {
+  char line[32];
+  char first_date[9];
+  char first_hour[3];
+  char last_day[3];
+  char last_hour[3];
+
+  memcpy(first_date, qso_file_op.first_tm, 8);
+  first_date[8] = '\0';
+  memcpy(first_hour, qso_file_op.first_tm + 9, 2);
+  first_hour[2] = '\0';
+  memcpy(last_day, qso_file_op.last_tm + 6, 2);
+  last_day[2] = '\0';
+  memcpy(last_hour, qso_file_op.last_tm + 9, 2);
+  last_hour[2] = '\0';
+
+  snprintf(line, sizeof(line), "%03d %s %s-%s %s",
+           number, first_date, first_hour, last_day, last_hour);
+  int nw = snprintf(qso_file_op.result_buf + qso_file_op.result_used,
+                    sizeof(qso_file_op.result_buf) - qso_file_op.result_used,
+                    "%s%s", qso_file_op.shown ? "\n" : "", line);
+  if (nw > 0 &&
+      (size_t)nw < sizeof(qso_file_op.result_buf) - qso_file_op.result_used) {
+    qso_file_op.result_used += (size_t)nw;
+    qso_file_op.shown++;
+  }
+}
+
+void list_qso_backup_files() {
+  if (qso_file_op.state != QSO_FILE_OP_IDLE) {
+    char display_buf[64];
+    snprintf(display_buf, sizeof(display_buf), "QSO file operation\nin progress");
+    upd_display_info_flash(display_buf);
+    return;
+  }
+
+  reset_qso_file_op_context();
+  qso_file_op.state = QSO_FILE_OP_DIR_OPEN;
+  qso_file_op.directory_for_switch = false;
+  qso_file_op.result_buf[0] = '\0';
+  qso_file_op.result_used = 0;
+  show_qso_file_op_progress(true);
+}
+
+bool switch_qso_log(int backup_number) {
+  if (qso_file_op.state != QSO_FILE_OP_IDLE) {
+    char display_buf[64];
+    snprintf(display_buf, sizeof(display_buf), "QSO file operation\nin progress");
+    upd_display_info_flash(display_buf);
+    return false;
+  }
+  if (backup_number < 0 || backup_number > 999) return false;
+
+  reset_qso_file_op_context();
+  qso_file_op.requested_number = backup_number;
+  snprintf(qso_file_op.source_name, sizeof(qso_file_op.source_name),
+           "/qsobak.%03d", backup_number);
+  qso_file_op.state = QSO_FILE_OP_SWITCH_VALIDATE;
+  char display_buf[64];
+  snprintf(display_buf, sizeof(display_buf), "SWITCHLOG%03d\nChecking file", backup_number);
+  upd_display_info_flash(display_buf);
+  show_qso_file_op_progress(true);
+  return true;
+}
+
+void process_qso_file_operation() {
+  union qso_union_tag rec;
+
+  if (qso_file_op.state != QSO_FILE_OP_IDLE) show_qso_file_op_progress(false);
+
+  switch (qso_file_op.state) {
+    case QSO_FILE_OP_IDLE:
+      return;
+
+    case QSO_FILE_OP_DIR_OPEN:
+      qso_file_op.root = SD.open("/");
+      if (!qso_file_op.root || !qso_file_op.root.isDirectory()) {
+        fail_qso_file_op("Cannot open SD root");
+        return;
+      }
+      qso_file_op.state = QSO_FILE_OP_DIR_NEXT;
+      return;
+
+    case QSO_FILE_OP_DIR_NEXT: {
+      File entry = qso_file_op.root.openNextFile();
+      if (!entry) {
+        qso_file_op.root.close();
+        if (qso_file_op.directory_for_switch) {
+          qso_file_op.saved_number = qso_file_op.latest_number + 1;
+          if (qso_file_op.saved_number > 999) {
+            fail_qso_file_op("QSOBAK number full");
+            return;
+          }
+          snprintf(qso_file_op.saved_name, sizeof(qso_file_op.saved_name),
+                   "/qsobak.%03d", qso_file_op.saved_number);
+          qso_file_op.state = QSO_FILE_OP_SWITCH_CLOSE_CURRENT;
+        } else {
+          qso_file_op.backup_index = 0;
+          qso_file_op.state = QSO_FILE_OP_LIST_PREPARE;
+        }
+        return;
+      }
+      qso_file_op.directory_entries_seen++;
+      if (!entry.isDirectory() && entry.size() >= QSO_RECORD_SIZE) {
+        int number = qsobak_number_from_name(entry.name());
+        if (number >= 0) {
+          if (number > qso_file_op.latest_number)
+            qso_file_op.latest_number = number;
+          if (!qso_file_op.directory_for_switch)
+            remember_qsobak_number(number);
+        }
+      }
+      entry.close();
+      return;
+    }
+
+    case QSO_FILE_OP_LIST_PREPARE:
+      if (qso_file_op.backup_index >= qso_file_op.backup_count) {
+        if (qso_file_op.shown == 0)
+          snprintf(qso_file_op.result_buf, sizeof(qso_file_op.result_buf),
+                   "No QSO backup files");
+        upd_display_info_flash(qso_file_op.result_buf);
+        finish_qso_file_op();
+        return;
+      }
+      qso_file_op.scan_number =
+          qso_file_op.backup_numbers[qso_file_op.backup_index++];
+      snprintf(qso_file_op.candidate_name, sizeof(qso_file_op.candidate_name),
+               "/qsobak.%03d", qso_file_op.scan_number);
+      qso_file_op.state = QSO_FILE_OP_LIST_OPEN;
+      return;
+
+    case QSO_FILE_OP_LIST_OPEN:
+      qso_file_op.file = SD.open(qso_file_op.candidate_name, FILE_READ);
+      if (!qso_file_op.file || qso_file_op.file.size() < QSO_RECORD_SIZE) {
+        if (qso_file_op.file) qso_file_op.file.close();
+        qso_file_op.state = QSO_FILE_OP_LIST_PREPARE;
+        return;
+      }
+      qso_file_op.record_count = qso_file_op.file.size() / QSO_RECORD_SIZE;
+      qso_file_op.record_index = 0;
+      qso_file_op.have_first = false;
+      qso_file_op.have_last = false;
+      qso_file_op.state = QSO_FILE_OP_LIST_SCAN_FIRST;
+      return;
+
+    case QSO_FILE_OP_LIST_SCAN_FIRST:
+      if (qso_file_op.record_index >= qso_file_op.record_count) {
+        qso_file_op.file.close();
+        qso_file_op.state = QSO_FILE_OP_LIST_PREPARE;
+        return;
+      }
+      if (!qso_file_op.file.seek(qso_file_op.record_index * QSO_RECORD_SIZE) ||
+          qso_file_op.file.read(rec.all, QSO_RECORD_SIZE) != QSO_RECORD_SIZE) {
+        qso_file_op.file.close();
+        qso_file_op.state = QSO_FILE_OP_LIST_PREPARE;
+        return;
+      }
+      qso_file_op.record_index++;
+      if (rec.entry.type[0] == 'Q') {
+        snprintf(qso_file_op.first_tm, sizeof(qso_file_op.first_tm), "%.17s", rec.entry.tm);
+        qso_file_op.have_first = true;
+        qso_file_op.record_index = qso_file_op.record_count;
+        qso_file_op.state = QSO_FILE_OP_LIST_SCAN_LAST;
+      }
+      return;
+
+    case QSO_FILE_OP_LIST_SCAN_LAST:
+      if (qso_file_op.record_index == 0) {
+        qso_file_op.file.close();
+        qso_file_op.state = QSO_FILE_OP_LIST_PREPARE;
+        return;
+      }
+      qso_file_op.record_index--;
+      if (!qso_file_op.file.seek(qso_file_op.record_index * QSO_RECORD_SIZE) ||
+          qso_file_op.file.read(rec.all, QSO_RECORD_SIZE) != QSO_RECORD_SIZE) return;
+      if (rec.entry.type[0] == 'Q') {
+        snprintf(qso_file_op.last_tm, sizeof(qso_file_op.last_tm), "%.17s", rec.entry.tm);
+        qso_file_op.have_last = true;
+        qso_file_op.file.close();
+        if (qso_file_op.have_first) append_qso_backup_line(qso_file_op.scan_number);
+        qso_file_op.state = QSO_FILE_OP_LIST_PREPARE;
+      }
+      return;
+
+    case QSO_FILE_OP_SWITCH_VALIDATE:
+      qso_file_op.src = SD.open(qso_file_op.source_name, FILE_READ);
+      if (!qso_file_op.src || qso_file_op.src.size() == 0) {
+        if (qso_file_op.src) qso_file_op.src.close();
+        char display_buf[64];
+        snprintf(display_buf, sizeof(display_buf),
+                 "SWITCHLOG%03d\nFile not found/empty",
+                 qso_file_op.requested_number);
+        upd_display_info_flash(display_buf);
+        finish_qso_file_op();
+        return;
+      }
+      qso_file_op.src.close();
+      qso_file_op.latest_number = -1;
+      qso_file_op.directory_for_switch = true;
+      qso_file_op.state = QSO_FILE_OP_DIR_OPEN;
+      return;
+
+    case QSO_FILE_OP_SWITCH_CLOSE_CURRENT:
+      close_qsolog();
+      qso_file_op.state = QSO_FILE_OP_SWITCH_RENAME_CURRENT;
+      return;
+
+    case QSO_FILE_OP_SWITCH_RENAME_CURRENT:
+      if (SD.exists(qsologfn)) {
+        if (!SD.rename(qsologfn, qso_file_op.saved_name)) {
+          fail_qso_file_op("Cannot save QSO.TXT");
+          return;
+        }
+        qso_file_op.current_log_saved = true;
+      }
+      qso_file_op.state = QSO_FILE_OP_SWITCH_OPEN_COPY;
+      return;
+
+    case QSO_FILE_OP_SWITCH_OPEN_COPY:
+      qso_file_op.src = SD.open(qso_file_op.source_name, FILE_READ);
+      if (!qso_file_op.src) {
+        fail_qso_file_op("Cannot open source");
+        return;
+      }
+      SD.remove(qsologfn);
+      qso_file_op.dst = SD.open(qsologfn, FILE_WRITE);
+      if (!qso_file_op.dst) {
+        fail_qso_file_op("Cannot create QSO.TXT");
+        return;
+      }
+      qso_file_op.state = QSO_FILE_OP_SWITCH_COPY;
+      return;
+
+    case QSO_FILE_OP_SWITCH_COPY: {
+      uint8_t buf[256];
+      if (!qso_file_op.src.available()) {
+        qso_file_op.dst.flush();
+        qso_file_op.dst.close();
+        qso_file_op.src.close();
+        qso_file_op.state = QSO_FILE_OP_SWITCH_PREPARE_REBUILD;
+        return;
+      }
+      size_t nr = qso_file_op.src.read(buf, sizeof(buf));
+      if (nr == 0 || qso_file_op.dst.write(buf, nr) != nr) {
+        fail_qso_file_op("Copy error");
+      }
+      return;
+    }
+
+    case QSO_FILE_OP_SWITCH_PREPARE_REBUILD:
+      init_dupechk_maincpu();
+      reset_dupechk_subcpu();
+      init_score();
+      clear_multi_worked();
+      plogw->seqnr = 0;
+      memset(plogw->seqnr_band, 0, sizeof(plogw->seqnr_band));
+      if (dupechk->dupechk_at == 1) {
+        begin_makedupe_subcpu(plogw->mask);
+        qso_file_op.bulk_started = true;
+      }
+      qso_file_op.file = SD.open(qsologfn, FILE_READ);
+      if (!qso_file_op.file) {
+        fail_qso_file_op("Cannot rebuild log");
+        return;
+      }
+      qso_file_op.record_count = qso_file_op.file.size() / QSO_RECORD_SIZE;
+      qso_file_op.record_index = 0;
+      qso_file_op.state = QSO_FILE_OP_SWITCH_REBUILD;
+      return;
+
+    case QSO_FILE_OP_SWITCH_REBUILD:
+      if (qso_file_op.record_index >= qso_file_op.record_count) {
+        qso_file_op.file.close();
+        if (qso_file_op.bulk_started) {
+          finish_makedupe_subcpu();
+          qso_file_op.bulk_started = false;
+        }
+        qso_file_op.state = QSO_FILE_OP_SWITCH_FINISH;
+        return;
+      }
+      if (!qso_file_op.file.seek(qso_file_op.record_index * QSO_RECORD_SIZE) ||
+          qso_file_op.file.read(qso.all, QSO_RECORD_SIZE) != QSO_RECORD_SIZE) {
+        fail_qso_file_op("Read error rebuilding");
+        return;
+      }
+      qso_file_op.record_index++;
+      if (qso.entry.type[0] == 'Q') {
+        reformat_qso_entry(&qso);
+        makedupe_qso_entry();
+      }
+      return;
+
+    case QSO_FILE_OP_SWITCH_FINISH:
+      open_qsolog();
+      qso_file_op.current_log_saved = false;
+      char display_buf[96];
+      snprintf(display_buf, sizeof(display_buf),
+               "SWITCHLOG%03d\nCurrent -> %03d\nQSO.TXT opened",
+               qso_file_op.requested_number, qso_file_op.saved_number);
+      upd_display_info_flash(display_buf);
+      finish_qso_file_op();
+      return;
+
+    case QSO_FILE_OP_ERROR:
+    default:
+      fail_qso_file_op("Invalid state");
+      return;
+  }
+}
+
 void create_new_qso_log() {
   if (!plogw->f_console_emu) plogw->ostream->println("Creating new QSO logfile");
 

@@ -148,28 +148,33 @@ void display_printStr(char *s, byte ycol) {
   }
 }
 
-// store \n delimited string to s (may be dp->lcdbuf) and printed to left display
-void upd_display_info_flash(char *s) {
+// Display a newline-delimited string on the left display.
+// The input may point to a string literal, so it must not be modified.
+void upd_display_info_flash(const char *s) {
   select_left_display();
   u8g2_l->clearBuffer();  // clear the internal memory
   if (plogw->f_console_emu) {
     clear_display_emu(1);
   }
-  char *p;
-  int count;
-  count = 0;
-  p = strtok(s, "\n");
-  if (p != NULL) {
-    display_printStr(p, 10 + count);
+
+  int count = 0;
+  const char *p = s;
+  while (p != NULL && *p != '\0' && count < 6) {
+    const char *eol = strchr(p, '\n');
+    size_t len = eol != NULL ? (size_t)(eol - p) : strlen(p);
+
+    char line[96];
+    if (len >= sizeof(line)) len = sizeof(line) - 1;
+    memcpy(line, p, len);
+    line[len] = '\0';
+
+    display_printStr(line, 10 + count);
     count++;
+
+    if (eol == NULL) break;
+    p = eol + 1;
   }
-  while (p != NULL) {
-    p = strtok(NULL, "\n");
-    if (p != NULL) {
-      display_printStr(p, 10 + count);
-      count++;
-    }
-  }
+
   info_disp.show_info = INFO_DISP_FLASH;
   u8g2_l->sendBuffer();  // transfer internal memory to the display
   // set timer
@@ -891,6 +896,68 @@ void upd_display_info_signal()
 }
 
 
+static int count_unworked_bandmap_entries(int band_index) {
+  if (band_index < 0 || band_index >= N_BAND) return 0;
+
+  int n_to_work = 0;
+  for (int i = 0; i < bandmap[band_index].nentry; i++) {
+    struct bandmap_entry *p = bandmap[band_index].entry + i;
+    if (*p->station == '\0') continue;
+    if (p->flag & BANDMAP_ENTRY_FLAG_WORKED) continue;
+    n_to_work++;
+  }
+  return n_to_work;
+}
+
+void upd_display_info_contest_band_nearby(struct radio *radio) {
+  select_left_display();
+  u8g2_l->clearBuffer();
+  if (plogw->f_console_emu) clear_display_emu(1);
+
+  // Keep the two contest-summary lines from the legacy Ctrl-X display.
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "%s D:%s",
+           plogw->contest_name + 2,
+           plogw->mask == 0xff ? "OK C/P" : "NG C/P");
+  display_printStr(dp->lcdbuf, 10);
+
+  int total_qso = 0;
+  int total_multi = 0;
+  for (int band = 0; band < N_BAND; band++) {
+    total_qso += score.worked[0][band] + score.worked[1][band];
+    total_multi += score.nmulti[band];
+  }
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "QSO:%d MUL:%d",
+           total_qso, total_multi);
+  display_printStr(dp->lcdbuf, 11);
+
+  // Show one band before through two bands after the current operating band.
+  // Shift the four-row window at either end of the band table.
+  int current_band = radio != NULL ? radio->bandid - 1 : 0;
+  if (current_band < 0) current_band = 0;
+  if (current_band >= N_BAND) current_band = N_BAND - 1;
+
+  int first_band = max(0, current_band - 1);
+  if (first_band + 4 > N_BAND) first_band = max(0, N_BAND - 4);
+
+  for (int row = 0; row < 4; row++) {
+    int band = first_band + row;
+    if (band >= N_BAND) break;
+
+    int nq = score.worked[0][band] + score.worked[1][band];
+    int nm = score.nmulti[band];
+    int nw = count_unworked_bandmap_entries(band);
+
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "%c%s %3dQ>%2d %2dM",
+             band == current_band ? '>' : ' ', bandid_str[band], nq, nw, nm);
+    display_printStr(dp->lcdbuf, 12 + row);
+  }
+
+  u8g2_l->sendBuffer();
+  info_disp.show_info = INFO_DISP_CONTEST_SETTINGS;
+  info_disp.timer = 5000;
+}
+
+
 
 void upd_display_info_contest_settings(struct radio *radio) {
 
@@ -998,6 +1065,215 @@ void upd_display_info_contest_settings(struct radio *radio) {
   info_disp.timer = 5000;
 }
 
+
+static void begin_multi_info_display() {
+  select_left_display();
+  u8g2_l->clearBuffer();
+  if (plogw->f_console_emu) clear_display_emu(1);
+}
+
+static void finish_multi_info_display() {
+  u8g2_l->sendBuffer();
+  info_disp.show_info = INFO_DISP_CONTEST_SETTINGS;
+  info_disp.timer = 5000;
+}
+
+static int find_multi_index_on_band(int band_index, const char *mul) {
+  if (band_index < 0 || band_index >= N_BAND || mul == NULL || *mul == '\0') return -1;
+  if (multi_list.multi[band_index] == NULL) return -1;
+
+  for (int i = 0; i < multi_list.n_multi[band_index]; i++) {
+    if (strcmp(multi_list.multi[band_index]->mul[i], mul) == 0) return i;
+  }
+  return -1;
+}
+
+static void utf8_remove_last_codepoint(char *s) {
+  size_t len = strlen(s);
+  if (len == 0) return;
+  size_t p = len - 1;
+  while (p > 0 && (((unsigned char)s[p] & 0xC0) == 0x80)) --p;
+  s[p] = '\0';
+}
+
+static void utf8_truncate_to_pixel_width(char *s, int max_width) {
+  if (max_width < 0) max_width = 0;
+  while (*s != '\0' && u8g2_l->getUTF8Width(s) > max_width) {
+    utf8_remove_last_codepoint(s);
+  }
+}
+
+static void print_wrapped_multi_item(int *row, int *column, const char *item) {
+  const int display_columns = 21;
+  int len = strlen(item);
+
+  if (*column > 0 && *column + len > display_columns) {
+    display_printStr(dp->lcdbuf, 10 + *row);
+    (*row)++;
+    *column = 0;
+    *dp->lcdbuf = '\0';
+  }
+  if (*row >= 6) return;
+
+  // A single unusually long multiplier is clipped rather than overflowing lcdbuf.
+  int available = display_columns - *column;
+  strncat(dp->lcdbuf, item, available);
+  *column += min(len, available);
+}
+
+void upd_display_info_multi_nearby(struct radio *radio) {
+  begin_multi_info_display();
+
+  int band_index = radio->bandid - 1;
+  if (band_index < 0 || band_index >= N_BAND || multi_list.multi[band_index] == NULL) {
+    display_printStr("mult:No CHECK", 10);
+    finish_multi_info_display();
+    return;
+  }
+
+  int selected = radio->multi;
+  if (selected < 0 || selected >= multi_list.n_multi[band_index]) {
+    display_printStr("mult:Not valid", 10);
+    finish_multi_info_display();
+    return;
+  }
+
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "mult: %s %s",
+           multi_list.multi[band_index]->mul[selected],
+           multi_list.multi[band_index]->name[selected]);
+  utf8_truncate_to_pixel_width(dp->lcdbuf, dp->wcol);
+  display_printStr(dp->lcdbuf, 10);
+
+  // Start a few entries before the selected multiplier.  The selected entry
+  // is therefore normally visible near the beginning rather than at an edge.
+  int start = max(0, selected - 3);
+  int row = 1;
+  int column = 0;
+  *dp->lcdbuf = '\0';
+
+  for (int i = start; i < multi_list.n_multi[band_index] && row < 6; i++) {
+    char item[20];
+    snprintf(item, sizeof(item), "%c%s ",
+             multi_list.multi_worked[band_index][i] ? '*' : ' ',
+             multi_list.multi[band_index]->mul[i]);
+    print_wrapped_multi_item(&row, &column, item);
+  }
+  if (row < 6 && column > 0) display_printStr(dp->lcdbuf, 10 + row);
+
+  finish_multi_info_display();
+}
+
+void upd_display_info_multi_bands(struct radio *radio) {
+  begin_multi_info_display();
+
+  int current_band = radio->bandid - 1;
+  if (current_band < 0 || current_band >= N_BAND ||
+      multi_list.multi[current_band] == NULL ||
+      radio->multi < 0 || radio->multi >= multi_list.n_multi[current_band]) {
+    display_printStr("mult:Not valid", 10);
+    finish_multi_info_display();
+    return;
+  }
+
+  int selected = radio->multi;
+  const char *selected_mul = multi_list.multi[current_band]->mul[selected];
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "mult: %s %s", selected_mul,
+           multi_list.multi[current_band]->name[selected]);
+  utf8_truncate_to_pixel_width(dp->lcdbuf, dp->wcol);
+  display_printStr(dp->lcdbuf, 10);
+
+  // One-character band labels, from 1.8 through 1200 MHz.
+  // Keep the header and the worked-status columns right-aligned.
+  const char *band_header = "137ABC524G";
+  int header_width = u8g2_l->getUTF8Width(band_header);
+  int header_x = max(0, dp->wcol - header_width);
+
+  display_printStr("", 11);  // clear the second line first
+  u8g2_l->drawUTF8(header_x, dp->hcol[1], band_header);
+
+  // Underline the current operating band using the same hline convention
+  // used elsewhere in DVPlogger.  Measure the actual font width so that the
+  // line remains aligned even if the display font changes.
+  if (current_band >= 0 && current_band < 10) {
+    char prefix[11];
+    char current_char[2];
+    memcpy(prefix, band_header, current_band);
+    prefix[current_band] = '\0';
+    current_char[0] = band_header[current_band];
+    current_char[1] = '\0';
+    int underline_x = header_x + u8g2_l->getUTF8Width(prefix);
+    int underline_width = u8g2_l->getUTF8Width(current_char);
+    int underline_y = 2 * dp->hcol[1] - 1;
+    u8g2_l->drawHLine(underline_x, underline_y, underline_width);
+  }
+
+  if (plogw->f_console_emu) {
+    char emu_line[32];
+    int pad = max(0, 21 - 10);
+    snprintf(emu_line, sizeof(emu_line), "%*s%s", pad, "", band_header);
+    char esc[48];
+    snprintf(esc, sizeof(esc), "\033[2;1H%-21s", emu_line);
+    plogw->ostream->print(esc);
+    if (current_band < 10) {
+      snprintf(esc, sizeof(esc), "\033[2;%dH\033[4m%c\033[0m",
+               pad + current_band + 1, band_header[current_band]);
+      plogw->ostream->print(esc);
+    }
+  }
+
+  // Show four neighbouring multipliers. Normally this is one before the
+  // selected multiplier, the selected one, and two after it. Shift the
+  // window at either end so that four entries are shown whenever possible.
+  int n_multi = multi_list.n_multi[current_band];
+  int first = max(0, selected - 1);
+  if (first + 4 > n_multi) first = max(0, n_multi - 4);
+
+  for (int row = 0; row < 4 && first + row < n_multi; row++) {
+    int multi_index = first + row;
+    const char *mul = multi_list.multi[current_band]->mul[multi_index];
+    char status[11];
+
+    for (int band = 0; band < 10; band++) {
+      int idx = find_multi_index_on_band(band, mul);
+      if (multi_list.multi[band] == NULL || idx < 0) {
+        status[band] = '-';
+      } else if (multi_list.multi_worked[band][idx]) {
+        status[band] = '*';
+      } else {
+        status[band] = '_';
+      }
+    }
+    status[10] = '\0';
+
+    // Put the multiplier and as much of its name as will fit at the left.
+    // The right-aligned ten-band status always starts at header_x.
+    const char *multi_name = multi_list.multi[current_band]->name[multi_index];
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "%c%s %s",
+             multi_index == selected ? '>' : ' ', mul, multi_name);
+
+    // Trim the left field until it fits before the status columns.  This uses
+    // the actual font width rather than assuming a fixed number of characters.
+    int left_max_width = max(0, header_x - 2);
+    while (*dp->lcdbuf != '\0' && u8g2_l->getUTF8Width(dp->lcdbuf) > left_max_width) {
+      dp->lcdbuf[strlen(dp->lcdbuf) - 1] = '\0';
+    }
+    display_printStr(dp->lcdbuf, 12 + row);
+    u8g2_l->drawUTF8(header_x, (2 + row) * dp->hcol[1], status);
+
+    if (plogw->f_console_emu) {
+      char emu_line[40];
+      int left_len = min((int)strlen(dp->lcdbuf), 10);
+      int spaces = max(1, 21 - left_len - 10);
+      snprintf(emu_line, sizeof(emu_line), "%.10s%*s%.10s",
+               dp->lcdbuf, spaces, "", status);
+      char esc[64];
+      snprintf(esc, sizeof(esc), "\033[%d;1H%-21s", 3 + row, emu_line);
+      plogw->ostream->print(esc);
+    }
+  }
+
+  finish_multi_info_display();
+}
 
 
 void show_summary() {

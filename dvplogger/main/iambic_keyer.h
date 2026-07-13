@@ -22,7 +22,7 @@
 #ifndef FILE_IAMBIC_KEYER_H
 #define FILE_IAMBIC_KEYER_H
 
-#define QUEUE_PADDLE_LEN 50
+#define QUEUE_PADDLE_LEN 1
 struct paddle_queue {
   int paddle;
   int voltage;

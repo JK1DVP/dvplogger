@@ -596,6 +596,25 @@ void cmd_interp(char *cmd) {
         read_qso_log(READQSO_PRINT);
         break;
       }
+      if (strcasecmp(cmd, "listqsofile") == 0) {
+        list_qso_backup_files();
+        break;
+      }
+      if (strncasecmp(cmd, "switchlog", 9) == 0) {
+        const char *arg = cmd + 9;
+        while (*arg == ' ') arg++;
+        char *endp = NULL;
+        long n = strtol(arg, &endp, 10);
+        if (arg == endp || *endp != '\0' || n < 0 || n > 999) {
+          plogw->ostream->println("Usage: SWITCHLOGnnn");
+          snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                   "Usage:\nSWITCHLOGnnn");
+          upd_display_info_flash(dp->lcdbuf);
+        } else {
+          switch_qso_log((int)n);
+        }
+        break;
+      }
       if (strncmp("mailqso", cmd, 7) == 0) {
         plogw->ostream->println("mailsqso command");
 	//        mail_qso_log();

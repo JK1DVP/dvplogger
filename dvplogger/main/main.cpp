@@ -36,6 +36,7 @@
 // implemented above but cq/sp switch doesnot recall old frequency (may be saved overwriting)
 
 #include "Arduino.h"
+#include "user_contest_md.h"
 #include "decl.h"
 #include "hardware.h"
 #include "variables.h"
@@ -484,11 +485,17 @@ void loop() {
     cardkey_process();
   }
   
-  // check iambic_keyer
-  if (verbose & 2048) {
-    while (uxQueueMessagesWaiting(xQueuePaddle)){
-      xQueueReceive(xQueuePaddle, &paddle_queue_recv, 0);
-      printf("Paddle %d %d\n",paddle_queue_recv.paddle, paddle_queue_recv.voltage);
+  // Check the latest iambic-keyer diagnostic sample at a modest rate.
+  // Paddle processing itself remains in iambic_keyer_handler().
+  if ((verbose & 2048) && xQueuePaddle != NULL) {
+    static uint32_t next_paddle_report_ms = 0;
+    uint32_t now_ms = millis();
+    if ((int32_t)(now_ms - next_paddle_report_ms) >= 0) {
+      next_paddle_report_ms = now_ms + 20;
+      if (xQueueReceive(xQueuePaddle, &paddle_queue_recv, 0) == pdTRUE) {
+        printf("Paddle %d %d\n", paddle_queue_recv.paddle,
+               paddle_queue_recv.voltage);
+      }
     }
   }
   //  btserial_process();
@@ -496,6 +503,10 @@ void loop() {
   
   Prs.process_keyrpt_queue(); // process keyboard input
   Prs1.process_keyrpt_queue(); // process keyboard input from external
+
+  process_qso_file_operation(); // advance one SD-backed QSO file operation step
+
+  process_user_md_contest();
 
   Control_TX_process();  
   time_measure_start(1);    timekeep();  time_measure_stop(1);  
