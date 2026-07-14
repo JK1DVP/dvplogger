@@ -1,4 +1,5 @@
 # 除外: Arduino-ESP31本体
+.gitignore
 dvplogger/components/arduino/*
 dvplogger/arduino-esp32/*
 
@@ -14,3 +15,7 @@ dvplogger/arduino-esp32/tools/xtensa-esp32-elf/*
 # 念のため不要なビルド生成物も
 dvplogger/build/
 dvplogger_ext/build/
+build-ext-hw3/
+build-main-hw3/
+build-ext-hw1/
+build-main-hw1/

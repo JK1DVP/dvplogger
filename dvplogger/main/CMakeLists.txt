@@ -59,4 +59,10 @@ INCLUDE_DIRS ""
 INCLUDE_DIRS "../components/esp-serial-flasher/examples/common/"
 )
 # USE_SD 定義を追加
-target_compile_definitions(${COMPONENT_LIB} PRIVATE USE_SD)
+#target_compile_definitions(${COMPONENT_LIB} PRIVATE USE_SD)
+target_compile_definitions(
+    ${COMPONENT_LIB}
+    PRIVATE
+        USE_SD
+        JK1DVPLOG_HWVER=${JK1DVPLOG_HWVER}
+)

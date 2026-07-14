@@ -4,7 +4,19 @@ cmake_minimum_required(VERSION 3.5)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
-project(dvplogger_ext)
+if(NOT DEFINED JK1DVPLOG_HWVER)
+    message(FATAL_ERROR
+        "Specify -DJK1DVPLOG_HWVER=1 or 3")
+endif()
+
+if(NOT JK1DVPLOG_HWVER STREQUAL "1"
+   AND NOT JK1DVPLOG_HWVER STREQUAL "3")
+    message(FATAL_ERROR
+        "JK1DVPLOG_HWVER must be 1 or 3")
+endif()
+
+project(jk1dvplog_ext)
+
 
 # SPIFFSイメージの自動作成（spiffsgenを呼び出す）
 add_custom_command(
@@ -17,18 +29,18 @@ add_custom_command(
 
 add_custom_target(spiffs_image ALL DEPENDS ${CMAKE_BINARY_DIR}/spiffs.bin)
 
-add_custom_command(
-    POST_BUILD
-    OUTPUT ${CMAKE_BINARY_DIR}/binaries.c
-    COMMAND ${CMAKE_COMMAND}
-        -DINPUT_DIR=${CMAKE_BINARY_DIR}
-        -DOUTPUT_FILE=${CMAKE_BINARY_DIR}/binaries.c
-        -P ${CMAKE_CURRENT_LIST_DIR}/main/bin2array_runner.cmake
-    DEPENDS ${CMAKE_BINARY_DIR}/dvplogger_ext.elf
-    COMMENT "Converting bin to C array !"
-)
+#add_custom_command(
+#    POST_BUILD
+#    OUTPUT ${CMAKE_BINARY_DIR}/binaries.c
+#    COMMAND ${CMAKE_COMMAND}
+#        -DINPUT_DIR=${CMAKE_BINARY_DIR}
+#        -DOUTPUT_FILE=${CMAKE_BINARY_DIR}/binaries.c
+#        -P ${CMAKE_CURRENT_LIST_DIR}/main/bin2array_runner.cmake
+#    DEPENDS ${CMAKE_BINARY_DIR}/jk1dvplog_ext.elf
+#    COMMENT "Converting bin to C array !"
+#)
 
-add_custom_target(generate_resources ALL
-    DEPENDS ${CMAKE_BINARY_DIR}/binaries.c
-)
+#add_custom_target(generate_resources ALL
+#    DEPENDS ${CMAKE_BINARY_DIR}/binaries.c
+#)
 

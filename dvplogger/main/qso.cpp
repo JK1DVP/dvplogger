@@ -46,10 +46,269 @@
 #include "zserver.h"
 #include "misc.h"
 #include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
 #include "so2r.h"
 
 
 File qsologf;            // qso logf
+
+bool qso_log_is_open()
+{
+  return (bool)qsologf;
+}
+
+bool open_qso_log_readonly(File *f)
+{
+  if (f == NULL) return false;
+  if (*f) f->close();
+  *f = SD.open(qsologfn, FILE_READ);
+  return (bool)(*f);
+}
+
+void close_qso_log_readonly(File *f)
+{
+  if (f != NULL && *f) f->close();
+}
+
+int read_qso_log_record(File *f, union qso_union_tag *record)
+{
+  if (f == NULL || record == NULL || !(*f)) return -1;
+  return f->read(record->all, sizeof(record->all));
+}
+
+size_t append_qso_log_record(const union qso_union_tag *record,
+                             size_t *size_before, size_t *size_after)
+{
+  if (size_before) *size_before = 0;
+  if (size_after) *size_after = 0;
+  if (record == NULL || !qsologf) return 0;
+
+  const size_t before = qsologf.size();
+  const size_t written = qsologf.write(record->all, sizeof(record->all));
+  qsologf.flush();
+  const size_t after = qsologf.size();
+
+  if (size_before) *size_before = before;
+  if (size_after) *size_after = after;
+  return written;
+}
+
+
+struct qso_repair_meta {
+  uint32_t hash;
+  uint32_t qsoid;
+  uint32_t leader;
+  uint32_t group_count;
+  uint32_t server_count;
+  uint8_t qsoid_valid;
+  uint8_t server_match;
+  uint8_t keep;
+  uint8_t reserved;
+};
+
+static void qso_repair_fixed_to_cstr(char *dst, size_t dst_size,
+                                     const char *src, size_t src_size)
+{
+  size_t n = src_size;
+  while (n > 0 && (src[n - 1] == ' ' || src[n - 1] == '\r' ||
+                   src[n - 1] == '\n' || src[n - 1] == '\0')) n--;
+  if (n >= dst_size) n = dst_size - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+static bool qso_repair_get_qsoid(const union qso_union_tag *rec, uint32_t *id)
+{
+  char seqbuf[sizeof(rec->entry.seqnr) + 1];
+  char remarks[sizeof(rec->entry.remarks) + 1];
+  char run[3] = {0};
+  unsigned int tx = 0, rnd = 0;
+
+  qso_repair_fixed_to_cstr(seqbuf, sizeof(seqbuf), rec->entry.seqnr,
+                           sizeof(rec->entry.seqnr));
+  qso_repair_fixed_to_cstr(remarks, sizeof(remarks), rec->entry.remarks,
+                           sizeof(rec->entry.remarks));
+  unsigned long seq = strtoul(seqbuf, NULL, 10);
+  if (seq == 0) return false;
+  if (sscanf(remarks, "%2s %1u%2u", run, &tx, &rnd) != 3) return false;
+  if ((strcmp(run, "CQ") != 0 && strcmp(run, "SP") != 0) || tx > 9 || rnd > 99)
+    return false;
+  *id = (uint32_t)(tx * 100000000UL + seq * 10000UL + rnd * 100UL);
+  return true;
+}
+
+static bool qso_repair_server_has(const uint32_t *ids, size_t count, uint32_t id)
+{
+  size_t lo = 0, hi = count;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (ids[mid] == id) return true;
+    if (ids[mid] < id) lo = mid + 1; else hi = mid;
+  }
+  return false;
+}
+
+static void qso_repair_normalize(union qso_union_tag *dst,
+                                 const union qso_union_tag *src)
+{
+  memcpy(dst->all, src->all, sizeof(dst->all));
+  memset(dst->entry.seqnr, 0, sizeof(dst->entry.seqnr));
+
+  char remarks[sizeof(src->entry.remarks) + 1];
+  qso_repair_fixed_to_cstr(remarks, sizeof(remarks), src->entry.remarks,
+                           sizeof(src->entry.remarks));
+  const char *body = remarks;
+  char run[3] = {0};
+  unsigned int tx = 0, rnd = 0;
+  int used = 0;
+  if (sscanf(remarks, "%2s %1u%2u %n", run, &tx, &rnd, &used) >= 3 &&
+      (strcmp(run, "CQ") == 0 || strcmp(run, "SP") == 0) &&
+      tx <= 9 && rnd <= 99) {
+    body = remarks + used;
+  }
+  memset(dst->entry.remarks, 0, sizeof(dst->entry.remarks));
+  strlcpy(dst->entry.remarks, body, sizeof(dst->entry.remarks));
+}
+
+static uint32_t qso_repair_hash(const union qso_union_tag *rec)
+{
+  union qso_union_tag normalized;
+  qso_repair_normalize(&normalized, rec);
+  uint32_t h = 2166136261UL;
+  for (size_t i = 0; i < sizeof(normalized.all); i++) {
+    h ^= normalized.all[i];
+    h *= 16777619UL;
+  }
+  return h;
+}
+
+static bool qso_repair_same(const union qso_union_tag *a,
+                            const union qso_union_tag *b)
+{
+  union qso_union_tag na, nb;
+  qso_repair_normalize(&na, a);
+  qso_repair_normalize(&nb, b);
+  return memcmp(na.all, nb.all, sizeof(na.all)) == 0;
+}
+
+bool repair_qso_log(const uint32_t *server_ids, size_t server_count,
+                    struct qso_repair_stats *stats)
+{
+  if (stats) memset(stats, 0, sizeof(*stats));
+  if (!server_ids && server_count != 0) return false;
+
+  File src = SD.open(qsologfn, FILE_READ);
+  if (!src) return false;
+  const size_t record_size = QSO_RECORD_SIZE;
+  const size_t count = src.size() / record_size;
+  if (stats) stats->total_records = count;
+
+  struct qso_repair_meta *meta = NULL;
+  if (count != 0) {
+    meta = (struct qso_repair_meta *)heap_caps_calloc(
+        count, sizeof(*meta), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!meta) meta = (struct qso_repair_meta *)calloc(count, sizeof(*meta));
+    if (!meta) { src.close(); return false; }
+  }
+
+  union qso_union_tag rec, prev;
+  bool ok = true;
+  for (size_t i = 0; i < count && ok; i++) {
+    if (!src.seek(i * record_size) || src.read(rec.all, record_size) != (int)record_size) {
+      ok = false;
+      break;
+    }
+    meta[i].hash = qso_repair_hash(&rec);
+    meta[i].leader = i;
+    meta[i].group_count = 1;
+    meta[i].keep = 1;
+    meta[i].qsoid_valid = qso_repair_get_qsoid(&rec, &meta[i].qsoid);
+    meta[i].server_match = meta[i].qsoid_valid &&
+        qso_repair_server_has(server_ids, server_count, meta[i].qsoid);
+    meta[i].server_count = meta[i].server_match ? 1 : 0;
+
+    if (rec.entry.type[0] == 'Q') {
+      for (size_t j = 0; j < i; j++) {
+        if (meta[j].leader != j || meta[j].hash != meta[i].hash) continue;
+        if (!src.seek(j * record_size) ||
+            src.read(prev.all, record_size) != (int)record_size) {
+          ok = false;
+          break;
+        }
+        if (qso_repair_same(&rec, &prev)) {
+          meta[i].leader = j;
+          meta[j].group_count++;
+          if (meta[i].server_match) meta[j].server_count++;
+          break;
+        }
+      }
+    }
+    if ((i & 15U) == 15U) delay(1);
+  }
+
+  if (ok) {
+    for (size_t i = 0; i < count; i++) {
+      if (meta[i].leader != i || meta[i].group_count <= 1) continue;
+      if (stats) stats->duplicate_groups++;
+      bool kept_server = false;
+      for (size_t j = i; j < count; j++) {
+        if (meta[j].leader != i && j != i) continue;
+        if (meta[i].server_count != 0) {
+          meta[j].keep = meta[j].server_match && !kept_server;
+          if (meta[j].keep) kept_server = true;
+        } else {
+          // Repeated records whose reconstructed IDs are all absent from the
+          // server are removed as a group. A following normal zmerge restores
+          // one authoritative record with the correct ID.
+          meta[j].keep = 0;
+        }
+      }
+      if (meta[i].server_count == 0 && stats) stats->groups_restored_by_zmerge++;
+    }
+  }
+
+  // FAT short-name compatible repair files (8.3 format).
+  const char *tmpname = "/QSOTMP.TXT";
+  const char *bakname = "/QSOBAK.TXT";
+  SD.remove(tmpname);
+  File dst;
+  if (ok) {
+    dst = SD.open(tmpname, FILE_WRITE);
+    if (!dst) ok = false;
+  }
+  if (ok) {
+    for (size_t i = 0; i < count; i++) {
+      if (!src.seek(i * record_size) ||
+          src.read(rec.all, record_size) != (int)record_size) { ok = false; break; }
+      if (meta[i].keep) {
+        if (dst.write(rec.all, record_size) != record_size) { ok = false; break; }
+        if (stats) stats->kept_records++;
+      } else if (stats) {
+        stats->removed_records++;
+      }
+      if ((i & 15U) == 15U) delay(1);
+    }
+  }
+  if (dst) { dst.flush(); dst.close(); }
+  src.close();
+  if (meta) free(meta);
+  if (!ok) { SD.remove(tmpname); return false; }
+
+  close_qsolog();
+  SD.remove(bakname);
+  if (!SD.rename(qsologfn, bakname)) {
+    SD.remove(tmpname);
+    open_qsolog();
+    return false;
+  }
+  if (!SD.rename(tmpname, qsologfn)) {
+    SD.rename(bakname, qsologfn);
+    open_qsolog();
+    return false;
+  }
+  open_qsolog();
+  return (bool)qsologf;
+}
 
 void init_qsofiles() {
   strcpy(qsologfn, "/qso.txt");

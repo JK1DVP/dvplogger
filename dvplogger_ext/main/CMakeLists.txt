@@ -5,4 +5,10 @@ INCLUDE_DIRS ""
 
 
 # Build shared sources for the extension/sub CPU.
-target_compile_definitions(${COMPONENT_LIB} PRIVATE DVPLOGGER_EXT)
+#target_compile_definitions(${COMPONENT_LIB} PRIVATE DVPLOGGER_EXT)
+target_compile_definitions(
+    ${COMPONENT_LIB}
+    PRIVATE
+        DVPLOGGER_EXT
+        JK1DVPLOG_HWVER=${JK1DVPLOG_HWVER}
+)

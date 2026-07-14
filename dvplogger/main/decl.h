@@ -28,11 +28,22 @@
 // HWVER=1 ver 2024
 // HWVER=2 ver 2024 mod for PSRAM, KEY1 moved to main IO2, subcpu update possible
 // HWVER=3 CAT RX/TX swapped on the board 
-//#define JK1DVPLOG_HWVER 1
-#define JK1DVPLOG_HWVER 3
+//#define JK1DVPLOG_HWVER 1 // 1: version 2024 and version mini Hamfair 2025 ?
+//#define JK1DVPLOG_HWVER 3 //   3: version Wide Hamfair 2025
 //#define JK1DVPLOG_HWVER 2
+
+#ifndef JK1DVPLOG_HWVER
+#error "JK1DVPLOG_HWVER must be defined as 1 or 3"
+#endif
+
+#if JK1DVPLOG_HWVER != 1 && JK1DVPLOG_HWVER != 3
+#error "JK1DVPLOG_HWVER must be 1 or 3"
+#endif
+
 //#define JK1DVPLOG_VERSION_STRING "ver 25/8/19"
-#define JK1DVPLOG_VERSION_STRING "ver 25/12/19"
+//#define JK1DVPLOG_VERSION_STRING "ver 25/12/19"
+
+#define JK1DVPLOG_VERSION_STRING "ver 26/7/14"
 
 #if JK1DVPLOG_HWVER >= 2
 #define PSRAM_EXISTS

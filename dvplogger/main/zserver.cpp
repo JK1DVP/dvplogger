@@ -32,6 +32,10 @@
 #include "network.h"
 #include "AsyncTCP.h"
 #include "so2r.h"
+#include "qso.h"
+#include "cw_keying.h"
+#include "timekeep.h"
+#include "esp_heap_caps.h"
 
 
 char zserver_server[40] = "192.168.1.2";
@@ -60,7 +64,600 @@ const char *zserver_client_commands[]={ "FREQ","QSOIDS","ENDQSOIDS","PROMPTUPDAT
 			"INSQSO","PUTLOGEX","PUTLOG","RENEW","SENDLOG" };
 
 
-const char *zserver_server_commands[]={"GETQSOIDS","SENDCLUSTER","SENDPACKET","SENDSCRATCH",
+
+
+#define ZMERGE_LINE_QUEUE 16
+#define ZMERGE_LINE_SIZE 1024
+#define ZMERGE_SEND_INTERVAL_MS 25
+#define ZMERGE_REPLY_TIMEOUT_MS 15000
+
+struct zmerge_context {
+  uint8_t phase; // 0 idle, 1 wait lock, 2 receive IDs, 3 scan/upload, 4 fetch server-only
+  bool locked;
+  bool abort_requested;
+  bool dry_run;
+  bool repair_mode;
+  uint32_t deadline;
+  uint32_t next_send;
+  uint32_t *server_ids;
+  uint8_t *server_seen;
+  size_t server_count;
+  size_t server_capacity;
+  unsigned long total_records;
+  unsigned long sent_records;
+  unsigned long common_records;
+  unsigned long local_only_records;
+  unsigned long skipped_no_qsoid;
+  unsigned long skipped_deleted;
+  unsigned long received_records;
+  size_t fetch_index;
+  uint32_t requested_qsoid;
+  union qso_union_tag pending_record;
+  bool pending_valid;
+  struct qso_repair_stats repair_stats;
+};
+
+static struct zmerge_context zmerge;
+static char zmerge_lines[ZMERGE_LINE_QUEUE][ZMERGE_LINE_SIZE];
+static volatile uint8_t zmerge_line_rptr = 0;
+static volatile uint8_t zmerge_line_wptr = 0;
+static volatile bool zmerge_line_overflow = false;
+
+// zserver_process() runs in a task with limited stack.  Keep the large
+// merge work buffers out of the task stack.
+static char zmerge_rx_line[NCHR_ZSERVER_CMD + 1];
+static union qso_union_tag zmerge_record;
+static char zmerge_tx_line[NCHR_ZSERVER_CMD + 1];
+// Local QSO scan uses a temporary read-only handle so the persistent
+// append handle (qsologf) and its file position are never disturbed.
+static File zmerge_scanf;
+
+static void zmerge_reset(bool restore_log_pos);
+static void zmerge_finish(bool success, const char *reason);
+static void zmerge_process_line(const char *line);
+static bool zmerge_build_putlog(const union qso_union_tag *rec, uint32_t qsoid,
+                                char *buf, size_t buf_size);
+static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
+                                  uint32_t expected_qsoid);
+static bool zmerge_append_pending_record();
+
+static void zmerge_queue_line(const char *line)
+{
+  uint8_t next = (uint8_t)((zmerge_line_wptr + 1) % ZMERGE_LINE_QUEUE);
+  if (next == zmerge_line_rptr) {
+    zmerge_line_overflow = true;
+    return;
+  }
+  strlcpy(zmerge_lines[zmerge_line_wptr], line, sizeof(zmerge_lines[0]));
+  zmerge_line_wptr = next;
+}
+
+static bool zmerge_dequeue_line(char *line, size_t line_size)
+{
+  if (zmerge_line_rptr == zmerge_line_wptr) return false;
+  strlcpy(line, zmerge_lines[zmerge_line_rptr], line_size);
+  zmerge_line_rptr = (uint8_t)((zmerge_line_rptr + 1) % ZMERGE_LINE_QUEUE);
+  return true;
+}
+
+static void fixed_field_to_cstr(char *dst, size_t dst_size,
+                                const char *src, size_t src_size)
+{
+  size_t n = src_size;
+  while (n > 0 && (src[n - 1] == ' ' || src[n - 1] == '\r' ||
+                   src[n - 1] == '\n' || src[n - 1] == '\0')) n--;
+  if (n >= dst_size) n = dst_size - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+static bool zmerge_qsoid_from_record(const union qso_union_tag *rec,
+                                     uint32_t *qsoid)
+{
+  char seqbuf[sizeof(rec->entry.seqnr) + 1];
+  char remarks[sizeof(rec->entry.remarks) + 1];
+  char run[3] = {0};
+  unsigned int tx = 0, rnd = 0;
+
+  fixed_field_to_cstr(seqbuf, sizeof(seqbuf), rec->entry.seqnr,
+                      sizeof(rec->entry.seqnr));
+  fixed_field_to_cstr(remarks, sizeof(remarks), rec->entry.remarks,
+                      sizeof(rec->entry.remarks));
+  unsigned long seq = strtoul(seqbuf, NULL, 10);
+  if (seq == 0) return false;
+
+  if (sscanf(remarks, "%2s %1u%2u", run, &tx, &rnd) != 3) return false;
+  if ((strcmp(run, "CQ") != 0 && strcmp(run, "SP") != 0) || tx > 9 || rnd > 99)
+    return false;
+
+  *qsoid = (uint32_t)(tx * 100000000UL + seq * 10000UL + rnd * 100UL);
+  return true;
+}
+
+static int compare_u32(const void *a, const void *b)
+{
+  uint32_t aa = *(const uint32_t *)a;
+  uint32_t bb = *(const uint32_t *)b;
+  return (aa > bb) - (aa < bb);
+}
+
+static int zmerge_find_server_id(uint32_t id)
+{
+  if (zmerge.server_count == 0 || zmerge.server_ids == NULL) return -1;
+  uint32_t *p = (uint32_t *)bsearch(&id, zmerge.server_ids, zmerge.server_count,
+                                    sizeof(uint32_t), compare_u32);
+  return p ? (int)(p - zmerge.server_ids) : -1;
+}
+
+static bool zmerge_append_server_id(uint32_t id)
+{
+  if (id == 0) return true;
+  if (zmerge.server_count >= zmerge.server_capacity) {
+    size_t new_capacity = zmerge.server_capacity ? zmerge.server_capacity * 2 : 256;
+    uint32_t *new_ids = (uint32_t *)heap_caps_malloc(new_capacity * sizeof(uint32_t),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *new_seen = (uint8_t *)heap_caps_malloc(new_capacity,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!new_ids) new_ids = (uint32_t *)malloc(new_capacity * sizeof(uint32_t));
+    if (!new_seen) new_seen = (uint8_t *)malloc(new_capacity);
+    if (!new_ids || !new_seen) {
+      if (new_ids) free(new_ids);
+      if (new_seen) free(new_seen);
+      return false;
+    }
+    memset(new_seen, 0, new_capacity);
+    if (zmerge.server_ids) {
+      memcpy(new_ids, zmerge.server_ids, zmerge.server_count * sizeof(uint32_t));
+      memcpy(new_seen, zmerge.server_seen, zmerge.server_count);
+      free(zmerge.server_ids);
+      free(zmerge.server_seen);
+    }
+    zmerge.server_ids = new_ids;
+    zmerge.server_seen = new_seen;
+    zmerge.server_capacity = new_capacity;
+  }
+  zmerge.server_ids[zmerge.server_count] = id;
+  zmerge.server_seen[zmerge.server_count] = 0;
+  zmerge.server_count++;
+  return true;
+}
+
+static double zmerge_tdatetime(const char *tm)
+{
+  int yy, mo, dd, hh, mm, ss;
+  if (sscanf(tm, "%d/%d/%d-%d:%d:%d", &yy, &mo, &dd, &hh, &mm, &ss) != 6)
+    return 0.0;
+  int year = (yy < 70) ? 2000 + yy : 1900 + yy;
+  myDateTime dt(year, mo, dd, hh, mm, ss);
+  unsigned long st = dt.unixtime();
+  return (double)(st / 86400UL + (45384 - 19815)) +
+         (double)(st % 86400UL) / 86400.0;
+}
+
+static void append_field(char *buf, size_t buf_size, const char *value, bool tilde=true)
+{
+  strlcat(buf, value ? value : "", buf_size);
+  if (tilde) strlcat(buf, "~", buf_size);
+}
+
+static bool zmerge_build_putlog(const union qso_union_tag *rec, uint32_t qsoid,
+                                char *buf, size_t buf_size)
+{
+  char seq[16], tm[32], freq[24], band[12], opmode[16];
+  char call[LEN_CALLSIGN + 2], sentrst[8], sentexch[LEN_EXCH + 2];
+  char rcvrst[8], rcvexch[LEN_EXCH + 2], remarks[LEN_REMARKS + 2];
+  char tmp[64], run[3] = {0};
+  int tx = (int)(qsoid / 100000000UL);
+  int cq = 0;
+
+  fixed_field_to_cstr(seq, sizeof(seq), rec->entry.seqnr, sizeof(rec->entry.seqnr));
+  fixed_field_to_cstr(tm, sizeof(tm), rec->entry.tm, sizeof(rec->entry.tm));
+  fixed_field_to_cstr(freq, sizeof(freq), rec->entry.freq, sizeof(rec->entry.freq));
+  fixed_field_to_cstr(band, sizeof(band), rec->entry.band, sizeof(rec->entry.band));
+  fixed_field_to_cstr(opmode, sizeof(opmode), rec->entry.opmode, sizeof(rec->entry.opmode));
+  fixed_field_to_cstr(call, sizeof(call), rec->entry.hiscall, sizeof(rec->entry.hiscall));
+  fixed_field_to_cstr(sentrst, sizeof(sentrst), rec->entry.sentrst, sizeof(rec->entry.sentrst));
+  fixed_field_to_cstr(sentexch, sizeof(sentexch), rec->entry.sentexch, sizeof(rec->entry.sentexch));
+  fixed_field_to_cstr(rcvrst, sizeof(rcvrst), rec->entry.rcvrst, sizeof(rec->entry.rcvrst));
+  fixed_field_to_cstr(rcvexch, sizeof(rcvexch), rec->entry.rcvexch, sizeof(rec->entry.rcvexch));
+  fixed_field_to_cstr(remarks, sizeof(remarks), rec->entry.remarks, sizeof(rec->entry.remarks));
+  if (sscanf(remarks, "%2s", run) == 1 && strcmp(run, "CQ") == 0) cq = 1;
+  // The leading "CQ/SP trr" token is DVPlogger's local QSOID metadata,
+  // not the operator memo sent to zLog.
+  char *memo = remarks;
+  if ((!strncmp(remarks, "CQ ", 3) || !strncmp(remarks, "SP ", 3)) &&
+      strlen(remarks) >= 7) memo = remarks + 7;
+
+  int bandid = atoi(band);
+  int zband = (bandid >= 0 && bandid < (int)(sizeof(zserver_bandid_freqcodes_map)/sizeof(zserver_bandid_freqcodes_map[0])))
+                ? zserver_bandid_freqcodes_map[bandid] : 0;
+  int zmode = opmode2zLogmode(opmode);
+  int pcode = 6, pwr = 50;
+  char *pc = power_code(bandid);
+  if (pc) {
+    if (!strcmp(pc, "P")) { pcode = 2; pwr = 5; }
+    else if (!strcmp(pc, "L")) { pcode = 3; pwr = 10; }
+    else if (!strcmp(pc, "M")) { pcode = 6; pwr = 50; }
+    else if (!strcmp(pc, "H")) { pcode = 10; pwr = 1000; }
+  }
+
+  buf[0] = '\0';
+  strlcpy(buf, "#ZLOG# PUTLOG ZLOGQSODATA:~", buf_size);
+  snprintf(tmp, sizeof(tmp), "%.8f", zmerge_tdatetime(tm)); append_field(buf, buf_size, tmp);
+  append_field(buf, buf_size, call);
+  append_field(buf, buf_size, sentexch);
+  append_field(buf, buf_size, rcvexch);
+  append_field(buf, buf_size, sentrst);
+  append_field(buf, buf_size, rcvrst);
+  append_field(buf, buf_size, seq);
+  snprintf(tmp, sizeof(tmp), "%d", zmode); append_field(buf, buf_size, tmp);
+  snprintf(tmp, sizeof(tmp), "%d", zband); append_field(buf, buf_size, tmp);
+  snprintf(tmp, sizeof(tmp), "%d", pcode); append_field(buf, buf_size, tmp);
+  append_field(buf, buf_size, ""); // multi1
+  append_field(buf, buf_size, ""); // multi2
+  append_field(buf, buf_size, "0");
+  append_field(buf, buf_size, "0");
+  char qmode[8];
+  fixed_field_to_cstr(qmode, sizeof(qmode), rec->entry.mode, sizeof(rec->entry.mode));
+  snprintf(tmp, sizeof(tmp), "%d", !strcmp(qmode, "CW") ? plogw->cw_pts : 1);
+  append_field(buf, buf_size, tmp);
+  append_field(buf, buf_size, plogw->my_name + 2);
+  append_field(buf, buf_size, memo);
+  snprintf(tmp, sizeof(tmp), "%d", cq); append_field(buf, buf_size, tmp);
+  append_field(buf, buf_size, "0"); // dupe is recalculated by zLog
+  append_field(buf, buf_size, "0");
+  snprintf(tmp, sizeof(tmp), "%d", tx); append_field(buf, buf_size, tmp);
+  snprintf(tmp, sizeof(tmp), "%d", pwr); append_field(buf, buf_size, tmp);
+  append_field(buf, buf_size, "0");
+  snprintf(tmp, sizeof(tmp), "%lu", (unsigned long)qsoid); append_field(buf, buf_size, tmp);
+  append_field(buf, buf_size, freq);
+  append_field(buf, buf_size, "0");
+  append_field(buf, buf_size, plogw->hostname + 2);
+  append_field(buf, buf_size, "0");
+  append_field(buf, buf_size, "0");
+  append_field(buf, buf_size, "0", false);
+  return strlen(buf) < buf_size - 1;
+}
+
+static int zmerge_local_bandid(int zband)
+{
+  for (int i = 1; i < (int)(sizeof(zserver_bandid_freqcodes_map) /
+                             sizeof(zserver_bandid_freqcodes_map[0])); i++)
+    if (zserver_bandid_freqcodes_map[i] == zband) return i;
+  return 1;
+}
+
+static void zmerge_set_field(char *dst, size_t dst_size, const char *src)
+{
+  if (!src) return;
+  size_t n = strlen(src);
+  if (n >= dst_size) n = dst_size - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+static bool zmerge_datetime_to_tm(const char *src, char *dst, size_t dst_size)
+{
+  double td = atof(src);
+  if (td <= 0.0) return false;
+  double unix_days = td - (45384.0 - 19815.0);
+  if (unix_days < 0.0) return false;
+  uint32_t unix_time = (uint32_t)(unix_days * 86400.0 + 0.5);
+  DateTime dt(unix_time);
+  snprintf(dst, dst_size, "%02d/%02d/%02d-%02d:%02d:%02d",
+           dt.year() % 100, dt.month(), dt.day(),
+           dt.hour(), dt.minute(), dt.second());
+  return true;
+}
+
+static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
+                                  uint32_t expected_qsoid)
+{
+  const char *p = strstr(line, "ZLOGQSODATA:");
+  if (!p) return false;
+  p += strlen("ZLOGQSODATA:");
+  if (*p == '~') p++;
+
+  char data[NCHR_ZSERVER_CMD + 1];
+  strlcpy(data, p, sizeof(data));
+  char *field[30] = {0};
+  int nf = 0;
+  char *q = data;
+  while (nf < 30) {
+    field[nf++] = q;
+    char *sep = strchr(q, '~');
+    if (!sep) break;
+    *sep = '\0';
+    q = sep + 1;
+  }
+  if (nf < 30) return false;
+
+  uint32_t qsoid = strtoul(field[23], NULL, 10);
+  if (qsoid == 0 || (expected_qsoid && qsoid != expected_qsoid)) return false;
+  if (atoi(field[29]) != 0) return false;
+
+  memset(rec->all, ' ', sizeof(rec->all));
+  rec->entry.type[0] = 'Q';
+  rec->entry.type[1] = '\0';
+  char tm[20];
+  if (!zmerge_datetime_to_tm(field[0], tm, sizeof(tm))) return false;
+  zmerge_set_field(rec->entry.tm, sizeof(rec->entry.tm), tm);
+  zmerge_set_field(rec->entry.hiscall, sizeof(rec->entry.hiscall), field[1]);
+  zmerge_set_field(rec->entry.sentexch, sizeof(rec->entry.sentexch), field[2]);
+  zmerge_set_field(rec->entry.rcvexch, sizeof(rec->entry.rcvexch), field[3]);
+  zmerge_set_field(rec->entry.sentrst, sizeof(rec->entry.sentrst), field[4]);
+  zmerge_set_field(rec->entry.rcvrst, sizeof(rec->entry.rcvrst), field[5]);
+  zmerge_set_field(rec->entry.seqnr, sizeof(rec->entry.seqnr), field[6]);
+  zmerge_set_field(rec->entry.mycall, sizeof(rec->entry.mycall), plogw->my_callsign + 2);
+
+  int zmode = atoi(field[7]);
+  int zband = atoi(field[8]);
+  int bandid = zmerge_local_bandid(zband);
+
+  // PUTLOGEX normally carries the frequency in Hz in field 25
+  // (field[24] after removing the ZLOGQSODATA prefix).  Some zLog records,
+  // especially records entered without rig control, leave this field empty.
+  // Preserve an explicit frequency when present; otherwise use the nominal
+  // frequency represented by the Z-Server band code.  The latter cannot
+  // recover the exact operating frequency, but avoids storing an empty or
+  // zero frequency in the local QSO record.
+  if (field[24][0] && strtoull(field[24], NULL, 10) != 0) {
+    zmerge_set_field(rec->entry.freq, sizeof(rec->entry.freq), field[24]);
+  } else {
+    char freqtmp[20];
+    unsigned long long nominal_hz = 0;
+    if (zband >= 0 &&
+        zband < (int)(sizeof(zserver_freqcodes) / sizeof(zserver_freqcodes[0]))) {
+      double mhz = atof(zserver_freqcodes[zband]);
+      if (mhz > 0.0) nominal_hz = (unsigned long long)(mhz * 1000000.0 + 0.5);
+    }
+    if (nominal_hz == 0 && bandid > 0) {
+      // Last-resort values for local bands whose Z-Server code is unknown.
+      static const unsigned long long local_nominal_hz[] = {
+        0ULL, 1900000ULL, 3500000ULL, 7000000ULL, 14000000ULL,
+        21000000ULL, 28000000ULL, 50000000ULL, 144000000ULL,
+        430000000ULL, 1200000000ULL, 2400000000ULL, 5600000000ULL,
+        10000000000ULL, 10000000ULL, 18000000ULL, 24000000ULL
+      };
+      if (bandid < (int)(sizeof(local_nominal_hz) /
+                         sizeof(local_nominal_hz[0])))
+        nominal_hz = local_nominal_hz[bandid];
+    }
+    snprintf(freqtmp, sizeof(freqtmp), "%llu", nominal_hz);
+    zmerge_set_field(rec->entry.freq, sizeof(rec->entry.freq), freqtmp);
+    plogw->ostream->printf(
+        "zmerge: PUTLOGEX QSOID %lu has no frequency; using nominal %llu Hz\n",
+        (unsigned long)qsoid, nominal_hz);
+  }
+  char tmp[20];
+  snprintf(tmp, sizeof(tmp), "%d", bandid);
+  zmerge_set_field(rec->entry.band, sizeof(rec->entry.band), tmp);
+  switch (zmode) {
+  case 0:
+    zmerge_set_field(rec->entry.mode, sizeof(rec->entry.mode), "CW");
+    zmerge_set_field(rec->entry.opmode, sizeof(rec->entry.opmode), "CW");
+    break;
+  case 1:
+    zmerge_set_field(rec->entry.mode, sizeof(rec->entry.mode), "PH");
+    zmerge_set_field(rec->entry.opmode, sizeof(rec->entry.opmode),
+                     bandid <= 3 ? "LSB" : "USB");
+    break;
+  case 2:
+    zmerge_set_field(rec->entry.mode, sizeof(rec->entry.mode), "PH");
+    zmerge_set_field(rec->entry.opmode, sizeof(rec->entry.opmode), "FM");
+    break;
+  case 3:
+    zmerge_set_field(rec->entry.mode, sizeof(rec->entry.mode), "PH");
+    zmerge_set_field(rec->entry.opmode, sizeof(rec->entry.opmode), "AM");
+    break;
+  case 4:
+    zmerge_set_field(rec->entry.mode, sizeof(rec->entry.mode), "DG");
+    zmerge_set_field(rec->entry.opmode, sizeof(rec->entry.opmode), "RTTY");
+    break;
+  default:
+    zmerge_set_field(rec->entry.mode, sizeof(rec->entry.mode), "DG");
+    zmerge_set_field(rec->entry.opmode, sizeof(rec->entry.opmode), "OTHER");
+    break;
+  }
+
+  unsigned tx = (unsigned)((qsoid / 100000000UL) % 100UL);
+  unsigned rnd = (unsigned)((qsoid / 100UL) % 100UL);
+  snprintf(tmp, sizeof(tmp), "%s %1u%02u ", atoi(field[17]) ? "CQ" : "SP",
+           tx % 10, rnd);
+  zmerge_set_field(rec->entry.remarks, sizeof(rec->entry.remarks), tmp);
+  if (field[16][0]) strlcat(rec->entry.remarks, field[16], sizeof(rec->entry.remarks));
+  return true;
+}
+
+static bool zmerge_append_pending_record()
+{
+  if (!zmerge.pending_valid) return false;
+
+  // The QSO module owns the persistent append handle.  zserver.cpp never
+  // seeks or writes that handle directly.
+  size_t size_before = 0;
+  size_t size_after = 0;
+  const size_t record_size = sizeof(zmerge.pending_record.all);
+  const size_t nw = append_qso_log_record(&zmerge.pending_record,
+                                           &size_before, &size_after);
+
+  if (nw != record_size || size_after != size_before + record_size) {
+    plogw->ostream->printf("zmerge: append verification failed: before=%u written=%u after=%u\n",
+                           (unsigned)size_before, (unsigned)nw,
+                           (unsigned)size_after);
+    return false;
+  }
+  zmerge.pending_valid = false;
+  zmerge.received_records++;
+  return true;
+}
+
+static void zmerge_reset(bool restore_log_pos)
+{
+  (void)restore_log_pos;
+  close_qso_log_readonly(&zmerge_scanf);
+  if (zmerge.server_ids) free(zmerge.server_ids);
+  if (zmerge.server_seen) free(zmerge.server_seen);
+  memset(&zmerge, 0, sizeof(zmerge));
+  zmerge_line_rptr = zmerge_line_wptr = 0;
+  zmerge_line_overflow = false;
+}
+
+static void zmerge_finish(bool success, const char *reason)
+{
+  if (zmerge.locked && zserver_client->connected())
+    println_tcpserver(zserver_client, "#ZLOG# ENDMERGE");
+  if (!success) {
+    plogw->ostream->print("zmerge failed: ");
+    plogw->ostream->println(reason ? reason : "unknown error");
+  } else {
+    unsigned long server_only = (zmerge.server_count > zmerge.common_records)
+                                ? zmerge.server_count - zmerge.common_records : 0;
+    if (zmerge.repair_mode) {
+      plogw->ostream->printf("zmerge repair complete: total=%lu, kept=%lu, removed=%lu, duplicate groups=%lu, groups awaiting restore=%lu\n",
+                             zmerge.repair_stats.total_records,
+                             zmerge.repair_stats.kept_records,
+                             zmerge.repair_stats.removed_records,
+                             zmerge.repair_stats.duplicate_groups,
+                             zmerge.repair_stats.groups_restored_by_zmerge);
+      if (zmerge.repair_stats.groups_restored_by_zmerge != 0)
+        plogw->ostream->println("zmerge repair: run normal zmerge to restore authoritative server QSOs");
+    } else if (zmerge.dry_run) {
+      plogw->ostream->printf("zmerge dry complete: server IDs=%u, local=%lu, common=%lu, local only=%lu, server only=%lu, no QSOID=%lu, deleted=%lu\n",
+                             (unsigned)zmerge.server_count, zmerge.total_records,
+                             zmerge.common_records, zmerge.local_only_records,
+                             server_only, zmerge.skipped_no_qsoid,
+                             zmerge.skipped_deleted);
+    } else {
+      plogw->ostream->printf("zmerge complete: server IDs=%u, local=%lu, common=%lu, uploaded=%lu, downloaded=%lu, no QSOID=%lu, deleted=%lu\n",
+                             (unsigned)zmerge.server_count, zmerge.total_records,
+                             zmerge.common_records, zmerge.sent_records,
+                             zmerge.received_records, zmerge.skipped_no_qsoid,
+                             zmerge.skipped_deleted);
+    }
+  }
+  zmerge_reset(true);
+  zserver.stat = zserver_client->connected() ? 4 : 0;
+}
+
+static void zmerge_process_line(const char *line)
+{
+  if (!strcmp(line, "#ZLOG# BEGINMERGE-OK")) {
+    if (zmerge.phase != 1) return;
+    zmerge.locked = true;
+    zmerge.phase = 2;
+    zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
+    println_tcpserver(zserver_client, "#ZLOG# GETQSOIDS");
+    plogw->ostream->println("zmerge: lock acquired; requesting QSOIDs");
+    return;
+  }
+  if (!strcmp(line, "#ZLOG# BEGINMERGE-NG")) {
+    zmerge_finish(false, "Z-Server is already being merged");
+    return;
+  }
+  if (!strncmp(line, "#ZLOG# QSOIDS", 13)) {
+    if (zmerge.phase != 2) return;
+    const char *p = line + 13;
+    while (*p) {
+      while (*p == ' ') p++;
+      if (!*p) break;
+      char *endp;
+      unsigned long id = strtoul(p, &endp, 10);
+      if (endp == p) break;
+      if (!zmerge_append_server_id((uint32_t)id)) {
+        zmerge_finish(false, "not enough memory for QSOID list");
+        return;
+      }
+      p = endp;
+    }
+    zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
+    return;
+  }
+  if (!strcmp(line, "#ZLOG# ENDQSOIDS")) {
+    if (zmerge.phase != 2) return;
+    if (zmerge.server_count > 1) {
+      qsort(zmerge.server_ids, zmerge.server_count, sizeof(uint32_t), compare_u32);
+      // QSOIDS should be unique, but compact duplicates so summary counts stay sane.
+      size_t out = 1;
+      for (size_t i = 1; i < zmerge.server_count; i++) {
+        if (zmerge.server_ids[i] != zmerge.server_ids[out - 1])
+          zmerge.server_ids[out++] = zmerge.server_ids[i];
+      }
+      zmerge.server_count = out;
+    }
+    if (zmerge.repair_mode) {
+      plogw->ostream->println("zmerge repair: rebuilding QSO log");
+      if (!repair_qso_log(zmerge.server_ids, zmerge.server_count,
+                          &zmerge.repair_stats)) {
+        zmerge_finish(false, "QSO log repair failed");
+        return;
+      }
+      zmerge_finish(true, NULL);
+      return;
+    }
+    close_qso_log_readonly(&zmerge_scanf);
+    if (!open_qso_log_readonly(&zmerge_scanf)) {
+      zmerge_finish(false, "cannot open QSO log for read");
+      return;
+    }
+    zmerge.phase = 3;
+    zmerge.next_send = millis();
+    zmerge.deadline = millis() + 120000UL;
+    plogw->ostream->printf("zmerge: received %u server QSOIDs; scanning local log\n",
+                           (unsigned)zmerge.server_count);
+    return;
+  }
+  if (!strncmp(line, "#ZLOG# PUTLOGEX", strlen("#ZLOG# PUTLOGEX"))) {
+    if (zmerge.phase != 4 || zmerge.pending_valid || zmerge.requested_qsoid == 0)
+      return;
+    if (!zmerge_parse_putlogex(line, &zmerge.pending_record,
+                               zmerge.requested_qsoid)) {
+      zmerge_finish(false, "invalid PUTLOGEX data");
+      return;
+    }
+    zmerge.pending_valid = true;
+    zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
+    return;
+  }
+}
+
+bool zserver_merge_active()
+{
+  return zmerge.phase != 0;
+}
+
+bool zserver_start_merge(bool dry_run)
+{
+  if (zmerge.phase != 0) {
+    plogw->ostream->println("zmerge: already running");
+    return false;
+  }
+  if (zserver.stat != 4 || !zserver_client->connected()) {
+    plogw->ostream->println("zmerge: Z-Server is not connected and initialized");
+    return false;
+  }
+  if (!qso_log_is_open()) {
+    plogw->ostream->println("zmerge: QSO log is not open");
+    return false;
+  }
+  zmerge_reset(false);
+  zmerge.phase = 1;
+  zmerge.dry_run = dry_run;
+  zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
+  zserver.stat = 5;
+  println_tcpserver(zserver_client, "#ZLOG# BEGINMERGE");
+  plogw->ostream->println(dry_run ? "zmerge dry: BEGINMERGE sent" : "zmerge: BEGINMERGE sent");
+  return true;
+}
+
+bool zserver_start_repair()
+{
+  if (!zserver_start_merge(false)) return false;
+  zmerge.repair_mode = true;
+  plogw->ostream->println("zmerge repair: backup will be QSOBAK.TXT");
+  return true;
+}
+const char *zserver_server_commands[]={"BEGINMERGE","ENDMERGE","GETQSOIDS","SENDCLUSTER","SENDPACKET","SENDSCRATCH",
 			       "BSDATA","POSTWANTED","DELWANTED","CONNECTCLUSTER",
 			       "GETLOGQSOID","SENDRENEW","DELQSO","EXDELQSO","RENEW",
 			       "LOCKQSO","UNLOCKQSO","BAND","OPERATOR","FREQ","SPOT",
@@ -108,7 +705,7 @@ void handleData_zserver(void *arg, AsyncClient *client, void *data, size_t len)
     plogw->ostream->print("Z:");
     plogw->ostream->write((uint8_t *)data, len);
   }
-  if (zserver.stat == 4) {
+  if (zserver.stat == 4 || zserver.stat == 5) {
     zserver.timeout_alive = millis() + 120000; // not used but timeout counter 
     char c;
     int ret;
@@ -124,6 +721,9 @@ void handleData_zserver(void *arg, AsyncClient *client, void *data, size_t len)
 	  Serial.print("Z readline:");
 	  Serial.println(zserver.cmdbuf);
 	}
+	// Keep the AsyncTCP callback short. Merge commands are handled later
+	// from zserver_process().
+	if (zserver.stat == 5) zmerge_queue_line(zserver.cmdbuf);
 	// check commands
 	if (strncmp(zserver.cmdbuf,"#ZLOG# PUTMESSAGE",17)==0) {
 	  //	    sprintf(dp->lcdbuf,"ZserverMSG:\n%s",zserver.cmdbuf);
@@ -167,6 +767,7 @@ void onDisconnect_zserver(void *arg, AsyncClient *client)
 {
   //  zserver.stat = 0;
   //  zserver.timeout = millis() + 2000;
+  if (zmerge.phase != 0) zmerge.abort_requested = true;
   if (!plogw->f_console_emu) {
     plogw->ostream->println("onDisconnect_zserver():disconnected from zserver.");
   }
@@ -302,22 +903,117 @@ void zserver_process() {
       zserver.stat = 0;
     } 
     break;
-  case 5: // merging log with zserver
-    // protocol:
-    // 1. send BEGINMERGE and wait for BEGINMERGE-OK or BEGINMERGE-NG
-    // 2. send GETQSOIDS and read QSOIDS until ENDQSOIDS received.
-    // 3. check each QSOID and if local is newer EDITQSOTO to renew server's entry
-    //    if QSO not in zserver PUTLOG
-    //    if local is older, send GETLOGQSOID and receive PUTLOGEX to replace new QSO data.
-    // 4. if received RENEW, renew and display the local database
-    // 5. to finish GETLOGQSOID, send SENDRENEW to request zserver display
-    // 6. to finish merging, send ENDMERGE to unlock zserver
-    //
-    // to download log from zserver
-    // 1. send SENDLOG to request all log data to zserver
-    // 2. receive PUTLOG for all QSO data
-    // 3. if received RENEW renew our display.(end of download log from zserver)
+  case 5: { // merging log with zserver
+    if (zmerge.abort_requested || !zserver_client->connected()) {
+      zmerge_finish(false, "connection lost");
+      break;
+    }
+    if (zmerge_line_overflow) {
+      zmerge_finish(false, "receive queue overflow");
+      break;
+    }
+    while (zmerge_dequeue_line(zmerge_rx_line, sizeof(zmerge_rx_line))) {
+      zmerge_process_line(zmerge_rx_line);
+      if (zmerge.phase == 0) break;
+    }
+    if (zmerge.phase == 0) break;
+    if ((int32_t)(millis() - zmerge.deadline) > 0) {
+      zmerge_finish(false, "timeout");
+      break;
+    }
+    if (zmerge.phase == 3 && (int32_t)(millis() - zmerge.next_send) >= 0) {
+      if (!zmerge_scanf) {
+        zmerge_finish(false, "QSO scan file is not open");
+        break;
+      }
+      int n = read_qso_log_record(&zmerge_scanf, &zmerge_record);
+      if (n == 0) {
+        close_qso_log_readonly(&zmerge_scanf);
+        if (zmerge.dry_run) {
+          zmerge_finish(true, NULL);
+        } else {
+          zmerge.phase = 4;
+          zmerge.fetch_index = 0;
+          zmerge.requested_qsoid = 0;
+          zmerge.pending_valid = false;
+          zmerge.deadline = millis() + 120000UL;
+          plogw->ostream->println("zmerge: requesting server-only QSOs");
+        }
+        break;
+      }
+      if (n != sizeof(zmerge_record.all)) {
+        zmerge_finish(false, "short QSO log record");
+        break;
+      }
+      zmerge.total_records++;
+      if (zmerge_record.entry.type[0] == 'D') {
+        zmerge.skipped_deleted++;
+      } else if (zmerge_record.entry.type[0] != 'Q') {
+        // Ignore unused/corrupt records rather than interpreting them as QSOs.
+        zmerge.skipped_no_qsoid++;
+      } else {
+        uint32_t qsoid;
+        if (!zmerge_qsoid_from_record(&zmerge_record, &qsoid)) {
+          zmerge.skipped_no_qsoid++;
+        } else {
+          int server_index = zmerge_find_server_id(qsoid);
+          if (server_index >= 0) {
+            zmerge.server_seen[server_index] = 1;
+            zmerge.common_records++;
+          } else {
+            zmerge.local_only_records++;
+            if (zmerge.dry_run) {
+              zmerge.next_send = millis();
+              break;
+            }
+            if (!zmerge_build_putlog(&zmerge_record, qsoid,
+                                     zmerge_tx_line, sizeof(zmerge_tx_line))) {
+              zmerge_finish(false, "PUTLOG command too long");
+              break;
+            }
+            println_tcpserver(zserver_client, zmerge_tx_line);
+            zmerge.sent_records++;
+            zmerge.next_send = millis() + ZMERGE_SEND_INTERVAL_MS;
+            zmerge.deadline = millis() + 120000UL;
+          }
+        }
+      }
+    }
+    if (zmerge.phase == 4) {
+      if (zmerge.pending_valid) {
+        if (!zmerge_append_pending_record()) {
+          zmerge_finish(false, "cannot append PUTLOGEX to local log");
+          break;
+        }
+        zmerge.requested_qsoid = 0;
+      }
+      if (zmerge.requested_qsoid == 0) {
+        while (zmerge.fetch_index < zmerge.server_count &&
+               zmerge.server_seen[zmerge.fetch_index])
+          zmerge.fetch_index++;
+        if (zmerge.fetch_index >= zmerge.server_count) {
+          println_tcpserver(zserver_client, "#ZLOG# SENDRENEW");
+          zmerge_finish(true, NULL);
+          // Do not rebuild the complete dupe/score database synchronously here.
+          // read_qso_log(READQSO_MAKEDUPE) walks the whole log and exchanges bulk
+          // data with the sub CPU from the main Arduino task.  Running it directly
+          // after a network merge can starve IDLE1 long enough to trip the task
+          // watchdog.  The downloaded records are already durable in QSO.txt;
+          // rebuild dupe/score state later through the normal startup/manual path.
+          if (zmerge.received_records != 0)
+            plogw->ostream->println("zmerge: QSO log updated; dupe/score rebuild deferred");
+          break;
+        }
+        zmerge.requested_qsoid = zmerge.server_ids[zmerge.fetch_index++];
+        char req[96];
+        snprintf(req, sizeof(req), "#ZLOG# GETLOGQSOID %lu",
+                 (unsigned long)zmerge.requested_qsoid);
+        println_tcpserver(zserver_client, req);
+        zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
+      }
+    }
     break;
+  }
     
   } 
 }
