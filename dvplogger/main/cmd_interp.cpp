@@ -51,7 +51,6 @@
 #include "esp32_flasher.h"
 #include "so2r.h"
 #include "network.h"
-#include "zserver.h"
 #include "dac-adc.h"
 #include "mcp_interface.h"
 #include "morse_decoder_simple.h"
@@ -79,7 +78,6 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"playwpm<n>", "set tone CW speed in WPM"},
   {"playq", "show current audio/CW playback queue"},
   {"newqsolog", "start a new QSO.TXT log"},
-  {"zmerge [dry|repair]", "merge, compare, or repair duplicate QSOs"},
   {"makedupe", "rebuild dupe/multiplier data from QSO.TXT"},
   {"dumpqso[n]", "dump current raw QSO log, or backup log n"},
   {"readqso", "print QSO.TXT in importable text format"},
@@ -501,19 +499,6 @@ void cmd_interp(char *cmd) {
       }
 
 
-
-      if (strcmp(cmd, "zmerge") == 0) {
-        zserver_start_merge(false);
-        break;
-      }
-      if (strcmp(cmd, "zmerge dry") == 0) {
-        zserver_start_merge(true);
-        break;
-      }
-      if (strcmp(cmd, "zmerge repair") == 0) {
-        zserver_start_repair();
-        break;
-      }
 
       if (strcmp(cmd, "listdir") == 0) {
         listDir(SD, "/", 0);

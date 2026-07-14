@@ -22,26 +22,6 @@
 #ifndef FILE_QSO_H
 #define FILE_QSO_H
 extern File qsologf;            // qso logf
-// QSO log access helpers for modules that must not manipulate qsologf directly.
-bool qso_log_is_open();
-bool open_qso_log_readonly(File *f);
-void close_qso_log_readonly(File *f);
-int read_qso_log_record(File *f, union qso_union_tag *record);
-size_t append_qso_log_record(const union qso_union_tag *record,
-                             size_t *size_before, size_t *size_after);
-
-struct qso_repair_stats {
-  unsigned long total_records;
-  unsigned long kept_records;
-  unsigned long removed_records;
-  unsigned long duplicate_groups;
-  unsigned long groups_restored_by_zmerge;
-};
-
-// Rebuild QSO.TXT through a temporary file. The original is preserved as
-// QSO.TXT.zbackup until the next successful repair.
-bool repair_qso_log(const uint32_t *server_ids, size_t server_count,
-                    struct qso_repair_stats *stats);
 void init_qsofiles() ;
 void init_qso() ;
 void makedupe_qso_entry() ;
