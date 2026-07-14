@@ -1,5 +1,4 @@
 # 除外: Arduino-ESP31本体
-.gitignore
 dvplogger/components/arduino/*
 dvplogger/arduino-esp32/*
 
