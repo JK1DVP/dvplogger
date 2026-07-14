@@ -136,6 +136,14 @@ build_set()
         "${main_build}/dvplogger-hw${hwver}.bin" \
         "${dest_dir}/dvplogger.bin"
 
+    copy_file \
+        "${main_build}/bootloader/bootloader.bin" \
+        "${dest_dir}/bootloader.bin"
+
+    copy_file \
+        "${main_build}/partition_table/partition-table.bin" \
+        "${dest_dir}/partition-table.bin"
+    
     echo
     echo "HW${hwver} / ${model_dir} completed."
 }
@@ -156,6 +164,8 @@ echo "============================================================"
 echo
 echo "HW1 / mini:"
 echo "  binaries/mini/dvplogger.bin"
+echo "  binaries/mini/bootloader.bin"
+echo "  binaries/mini/partition-table.bin"
 echo "  binaries/mini/subcpu/app0.bin"
 echo "  binaries/mini/subcpu/bootload.bin"
 echo "  binaries/mini/subcpu/partitio.bin"
@@ -163,6 +173,8 @@ echo "  binaries/mini/subcpu/spiffs.bin"
 echo
 echo "HW3 / Wide:"
 echo "  binaries/Wide/dvplogger.bin"
+echo "  binaries/Wide/bootloader.bin"
+echo "  binaries/Wide/partition-table.bin"
 echo "  binaries/Wide/subcpu/app0.bin"
 echo "  binaries/Wide/subcpu/bootload.bin"
 echo "  binaries/Wide/subcpu/partitio.bin"

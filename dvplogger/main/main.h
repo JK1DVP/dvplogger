@@ -23,6 +23,9 @@
 #define FILE_MAIN_H
 void localip_to_string(char *buf);
 void print_wifiinfo();
-void request_memstat_main_subcpu();
+void request_memstat_main_subcpu(bool update_lcd = true);
+void start_memstat_watch();
+void stop_memstat_watch();
+void process_memstat_watch();
 //extern xTaskHandle gxHandle_USBloop;
 #endif

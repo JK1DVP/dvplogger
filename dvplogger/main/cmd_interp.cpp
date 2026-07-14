@@ -113,7 +113,7 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"callhist_set [file]", "receive Call History entries until 'end'"},
   {"callhist_search", "interactive Call History search; 'end' exits"},
   {"mem", "show Main CPU memory information"},
-  {"memstat", "show Main/Sub CPU memory and dupe status"},
+  {"memstat [watch|stop]", "show memory once or start/stop 1-second terminal watch"},
   {"submem", "alias of memstat"},
   {"addap <ssid> <password>", "add a Wi-Fi access point"},
   {"time [yyyy-mm-ddThh:mm:ss]", "show or set RTC time"},
@@ -423,8 +423,16 @@ void cmd_interp(char *cmd) {
       	break;
       }
 
+      if (strcmp(cmd,"memstat watch")==0) {
+        start_memstat_watch();
+        break;
+      }
+      if (strcmp(cmd,"memstat stop")==0) {
+        stop_memstat_watch();
+        break;
+      }
       if (strcmp(cmd,"submem")==0 || strcmp(cmd,"memstat")==0) {
-        request_memstat_main_subcpu();
+        request_memstat_main_subcpu(true);
         break;
       }
       if (strcmp(cmd,"subcpu_halt")==0) {

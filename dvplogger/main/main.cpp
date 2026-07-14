@@ -112,17 +112,66 @@ void usb_loop_setup()
 Stream *console; 
 
 
-void request_memstat_main_subcpu()
+static bool memstat_watch_enabled = false;
+static bool memstat_request_pending = false;
+static bool memstat_update_lcd = true;
+static uint32_t memstat_request_ms = 0;
+static uint32_t memstat_next_ms = 0;
+
+void request_memstat_main_subcpu(bool update_lcd)
 {
   if (f_mux_transport) {
     const char *request = "memstat";
+    memstat_update_lcd = update_lcd;
+    memstat_request_pending = true;
+    memstat_request_ms = millis();
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
                            (unsigned char *)request, strlen(request));
-    console->println("requested main/sub CPU memory status");
+    if (update_lcd) {
+      console->println("requested main/sub CPU memory status");
+    }
   } else {
+    memstat_request_pending = false;
     console->println("MUXTRANS is not active");
-    sprintf(dp->lcdbuf, "MEMSTAT\nMUXTRANS inactive\n");
-    upd_display_info_flash(dp->lcdbuf);
+    if (update_lcd) {
+      sprintf(dp->lcdbuf, "MEMSTAT\nMUXTRANS inactive\n");
+      upd_display_info_flash(dp->lcdbuf);
+    }
+  }
+}
+
+void start_memstat_watch()
+{
+  memstat_watch_enabled = true;
+  memstat_request_pending = false;
+  memstat_next_ms = millis();
+  console->println("memstat watch: started (1 second interval)");
+}
+
+void stop_memstat_watch()
+{
+  memstat_watch_enabled = false;
+  memstat_request_pending = false;
+  console->println("memstat watch: stopped");
+}
+
+void process_memstat_watch()
+{
+  if (!memstat_watch_enabled) return;
+
+  uint32_t now = millis();
+  if (memstat_request_pending) {
+    if ((uint32_t)(now - memstat_request_ms) >= 3000) {
+      memstat_request_pending = false;
+      console->println("memstat watch: subcpu response timeout");
+      memstat_next_ms = now;
+    }
+    return;
+  }
+
+  if ((int32_t)(now - memstat_next_ms) >= 0) {
+    request_memstat_main_subcpu(false);
+    memstat_next_ms = now + 1000;
   }
 }
 
@@ -145,6 +194,7 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
     buf[n] = '\0';
     process_dupechk_partial_response_maincpu(buf);
   } else if (strncmp(packet->buf, "memstat:", 8) == 0) {
+    memstat_request_pending = false;
     unsigned int sub_free8, sub_min8, sub_largest8;
     unsigned int sub_internal, sub_spiram;
     unsigned int sub_nmaxqso, sub_ncallsign;
@@ -173,14 +223,18 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
           heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
       unsigned int main_internal =
           heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      unsigned int main_internal_min =
+          heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      unsigned int main_internal_largest =
+          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
       unsigned int main_spiram =
           heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
       console->printf(
-          "maincpu heap: free=%u min=%u largest=%u "
-          "internal=%u spiram=%u\n",
+          "maincpu heap: free8=%u min8=%u largest8=%u "
+          "internal=%u internal_min=%u internal_largest=%u spiram=%u\n",
           main_free8, main_min8, main_largest8,
-          main_internal, main_spiram);
+          main_internal, main_internal_min, main_internal_largest, main_spiram);
       console->printf(
           "subcpu heap: free=%u min=%u largest=%u "
           "internal=%u spiram=%u dupe=%u/%u\n",
@@ -188,28 +242,32 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
           sub_internal, sub_spiram,
           sub_ncallsign, sub_nmaxqso);
 
-      sprintf(dp->lcdbuf,
-              "MEM M%u S%u D%u\n"
-              "CPU  Free Min Max\n"
-              "MAIN %u %u %u\n"
-              "SUB  %u %u %u\n"
-              "INT  %u     %u\n"
-              "PS   %u     %u\n",
-              (unsigned int)dupechk->nmaxqso,
-              sub_nmaxqso,
-              sub_ncallsign,
-              main_free8 / 1024,
-              main_min8 / 1024,
-              main_largest8 / 1024,
-              sub_free8 / 1024,
-              sub_min8 / 1024,
-              sub_largest8 / 1024,
-              main_internal / 1024,
-              sub_internal / 1024,
-              main_spiram / 1024,
-              sub_spiram / 1024);
+      if (memstat_update_lcd) {
+        sprintf(dp->lcdbuf,
+                "DUPE M%u S%u/%u\n"
+                "CPU Heap Low Big\n"
+                "MAIN %u %u %u\n"
+                "SUB  %u %u %u\n"
+                "IRAM M%u/%u/%u S%u\n"
+                "PSRAM M%u S%u\n",
+                (unsigned int)dupechk->nmaxqso,
+                sub_ncallsign,
+                sub_nmaxqso,
+                main_free8 / 1024,
+                main_min8 / 1024,
+                main_largest8 / 1024,
+                sub_free8 / 1024,
+                sub_min8 / 1024,
+                sub_largest8 / 1024,
+                main_internal / 1024,
+                main_internal_min / 1024,
+                main_internal_largest / 1024,
+                sub_internal / 1024,
+                main_spiram / 1024,
+                sub_spiram / 1024);
 
-      upd_display_info_flash(dp->lcdbuf);
+        upd_display_info_flash(dp->lcdbuf);
+      }
     } else {
       console->print("invalid subcpu memstat response: ");
       console->println(buf);
@@ -475,6 +533,7 @@ void loop() {
     mux_transport.recv_pkt();
   } else {
   }
+  process_memstat_watch();
 
   decoder.morse_decode_task(); // called in main loop
   decoder.monitor_task(); // morse decoder display task 

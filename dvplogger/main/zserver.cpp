@@ -66,7 +66,7 @@ const char *zserver_client_commands[]={ "FREQ","QSOIDS","ENDQSOIDS","PROMPTUPDAT
 
 
 
-#define ZMERGE_LINE_QUEUE 16
+#define ZMERGE_LINE_QUEUE 8
 #define ZMERGE_LINE_SIZE 1024
 #define ZMERGE_SEND_INTERVAL_MS 25
 #define ZMERGE_REPLY_TIMEOUT_MS 15000
@@ -98,16 +98,17 @@ struct zmerge_context {
 };
 
 static struct zmerge_context zmerge;
-static char zmerge_lines[ZMERGE_LINE_QUEUE][ZMERGE_LINE_SIZE];
+static char (*zmerge_lines)[ZMERGE_LINE_SIZE] = nullptr;
 static volatile uint8_t zmerge_line_rptr = 0;
 static volatile uint8_t zmerge_line_wptr = 0;
 static volatile bool zmerge_line_overflow = false;
+static portMUX_TYPE zmerge_line_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // zserver_process() runs in a task with limited stack.  Keep the large
 // merge work buffers out of the task stack.
-static char zmerge_rx_line[NCHR_ZSERVER_CMD + 1];
-static union qso_union_tag zmerge_record;
-static char zmerge_tx_line[NCHR_ZSERVER_CMD + 1];
+static char *zmerge_rx_line = nullptr;
+static union qso_union_tag *zmerge_record = nullptr;
+static char *zmerge_tx_line = nullptr;
 // Local QSO scan uses a temporary read-only handle so the persistent
 // append handle (qsologf) and its file position are never disturbed.
 static File zmerge_scanf;
@@ -120,23 +121,83 @@ static bool zmerge_build_putlog(const union qso_union_tag *rec, uint32_t qsoid,
 static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
                                   uint32_t expected_qsoid);
 static bool zmerge_append_pending_record();
+static bool zmerge_alloc_work_buffers();
+static void zmerge_free_work_buffers();
+
+static bool zmerge_alloc_work_buffers()
+{
+  if (zmerge_lines && zmerge_rx_line && zmerge_record && zmerge_tx_line)
+    return true;
+
+  zmerge_lines = (char (*)[ZMERGE_LINE_SIZE])heap_caps_calloc(
+      ZMERGE_LINE_QUEUE, ZMERGE_LINE_SIZE,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  zmerge_rx_line = (char *)heap_caps_malloc(
+      NCHR_ZSERVER_CMD + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  zmerge_record = (union qso_union_tag *)heap_caps_malloc(
+      sizeof(union qso_union_tag), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  zmerge_tx_line = (char *)heap_caps_malloc(
+      NCHR_ZSERVER_CMD + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  if (!zmerge_lines || !zmerge_rx_line || !zmerge_record || !zmerge_tx_line) {
+    zmerge_free_work_buffers();
+    return false;
+  }
+
+  memset(zmerge_rx_line, 0, NCHR_ZSERVER_CMD + 1);
+  memset(zmerge_record, 0, sizeof(*zmerge_record));
+  memset(zmerge_tx_line, 0, NCHR_ZSERVER_CMD + 1);
+  return true;
+}
+
+static void zmerge_free_work_buffers()
+{
+  char (*lines)[ZMERGE_LINE_SIZE];
+  portENTER_CRITICAL(&zmerge_line_mux);
+  lines = zmerge_lines;
+  zmerge_lines = nullptr;
+  zmerge_line_rptr = zmerge_line_wptr = 0;
+  portEXIT_CRITICAL(&zmerge_line_mux);
+
+  if (lines) free(lines);
+  if (zmerge_rx_line) free(zmerge_rx_line);
+  if (zmerge_record) free(zmerge_record);
+  if (zmerge_tx_line) free(zmerge_tx_line);
+  zmerge_rx_line = nullptr;
+  zmerge_record = nullptr;
+  zmerge_tx_line = nullptr;
+}
 
 static void zmerge_queue_line(const char *line)
 {
+  portENTER_CRITICAL(&zmerge_line_mux);
+  if (!zmerge_lines) {
+    zmerge_line_overflow = true;
+    portEXIT_CRITICAL(&zmerge_line_mux);
+    return;
+  }
   uint8_t next = (uint8_t)((zmerge_line_wptr + 1) % ZMERGE_LINE_QUEUE);
   if (next == zmerge_line_rptr) {
     zmerge_line_overflow = true;
+    portEXIT_CRITICAL(&zmerge_line_mux);
     return;
   }
   strlcpy(zmerge_lines[zmerge_line_wptr], line, sizeof(zmerge_lines[0]));
   zmerge_line_wptr = next;
+  portEXIT_CRITICAL(&zmerge_line_mux);
 }
 
 static bool zmerge_dequeue_line(char *line, size_t line_size)
 {
-  if (zmerge_line_rptr == zmerge_line_wptr) return false;
+  if (!line) return false;
+  portENTER_CRITICAL(&zmerge_line_mux);
+  if (!zmerge_lines || zmerge_line_rptr == zmerge_line_wptr) {
+    portEXIT_CRITICAL(&zmerge_line_mux);
+    return false;
+  }
   strlcpy(line, zmerge_lines[zmerge_line_rptr], line_size);
   zmerge_line_rptr = (uint8_t)((zmerge_line_rptr + 1) % ZMERGE_LINE_QUEUE);
+  portEXIT_CRITICAL(&zmerge_line_mux);
   return true;
 }
 
@@ -498,6 +559,7 @@ static void zmerge_reset(bool restore_log_pos)
   close_qso_log_readonly(&zmerge_scanf);
   if (zmerge.server_ids) free(zmerge.server_ids);
   if (zmerge.server_seen) free(zmerge.server_seen);
+  zmerge_free_work_buffers();
   memset(&zmerge, 0, sizeof(zmerge));
   zmerge_line_rptr = zmerge_line_wptr = 0;
   zmerge_line_overflow = false;
@@ -536,8 +598,9 @@ static void zmerge_finish(bool success, const char *reason)
                              zmerge.skipped_deleted);
     }
   }
-  zmerge_reset(true);
+  // Stop the AsyncTCP callback from queueing merge lines before freeing buffers.
   zserver.stat = zserver_client->connected() ? 4 : 0;
+  zmerge_reset(true);
 }
 
 static void zmerge_process_line(const char *line)
@@ -641,6 +704,14 @@ bool zserver_start_merge(bool dry_run)
     return false;
   }
   zmerge_reset(false);
+  if (!zmerge_alloc_work_buffers()) {
+    plogw->ostream->println("zmerge: cannot allocate work buffers in PSRAM");
+    return false;
+  }
+  plogw->ostream->printf("zmerge: PSRAM work buffers allocated (%u bytes)\n",
+                         (unsigned)(ZMERGE_LINE_QUEUE * ZMERGE_LINE_SIZE +
+                                    2 * (NCHR_ZSERVER_CMD + 1) +
+                                    sizeof(union qso_union_tag)));
   zmerge.phase = 1;
   zmerge.dry_run = dry_run;
   zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
@@ -912,7 +983,7 @@ void zserver_process() {
       zmerge_finish(false, "receive queue overflow");
       break;
     }
-    while (zmerge_dequeue_line(zmerge_rx_line, sizeof(zmerge_rx_line))) {
+    while (zmerge_dequeue_line(zmerge_rx_line, NCHR_ZSERVER_CMD + 1)) {
       zmerge_process_line(zmerge_rx_line);
       if (zmerge.phase == 0) break;
     }
@@ -926,7 +997,7 @@ void zserver_process() {
         zmerge_finish(false, "QSO scan file is not open");
         break;
       }
-      int n = read_qso_log_record(&zmerge_scanf, &zmerge_record);
+      int n = read_qso_log_record(&zmerge_scanf, zmerge_record);
       if (n == 0) {
         close_qso_log_readonly(&zmerge_scanf);
         if (zmerge.dry_run) {
@@ -941,19 +1012,19 @@ void zserver_process() {
         }
         break;
       }
-      if (n != sizeof(zmerge_record.all)) {
+      if (n != sizeof(zmerge_record->all)) {
         zmerge_finish(false, "short QSO log record");
         break;
       }
       zmerge.total_records++;
-      if (zmerge_record.entry.type[0] == 'D') {
+      if (zmerge_record->entry.type[0] == 'D') {
         zmerge.skipped_deleted++;
-      } else if (zmerge_record.entry.type[0] != 'Q') {
+      } else if (zmerge_record->entry.type[0] != 'Q') {
         // Ignore unused/corrupt records rather than interpreting them as QSOs.
         zmerge.skipped_no_qsoid++;
       } else {
         uint32_t qsoid;
-        if (!zmerge_qsoid_from_record(&zmerge_record, &qsoid)) {
+        if (!zmerge_qsoid_from_record(zmerge_record, &qsoid)) {
           zmerge.skipped_no_qsoid++;
         } else {
           int server_index = zmerge_find_server_id(qsoid);
@@ -966,8 +1037,8 @@ void zserver_process() {
               zmerge.next_send = millis();
               break;
             }
-            if (!zmerge_build_putlog(&zmerge_record, qsoid,
-                                     zmerge_tx_line, sizeof(zmerge_tx_line))) {
+            if (!zmerge_build_putlog(zmerge_record, qsoid,
+                                     zmerge_tx_line, NCHR_ZSERVER_CMD + 1)) {
               zmerge_finish(false, "PUTLOG command too long");
               break;
             }

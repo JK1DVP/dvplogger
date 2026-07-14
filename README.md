@@ -7,7 +7,7 @@ Release にマニュアル、ログ変換プログラム、内蔵Bluetooth モ�
 
 # License
 下記の通りGPLv2 or laterです。
-/* Copyright (c) 2021-2025 Eiichiro Araki
+/* Copyright (c) 2021-2026 Eiichiro Araki
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
 as published by the Free Software Foundation; either version 2
@@ -23,11 +23,12 @@ along with this program. If not, see http://www.gnu.org/licenses/.
 */
 
 ## binary のesp32 への書き込み
-Release で配布されているバイナリイメージを書き込む方法は[esptool](https://github.com/espressif/esptool) をインストールした上で、bootloader.bin partition-table.bin jk1dvplog.bin をディレクトリに置き、
+Release で配布されているバイナリイメージを書き込む方法は[esptool](https://github.com/espressif/esptool) をインストールした上で、bootloader.bin partition-table.bin dvplogger.bin をディレクトリに置き、
 
-python esptool.py -p シリアルポート -b 460800 --before default_reset --after hard_reset --chip esp32  write_flash --flash_mode dio --flash_size detect --flash_freq 40m 0x1000 bootloader.bin 0x8000 partition-table.bin 0x10000 jk1dvplog.bin
+python esptool.py -p シリアルポート -b 460800 --before default_reset --after hard_reset --chip esp32  write_flash --flash_mode dio --flash_size detect --flash_freq 40m 0x1000 bootloader.bin 0x8000 partition-table.bin 0x10000 dvplogger.bin
 `
 で書き込めるはずです。
+subcpu への書き込みは、Hamfair 2025以降の頒布ハードウェアではいずれも基板にアクセスせずともできるようになっていますが、それ以前の場合はジャンパ２本の接続が必要となります（instructionを参照してください）。
 
 ## source からのビルド方法
 本システムは、esp-idf v4.4.7 でビルドしています。
@@ -46,35 +47,22 @@ git clone -b 2.0.17 --recursive https://github.com/espressif/arduino-esp32 ./com
 
 ただし、dvploggerでは、arduino-esp32のライブラリを追加かつ変更していますので、components/arduino/libraries/の下を本リポジトリの内容で上書きをしてください。（こんなやり方で良いか不明・・・）
 
-その上で、メインCPU用のプログラムを
+その上で、
 
-cd dvplogger<br>
-idf.py build flash monitor<br>
+bash build-all.sh
 
-すれば、ビルドして書き込みまでできるはずです。
+すれば、２つの異なるハードウェア用のバイナリがbinaries/Wide, miniの下にできます。<br>
+書き込みは、バイナリ配布と同様に、binariesの下にできているファイルをesptoolを使ってもできますし、<br>
+idf.py を使い、
+idf.py -B build-main-hw1 flash monitor (mini版の場合) または、<br>
+idf.py -B build-main-hw3 flash monitor (mini版の場合) <br>
+としても、行えます。
 
-[注意] 本システムのメインCPUのプログラムはmini 版とwide版でビルドを分けることが必要です。
-
-ビルド前に
-
-dvplogger/main/decl.h に<br>
-\#define JK1DVPLOG_HWVER<br>
-の記述がありますので、mini版の方は<br>
-\#define JK1DVPLOG_HWVER 1<br>
-、Wide版の方は<br>
-\#define JK1DVPLOG_HWVER 3<br>
-とコメントアウトを外してください。
-
-サブCPUのプログラムの方は、同様に<br>
-cd dvplogger_ext<br>
-idf.py build<br>
-することにより、dvplogger_ext にapp0.bin , bootload.bin, parttio.bin, spiffs.bin のそれぞれシンボリックリンク先の実態ができていると思います。
-これをdvplogger のWebサーバーにアクセスし、DVPloggerのSDメモリにアップロードをしてください。
+同様に、サブCPUのプログラムもapp0.bin , bootload.bin, parttio.bin, spiffs.binのようにできています。<br>
+サブCPUのプログラムはdvplogger のWebサーバーにアクセスし、DVPloggerのSDメモリにアップロードをしてください。
 そのうえで、dvploggerのターミナル接続(idf.py monitorなどでやると良いでしょう）から、<br>
 flashersd app0 boot part spiffs [Enter]<br>
 とコマンドを打つことで、サブCPUへのflash書き込みができるようになっています。
-
-また、古い版のサブCPUプログラム（最低限の機能を実装）はSDへのアップロードなしに、flasher コマンドで書き込めるようにしておきましたので、不都合がある場合は、試してみてください。
 
 プログラムを書き換えた場合には、<br>
 restart_dvplogger<br>

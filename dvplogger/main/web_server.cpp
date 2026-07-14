@@ -41,6 +41,7 @@
 #include "log.h"
 #include "contest.h"
 #include "user_contest_md.h"
+#include "esp_heap_caps.h"
 
 
 AsyncWebServer web_server(80);
@@ -543,7 +544,7 @@ document.addEventListener("DOMContentLoaded", () => {
 )rawliteral";
 
 
-const char *rigs_page_html = R"rawliteral(
+static const char rigs_page_header[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -575,7 +576,9 @@ const char *rigs_page_html = R"rawliteral(
 <button onclick="fetch('/save_rigs').then(() => location.reload());">Save RIGs</button>
 <button onclick="fetch('/load_rigs').then(() => location.reload());">Load RIGs</button>
   <form id="settingsForm">
-    %RIGS_INPUTS%
+)rawliteral";
+
+static const char rigs_page_footer[] PROGMEM = R"rawliteral(
   </form>
   <p id="status"></p>
 <script>
@@ -660,36 +663,118 @@ void setupSettingsPageHandler() {
 
 
   web_server.on("/rigs", HTTP_GET, [](AsyncWebServerRequest *request) {
-    char spec_buf[300];
-    String html = rigs_page_html;  // テンプレートを複製
-    String inputs;
+    struct RigsPageState {
+      enum Stage : uint8_t { Header, RigEntry, Footer, Done } stage = Header;
+      size_t offset = 0;
+      size_t line_length = 0;
+      int rig_index = 0;
+      char line[640];
+    };
 
-    for (int i = 0; i < N_RIG; ++i) {
-      if (*rig_spec[i].name=='\0') {
-	break;
-      }
-      char line[300];
-      *spec_buf='\0';
-      print_rig_spec_str(i,spec_buf);
-      spec_buf[strlen(spec_buf)]='\0';
-      //      console->print(i); console->print(";");
-      //      console->print(rig_spec[i].name);      console->print(":");
-      //      console->println(spec_buf);
-      snprintf(line, sizeof(line), example_input_html,
-	       i,
-	       rig_spec[i].name,
-	       i,
-	       i,
-	       spec_buf,
-	       300,
-	       ""
-	       );
-      //      console->print("line:");console->println(line);
-      inputs += line;
-    }
+    RigsPageState state;
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "text/html",
+      [state](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+        (void)index;
+        size_t written = 0;
 
-    html.replace("%RIGS_INPUTS%", inputs);
-    request->send(200, "text/html", html);
+        // Copy as much as possible from a NUL-terminated source while
+        // remembering the current offset between chunk callbacks.
+        auto copy_text = [&](const char *src) -> bool {
+          const size_t length = strlen(src);
+          const size_t remain = length - state.offset;
+          const size_t ncopy = (remain < (maxLen - written))
+                               ? remain : (maxLen - written);
+          if (ncopy > 0) {
+            memcpy(buffer + written, src + state.offset, ncopy);
+            written += ncopy;
+            state.offset += ncopy;
+          }
+          if (state.offset == length) {
+            state.offset = 0;
+            return true;
+          }
+          return false;
+        };
+
+        while (written < maxLen && state.stage != RigsPageState::Done) {
+          switch (state.stage) {
+          case RigsPageState::Header:
+            if (copy_text(rigs_page_header)) {
+              state.stage = RigsPageState::RigEntry;
+            }
+            break;
+
+          case RigsPageState::RigEntry:
+            if (state.line_length == 0) {
+              while (state.rig_index < N_RIG &&
+                     *rig_spec[state.rig_index].name == '\0') {
+                state.rig_index = N_RIG;
+              }
+
+              if (state.rig_index >= N_RIG) {
+                state.stage = RigsPageState::Footer;
+                break;
+              }
+
+              char spec_buf[300];
+              spec_buf[0] = '\0';
+              print_rig_spec_str(state.rig_index, spec_buf);
+              spec_buf[sizeof(spec_buf) - 1] = '\0';
+
+              const int len = snprintf(state.line, sizeof(state.line),
+                                       example_input_html,
+                                       state.rig_index,
+                                       rig_spec[state.rig_index].name,
+                                       state.rig_index,
+                                       state.rig_index,
+                                       spec_buf,
+                                       300,
+                                       "");
+              if (len < 0) {
+                state.line[0] = '\0';
+                state.line_length = 0;
+                ++state.rig_index;
+                break;
+              }
+
+              state.line_length = strnlen(state.line, sizeof(state.line));
+              state.offset = 0;
+            }
+
+            {
+              const size_t remain = state.line_length - state.offset;
+              const size_t ncopy = (remain < (maxLen - written))
+                                   ? remain : (maxLen - written);
+              if (ncopy > 0) {
+                memcpy(buffer + written, state.line + state.offset, ncopy);
+                written += ncopy;
+                state.offset += ncopy;
+              }
+              if (state.offset == state.line_length) {
+                state.offset = 0;
+                state.line_length = 0;
+                ++state.rig_index;
+              }
+            }
+            break;
+
+          case RigsPageState::Footer:
+            if (copy_text(rigs_page_footer)) {
+              state.stage = RigsPageState::Done;
+            }
+            break;
+
+          case RigsPageState::Done:
+            break;
+          }
+        }
+
+        return written;
+      });
+
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
 
   web_server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -1533,7 +1618,18 @@ function handleShiftKey(event) {
 </body></html>
 )rawliteral";
 
+static void web_heap_point(const char *tag)
+{
+  console->printf("[MEM] %-22s internal=%u largest=%u min=%u psram=%u\n",
+                  tag,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+
 void init_webserver() {
+  web_heap_point("before web handlers");
 
   
   web_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -2136,7 +2232,9 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
   setupNearestHandler(web_server);
   setupNearestSummit(web_server);
   setupSettingsPageHandler();  
+  web_heap_point("after web handlers");
   web_server.begin();
+  web_heap_point("after web begin");
 }
 
 
