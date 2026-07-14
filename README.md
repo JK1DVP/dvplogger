@@ -28,7 +28,10 @@ Release で配布されているバイナリイメージを書き込む方法は
 python esptool.py -p シリアルポート -b 460800 --before default_reset --after hard_reset --chip esp32  write_flash --flash_mode dio --flash_size detect --flash_freq 40m 0x1000 bootloader.bin 0x8000 partition-table.bin 0x10000 dvplogger.bin
 `
 で書き込めるはずです。
-subcpu への書き込みは、Hamfair 2025以降の頒布ハードウェアではいずれも基板にアクセスせずともできるようになっていますが、それ以前の場合はジャンパ２本の接続が必要となります（instructionを参照してください）。
+subcpu への書き込みは、Hamfair 2025以降の頒布ハードウェアではいずれも基板にアクセスせずともできるようになっていますが、それ以前の場合は下記の通り、少々改造が必要です。
+<img width="782" height="605" alt="image" src="https://github.com/user-attachments/assets/fad1a7f8-5d5b-4aea-9dcf-ff3e408ce474" />
+のように、２本の線を10pin コネクターと秋月モジュールの間に接続を行ってください。
+
 
 ## source からのビルド方法
 本システムは、esp-idf v4.4.7 でビルドしています。
