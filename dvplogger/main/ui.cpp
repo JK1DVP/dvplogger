@@ -2383,15 +2383,7 @@ void process_enter(int option) {
       break;
     }
     if (strcmp(radio->callsign + 2, "WIFI") == 0) {
-      wifi_enable = 1 - wifi_enable;
-      cluster.stat = 0;
-      wifi_count = 0;
-      if (!wifi_enable) {
-	WiFi.disconnect(true);
-	WiFi.mode(WIFI_OFF);
-      } else {
-			
-      }
+      set_wifi_enabled(!wifi_enable);
       sprintf(dp->lcdbuf, "wifi_enable=%d", wifi_enable);
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);

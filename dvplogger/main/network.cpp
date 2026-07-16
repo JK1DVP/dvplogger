@@ -232,7 +232,8 @@ int check_wifi() {
       sprintf(dp->lcdbuf, "check_wifi()\nrun()");
       upd_display_info_flash(dp->lcdbuf);
       
-      if (ESPWMAP.handle() == WL_CONNECTED) {      
+      wl_status_t status = ESPWMAP.handle();
+      if (status == WL_CONNECTED) {      
 	sprintf(dp->lcdbuf, "check_wifi()\nConnected.\n%s",WiFi.localIP().toString().c_str());
 	upd_display_info_flash(dp->lcdbuf);
 
@@ -243,6 +244,9 @@ int check_wifi() {
 	sprintf(dp->lcdbuf, "check_wifi()\nnot found.cnt=%d",wifi_count);
 	upd_display_info_flash(dp->lcdbuf);
 	
+	snprintf(buf, 128, "WIFI: connect failed count=%d status=%d mode=%d",
+	         wifi_count, (int)status, (int)WiFi.getMode());
+	console->println(buf);
 	wifi_count++;
 	if (wifi_count > 10) {
 	  console->println("check wifi failed > 10... disabling wifi");
@@ -265,10 +269,41 @@ int check_wifi() {
       }
     }
   } else {
+    // Do not leave a stale connected flag after Wi-Fi has been disabled.
+    wifi_status = 0;
     return 0;
   }
 }
 
+
+
+void set_wifi_enabled(int enabled) {
+  wifi_count = 0;
+  wifi_status = 0;
+  cluster.stat = 0;
+
+  if (!enabled) {
+    wifi_enable = 0;
+    console->println("WIFI: disabling station and disconnecting");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return;
+  }
+
+  wifi_enable = 1;
+  console->println("WIFI: enabling station and restarting ESPWMAP");
+
+  // WIFI_OFF cannot be recovered by ESPWMAP.handle() alone.  Restore STA
+  // mode and restart the multi-AP manager before attempting a connection.
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  ESPWMAP.begin();
+
+  int result = check_wifi();
+  snprintf(buf, 128, "WIFI: reconnect attempt result=%d status=%d mode=%d",
+           result, (int)WiFi.status(), (int)WiFi.getMode());
+  console->println(buf);
+}
 
 /// AsyncTCP comm related routines
 int println_tcpserver(void *arg,const char *s)

@@ -26,6 +26,7 @@ void print_wifiinfo() ;
 void localip_to_string(char *buf);
 void init_network() ;
 int check_wifi() ;
+void set_wifi_enabled(int enabled);
 void multiwifi_addap(char *ssid,char *passwd);
 int println_tcpserver(void *arg,const char *s);
 void ftp_service_loop();

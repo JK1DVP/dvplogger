@@ -741,24 +741,39 @@ body{font-family:sans-serif;margin:18px;max-width:1250px}
 table{border-collapse:collapse;width:100%;margin:12px 0 24px}
 th,td{border:1px solid #aaa;padding:6px;text-align:left;vertical-align:middle}
 tr.current{font-weight:bold;background:#e8f3ff}
-input{box-sizing:border-box;padding:5px;font-size:.95em;width:100%}
+input{box-sizing:border-box;padding:5px;font-size:.95em;width:100%;min-width:9em}
 button{padding:5px 10px;white-space:nowrap}.dupe-ok{color:#075f16;font-weight:bold}.dupe-ng{color:#9b1c1c;font-weight:bold}
 #status{min-height:1.4em;font-weight:bold}.note{font-size:.9em}.name{white-space:nowrap}
+.contest-wrap{overflow-x:auto;width:100%}.contest-table{table-layout:fixed;min-width:1180px}
+.contest-table .col-id{width:38px}.contest-table .col-name{width:150px}.contest-table .col-dupe{width:80px}
+.contest-table .col-msg{width:175px}.contest-table .col-exch{width:150px}.contest-table .col-action{width:145px}
+.user-table{table-layout:fixed;min-width:1120px}
+.user-table .col-user-name{width:220px}.user-table .col-msg{width:175px}
+.user-table .col-exch{width:150px}.user-table .col-action{width:145px}
+.user-name-field{display:flex;align-items:center;gap:4px;white-space:nowrap}
+.user-name-field input{min-width:0;flex:1}
 .help{max-width:900px}.help th:first-child,.help td:first-child{white-space:nowrap}.examples code{white-space:nowrap}
 </style></head><body><h2>Contest selection</h2>
 <p>Current contest: <strong>%CURRENT_CONTEST%</strong></p>
 <p class="note"><strong>%SD_STATUS%</strong><br>Last action: %LAST_STATUS%</p><p id="status"></p>
 <p class="note">Select &amp; Save stores the F1, F2, F3, F5 and sent exchange preset on the SD card, then activates the contest.</p>
-<table><thead><tr><th>ID</th><th>Contest</th><th>Dupe</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody>
+<div class="contest-wrap"><table class="contest-table"><colgroup>
+<col class="col-id"><col class="col-name"><col class="col-dupe">
+<col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg">
+<col class="col-exch"><col class="col-action"></colgroup>
+<thead><tr><th>ID</th><th>Contest</th><th>Dupe</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody>
 )rawliteral";
 
 static const char contests_page_footer[] PROGMEM = R"rawliteral(
-</tbody></table><h3>User contest (.MD)</h3>
+</tbody></table></div><h3>User contest (.MD)</h3>
 <p>Enter the filename without <code>User</code> and <code>.MD</code>. The preset is saved separately for each User filename.</p>
 <form method="GET" action="/select_user_contest">
-<table><tbody><tr><td class="name">User<input name="filename" maxlength="8" value="%USER_FILENAME%" placeholder="TOKYO" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></td>
+<div class="contest-wrap"><table class="user-table"><colgroup>
+<col class="col-user-name"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-exch"><col class="col-action">
+</colgroup><thead><tr><th>User MD filename</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody><tr>
+<td><div class="user-name-field"><span>User</span><input name="filename" maxlength="8" value="%USER_FILENAME%" placeholder="TOKYO" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></div></td>
 <td><input name="f1" maxlength="30" value="%USER_F1%"></td><td><input name="f2" maxlength="30" value="%USER_F2%"></td><td><input name="f3" maxlength="30" value="%USER_F3%"></td><td><input name="f5" maxlength="30" value="%USER_F5%"></td><td><input name="exch" maxlength="17" value="%USER_EXCH%"></td>
-<td><button type="submit">Select &amp; Save</button></td></tr></tbody></table>
+<td><button type="submit">Select &amp; Save</button></td></tr></tbody></table></div>
 </form>
 <p class="note">The MD file must exist as <code>/FILENAME.MD</code>. Allowed filename characters: A-Z, 0-9, _ and -.</p>
 
@@ -1045,7 +1060,7 @@ static void setupContestPageHandler() {
   load_contest_web_presets();
 
   web_server.on("/contests", HTTP_GET, [](AsyncWebServerRequest *request) {
-    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; char text[1600]; };
+    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; char text[3584]; };
     State state;
     AsyncWebServerResponse *response=request->beginChunkedResponse("text/html",
       [state](uint8_t *buffer,size_t maxLen,size_t chunkIndex) mutable -> size_t {
@@ -1088,16 +1103,16 @@ static void setupContestPageHandler() {
               const char *f5=p?p->f5:(current?plogw->cw_msg[4]+2:plogw->cw_msg[4]+2);
               const char *ex=p?p->exch:(current?plogw->sent_exch+2:plogw->sent_exch+2);
               bool dupe_ok=contest_definition_mask(state.index)==CW_PH_DUPE_OK;
-              String row=String("<tr")+(current?" class=\"current\"":"")+"><td>"+id+"</td><td class=\"name\">"+html_attr_escape(name)+"</td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(dupe_ok?"OK C/P":"NG C/P")+"</td>";
-              row += "<td colspan=\"6\"><form method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"><table style=\"margin:0;width:100%;border:0\"><tr>";
-              row += "<td style=\"border:0\"><input name=\"f1\" maxlength=\"30\" value=\""+html_attr_escape(f1)+"\"></td>";
-              row += "<td style=\"border:0\"><input name=\"f2\" maxlength=\"30\" value=\""+html_attr_escape(f2)+"\"></td>";
-              row += "<td style=\"border:0\"><input name=\"f3\" maxlength=\"30\" value=\""+html_attr_escape(f3)+"\"></td>";
-              row += "<td style=\"border:0\"><input name=\"f5\" maxlength=\"30\" value=\""+html_attr_escape(f5)+"\"></td>";
-              row += "<td style=\"border:0\"><input name=\"exch\" maxlength=\"17\" value=\""+html_attr_escape(ex)+"\"></td>";
-              row += String("<td style=\"border:0\"><button type=\"submit\">")
+              String form_id = String("contest_form_") + String(state.index);
+              String row=String("<tr")+(current?" class=\"current\"":"")+"><td><form id=\""+form_id+"\" method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"></form>"+String(id)+"</td><td class=\"name\">"+html_attr_escape(name)+"</td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(dupe_ok?"OK C/P":"NG C/P")+"</td>";
+              row += "<td><input form=\""+form_id+"\" name=\"f1\" maxlength=\"30\" value=\""+html_attr_escape(f1)+"\"></td>";
+              row += "<td><input form=\""+form_id+"\" name=\"f2\" maxlength=\"30\" value=\""+html_attr_escape(f2)+"\"></td>";
+              row += "<td><input form=\""+form_id+"\" name=\"f3\" maxlength=\"30\" value=\""+html_attr_escape(f3)+"\"></td>";
+              row += "<td><input form=\""+form_id+"\" name=\"f5\" maxlength=\"30\" value=\""+html_attr_escape(f5)+"\"></td>";
+              row += "<td><input form=\""+form_id+"\" name=\"exch\" maxlength=\"17\" value=\""+html_attr_escape(ex)+"\"></td>";
+              row += String("<td><button form=\"") + form_id + "\" type=\"submit\">"
                      + (current ? "Save / Re-select" : "Select & Save")
-                     + "</button></td></tr></table></form></td></tr>\n";
+                     + "</button></td></tr>\n";
               row.toCharArray(state.text,sizeof(state.text)); state.length=strnlen(state.text,sizeof(state.text)); state.offset=0;
             }
             if (copy()) ++state.index;
