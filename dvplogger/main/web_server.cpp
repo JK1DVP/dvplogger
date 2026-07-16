@@ -41,7 +41,108 @@
 #include "log.h"
 #include "contest.h"
 #include "user_contest_md.h"
+#include "timekeep.h"
 #include "esp_heap_caps.h"
+#include "bandmap.h"
+#include "dupechk.h"
+#include "multi_process.h"
+#include <algorithm>
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <errno.h>
+
+namespace {
+constexpr size_t WEB_LOG_LINE_SIZE = 192;
+constexpr uint8_t WEB_LOG_QUEUE_LEN = 8;
+
+struct WebLogLine {
+  char text[WEB_LOG_LINE_SIZE];
+};
+
+static WebLogLine web_log_queue[WEB_LOG_QUEUE_LEN];
+static volatile uint8_t web_log_head = 0;
+static volatile uint8_t web_log_tail = 0;
+static volatile uint32_t web_log_dropped = 0;
+static portMUX_TYPE web_log_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void enqueue_web_log_line(const char *text) {
+  if (!text) return;
+  portENTER_CRITICAL(&web_log_mux);
+  uint8_t next = (uint8_t)((web_log_head + 1) % WEB_LOG_QUEUE_LEN);
+  if (next == web_log_tail) {
+    ++web_log_dropped;
+    portEXIT_CRITICAL(&web_log_mux);
+    return;
+  }
+  strlcpy(web_log_queue[web_log_head].text, text, WEB_LOG_LINE_SIZE);
+  web_log_head = next;
+  portEXIT_CRITICAL(&web_log_mux);
+}
+
+class DeferredWebLogPrint : public Print {
+public:
+  size_t write(uint8_t c) override {
+    portENTER_CRITICAL(&mux_);
+    if (c == '\r') {
+      portEXIT_CRITICAL(&mux_);
+      return 1;
+    }
+    if (c == '\n' || len_ >= sizeof(line_) - 1) {
+      line_[len_] = '\0';
+      if (len_ > 0) enqueue_web_log_line(line_);
+      len_ = 0;
+      if (c != '\n') line_[len_++] = (char)c;
+    } else {
+      line_[len_++] = (char)c;
+    }
+    portEXIT_CRITICAL(&mux_);
+    return 1;
+  }
+
+  size_t write(const uint8_t *buffer, size_t size) override {
+    if (!buffer) return 0;
+    for (size_t i = 0; i < size; ++i) write(buffer[i]);
+    return size;
+  }
+
+private:
+  char line_[WEB_LOG_LINE_SIZE];
+  size_t len_ = 0;
+  portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
+};
+
+static DeferredWebLogPrint webLog;
+}
+
+void process_web_terminal_log_queue() {
+  for (;;) {
+    WebLogLine line;
+    bool have_line = false;
+    uint32_t dropped = 0;
+
+    portENTER_CRITICAL(&web_log_mux);
+    if (web_log_tail != web_log_head) {
+      line = web_log_queue[web_log_tail];
+      web_log_tail = (uint8_t)((web_log_tail + 1) % WEB_LOG_QUEUE_LEN);
+      have_line = true;
+    } else if (web_log_dropped != 0) {
+      dropped = web_log_dropped;
+      web_log_dropped = 0;
+    }
+    portEXIT_CRITICAL(&web_log_mux);
+
+    if (have_line) {
+      console->print("[WEB] ");
+      console->println(line.text);
+      continue;
+    }
+    if (dropped) {
+      console->printf("[WEB] %lu log message(s) dropped\n", (unsigned long)dropped);
+    }
+    break;
+  }
+}
 
 
 AsyncWebServer web_server(80);
@@ -54,7 +155,7 @@ void notFound(AsyncWebServerRequest *request) {
 
 
 void rebootESP(String message) {
-  console->print("Rebooting ESP32: "); Serial.println(message);
+  webLog.print("Rebooting ESP32: "); webLog.println(message);
   ESP.restart();
 }
 
@@ -63,7 +164,7 @@ String humanReadableSize(const size_t bytes);
 // list all of the files, if ishtml=true, return html rather than simple text
 String listFiles(bool ishtml) {
   String returnText = "";
-  console->println("Listing files stored on SPIFFS");
+  webLog.println("Listing files stored on SPIFFS");
   File root = SD.open("/");
   File foundfile = root.openNextFile();
   if (ishtml) {
@@ -96,27 +197,27 @@ String humanReadableSize(const size_t bytes) {
 // handles uploads
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
   String logmessage = "Client:" + request->client()->remoteIP().toString() + " " + request->url();
-  console->println(logmessage);
+  webLog.println(logmessage);
 
   if (!index) {
     logmessage = "Upload Start: " + String(filename);
     // open the file on first call and store the file handle in the request object
     request->_tempFile = SD.open("/" + filename, "w");
-    console->println(logmessage);
+    webLog.println(logmessage);
   }
 
   if (len) {
     // stream the incoming chunk to the opened file
     request->_tempFile.write(data, len);
     logmessage = "Writing file: " + String(filename) + " index=" + String(index) + " len=" + String(len);
-    console->println(logmessage);
+    webLog.println(logmessage);
   }
 
   if (final) {
     logmessage = "Upload Complete: " + String(filename) + ",size: " + String(index + len);
     // close the file handle as the upload is now done
     request->_tempFile.close();
-    console->println(logmessage);
+    webLog.println(logmessage);
     request->redirect("/");
   }
 }
@@ -239,13 +340,13 @@ void setupNearestHandler(AsyncWebServer &server) {
 
     char gridstr[10];
     strcpy(gridstr,grid.c_str());
-    console->print("grid=");console->print(gridstr);
-    console->print("<-");console->println(grid.c_str());
+    webLog.print("grid=");webLog.print(gridstr);
+    webLog.print("<-");webLog.println(grid.c_str());
 	      
     myLat=mh2lat(gridstr);
     myLon=mh2lon(gridstr);
 
-    console->print("lat,lon=");console->print(myLat);console->print(" ");console->println(myLon);
+    webLog.print("lat,lon=");webLog.print(myLat);webLog.print(" ");webLog.println(myLon);
 
     File f = SD.open("/pota-jp.csv", "r");
     if (!f) {
@@ -272,10 +373,10 @@ void setupNearestHandler(AsyncWebServer &server) {
       String name = line.substring(c1 + 1, c2);
       double lat = line.substring(c2 + 1, c3).toFloat();
       double lon = line.substring(c3 + 1, c4).toFloat();
-      /*      console->print("code:");console->print(code);
-      console->print("name:");console->print(name);      
-      console->print(" lat:");console->print(lat);
-      console->print(" lon:");console->println(lon);
+      /*      webLog.print("code:");webLog.print(code);
+      webLog.print("name:");webLog.print(name);      
+      webLog.print(" lat:");webLog.print(lat);
+      webLog.print(" lon:");webLog.println(lon);
       */
       
 
@@ -348,22 +449,22 @@ void setupNearestSummit(AsyncWebServer &server) {
     //gridToLatLon(grid.c_str(), myLat, myLon);
     char gridstr[10];
     strcpy(gridstr,grid.c_str());
-    console->print("grid=");console->print(gridstr);
-    console->print("<-");console->println(grid.c_str());
+    webLog.print("grid=");webLog.print(gridstr);
+    webLog.print("<-");webLog.println(grid.c_str());
 	      
     myLat=mh2lat(gridstr);
     myLon=mh2lon(gridstr);
-    console->print("lat,lon=");console->print(myLat);console->print(" ");console->println(myLon);
+    webLog.print("lat,lon=");webLog.print(myLat);webLog.print(" ");webLog.println(myLon);
 
     File f = SD.open("/ja_sota.csv","r");
     if (!f){ req->send(500,"text/plain","SOTA CSV open err"); return; }
-    console->println("open ja_sota.csv");
+    webLog.println("open ja_sota.csv");
 
     SummitInfo best[3]; int filled=0;
     while(f.available()){
       String line=f.readStringUntil('\n');
       if(line.startsWith("summitCode")) continue;
-      //      console->println(line);
+      //      webLog.println(line);
       int c1=line.indexOf(',');
       int c2=line.indexOf(',',c1+1);
       int c3=line.indexOf(',',c2+1);
@@ -377,8 +478,8 @@ void setupNearestSummit(AsyncWebServer &server) {
       double lon= line.substring(c3+1,c4).toFloat();
       int alt   = line.substring(c4+1,c5).toInt();      
       if(lat==0||lon==0) continue;
-      //      console->print("lat:");console->print(lat);
-      //      console->print("lon:");console->println(lon);      
+      //      webLog.print("lat:");webLog.print(lat);
+      //      webLog.print("lon:");webLog.println(lon);      
       yield();
       double d = haversine(myLat,myLon,lat,lon);
       double bearing = calculateBearing(myLat, myLon, lat, lon);
@@ -409,7 +510,7 @@ void setupNearestSummit(AsyncWebServer &server) {
 	"}";
     }
     json+="]";
-    console->println(json);
+    webLog.println(json);
     req->send(200,"application/json",json);
   });
 }
@@ -631,6 +732,436 @@ const char *pattern_both =
 
 // settings_page_htmlとexample_input_html は前述の定数文字列
 
+static const char contests_page_header[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DVPlogger Contest Selection</title>
+<style>
+body{font-family:sans-serif;margin:18px;max-width:1250px}
+table{border-collapse:collapse;width:100%;margin:12px 0 24px}
+th,td{border:1px solid #aaa;padding:6px;text-align:left;vertical-align:middle}
+tr.current{font-weight:bold;background:#e8f3ff}
+input{box-sizing:border-box;padding:5px;font-size:.95em;width:100%}
+button{padding:5px 10px;white-space:nowrap}.dupe-ok{color:#075f16;font-weight:bold}.dupe-ng{color:#9b1c1c;font-weight:bold}
+#status{min-height:1.4em;font-weight:bold}.note{font-size:.9em}.name{white-space:nowrap}
+.help{max-width:900px}.help th:first-child,.help td:first-child{white-space:nowrap}.examples code{white-space:nowrap}
+</style></head><body><h2>Contest selection</h2>
+<p>Current contest: <strong>%CURRENT_CONTEST%</strong></p>
+<p class="note"><strong>%SD_STATUS%</strong><br>Last action: %LAST_STATUS%</p><p id="status"></p>
+<p class="note">Select &amp; Save stores the F1, F2, F3, F5 and sent exchange preset on the SD card, then activates the contest.</p>
+<table><thead><tr><th>ID</th><th>Contest</th><th>Dupe</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody>
+)rawliteral";
+
+static const char contests_page_footer[] PROGMEM = R"rawliteral(
+</tbody></table><h3>User contest (.MD)</h3>
+<p>Enter the filename without <code>User</code> and <code>.MD</code>. The preset is saved separately for each User filename.</p>
+<form method="GET" action="/select_user_contest">
+<table><tbody><tr><td class="name">User<input name="filename" maxlength="8" value="%USER_FILENAME%" placeholder="TOKYO" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></td>
+<td><input name="f1" maxlength="30" value="%USER_F1%"></td><td><input name="f2" maxlength="30" value="%USER_F2%"></td><td><input name="f3" maxlength="30" value="%USER_F3%"></td><td><input name="f5" maxlength="30" value="%USER_F5%"></td><td><input name="exch" maxlength="17" value="%USER_EXCH%"></td>
+<td><button type="submit">Select &amp; Save</button></td></tr></tbody></table>
+</form>
+<p class="note">The MD file must exist as <code>/FILENAME.MD</code>. Allowed filename characters: A-Z, 0-9, _ and -.</p>
+
+<h3>CW message macros</h3>
+<p class="note">Enter the sent exchange itself (for example <code>11</code> or <code>1115</code>) in the <strong>Sent EXCH</strong> box. Use <code>$W</code> in a CW message to transmit that value. Number abbreviation follows the DVPlogger CW-number abbreviation setting.</p>
+<table class="help"><thead><tr><th>Macro</th><th>Expanded value</th></tr></thead><tbody>
+<tr><td><code>$I</code></td><td>Your callsign</td></tr>
+<tr><td><code>$C</code></td><td>Other station's callsign</td></tr>
+<tr><td><code>$U</code></td><td><code>CQ</code> in CW/Digital mode</td></tr>
+<tr><td><code>$T</code></td><td><code>TEST</code> in CW/Digital mode</td></tr>
+<tr><td><code>$A</code></td><td><code>TU</code> in CW/Digital mode</td></tr>
+<tr><td><code>$V</code></td><td>Sent RST; normally abbreviated as <code>5NN</code> in CW</td></tr>
+<tr><td><code>$W</code></td><td>Sent EXCH entered in this table</td></tr>
+<tr><td><code>$P</code></td><td>Band-dependent power code</td></tr>
+<tr><td><code>$J</code></td><td>Your JCC/JCG number from the logger settings</td></tr>
+<tr><td><code>$S</code></td><td>Current sequential QSO number</td></tr>
+<tr><td><code>$Q</code></td><td>Next band-specific sequential number, formatted with three digits</td></tr>
+<tr><td><code>$N</code></td><td>Your operator name</td></tr>
+</tbody></table>
+
+<h3>Examples</h3>
+<table class="help examples"><thead><tr><th>Key</th><th>Example</th><th>Typical result</th></tr></thead><tbody>
+<tr><td>F1</td><td><code>$U $T DE $I $I $T</code></td><td><code>CQ TEST DE JK1DVP JK1DVP TEST</code></td></tr>
+<tr><td>F2</td><td><code>$C $V $W</code></td><td><code>JA1ABC 5NN 1115</code></td></tr>
+<tr><td>F3</td><td><code>$A $I $T</code></td><td><code>TU JK1DVP TEST</code></td></tr>
+<tr><td>F5</td><td><code>$C $V$W$P</code></td><td><code>JA1ABC 5NN1115M</code></td></tr>
+</tbody></table>
+<p class="note">Spaces written in the message are transmitted as word spaces. Macros may be joined without spaces, as in <code>$V$W$P</code>.</p>
+<p><a href="/">Back to Home</a></p>
+</body></html>
+)rawliteral";
+
+struct ContestWebPreset {
+  bool used;
+  char name[LEN_CONTEST_NAME + 1];
+  char f1[LEN_CWMSG_WINDOW + 1];
+  char f2[LEN_CWMSG_WINDOW + 1];
+  char f3[LEN_CWMSG_WINDOW + 1];
+  char f5[LEN_CWMSG_WINDOW + 1];
+  char exch[LEN_SENT_EXCH_WINDOW + 1];
+};
+
+static constexpr int MAX_CONTEST_WEB_PRESETS = N_CONTEST + 8;
+static ContestWebPreset contest_web_presets[MAX_CONTEST_WEB_PRESETS];
+static bool contest_web_presets_loaded = false;
+static const char *CONTEST_PRESET_FILE = "/CONTEST.TXT";
+static const char *CONTEST_PRESET_VFS_FILE = "/sd/CONTEST.TXT";
+static String contest_web_last_status = "No contest action has been received since boot.";
+static bool contest_web_file_loaded = false;
+static size_t contest_web_file_size = 0;
+
+static void set_contest_web_status(const String &message) {
+  contest_web_last_status = message;
+  if (console) console->printf("WEB CONTEST: %s\n", message.c_str());
+  Serial.printf("WEB CONTEST: %s\n", message.c_str());
+}
+
+static String contest_web_sd_status() {
+  String s = "microSD: ";
+  if (SD.cardType() == CARD_NONE) return s + "not mounted / no card";
+  s += "mounted, preset=";
+  if (SD.exists(CONTEST_PRESET_FILE)) {
+    File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
+    if (f) {
+      s += CONTEST_PRESET_FILE;
+      s += " (";
+      s += String(f.size());
+      s += " bytes)";
+      f.close();
+    } else {
+      s += "exists but cannot open";
+    }
+  } else {
+    s += "not created yet";
+  }
+  return s;
+}
+
+static void copy_web_value(char *dst, size_t dst_size, const String &src) {
+  if (!dst || dst_size == 0) return;
+  size_t n = 0;
+  while (n + 1 < dst_size && n < src.length()) {
+    char c = src.charAt(n);
+    dst[n] = (c == '\r' || c == '\n' || c == '\t') ? ' ' : c;
+    ++n;
+  }
+  dst[n] = '\0';
+}
+
+static String html_attr_escape(const char *src) {
+  String out;
+  if (!src) return out;
+  while (*src) {
+    switch (*src) {
+      case '&': out += F("&amp;"); break;
+      case '"': out += F("&quot;"); break;
+      case '<': out += F("&lt;"); break;
+      case '>': out += F("&gt;"); break;
+      default: out += *src; break;
+    }
+    ++src;
+  }
+  return out;
+}
+
+static String json_string_escape(const char *src) {
+  String out;
+  if (!src) return out;
+  while (*src) {
+    switch (*src) {
+      case '\\': out += F("\\\\"); break;
+      case '"': out += F("\\\""); break;
+      case '\r': out += F("\\r"); break;
+      case '\n': out += F("\\n"); break;
+      case '\t': out += F("\\t"); break;
+      default: out += *src; break;
+    }
+    ++src;
+  }
+  return out;
+}
+
+static ContestWebPreset *find_contest_web_preset(const char *name, bool create) {
+  if (!name || !*name) return NULL;
+  ContestWebPreset *free_slot = NULL;
+  for (int i = 0; i < MAX_CONTEST_WEB_PRESETS; ++i) {
+    if (contest_web_presets[i].used) {
+      if (strcasecmp(contest_web_presets[i].name, name) == 0) return &contest_web_presets[i];
+    } else if (!free_slot) free_slot = &contest_web_presets[i];
+  }
+  if (!create || !free_slot) return NULL;
+  memset(free_slot, 0, sizeof(*free_slot));
+  free_slot->used = true;
+  strlcpy(free_slot->name, name, sizeof(free_slot->name));
+  return free_slot;
+}
+
+static void load_contest_web_presets() {
+  if (contest_web_presets_loaded) return;
+  contest_web_presets_loaded = true;
+  memset(contest_web_presets, 0, sizeof(contest_web_presets));
+  File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
+  if (!f) {
+    contest_web_file_loaded = false;
+    contest_web_file_size = 0;
+    set_contest_web_status(String("preset file not found at ") + CONTEST_PRESET_FILE + "; starting with empty presets");
+    return;
+  }
+  contest_web_file_loaded = true;
+  contest_web_file_size = f.size();
+  set_contest_web_status(String("loaded ") + CONTEST_PRESET_FILE + " (" + String(contest_web_file_size) + " bytes)");
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    if (line.endsWith("\r")) line.remove(line.length() - 1);
+    if (!line.length() || line.charAt(0) == '#') continue;
+    int p1 = line.indexOf('\t');
+    int p2 = p1 < 0 ? -1 : line.indexOf('\t', p1 + 1);
+    int p3 = p2 < 0 ? -1 : line.indexOf('\t', p2 + 1);
+    int p4 = p3 < 0 ? -1 : line.indexOf('\t', p3 + 1);
+    int p5 = p4 < 0 ? -1 : line.indexOf('\t', p4 + 1);
+    if (p1 < 1 || p2 < 0 || p3 < 0) continue;
+    String name = line.substring(0, p1);
+    ContestWebPreset *p = find_contest_web_preset(name.c_str(), true);
+    if (!p) continue;
+    copy_web_value(p->f1, sizeof(p->f1), line.substring(p1 + 1, p2));
+    if (p4 >= 0 && p5 >= 0) {
+      copy_web_value(p->f2, sizeof(p->f2), line.substring(p2 + 1, p3));
+      copy_web_value(p->f3, sizeof(p->f3), line.substring(p3 + 1, p4));
+      copy_web_value(p->f5, sizeof(p->f5), line.substring(p4 + 1, p5));
+      copy_web_value(p->exch, sizeof(p->exch), line.substring(p5 + 1));
+    } else {
+      copy_web_value(p->f3, sizeof(p->f3), line.substring(p2 + 1, p3));
+      copy_web_value(p->exch, sizeof(p->exch), line.substring(p3 + 1));
+    }
+  }
+  f.close();
+}
+
+static bool save_contest_web_presets() {
+  if (SD.cardType() == CARD_NONE) {
+    set_contest_web_status("save failed: microSD is not mounted");
+    return false;
+  }
+  if (SD.exists(CONTEST_PRESET_FILE) && !SD.remove(CONTEST_PRESET_FILE)) {
+    set_contest_web_status(String("save failed: cannot remove old ") + CONTEST_PRESET_FILE);
+    return false;
+  }
+  // FILE_WRITE in the old Arduino-ESP32 core used by this project may open
+  // an existing file without O_CREAT.  Use the already-mounted VFS path
+  // explicitly so a new 8.3 file can always be created/truncated.
+  FILE *fp = fopen(CONTEST_PRESET_VFS_FILE, "w");
+  if (!fp) {
+    set_contest_web_status(String("save failed: fopen(") + CONTEST_PRESET_VFS_FILE + ",w) failed, errno=" + String(errno));
+    return false;
+  }
+  size_t written = 0;
+  int n = fprintf(fp, "# contest-name\tF1\tF2\tF3\tF5\tsent-exchange\n");
+  if (n > 0) written += (size_t)n;
+  for (int i = 0; i < MAX_CONTEST_WEB_PRESETS; ++i) {
+    const ContestWebPreset &p = contest_web_presets[i];
+    if (!p.used) continue;
+    n = fprintf(fp, "%s\t%s\t%s\t%s\t%s\t%s\n",
+                p.name, p.f1, p.f2, p.f3, p.f5, p.exch);
+    if (n < 0) {
+      fclose(fp);
+      set_contest_web_status(String("save failed while writing ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
+      return false;
+    }
+    written += (size_t)n;
+  }
+  if (fflush(fp) != 0) {
+    fclose(fp);
+    set_contest_web_status(String("save failed while flushing ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
+    return false;
+  }
+  if (fclose(fp) != 0) {
+    set_contest_web_status(String("save failed while closing ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
+    return false;
+  }
+  if (!SD.exists(CONTEST_PRESET_FILE)) {
+    set_contest_web_status(String("save failed: ") + CONTEST_PRESET_FILE + " is absent after close");
+    return false;
+  }
+  File verify = SD.open(CONTEST_PRESET_FILE, FILE_READ);
+  if (!verify) {
+    set_contest_web_status(String("save failed: cannot reopen ") + CONTEST_PRESET_FILE);
+    return false;
+  }
+  const size_t verified = verify.size();
+  verify.close();
+  contest_web_file_loaded = true;
+  contest_web_file_size = verified;
+  set_contest_web_status(String("saved ") + CONTEST_PRESET_FILE + " (" + String(verified) + " bytes, write reported " + String(written) + ")");
+  return true;
+}
+
+static void set_current_contest_messages(const ContestWebPreset &p) {
+  strlcpy(plogw->cw_msg[0] + 2, p.f1, LEN_CWMSG_WINDOW + 1);
+  plogw->cw_msg[0][1] = strlen(plogw->cw_msg[0] + 2);
+  strlcpy(plogw->cw_msg[1] + 2, p.f2, LEN_CWMSG_WINDOW + 1);
+  plogw->cw_msg[1][1] = strlen(plogw->cw_msg[1] + 2);
+  strlcpy(plogw->cw_msg[2] + 2, p.f3, LEN_CWMSG_WINDOW + 1);
+  plogw->cw_msg[2][1] = strlen(plogw->cw_msg[2] + 2);
+  strlcpy(plogw->cw_msg[4] + 2, p.f5, LEN_CWMSG_WINDOW + 1);
+  plogw->cw_msg[4][1] = strlen(plogw->cw_msg[4] + 2);
+  strlcpy(plogw->sent_exch + 2, p.exch, LEN_SENT_EXCH_WINDOW + 1);
+  plogw->sent_exch[1] = strlen(plogw->sent_exch + 2);
+}
+
+static AsyncWebParameter *contest_request_param(AsyncWebServerRequest *request, const char *name) {
+  if (request->hasParam(name, true)) return request->getParam(name, true);
+  if (request->hasParam(name)) return request->getParam(name);
+  return NULL;
+}
+
+static bool update_preset_from_request(AsyncWebServerRequest *request, const char *name, ContestWebPreset **result) {
+  AsyncWebParameter *f1 = contest_request_param(request, "f1");
+  AsyncWebParameter *f2 = contest_request_param(request, "f2");
+  AsyncWebParameter *f3 = contest_request_param(request, "f3");
+  AsyncWebParameter *f5 = contest_request_param(request, "f5");
+  AsyncWebParameter *exch = contest_request_param(request, "exch");
+  if (!f1 || !f2 || !f3 || !f5 || !exch) return false;
+  ContestWebPreset *p = find_contest_web_preset(name, true);
+  if (!p) return false;
+  copy_web_value(p->f1, sizeof(p->f1), f1->value());
+  copy_web_value(p->f2, sizeof(p->f2), f2->value());
+  copy_web_value(p->f3, sizeof(p->f3), f3->value());
+  copy_web_value(p->f5, sizeof(p->f5), f5->value());
+  copy_web_value(p->exch, sizeof(p->exch), exch->value());
+  if (result) *result = p;
+  return true;
+}
+
+static bool valid_web_user_md_basename(const String &filename) {
+  if (filename.length() < 1 || filename.length() > 8) return false;
+  for (size_t i = 0; i < filename.length(); ++i) {
+    const char c = filename.charAt(i);
+    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+  }
+  return true;
+}
+
+static void setupContestPageHandler() {
+  load_contest_web_presets();
+
+  web_server.on("/contests", HTTP_GET, [](AsyncWebServerRequest *request) {
+    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; char text[1600]; };
+    State state;
+    AsyncWebServerResponse *response=request->beginChunkedResponse("text/html",
+      [state](uint8_t *buffer,size_t maxLen,size_t chunkIndex) mutable -> size_t {
+        (void)chunkIndex; size_t written=0;
+        auto prepare=[&](const char *source,bool footer){
+          String text=FPSTR(source);
+          if (!footer) {
+            text.replace("%CURRENT_CONTEST%",html_attr_escape(plogw->contest_name+2));
+            text.replace("%SD_STATUS%", html_attr_escape(contest_web_sd_status().c_str()));
+            text.replace("%LAST_STATUS%", html_attr_escape(contest_web_last_status.c_str()));
+          }
+          else {
+            const char *userfile=""; if(is_user_md_contest_name(plogw->contest_name+2)) userfile=plogw->contest_name+6;
+            text.replace("%USER_FILENAME%",html_attr_escape(userfile));
+            ContestWebPreset *p=find_contest_web_preset(plogw->contest_name+2,false);
+            text.replace("%USER_F1%",html_attr_escape(p?p->f1:plogw->cw_msg[0]+2));
+            text.replace("%USER_F2%",html_attr_escape(p?p->f2:plogw->cw_msg[1]+2));
+            text.replace("%USER_F3%",html_attr_escape(p?p->f3:plogw->cw_msg[2]+2));
+            text.replace("%USER_F5%",html_attr_escape(p?p->f5:plogw->cw_msg[4]+2));
+            text.replace("%USER_EXCH%",html_attr_escape(p?p->exch:plogw->sent_exch+2));
+          }
+          text.toCharArray(state.text,sizeof(state.text)); state.length=strnlen(state.text,sizeof(state.text)); state.offset=0;
+        };
+        auto copy=[&]()->bool { size_t remain=state.length-state.offset,room=maxLen-written,n=remain<room?remain:room; if(n){memcpy(buffer+written,state.text+state.offset,n);written+=n;state.offset+=n;} if(state.offset==state.length){state.offset=0;state.length=0;return true;} return false; };
+        while(written<maxLen && state.stage!=State::Done){
+          switch(state.stage){
+          case State::Header:
+            if (!state.length) prepare(contests_page_header, false);
+            if (copy()) state.stage = State::Entry;
+            break;
+          case State::Entry:
+            if(state.index>=contest_definition_count()){state.stage=State::Footer;break;}
+            if(!state.length){
+              int id=contest_definition_id(state.index); const char *name=contest_definition_name(state.index);
+              bool current=plogw->contest_id==id && strcasecmp(plogw->contest_name+2,name)==0;
+              ContestWebPreset *p=find_contest_web_preset(name,false);
+              const char *f1=p?p->f1:(current?plogw->cw_msg[0]+2:plogw->cw_msg[0]+2);
+              const char *f2=p?p->f2:(current?plogw->cw_msg[1]+2:plogw->cw_msg[1]+2);
+              const char *f3=p?p->f3:(current?plogw->cw_msg[2]+2:plogw->cw_msg[2]+2);
+              const char *f5=p?p->f5:(current?plogw->cw_msg[4]+2:plogw->cw_msg[4]+2);
+              const char *ex=p?p->exch:(current?plogw->sent_exch+2:plogw->sent_exch+2);
+              bool dupe_ok=contest_definition_mask(state.index)==CW_PH_DUPE_OK;
+              String row=String("<tr")+(current?" class=\"current\"":"")+"><td>"+id+"</td><td class=\"name\">"+html_attr_escape(name)+"</td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(dupe_ok?"OK C/P":"NG C/P")+"</td>";
+              row += "<td colspan=\"6\"><form method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"><table style=\"margin:0;width:100%;border:0\"><tr>";
+              row += "<td style=\"border:0\"><input name=\"f1\" maxlength=\"30\" value=\""+html_attr_escape(f1)+"\"></td>";
+              row += "<td style=\"border:0\"><input name=\"f2\" maxlength=\"30\" value=\""+html_attr_escape(f2)+"\"></td>";
+              row += "<td style=\"border:0\"><input name=\"f3\" maxlength=\"30\" value=\""+html_attr_escape(f3)+"\"></td>";
+              row += "<td style=\"border:0\"><input name=\"f5\" maxlength=\"30\" value=\""+html_attr_escape(f5)+"\"></td>";
+              row += "<td style=\"border:0\"><input name=\"exch\" maxlength=\"17\" value=\""+html_attr_escape(ex)+"\"></td>";
+              row += String("<td style=\"border:0\"><button type=\"submit\">")
+                     + (current ? "Save / Re-select" : "Select & Save")
+                     + "</button></td></tr></table></form></td></tr>\n";
+              row.toCharArray(state.text,sizeof(state.text)); state.length=strnlen(state.text,sizeof(state.text)); state.offset=0;
+            }
+            if (copy()) ++state.index;
+            break;
+          case State::Footer:
+            if (!state.length) prepare(contests_page_footer, true);
+            if (copy()) state.stage = State::Done;
+            break;
+          case State::Done: break;
+          }
+        }
+        return written;
+      });
+    response->addHeader("Cache-Control","no-store"); request->send(response);
+  });
+
+  web_server.on("/contest_preset", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if(!request->hasParam("name")){request->send(400,"text/plain","Missing name");return;}
+    ContestWebPreset *p=find_contest_web_preset(request->getParam("name")->value().c_str(),false);
+    String json="{\"f1\":\""; json += json_string_escape(p ? p->f1 : ""); json += "\",\"f2\":\""; json += json_string_escape(p ? p->f2 : "");
+    json += "\",\"f3\":\""; json += json_string_escape(p ? p->f3 : ""); json += "\",\"f5\":\""; json += json_string_escape(p ? p->f5 : "");
+    json += "\",\"exch\":\""; json += json_string_escape(p ? p->exch : ""); json += "\"}";
+    request->send(200,"application/json",json);
+  });
+
+  web_server.on("/select_contest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.printf("WEB CONTEST: request /select_contest params=%u\n", (unsigned)request->params());
+    AsyncWebParameter *id_param=contest_request_param(request,"id");
+    if(!id_param){set_contest_web_status("request rejected: missing contest id");request->send(400,"text/plain",contest_web_last_status);return;}
+    int id=id_param->value().toInt(); int index=-1;
+    for(int i=0;i<contest_definition_count();++i) if(contest_definition_id(i)==id){index=i;break;}
+    if(index<0){set_contest_web_status(String("request rejected: invalid contest id ")+String(id));request->send(400,"text/plain",contest_web_last_status);return;}
+    Serial.printf("WEB CONTEST: built-in id=%d name=%s\n", id, contest_definition_name(index));
+    ContestWebPreset *p=NULL;
+    if(!update_preset_from_request(request,contest_definition_name(index),&p)){set_contest_web_status(String("request rejected: missing preset values for ")+contest_definition_name(index));request->send(400,"text/plain",contest_web_last_status);return;}
+    Serial.println("WEB CONTEST: preset values received; saving");
+    if(!save_contest_web_presets()){request->send(500,"text/plain",contest_web_last_status);return;}
+    Serial.println("WEB CONTEST: preset saved; applying contest");
+    plogw->contest_id=id; set_contest_id(); set_current_contest_messages(*p);
+    upd_display_info_contest_settings(so2r.radio_selected());
+    set_contest_web_status(String("selected ") + (plogw->contest_name+2) + ", F2=\"" + (plogw->cw_msg[1]+2) + "\", EXCH=\"" + (plogw->sent_exch+2) + "\"");
+    request->redirect("/contests");
+  });
+
+  web_server.on("/select_user_contest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.printf("WEB CONTEST: request /select_user_contest params=%u\n", (unsigned)request->params());
+    AsyncWebParameter *filename_param=contest_request_param(request,"filename");
+    if(!filename_param){set_contest_web_status("User request rejected: missing filename");request->send(400,"text/plain",contest_web_last_status);return;}
+    String filename=filename_param->value(); filename.toUpperCase();
+    if(!valid_web_user_md_basename(filename)){set_contest_web_status(String("User request rejected: invalid filename ")+filename);request->send(400,"text/plain",contest_web_last_status);return;}
+    if(user_md_contest_loading()){request->send(409,"text/plain","Another User contest is still loading");return;}
+    String contestName=String("User")+filename;
+    ContestWebPreset *p=NULL;
+    if(!update_preset_from_request(request,contestName.c_str(),&p)){request->send(400,"text/plain","Missing or invalid preset values");return;}
+    if(!save_contest_web_presets()){request->send(500,"text/plain",contest_web_last_status);return;}
+    strncpy(plogw->contest_name+2,contestName.c_str(),LEN_CONTEST_NAME); plogw->contest_name[2+LEN_CONTEST_NAME]='\0';
+    set_current_contest_messages(*p);
+    upd_display_info_contest_settings(so2r.radio_selected());
+    if(!start_user_md_contest(plogw->contest_name+2)){set_contest_web_status(String("saved preset, but failed to start loading /")+filename+".MD");request->send(400,"text/plain",contest_web_last_status);return;}
+    set_contest_web_status(String("saved preset and started loading /")+filename+".MD, F2=\""+(plogw->cw_msg[1]+2)+"\", EXCH=\""+(plogw->sent_exch+2)+"\"");
+    request->redirect("/contests");
+  });
+}
+
 //AsyncWebServer web_server(80);
 
 void setupSettingsPageHandler() {
@@ -825,7 +1356,7 @@ void setupSettingsPageHandler() {
       int index = request->getParam("index")->value().toInt();
       String value = request->getParam("value")->value();
       struct rig *spec;
-      //      console->print("rig_edit value:");console->println(value.c_str());
+      //      webLog.print("rig_edit value:");webLog.println(value.c_str());
       set_rig_spec_from_str_rig(&rig_spec[index],value.c_str());
       
       //      if (index >= 0 && index < N_EDITWIN) {
@@ -886,7 +1417,7 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
       memcpy(buffer, header.c_str(), header.length());
       bytesWritten += header.length();
       state.headerWritten = true;
-      //      console->println("header written");
+      //      webLog.println("header written");
     } else {
       // ヘッダーすら入らない → ダミー送信
       memcpy(buffer, "\n", 1);
@@ -901,11 +1432,11 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
       memcpy(buffer + bytesWritten, state.pendingLine.c_str(), len);
       bytesWritten += len;
       state.pendingLine = "";
-      console->println("pending line write");      
+      webLog.println("pending line write");      
     } else {
       // まだ入らない → 1バイトだけ送る
       memcpy(buffer + bytesWritten, "\n", 1);
-      console->println("dummy write +");
+      webLog.println("dummy write +");
       return bytesWritten + 1;
     }
   }
@@ -913,19 +1444,19 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
   // 2. ファイル終端チェック
   if (!state.file || state.finished || state.pos >= state.file.size()) {
     state.finished = true;
-    console->print("state.file:");    console->print(state.file);
-    console->print(" state.finished:");    console->println(state.finished);    
+    webLog.print("state.file:");    webLog.print(state.file);
+    webLog.print(" state.finished:");    webLog.println(state.finished);    
     return 0;
   }
 
   // main qso read & dump loop
-  console->print("maxLen:");      console->println(maxLen);
+  webLog.print("maxLen:");      webLog.println(maxLen);
   while ((bytesWritten < maxLen) && (bytesWritten < 2048) ) {
     //  while ((bytesWritten < maxLen)) {
     if (state.pos >= state.file.size()) {
       state.finished = true;
-      console->print("chk state.pos:");      console->print(state.pos);
-      console->print(" state.file.size():");      console->println(state.file.size());      
+      webLog.print("chk state.pos:");      webLog.print(state.pos);
+      webLog.print(" state.file.size():");      webLog.println(state.file.size());      
       break;
     }
 
@@ -933,7 +1464,7 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
     size_t n = state.file.read((uint8_t*)state.qso.all, RECORD_SIZE);
     if (n < RECORD_SIZE) {
       state.finished = true;
-      console->println("n<record_size");
+      webLog.println("n<record_size");
       break;
     }
     state.pos += n;
@@ -998,7 +1529,7 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
 	sprint_qso_entry(state.dumpbuf,&state.qso);	
       } else {
 	// error
-	console->print("errortic state.type=");console->println(state.type);
+	webLog.print("errortic state.type=");webLog.println(state.type);
 	state.finished = true;
 	break;
       }
@@ -1018,20 +1549,20 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
     if (bytesWritten+lineLen <= maxLen) {
       memcpy(buffer + bytesWritten, line.c_str(), lineLen);
       bytesWritten += lineLen;
-      console->print("bytesWritten:");console->print(bytesWritten);
-      console->print(" pos:");console->println(state.pos);    
+      webLog.print("bytesWritten:");webLog.print(bytesWritten);
+      webLog.print(" pos:");webLog.println(state.pos);    
     } else {
       // 5. 今回は出力できない → キャッシュに入れて、最小限の出力
       state.pendingLine = line;
       memcpy(buffer+bytesWritten, "\n", 1);  // ダミーでも返す
-      console->println("pending line  +cache + dummy write");      
+      webLog.println("pending line  +cache + dummy write");      
       return bytesWritten+1;
     }
   }
 
   // 終了処理
   if (state.finished) {
-    console->println("state.finished reached");
+    webLog.println("state.finished reached");
     String footer = "";
     if (state.type!=2 && state.type!=3) { // not adif
       footer += "---- end of file ";
@@ -1049,12 +1580,12 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
   } else {
     if (bytesWritten==0) {
       // dummy write here
-      console->println("dummy write");
+      webLog.println("dummy write");
       memcpy(buffer, "\n", 1);
       return 1;
     }
   }
-  console->print("returning bytesWritten:");console->println(bytesWritten);
+  webLog.print("returning bytesWritten:");webLog.println(bytesWritten);
   return bytesWritten;
 }
 
@@ -1115,7 +1646,9 @@ const char index_html[] PROGMEM = R"rawliteral(
 <p><a href="/potahelp">/potahelp</a> POTA 最寄り検索/ログ簡単アップロード</p>
 <p><a href="/sotahelp">/sotahelp</a> SOTA 最寄り検索/ログ簡単アップロード</p>
 <p><a href="/settings">/settings</a> View/Edit Logger Settings</p>
+<p><a href="/contests">/contests</a> Select Contest</p>
 <p><a href="/rigs">/rigs</a> View/Edit RIG Settings</p>
+<p><a href="/bandmap">/bandmap</a> Multi-band Bandmap</p>
 <p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_250819.pdf">Manual DVPlogger_manual_250819.pdf</a></p>
 <p><a href="/op">/op</a> Web Opeartion Window</p>
 
@@ -1403,7 +1936,7 @@ const char oppage_html[] PROGMEM =R"rawliteral(
     </div>
  <div class="form-container" id="cwkeyingDisplay"></div> <!-- CW keying ticker display -->
     <p>Band map test</p>
-    <p><a href="http://192.168.1.2/">go back to Home</a></p>
+    <p><a href="/">go back to Home</a></p>
 
   </form>
 
@@ -1620,12 +2153,696 @@ function handleShiftKey(event) {
 
 static void web_heap_point(const char *tag)
 {
-  console->printf("[MEM] %-22s internal=%u largest=%u min=%u psram=%u\n",
+  webLog.printf("[MEM] %-22s internal=%u largest=%u min=%u psram=%u\n",
                   tag,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+
+
+
+namespace {
+constexpr int WEB_BANDMAP_BANDS = N_BAND - 1;
+constexpr int WEB_BANDMAP_MAX_ENTRIES = 200;
+constexpr int WEB_BANDMAP_COLUMNS = 4;
+constexpr uint32_t WEB_BANDMAP_REFRESH_MS = 1000;
+constexpr uint8_t WEB_BANDMAP_COMMAND_QUEUE_LEN = 8;
+
+struct WebBandmapEntry {
+  uint32_t freq;
+  int32_t time;
+  char station[LEN_CALLSIGN + 1];
+  uint8_t mode;
+  uint8_t flag;
+};
+
+struct WebBandmapSnapshot {
+  uint16_t count[WEB_BANDMAP_BANDS];
+  WebBandmapEntry entry[WEB_BANDMAP_BANDS][WEB_BANDMAP_MAX_ENTRIES];
+  uint32_t band_generation[WEB_BANDMAP_BANDS];
+  uint32_t generation;
+  uint8_t sort_type;
+};
+
+enum WebBandmapCommandType : uint8_t {
+  WEB_BANDMAP_COMMAND_SELECT = 0,
+  WEB_BANDMAP_COMMAND_DELETE,
+  WEB_BANDMAP_COMMAND_CORRECT
+};
+
+struct WebBandmapCommand {
+  WebBandmapCommandType type;
+  uint8_t bandid;
+  uint8_t mode;
+  uint32_t freq;
+  int32_t time;
+  char station[LEN_CALLSIGN + 1];
+  char new_station[LEN_CALLSIGN + 1];
+};
+
+static WebBandmapSnapshot *web_bandmap_snapshots[2] = {nullptr, nullptr};
+static volatile uint8_t web_bandmap_active_snapshot = 0;
+static volatile uint32_t web_bandmap_published_generation = 0;
+static volatile bool web_bandmap_snapshot_ready = false;
+static SemaphoreHandle_t web_bandmap_snapshot_mutex = nullptr;
+static uint32_t web_bandmap_next_refresh_ms = 0;
+
+static WebBandmapCommand web_bandmap_command_queue[WEB_BANDMAP_COMMAND_QUEUE_LEN];
+static volatile uint8_t web_bandmap_command_head = 0;
+static volatile uint8_t web_bandmap_command_tail = 0;
+static portMUX_TYPE web_bandmap_command_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t web_bandmap_hash_mix(uint32_t hash, uint32_t value) {
+  hash ^= value;
+  hash *= 16777619UL;
+  return hash;
+}
+
+static bool web_bandmap_entry_less(const WebBandmapEntry &a,
+                                   const WebBandmapEntry &b,
+                                   uint8_t sort_type) {
+  if (sort_type == 1) {
+    if (a.freq != b.freq) return a.freq < b.freq;
+    return a.time > b.time;
+  }
+
+  const int32_t dt = b.time - a.time;
+  if (abs(dt) < 60) {
+    const bool a_multi = (a.flag & BANDMAP_ENTRY_FLAG_NEWMULTI) != 0;
+    const bool b_multi = (b.flag & BANDMAP_ENTRY_FLAG_NEWMULTI) != 0;
+    if (a_multi != b_multi) return a_multi;
+  }
+  if (a.time != b.time) return a.time > b.time;
+  return a.freq < b.freq;
+}
+
+static bool ensure_web_bandmap_snapshots() {
+  if (!web_bandmap_snapshot_mutex) {
+    web_bandmap_snapshot_mutex = xSemaphoreCreateMutex();
+    if (!web_bandmap_snapshot_mutex) return false;
+  }
+  if (web_bandmap_snapshots[0] && web_bandmap_snapshots[1]) return true;
+
+  for (int i = 0; i < 2; ++i) {
+    if (!web_bandmap_snapshots[i]) {
+      web_bandmap_snapshots[i] = static_cast<WebBandmapSnapshot *>(
+        heap_caps_calloc(1, sizeof(WebBandmapSnapshot),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+  }
+
+  if (!web_bandmap_snapshots[0] || !web_bandmap_snapshots[1]) {
+    webLog.println("bandmap: cannot allocate PSRAM snapshots");
+    return false;
+  }
+  return true;
+}
+
+static void rebuild_web_bandmap_snapshot() {
+  if (!ensure_web_bandmap_snapshots()) return;
+
+  // Build the inactive snapshot without holding the mutex.  Web handlers only
+  // read the active snapshot, so the lock is needed only for the final swap.
+  const uint8_t active = web_bandmap_active_snapshot;
+  const uint8_t next = active ^ 1U;
+  WebBandmapSnapshot *snapshot = web_bandmap_snapshots[next];
+  memset(snapshot, 0, sizeof(*snapshot));
+  snapshot->sort_type = bandmap_disp.sort_type;
+
+  uint32_t hash = 2166136261UL;
+  hash = web_bandmap_hash_mix(hash, snapshot->sort_type);
+
+  for (int band_index = 0; band_index < WEB_BANDMAP_BANDS; ++band_index) {
+    const int bandid = band_index + 1;
+    uint16_t count = 0;
+
+    for (int i = 0;
+         i < bandmap[band_index].nentry && count < WEB_BANDMAP_MAX_ENTRIES;
+         ++i) {
+      struct bandmap_entry *source = bandmap[band_index].entry + i;
+      if (source->station[0] == '\0') continue;
+      if (source->mode >= NMODEID) continue;
+
+      const int mode_type = modetype[source->mode];
+      if (dupe_check_nocallhist(source->station,
+                               bandmode_param(bandid, mode_type),
+                               plogw->mask)) {
+        source->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+        continue;
+      }
+      source->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+
+      WebBandmapEntry &dest = snapshot->entry[band_index][count++];
+      dest.freq = source->freq;
+      dest.time = source->time;
+      strlcpy(dest.station, source->station, sizeof(dest.station));
+      dest.mode = source->mode;
+      dest.flag = source->flag;
+    }
+
+    snapshot->count[band_index] = count;
+    std::sort(snapshot->entry[band_index],
+              snapshot->entry[band_index] + count,
+              [snapshot](const WebBandmapEntry &a, const WebBandmapEntry &b) {
+                return web_bandmap_entry_less(a, b, snapshot->sort_type);
+              });
+
+    uint32_t band_hash = 2166136261UL;
+    band_hash = web_bandmap_hash_mix(band_hash, snapshot->sort_type);
+    band_hash = web_bandmap_hash_mix(band_hash, bandid);
+    band_hash = web_bandmap_hash_mix(band_hash, count);
+    for (uint16_t i = 0; i < count; ++i) {
+      const WebBandmapEntry &entry = snapshot->entry[band_index][i];
+      band_hash = web_bandmap_hash_mix(band_hash, entry.freq);
+      band_hash = web_bandmap_hash_mix(band_hash, static_cast<uint32_t>(entry.time));
+      band_hash = web_bandmap_hash_mix(band_hash, entry.mode);
+      band_hash = web_bandmap_hash_mix(band_hash, entry.flag);
+      for (const char *p = entry.station; *p; ++p) {
+        band_hash = web_bandmap_hash_mix(
+          band_hash, static_cast<uint8_t>(*p));
+      }
+    }
+    snapshot->band_generation[band_index] = band_hash;
+    hash = web_bandmap_hash_mix(hash, band_hash);
+  }
+
+  snapshot->generation = hash;
+
+  // Publish the completed snapshot atomically.  This critical section is very
+  // short, so /version and /data no longer contend with worked checks/sorting.
+  if (xSemaphoreTake(web_bandmap_snapshot_mutex, portMAX_DELAY) == pdTRUE) {
+    web_bandmap_active_snapshot = next;
+    web_bandmap_published_generation = hash;
+    web_bandmap_snapshot_ready = true;
+    xSemaphoreGive(web_bandmap_snapshot_mutex);
+  }
+}
+
+static bool enqueue_web_bandmap_command(const WebBandmapCommand &command) {
+  bool queued = false;
+  portENTER_CRITICAL(&web_bandmap_command_mux);
+  const uint8_t next = static_cast<uint8_t>(
+    (web_bandmap_command_head + 1) % WEB_BANDMAP_COMMAND_QUEUE_LEN);
+  if (next != web_bandmap_command_tail) {
+    web_bandmap_command_queue[web_bandmap_command_head] = command;
+    web_bandmap_command_head = next;
+    queued = true;
+  }
+  portEXIT_CRITICAL(&web_bandmap_command_mux);
+  return queued;
+}
+
+static bool dequeue_web_bandmap_command(WebBandmapCommand *command) {
+  bool available = false;
+  portENTER_CRITICAL(&web_bandmap_command_mux);
+  if (web_bandmap_command_tail != web_bandmap_command_head) {
+    *command = web_bandmap_command_queue[web_bandmap_command_tail];
+    web_bandmap_command_tail = static_cast<uint8_t>(
+      (web_bandmap_command_tail + 1) % WEB_BANDMAP_COMMAND_QUEUE_LEN);
+    available = true;
+  }
+  portEXIT_CRITICAL(&web_bandmap_command_mux);
+  return available;
+}
+
+static bool valid_web_bandmap_callsign(const char *station) {
+  if (!station || !station[0]) return false;
+  const size_t length = strlen(station);
+  if (length > LEN_CALLSIGN) return false;
+  bool has_alnum = false;
+  for (size_t i = 0; i < length; ++i) {
+    const unsigned char c = static_cast<unsigned char>(station[i]);
+    if (isalnum(c)) has_alnum = true;
+    else if (c != '/') return false;
+  }
+  return has_alnum;
+}
+
+static void update_web_bandmap_entry_flags(struct bandmap_entry *entry,
+                                           uint8_t bandid) {
+  if (!entry || entry->mode >= NMODEID) return;
+  entry->flag &= ~(BANDMAP_ENTRY_FLAG_WORKED | BANDMAP_ENTRY_FLAG_NEWMULTI);
+
+  char *exch_history = nullptr;
+  const int bandmode = bandmode_param(bandid, modetype[entry->mode]);
+  if (dupe_callhist_check(entry->station, bandmode, plogw->mask, 1,
+                          &exch_history)) {
+    entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+  }
+  if (exch_history) {
+    const int multi = multi_check(exch_history, bandid);
+    if (multi >= 0 && multi_list.multi_worked[bandid - 1][multi] == 0) {
+      entry->flag |= BANDMAP_ENTRY_FLAG_NEWMULTI;
+    }
+  }
+}
+
+static struct bandmap_entry *find_web_bandmap_entry(
+    const WebBandmapCommand &command) {
+  if (command.bandid < 1 || command.bandid >= N_BAND) return nullptr;
+  const int band_index = command.bandid - 1;
+  for (int i = 0; i < bandmap[band_index].nentry; ++i) {
+    struct bandmap_entry *entry = bandmap[band_index].entry + i;
+    if (entry->station[0] == '\0') continue;
+    if (entry->freq == command.freq &&
+        entry->mode == command.mode &&
+        entry->time == command.time &&
+        strcasecmp(entry->station, command.station) == 0) {
+      return entry;
+    }
+  }
+  return nullptr;
+}
+
+static void process_web_bandmap_command_queue() {
+  WebBandmapCommand command;
+  while (dequeue_web_bandmap_command(&command)) {
+    struct bandmap_entry *entry = find_web_bandmap_entry(command);
+    if (!entry) {
+      webLog.printf("bandmap: requested spot no longer exists: %s\n",
+                    command.station);
+      continue;
+    }
+
+    if (command.type == WEB_BANDMAP_COMMAND_DELETE) {
+      char old_station[LEN_CALLSIGN + 1];
+      strlcpy(old_station, entry->station, sizeof(old_station));
+      entry->station[0] = '\0';
+      webLog.printf("bandmap: deleted %s %lu\n", old_station,
+                    static_cast<unsigned long>(entry->freq));
+      web_bandmap_next_refresh_ms = 0;
+      continue;
+    }
+
+    if (command.type == WEB_BANDMAP_COMMAND_CORRECT) {
+      if (!valid_web_bandmap_callsign(command.new_station)) {
+        webLog.println("bandmap: invalid corrected callsign");
+        continue;
+      }
+      char old_station[LEN_CALLSIGN + 1];
+      strlcpy(old_station, entry->station, sizeof(old_station));
+      strlcpy(entry->station, command.new_station, sizeof(entry->station));
+      update_web_bandmap_entry_flags(entry, command.bandid);
+      webLog.printf("bandmap: corrected %s -> %s\n", old_station,
+                    entry->station);
+      web_bandmap_next_refresh_ms = 0;
+      continue;
+    }
+
+    update_web_bandmap_entry_flags(entry, command.bandid);
+    if (entry->flag & BANDMAP_ENTRY_FLAG_WORKED) {
+      webLog.printf("bandmap: %s is already worked\n", entry->station);
+      web_bandmap_next_refresh_ms = 0;
+      continue;
+    }
+    if (!select_appropriate_radio(command.bandid)) {
+      webLog.printf("bandmap: no appropriate radio for band %u\n",
+                    command.bandid);
+      continue;
+    }
+
+    struct radio *radio = so2r.radio_selected();
+    set_station_entry(radio, entry->station, entry->freq,
+                      mode_str[entry->mode]);
+    webLog.printf("bandmap: selected %s %lu\n", entry->station,
+                  static_cast<unsigned long>(entry->freq));
+  }
+}
+
+static const char web_bandmap_page[] PROGMEM = R"rawliteral(
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DVPlogger Bandmap</title>
+<style>
+body{font-family:sans-serif;margin:10px;background:#f4f4f4;color:#111}
+h1{font-size:1.35rem;margin:.3rem 0 .8rem}.toolbar{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.7rem}
+select,button{font-size:1rem;padding:.35rem}.maps{display:flex;gap:10px;overflow-x:auto;align-items:flex-start;padding-bottom:8px}
+.band{flex:0 0 285px;background:#fff;border:1px solid #bbb;border-radius:5px;max-height:78vh;overflow-y:auto}
+.band h2{position:sticky;top:0;background:#e8e8e8;margin:0;padding:.45rem;font-size:1.05rem;border-bottom:1px solid #bbb;z-index:1}
+.spot{display:grid;grid-template-columns:78px 1fr 42px 34px 30px;gap:4px;padding:.28rem .4rem;border-bottom:1px solid #eee;cursor:pointer}
+.spot:hover{background:#fff4c4}.spot.newmulti{background:#fff3a8;border-left:5px solid #d07800;padding-left:calc(.4rem - 5px)}
+.spot.newmulti:hover{background:#ffe57a}.freq{font-family:monospace}.call{font-weight:bold}.multi{color:#a00018;font-weight:bold;text-align:center}.age{text-align:right;color:#555}.empty{padding:.8rem;color:#777}
+#status{font-size:.85rem;color:#555;margin-left:.3rem}.more{border:0;background:transparent;padding:0;font-size:1.25rem;line-height:1;cursor:pointer}.menu{position:fixed;display:none;z-index:20;background:#fff;border:1px solid #999;border-radius:5px;box-shadow:0 3px 14px #5558;min-width:170px}.menu button{display:block;width:100%;border:0;background:#fff;text-align:left;padding:.65rem}.menu button:hover{background:#eee}.modal{display:none;position:fixed;inset:0;background:#0007;z-index:30;align-items:center;justify-content:center}.dialog{background:#fff;border-radius:7px;padding:1rem;min-width:min(310px,88vw);box-shadow:0 5px 20px #0008}.dialog h3{margin:.1rem 0 .8rem}.dialog input{box-sizing:border-box;width:100%;font-size:1.1rem;padding:.45rem;text-transform:uppercase}.actions{display:flex;justify-content:flex-end;gap:.6rem;margin-top:1rem}.danger{color:#a00018;font-weight:bold}
+</style></head><body><h1>DVPlogger Bandmap</h1>
+<div class="toolbar"><select id="b0"></select><select id="b1"></select><select id="b2"></select><select id="b3"></select>
+<button id="reload">更新</button><span id="status"></span></div><div id="maps" class="maps"></div><div id="spotMenu" class="menu"><button id="menuDelete" class="danger">Delete Spot</button><button id="menuCorrect">Callsign correction</button></div><div id="spotModal" class="modal"><div class="dialog"><h3 id="modalTitle"></h3><div id="modalText"></div><input id="callInput" maxlength="12" autocomplete="off" autocapitalize="characters"><div class="actions"><button id="modalCancel">Cancel</button><button id="modalApply">Apply</button></div></div></div>
+<script>
+const defaults=[3,4,5,6];let bandGeneration={};let loadingBands=new Set();let menuSpot=null;let modalAction=null;
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function selected(){return [0,1,2,3].map(i=>Number(document.getElementById('b'+i).value));}
+function save(){localStorage.setItem('dvploggerBandmapBands',JSON.stringify(selected()));}
+function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+async function fetchJson(url,retry=true){try{const r=await fetch(url,{cache:'no-store'});const text=await r.text();
+if(!r.ok)throw new Error('HTTP '+r.status+': '+text.slice(0,80));
+try{return JSON.parse(text);}catch(e){console.error('bandmap JSON parse error',e,'length',text.length,'tail',text.slice(-160));throw new Error('JSON不正 len='+text.length);}}
+catch(e){if(retry){await sleep(300);return fetchJson(url,false);}throw e;}}
+function columnsForBand(bandid){const cols=[];for(let i=0;i<4;i++)if(Number(document.getElementById('b'+i).value)===Number(bandid))cols.push(i);return cols;}
+function ensureColumns(){const maps=document.getElementById('maps');while(maps.children.length<4){const col=document.createElement('section');col.className='band';col.innerHTML='<h2>Loading...</h2>';maps.appendChild(col);}}
+function renderBand(b,columns){ensureColumns();for(const column of columns){const col=document.getElementById('maps').children[column];const oldScroll=col.scrollTop;
+let h='<h2>'+esc(b.label)+' ('+b.spots.length+')</h2>';if(!b.spots.length)h+='<div class="empty">未交信スポットなし</div>';
+for(const s of b.spots){const cls=s.multi?'spot newmulti':'spot';h+='<div class="'+cls+'" data-band="'+b.id+'" data-freq="'+s.freq+'" data-mode="'+s.mode+'" data-time="'+s.time+'" data-call="'+esc(s.call)+'">'+
+'<span class="freq">'+esc(s.freqText)+'</span><span class="call">'+esc(s.call)+'</span><span class="multi">'+(s.multi?'M':'')+'</span><span class="age">'+s.age+'m</span><button class="more" aria-label="Spot menu">⋮</button></div>';}
+col.innerHTML=h;col.scrollTop=oldScroll;col.querySelectorAll('.spot').forEach(e=>{e.onclick=()=>selectSpot(e);const m=e.querySelector('.more');m.onclick=ev=>{ev.stopPropagation();openSpotMenu(e,m);};});}}
+async function loadBand(bandid,force=false){bandid=Number(bandid);if(loadingBands.has(bandid))return;loadingBands.add(bandid);
+try{const j=await fetchJson('/api/bandmap/data?band='+bandid);if(!j.bands||!j.bands.length)throw new Error('band data missing');
+bandGeneration[bandid]=Number(j.bandGeneration);renderBand(j.bands[0],columnsForBand(bandid));}
+catch(e){console.error('bandmap band load failed',bandid,e);document.getElementById('status').textContent='取得失敗: '+e.message;}finally{loadingBands.delete(bandid);}}
+async function loadSelected(force=false){const unique=[...new Set(selected())];document.getElementById('status').textContent='更新中…';await Promise.all(unique.map(b=>loadBand(b,force)));document.getElementById('status').textContent='更新 '+new Date().toLocaleTimeString();}
+async function loadBands(){const j=await fetchJson('/api/bandmap/bands');let saved;try{saved=JSON.parse(localStorage.getItem('dvploggerBandmapBands'));}catch(e){}
+const valid=new Set(j.bands.map(b=>Number(b.id)));if(!Array.isArray(saved)||saved.length!==4)saved=defaults.slice();
+saved=saved.map((v,n)=>{v=Number(v);return valid.has(v)?v:(valid.has(defaults[n])?defaults[n]:Number(j.bands[0].id));});
+for(let n=0;n<4;n++){const s=document.getElementById('b'+n);s.innerHTML='';for(const b of j.bands){const o=document.createElement('option');o.value=String(b.id);o.textContent=b.label;s.appendChild(o);}s.value=String(saved[n]);s.onchange=()=>{save();loadBand(Number(s.value),true);};}save();ensureColumns();}
+async function selectSpot(e){const p=new URLSearchParams({band:e.dataset.band,freq:e.dataset.freq,mode:e.dataset.mode,time:e.dataset.time,call:e.dataset.call});
+const r=await fetch('/api/bandmap/select',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});document.getElementById('status').textContent=await r.text();}
+function spotParams(e){return {band:e.dataset.band,freq:e.dataset.freq,mode:e.dataset.mode,time:e.dataset.time,call:e.dataset.call};}
+function closeSpotMenu(){document.getElementById('spotMenu').style.display='none';menuSpot=null;}
+function openSpotMenu(spot,button){menuSpot=spot;const menu=document.getElementById('spotMenu');const r=button.getBoundingClientRect();menu.style.left=Math.max(6,Math.min(window.innerWidth-180,r.right-170))+'px';menu.style.top=Math.min(window.innerHeight-110,r.bottom+3)+'px';menu.style.display='block';}
+function closeModal(){document.getElementById('spotModal').style.display='none';modalAction=null;}
+function showDeleteDialog(){if(!menuSpot)return;const p=spotParams(menuSpot);closeSpotMenu();menuSpot={dataset:p};modalAction='delete';document.getElementById('modalTitle').textContent='Delete Spot';document.getElementById('modalText').textContent=p.call+'  '+p.freq;document.getElementById('callInput').style.display='none';document.getElementById('modalApply').textContent='Delete';document.getElementById('modalApply').className='danger';document.getElementById('spotModal').style.display='flex';}
+function showCorrectDialog(){if(!menuSpot)return;const p=spotParams(menuSpot);closeSpotMenu();menuSpot={dataset:p};modalAction='correct';document.getElementById('modalTitle').textContent='Callsign correction';document.getElementById('modalText').textContent='Current: '+p.call;const input=document.getElementById('callInput');input.style.display='block';input.value=p.call;document.getElementById('modalApply').textContent='Apply';document.getElementById('modalApply').className='';document.getElementById('spotModal').style.display='flex';setTimeout(()=>{input.focus();input.select();},0);}
+async function postSpotAction(path,extra={}){if(!menuSpot)return;const p=new URLSearchParams({...spotParams(menuSpot),...extra});const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});const text=await r.text();if(!r.ok)throw new Error('HTTP '+r.status+': '+text);document.getElementById('status').textContent=text;}
+async function applyModal(){try{if(modalAction==='delete')await postSpotAction('/api/bandmap/delete');else if(modalAction==='correct'){const v=document.getElementById('callInput').value.trim().toUpperCase();if(!/^[A-Z0-9/]+$/.test(v))throw new Error('Invalid callsign');await postSpotAction('/api/bandmap/correct',{newcall:v});}closeModal();}catch(e){document.getElementById('status').textContent='操作失敗: '+e.message;}}
+document.getElementById('menuDelete').onclick=showDeleteDialog;document.getElementById('menuCorrect').onclick=showCorrectDialog;document.getElementById('modalCancel').onclick=closeModal;document.getElementById('modalApply').onclick=applyModal;document.getElementById('spotModal').onclick=e=>{if(e.target.id==='spotModal')closeModal();};document.addEventListener('click',e=>{if(!e.target.closest('#spotMenu')&&!e.target.closest('.more'))closeSpotMenu();});
+async function checkVersion(){try{const j=await fetchJson('/api/bandmap/version',false);if(!j.ready)return;for(const b of [...new Set(selected())]){const next=Number(j.bands[String(b)]);if(Number.isFinite(next)&&bandGeneration[b]!==undefined&&next!==bandGeneration[b])loadBand(b);}}catch(e){console.debug('bandmap version check failed',e);}}
+document.getElementById('reload').onclick=()=>loadSelected(true);(async()=>{await loadBands();await loadSelected(true);setInterval(checkVersion,1000);})();
+</script></body></html>)rawliteral";
+
+static constexpr uint16_t WEB_BANDMAP_MAX_DISPLAY_ENTRIES = 20;
+
+struct WebBandmapApiState {
+  struct BandData {
+    uint8_t bandid;
+    uint16_t count;
+    WebBandmapEntry *entries;
+  } band[WEB_BANDMAP_COLUMNS]{};
+  uint8_t band_count = 0;
+  uint8_t stage = 0;
+  uint8_t band_index = 0;
+  uint16_t entry_index = 0;
+  size_t offset = 0;
+  uint32_t generation = 0;
+  char line[256];
+
+  ~WebBandmapApiState() {
+    for (int i = 0; i < WEB_BANDMAP_COLUMNS; ++i) free(band[i].entries);
+  }
+};
+
+static uint8_t parse_web_bandmap_band(AsyncWebServerRequest *request) {
+  int bandid = 3;
+  if (request->hasParam("band")) {
+    bandid = request->getParam("band")->value().toInt();
+  }
+  if (bandid < 1 || bandid >= N_BAND) bandid = 3;
+  return static_cast<uint8_t>(bandid);
+}
+
+static WebBandmapApiState *make_web_bandmap_api_state(uint8_t bandid) {
+  if (!ensure_web_bandmap_snapshots()) return nullptr;
+  WebBandmapApiState *state = new (std::nothrow) WebBandmapApiState;
+  if (!state) return nullptr;
+
+  if (!web_bandmap_snapshot_ready ||
+      xSemaphoreTake(web_bandmap_snapshot_mutex, portMAX_DELAY) != pdTRUE) {
+    delete state;
+    return nullptr;
+  }
+  const uint8_t active = web_bandmap_active_snapshot;
+  WebBandmapSnapshot *snapshot = web_bandmap_snapshots[active];
+  state->generation = snapshot->band_generation[bandid - 1];
+  const uint16_t count = std::min<uint16_t>(
+    snapshot->count[bandid - 1], WEB_BANDMAP_MAX_DISPLAY_ENTRIES);
+  state->band[0].bandid = bandid;
+  state->band[0].count = count;
+  if (count) {
+    state->band[0].entries = static_cast<WebBandmapEntry *>(
+      heap_caps_malloc(sizeof(WebBandmapEntry) * count,
+                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!state->band[0].entries) {
+      xSemaphoreGive(web_bandmap_snapshot_mutex);
+      delete state;
+      return nullptr;
+    }
+    memcpy(state->band[0].entries,
+           snapshot->entry[bandid - 1],
+           sizeof(WebBandmapEntry) * count);
+  }
+  xSemaphoreGive(web_bandmap_snapshot_mutex);
+  state->band_count = 1;
+  return state;
+}
+
+static size_t web_bandmap_copy_line(WebBandmapApiState *state,
+                                    uint8_t *buffer, size_t maxLen) {
+  const size_t length = strlen(state->line);
+  const size_t remain = length - state->offset;
+  const size_t ncopy = std::min(remain, maxLen);
+  if (ncopy) memcpy(buffer, state->line + state->offset, ncopy);
+  state->offset += ncopy;
+  if (state->offset == length) {
+    state->offset = 0;
+    state->line[0] = '\0';
+  }
+  return ncopy;
+}
+
+static void web_bandmap_json_safe_copy(char *dest, size_t dest_size,
+                                       const char *source) {
+  if (!dest || dest_size == 0) return;
+  size_t out = 0;
+  if (!source) source = "";
+  while (*source && out + 1 < dest_size) {
+    const unsigned char c = static_cast<unsigned char>(*source++);
+    // Callsigns and band labels should be printable ASCII.  Replace JSON
+    // metacharacters/control bytes rather than allowing malformed JSON.
+    if (c < 0x20 || c == '"' || c == '\\') dest[out++] = '?';
+    else dest[out++] = static_cast<char>(c);
+  }
+  dest[out] = '\0';
+}
+
+static void setup_web_bandmap_handlers() {
+  web_server.on("/bandmap", HTTP_GET, [](AsyncWebServerRequest *request) {
+    AsyncWebServerResponse *response = request->beginResponse_P(
+      200, "text/html; charset=utf-8", web_bandmap_page);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  web_server.on("/api/bandmap/bands", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{\"bands\":[";
+    for (int bandid = 1; bandid < N_BAND; ++bandid) {
+      if (bandid > 1) json += ',';
+      json += "{\"id\":" + String(bandid) + ",\"label\":\"";
+      String label = bandid_str[bandid - 1];
+      label.trim();
+      json += label;
+      json += "\"}";
+    }
+    json += "]}";
+    request->send(200, "application/json", json);
+  });
+
+  web_server.on("/api/bandmap/version", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const bool ready = web_bandmap_snapshot_ready;
+    char json[768];
+    size_t used = snprintf(json, sizeof(json),
+                           "{\"ready\":%s,\"bands\":{",
+                           ready ? "true" : "false");
+    if (ready &&
+        xSemaphoreTake(web_bandmap_snapshot_mutex, portMAX_DELAY) == pdTRUE) {
+      const WebBandmapSnapshot *snapshot =
+        web_bandmap_snapshots[web_bandmap_active_snapshot];
+      for (int band_index = 0; band_index < WEB_BANDMAP_BANDS; ++band_index) {
+        used += snprintf(json + used, sizeof(json) - used,
+                         "%s\"%d\":%lu",
+                         band_index ? "," : "", band_index + 1,
+                         static_cast<unsigned long>(
+                           snapshot->band_generation[band_index]));
+      }
+      xSemaphoreGive(web_bandmap_snapshot_mutex);
+    }
+    snprintf(json + used, sizeof(json) - used, "}}");
+    request->send(200, "application/json", json);
+  });
+
+  web_server.on("/api/bandmap/data", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const uint8_t bandid = parse_web_bandmap_band(request);
+    WebBandmapApiState *state = make_web_bandmap_api_state(bandid);
+    if (!state) {
+      request->send(503, "text/plain", "bandmap snapshot unavailable");
+      return;
+    }
+
+    // A single band is limited to WEB_BANDMAP_MAX_DISPLAY_ENTRIES (20), so
+    // build a complete JSON document and send it with Content-Length.  This
+    // avoids truncated HTTP-200 JSON caused by the chunk generator state
+    // machine while keeping peak memory bounded to a few kilobytes.
+    String json;
+    size_t reserve_size = 160U +
+      static_cast<size_t>(state->band[0].count) * 144U;
+    if (reserve_size < 1024U) reserve_size = 1024U;
+    if (!json.reserve(reserve_size)) {
+      delete state;
+      request->send(503, "text/plain", "bandmap JSON allocation failed");
+      return;
+    }
+
+    json += F("{\"bandGeneration\":");
+    json += static_cast<unsigned long>(state->generation);
+    json += F(",\"bands\":[{");
+    json += F("\"id\":");
+    json += state->band[0].bandid;
+    json += F(",\"label\":\"");
+
+    String label = bandid_str[state->band[0].bandid - 1];
+    label.trim();
+    char safe_label[32];
+    web_bandmap_json_safe_copy(safe_label, sizeof(safe_label), label.c_str());
+    json += safe_label;
+    json += F("\",\"spots\":[");
+
+    const int now = my_rtc.unixtime();
+    for (uint16_t i = 0; i < state->band[0].count; ++i) {
+      const WebBandmapEntry &entry = state->band[0].entries[i];
+      const int age = max(0, (now - entry.time) / 60);
+      const unsigned long hz =
+        static_cast<unsigned long>(entry.freq) * FREQ_UNIT;
+      char freq_text[24];
+      snprintf(freq_text, sizeof(freq_text), "%lu.%01lu",
+               hz / 1000UL, (hz % 1000UL) / 100UL);
+      char safe_station[sizeof(entry.station)];
+      web_bandmap_json_safe_copy(safe_station, sizeof(safe_station),
+                                 entry.station);
+
+      if (i) json += ',';
+      json += F("{\"freq\":");
+      json += static_cast<unsigned long>(entry.freq);
+      json += F(",\"freqText\":\"");
+      json += freq_text;
+      json += F("\",\"call\":\"");
+      json += safe_station;
+      json += F("\",\"mode\":");
+      json += entry.mode;
+      json += F(",\"time\":");
+      json += static_cast<long>(entry.time);
+      json += F(",\"age\":");
+      json += age;
+      json += F(",\"multi\":");
+      json += (entry.flag & BANDMAP_ENTRY_FLAG_NEWMULTI) ? F("true") : F("false");
+      json += '}';
+    }
+    json += F("]}]}" );
+
+    delete state;
+    AsyncWebServerResponse *response =
+      request->beginResponse(200, "application/json", json);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  web_server.on("/api/bandmap/select", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      const char *required[] = {"band", "freq", "mode", "time", "call"};
+      for (const char *name : required) {
+        if (!request->hasParam(name, true)) {
+          request->send(400, "text/plain", "missing parameter");
+          return;
+        }
+      }
+
+      WebBandmapCommand command{};
+      command.type = WEB_BANDMAP_COMMAND_SELECT;
+      command.bandid = request->getParam("band", true)->value().toInt();
+      command.freq = request->getParam("freq", true)->value().toInt();
+      command.mode = request->getParam("mode", true)->value().toInt();
+      command.time = request->getParam("time", true)->value().toInt();
+      strlcpy(command.station,
+              request->getParam("call", true)->value().c_str(),
+              sizeof(command.station));
+
+      if (command.bandid < 1 || command.bandid >= N_BAND ||
+          command.station[0] == '\0' || command.mode >= NMODEID) {
+        request->send(400, "text/plain", "invalid spot");
+        return;
+      }
+      if (!enqueue_web_bandmap_command(command)) {
+        request->send(503, "text/plain", "bandmap command queue full");
+        return;
+      }
+      request->send(202, "text/plain", "spot selection queued");
+    });
+
+  auto enqueue_edit_command = [](AsyncWebServerRequest *request,
+                                 WebBandmapCommandType type) {
+    const char *required[] = {"band", "freq", "mode", "time", "call"};
+    for (const char *name : required) {
+      if (!request->hasParam(name, true)) {
+        request->send(400, "text/plain", "missing parameter");
+        return;
+      }
+    }
+
+    WebBandmapCommand command{};
+    command.type = type;
+    command.bandid = request->getParam("band", true)->value().toInt();
+    command.freq = request->getParam("freq", true)->value().toInt();
+    command.mode = request->getParam("mode", true)->value().toInt();
+    command.time = request->getParam("time", true)->value().toInt();
+    String old_call = request->getParam("call", true)->value();
+    old_call.trim(); old_call.toUpperCase();
+    strlcpy(command.station, old_call.c_str(), sizeof(command.station));
+
+    if (type == WEB_BANDMAP_COMMAND_CORRECT) {
+      if (!request->hasParam("newcall", true)) {
+        request->send(400, "text/plain", "missing newcall");
+        return;
+      }
+      String new_call = request->getParam("newcall", true)->value();
+      new_call.trim(); new_call.toUpperCase();
+      strlcpy(command.new_station, new_call.c_str(),
+              sizeof(command.new_station));
+      if (!valid_web_bandmap_callsign(command.new_station)) {
+        request->send(400, "text/plain", "invalid callsign");
+        return;
+      }
+    }
+
+    if (command.bandid < 1 || command.bandid >= N_BAND ||
+        command.station[0] == ' ' || command.mode >= NMODEID) {
+      request->send(400, "text/plain", "invalid spot");
+      return;
+    }
+    if (!enqueue_web_bandmap_command(command)) {
+      request->send(503, "text/plain", "bandmap command queue full");
+      return;
+    }
+    request->send(202, "text/plain",
+                  type == WEB_BANDMAP_COMMAND_DELETE
+                    ? "spot deletion queued"
+                    : "callsign correction queued");
+  };
+
+  web_server.on("/api/bandmap/delete", HTTP_POST,
+    [enqueue_edit_command](AsyncWebServerRequest *request) {
+      enqueue_edit_command(request, WEB_BANDMAP_COMMAND_DELETE);
+    });
+  web_server.on("/api/bandmap/correct", HTTP_POST,
+    [enqueue_edit_command](AsyncWebServerRequest *request) {
+      enqueue_edit_command(request, WEB_BANDMAP_COMMAND_CORRECT);
+    });
+}
+}
+
+void process_web_bandmap() {
+  process_web_bandmap_command_queue();
+  const uint32_t now = millis();
+  if ((int32_t)(now - web_bandmap_next_refresh_ms) >= 0) {
+    web_bandmap_next_refresh_ms = now + WEB_BANDMAP_REFRESH_MS;
+    rebuild_web_bandmap_snapshot();
+  }
 }
 
 void init_webserver() {
@@ -1634,7 +2851,7 @@ void init_webserver() {
   
   web_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     String logmessage = "Client:" + request->client()->remoteIP().toString() + + " " + request->url();
-    console->println(logmessage);
+    webLog.println(logmessage);
     request->send_P(200, "text/html", index_html, processor);
     logmessage="";
   });
@@ -1752,14 +2969,14 @@ function openPOTA(){
       selectedParkCode = req->getParam("code")->value();
       selectedParkName = req->getParam("name")->value();
       selectedGrid     = req->getParam("grid")->value();
-      console->printf("SELECTED  %s  %s  %s\n",
+      webLog.printf("SELECTED  %s  %s  %s\n",
 		    selectedParkCode.c_str(),
 		    selectedParkName.c_str(),
 		    selectedGrid.c_str());
 
       // replace park(POTA/) in plogw->jcc+2
       replace_string(plogw->jcc+2,"POTA/",selectedParkCode.c_str()," ");
-      console->print("jcc modified:");console->println(plogw->jcc+2);
+      webLog.print("jcc modified:");webLog.println(plogw->jcc+2);
       req->send(200, "text/plain", "OK");
     } else {
       req->send(400, "text/plain", "Missing params");
@@ -1870,10 +3087,10 @@ function openSOTA(){
       selGrid    =r->getParam("grid")->value();
 
       replace_string(plogw->jcc+2,"SOTA/",selSotaCode.c_str()," ");
-      console->print("jcc modified:");console->println(plogw->jcc+2);
+      webLog.print("jcc modified:");webLog.println(plogw->jcc+2);
       
-      console->print("select sota code:"); console->print(selSotaCode);
-      console->print(" grid:"); console->println(selGrid);
+      webLog.print("select sota code:"); webLog.print(selSotaCode);
+      webLog.print(" grid:"); webLog.println(selGrid);
       r->send(200,"text/plain","OK");
     } else r->send(400,"text/plain","missing");
   });
@@ -1943,22 +3160,22 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
     // HIDキーコードに基づいて処理
     if (keycodeToHid.find(keycode) != keycodeToHid.end()) {
       keyName = String(keycodeToHid.at(keycode));  // HIDキーコードから名前を取得
-      Serial.printf("Received HID Key: %s keycode %d\n", keyName.c_str(),keycode);
+      webLog.printf("Received HID Key: %s keycode %d\n", keyName.c_str(),keycode);
     } else {
-      Serial.printf("Unknown keycode: %d\n", keycode);
+      webLog.printf("Unknown keycode: %d\n", keycode);
     }
     keyName="";
 
     // function keys 
     if (keycode>=112 && keycode <=116) {
-      console->println("function keys");
+      webLog.println("function keys");
       so2r.cancel_msg_tx();	
       so2r.set_msg_tx_to_focused(); // start sending in the currently focued radio
       so2r.set_rx_in_sending_msg();	
       function_keys(keycode-54, 0);
     } else if (keycode==27) {
       // esc
-      console->println("esc from web");
+      webLog.println("esc from web");
       so2r.cancel_msg_tx();
       switch(so2r.radio_mode) {
       case SO2R::RADIO_MODE_SO2R:
@@ -2013,7 +3230,7 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
 
 
     // ログに出力
-    Serial.printf("Received input0: %s, input1: %s, index: %d\n", input1.c_str(), input2.c_str(), idx);
+    webLog.printf("Received input0: %s, input1: %s, index: %d\n", input1.c_str(), input2.c_str(), idx);
     input1="";
     input2="";
     strcpy(response_string,"Keycode received and processed.");
@@ -2024,7 +3241,7 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
     String command;
     // rig name change
     command = req->getParam("command")->value();
-    console->print("command:");console->println(command);
+    webLog.print("command:");webLog.println(command);
     if (command == "set") {
       if (req->hasParam("index") && req->hasParam("value")) {
 	// get index and value
@@ -2041,8 +3258,8 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
 	    radio = &radio_list[radio_idx];
 	    strncpy(radio->rig_name+2,value.c_str(),LEN_RIG_NAME-1);
 	    set_rig_from_name(radio);
-	    console->print("rig change radio=");console->print(radio_idx);
-	    console->print(" name=");console->println(radio->rig_name+2);
+	    webLog.print("rig change radio=");webLog.print(radio_idx);
+	    webLog.print(" name=");webLog.println(radio->rig_name+2);
 	    strcpy(response_string,"OK");
 	  }
 	  break;
@@ -2082,10 +3299,10 @@ web_server.on("/control", HTTP_GET, [](AsyncWebServerRequest *request) {
 
     radio=so2r.radio_selected();
     // control type Radio Mode Band
-    console->print("/control type=");
-    console->print(type);
-    console->print(" value=");
-    console->println(value);
+    webLog.print("/control type=");
+    webLog.print(type);
+    webLog.print(" value=");
+    webLog.println(value);
     int modetype;
     if (type == "Radio") {
       so2r.change_focused_radio(ival);
@@ -2102,8 +3319,8 @@ web_server.on("/control", HTTP_GET, [](AsyncWebServerRequest *request) {
       if (ival>=1 && ival<N_BAND) {
 	if (((1<<(ival -1)) & radio->band_mask) == 0) {
 	  band_change(ival,radio);
-	  console->print("band_change to band ");
-	  console->println(ival);
+	  webLog.print("band_change to band ");
+	  webLog.println(ival);
 	}
       }
     }
@@ -2205,7 +3422,7 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
   web_server.on("/input", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("call")) {
       String call = request->getParam("call")->value();
-      Serial.printf("[AJAX] Received: %s\n", call.c_str());
+      webLog.printf("[AJAX] Received: %s\n", call.c_str());
       request->send(200, "text/plain", "Received: " + call);
     } else {
       request->send(400, "text/plain", "Missing call param");
@@ -2224,6 +3441,8 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
   });
 
 
+  setup_web_bandmap_handlers();
+
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "*");
 
@@ -2231,6 +3450,7 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
 
   setupNearestHandler(web_server);
   setupNearestSummit(web_server);
+  setupContestPageHandler();
   setupSettingsPageHandler();  
   web_heap_point("after web handlers");
   web_server.begin();

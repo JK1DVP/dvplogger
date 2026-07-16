@@ -177,7 +177,8 @@ void print_rtcclock() {
 }
 
 
-void print_ntpstatus() {
+void print_ntpstatus(Stream *out) {
+    if (!out) out = console;
 
     timeval ntptime;
     struct tm local_tm;
@@ -187,10 +188,10 @@ void print_ntpstatus() {
     sprintf(datestr, "NTP:%04d/%02d/%02d %02d:%02d:%02d.%03ld myRTC:%02d:%02d:%02d.%03d",
 	    local_tm.tm_year+1900,local_tm.tm_mon+1,local_tm.tm_mday,local_tm.tm_hour,local_tm.tm_min,local_tm.tm_sec,ntptime.tv_usec/1000,
 	    my_rtc.hour(), my_rtc.minute(), my_rtc.second(),my_rtc.msec);
-    plogw->ostream->print(datestr);
-    console->print(" status=");
-    console->print(NTP.syncStatus());
-    console->printf (" Free heap: %u\n", ESP.getFreeHeap ());      
+    out->print(datestr);
+    out->print(" status=");
+    out->print(NTP.syncStatus());
+    out->printf (" Free heap: %u\n", ESP.getFreeHeap ());      
 }
 
 void set_rtcclock(char *timestr) { // yymmddhhmmss to set 

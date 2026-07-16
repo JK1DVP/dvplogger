@@ -59,6 +59,13 @@
 #include "usb_host.h"
 int cmd_interp_state = 0;
 
+static Stream *command_output = nullptr;
+
+static Stream *current_command_output()
+{
+  return command_output ? command_output : console;
+}
+
 struct terminal_help_entry {
   const char *command;
   const char *description;
@@ -148,14 +155,14 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"ROT...", "rotator commands: EN, TYPE, NORTH, SOUTH, TR, AZ, STEP, SWEEP"}
 };
 
-static void print_terminal_help()
+static void print_terminal_help(Print *out)
 {
-  plogw->ostream->println("Available Commands:");
+  out->println("Available Commands:");
   const size_t n = sizeof(terminal_help_entries) / sizeof(terminal_help_entries[0]);
   for (size_t i = 0; i < n; ++i) {
-    plogw->ostream->print(terminal_help_entries[i].command);
-    plogw->ostream->print(" - ");
-    plogw->ostream->println(terminal_help_entries[i].description);
+    out->print(terminal_help_entries[i].command);
+    out->print(" - ");
+    out->println(terminal_help_entries[i].description);
   }
 }
 // command interpreter
@@ -185,9 +192,9 @@ void play_cw_cmd(char *cmd)
       radio=so2r.radio_tx();
       set_ptt_rig(radio,1);
       radio->ptt=1;
-      console->print("ptt on and ");
+      current_command_output()->print("ptt on and ");
       mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL,MUX_PORT_EXT_BRD_CTRL,(unsigned char *)buf,strlen(buf));
-      console->print("sent ");console->println(buf);
+      current_command_output()->print("sent ");current_command_output()->println(buf);
       so2r.set_queue_monitor_status(1);
     }
   }
@@ -199,7 +206,7 @@ void play_wpm_set()
     char buf[20];
     sprintf(buf,"playw%d",cw_spd);
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL,MUX_PORT_EXT_BRD_CTRL,(unsigned char *)buf,strlen(buf));
-    console->print("sent ");console->println(buf);
+    current_command_output()->print("sent ");current_command_output()->println(buf);
   }
 }
 
@@ -209,7 +216,7 @@ void play_wpm_cmd(char *cmd)
     char buf[20];
     sprintf(buf,"playw%s",cmd);
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL,MUX_PORT_EXT_BRD_CTRL,(unsigned char *)buf,strlen(buf));
-    console->print("sent ");console->println(buf);
+    current_command_output()->print("sent ");current_command_output()->println(buf);
   }
   
 }
@@ -220,7 +227,7 @@ void play_queue_cmd()
     char buf[20];
     sprintf(buf,"playq");
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL,MUX_PORT_EXT_BRD_CTRL,(unsigned char *)buf,strlen(buf));
-    console->print("sent ");console->println(buf);	  
+    current_command_output()->print("sent ");current_command_output()->println(buf);	  
   }
 }
 
@@ -229,7 +236,7 @@ void play_stop_cmd() {
     char buf[20];
     sprintf(buf,"plays");
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL,MUX_PORT_EXT_BRD_CTRL,(unsigned char *)buf,strlen(buf));
-    console->print("sent ");console->println(buf);	  
+    current_command_output()->print("sent ");current_command_output()->println(buf);	  
   }
 }
 
@@ -245,21 +252,42 @@ void play_string_cmd(char *cmd)
       radio=so2r.radio_tx();
       set_ptt_rig(radio,1);
       radio->ptt=1;
-      console->print("ptt on and ");
+      current_command_output()->print("ptt on and ");
       mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL,MUX_PORT_EXT_BRD_CTRL,(unsigned char *)buf,strlen(buf));
-      console->print("sent ");console->println(buf);
+      current_command_output()->print("sent ");current_command_output()->println(buf);
       so2r.set_queue_monitor_status(1);
     }
   }
 }
 
-void cmd_interp(char *cmd) {
+namespace {
+class CommandOutputScope {
+public:
+  explicit CommandOutputScope(Stream *output)
+      : saved_(command_output) {
+    command_output = output ? output : console;
+  }
+
+  ~CommandOutputScope() {
+    command_output = saved_;
+  }
+
+  Stream *get() const { return current_command_output(); }
+
+private:
+  Stream *saved_;
+};
+}  // namespace
+
+void cmd_interp(char *cmd, Stream *output) {
+  CommandOutputScope output_scope(output);
+  Stream *out = output_scope.get();
   int tmp, tmp1;
   struct radio *radio;
   switch (cmd_interp_state) {
     case 0:  // command line
-      plogw->ostream->print("cmd:");
-      plogw->ostream->println(cmd);
+      out->print("cmd:");
+      out->println(cmd);
 
       if (strcmp("loadsat", cmd) == 0) {
 	load_satinfo();
@@ -277,12 +305,12 @@ void cmd_interp(char *cmd) {
       }
       if (strcmp(cmd,"decoderstop")==0) {
 	decoder.stop_i2s_adc_24k_rms_task(); // stop morse decoder
-	console->print("stopped morse decoder");
+	out->print("stopped morse decoder");
 	break;
       }
       if (strcmp(cmd,"decoder")==0) {
 	decoder.start_i2s_adc_24k_rms_task();// start morse decoder
-	console->print("started morse decoder");
+	out->print("started morse decoder");
 	break;
       }
 
@@ -307,49 +335,49 @@ void cmd_interp(char *cmd) {
 	char buf[40];	
 	for (int i=0;i<20;i++) {
 	  sprintf(buf,"\033[%d;1H\033[K",i);
-	  plogw->ostream->print(buf);
+	  out->print(buf);
 	}
         break;
       }
       
       if (strncmp(cmd,"play ",5)==0) {
 	// play_string
-	console->println("play command");
+	out->println("play command");
 	play_string_cmd(cmd+5);
 	break;
       }
       if (strncmp(cmd,"playcw",6)==0) {
 	// play_string
-	console->println("playcw command");
+	out->println("playcw command");
 	play_cw_cmd(cmd+6);
 	break;
       }
       if (strncmp(cmd,"playwpm",7)==0) {
 	// play queue query
-	console->println("playwpm command");
+	out->println("playwpm command");
 	play_wpm_cmd(cmd+7);
 	break;
       }
       if (strncmp(cmd,"playq",5)==0) {
 	// play queue query
-	console->println("playq command");
+	out->println("playq command");
 	play_queue_cmd();
 	break;
       }
       if (strcmp(cmd,"serial")==0) {
 	// status of serial port allocation
-	print_serial_instance();
+	print_serial_instance(out);
 	break;
       }
       if (strncmp(cmd, "send ", 5) == 0) {
 	//        SO2Rprint(cmd + 5);
 	Serial2.println(cmd+5);
-	console->print("sent Serial2:");console->println(cmd+5);
+	out->print("sent Serial2:");out->println(cmd+5);
         break;
       }
       if (strcmp(cmd,"i2c_scan")==0) {
 	// scan i2c bus and print result
-	i2c_scan();
+	i2c_scan(out);
 	break;
       }
       if (strcmp(cmd,"usb_desc")==0) {
@@ -357,7 +385,7 @@ void cmd_interp(char *cmd) {
 	break;
       }
       if (strcmp(cmd,"cp2105stat")==0) {
-	CP2105status();
+	CP2105status(out);
 	break;
       }
       if (strcmp(cmd,"cp2105port0")==0 || strcmp(cmd,"cp2105port1")==0) {
@@ -367,7 +395,7 @@ void cmd_interp(char *cmd) {
       if (strncmp(cmd,"cp2105baud0 ",12)==0 || strncmp(cmd,"cp2105baud1 ",12)==0) {
 	uint8_t port = cmd[10]-'0';
 	uint32_t baud = strtoul(cmd+12, NULL, 10);
-	if (!CP2105setBaud(port, baud)) console->println("CP2105 baud setting failed");
+	if (!CP2105setBaud(port, baud)) out->println("CP2105 baud setting failed");
 	break;
       }
 
@@ -378,17 +406,17 @@ void cmd_interp(char *cmd) {
 	    char c = Wire.read(); // receive a byte as characterif
 	    if (c != 0) {
 	      if (c==0x8b) { // Fn+BS exit from kbread
-		console->println("exit from kbread");
+		out->println("exit from kbread");
 		goto end_kb;
 	      }
-	      console->print("cardkb:");
+	      out->print("cardkb:");
 	      if (isprint(c)) {
-		console->print(c);
-		console->print(":");		
+		out->print(c);
+		out->print(":");		
 	      } else {
-		console->print(":");
+		out->print(":");
 	      }
-	      console->println(c, HEX);
+	      out->println(c, HEX);
 	    }
 	  }
 	  delay(10);
@@ -398,25 +426,25 @@ void cmd_interp(char *cmd) {
       }
 
       if (strcmp(cmd,"ntp_stat")==0) {
-	print_ntpstatus();
+	print_ntpstatus(out);
 	break;
       }
 
       if (strcmp(cmd,"reset_display")==0) {
-	  plogw->ostream->print("init_display()");
+	  out->print("init_display()");
 	  init_display();
 	  break;
       }
       if (strncmp(cmd,"flashersd",9)==0) {
-	console->println("flashersd boot part app spiffs (put what you want to flash).");
+	out->println("flashersd boot part app spiffs (put what you want to flash).");
 	// stop mux serial port
 	deinit_mux_serial();
 	// stop using SD card
 	close_qsolog();
-	console->println("esp_flashersd() ... ");		
+	out->println("esp_flashersd() ... ");		
 	//      	esp_flasher();
 	esp_flasher_sd(cmd+9);
-	console->println("esp_flashersd() end... ");		
+	out->println("esp_flashersd() end... ");		
 	// restore mux serial port
 	init_mux_serial();
 	attach_interrupt_civ();
@@ -424,22 +452,22 @@ void cmd_interp(char *cmd) {
       }
 
       if (strcmp(cmd,"memstat watch")==0) {
-        start_memstat_watch();
+        start_memstat_watch(out);
         break;
       }
       if (strcmp(cmd,"memstat stop")==0) {
-        stop_memstat_watch();
+        stop_memstat_watch(out);
         break;
       }
       if (strcmp(cmd,"submem")==0 || strcmp(cmd,"memstat")==0) {
-        request_memstat_main_subcpu(true);
+        request_memstat_main_subcpu(true, out);
         break;
       }
       if (strcmp(cmd,"subcpu_halt")==0) {
 	// keep subcpu reset pin low to halt subcpu
 	//const uint8_t reset_trigger_mcp_pin = 15;
 	mcp_write_pin(15, 0);
-	console->println("halted subcpu by keep en pin low.");
+	out->println("halted subcpu by keep en pin low.");
 	break;
       }
       
@@ -447,9 +475,9 @@ void cmd_interp(char *cmd) {
 	// stop mux serial port
 	deinit_mux_serial();
 	close_qsolog();
-	console->println("esp_flasher() ... ");
+	out->println("esp_flasher() ... ");
 	esp_flasher();
-	console->println("esp_flasher() end... ");	
+	out->println("esp_flasher() end... ");	
 	// restore mux serial port
 	init_mux_serial();
 	attach_interrupt_civ();
@@ -466,6 +494,7 @@ void cmd_interp(char *cmd) {
             verbose = 1;
           }
         }
+        out->printf("verbose=%d\n", verbose);
         break;
       }
       if (strncmp(cmd, "nextaos", 7) == 0) {
@@ -479,7 +508,7 @@ void cmd_interp(char *cmd) {
         break;
       }
       if (strncmp(cmd,"addap ",6)==0) {
-	console->println("addap command");	
+	out->println("addap command");	
 	char arg1[100];char arg0[100];
 	copy_token(arg0,cmd+6,0," ");
 	copy_token(arg1,cmd+6,1," ");
@@ -493,17 +522,17 @@ void cmd_interp(char *cmd) {
         if (sscanf(cmd + 4, "%d %d", &tmp, &tmp1) == 2) {
 	  write_mcp_gpio(tmp,tmp1);
 
-          plogw->ostream->print("write mcp gpio port ");
-          plogw->ostream->print(tmp);
-          plogw->ostream->print(" value ");
-          plogw->ostream->println(tmp1);
+          out->print("write mcp gpio port ");
+          out->print(tmp);
+          out->print(" value ");
+          out->println(tmp1);
           for (int i = 0; i < 16; i++) {
-            plogw->ostream->print(i);
-            plogw->ostream->print(" ");
-            plogw->ostream->println(read_mcp_gpio(i));
+            out->print(i);
+            out->print(" ");
+            out->println(read_mcp_gpio(i));
           }
         } else {
-          plogw->ostream->println("gpio mcp param error");
+          out->println("gpio mcp param error");
         }
         break;
       }
@@ -524,15 +553,15 @@ void cmd_interp(char *cmd) {
       }
 
       if (strcmp(cmd, "listdir") == 0) {
-        listDir(SD, "/", 0);
+        listDir(SD, "/", 0, out);
         break;
       }
       if (strcmp(cmd, "help") == 0) {
-        print_terminal_help();
+        print_terminal_help(out);
         break;
       }
       if (strncmp("callhist_set", cmd, 12) == 0) {
-        plogw->ostream->println("callhist_set command");
+        out->println("callhist_set command");
         if (cmd[12] == ' ') {
           set_callhistfn(cmd + 13);
         } else {
@@ -551,23 +580,23 @@ void cmd_interp(char *cmd) {
 	break;
       }
       if (strcmp("dumpcur",cmd)==0) {
-	dump_qso_current();
+	dump_qso_current(out);
 	break;
       }
       if (strcmp("dumptop",cmd)==0) {
 	info_disp.pos=0;
-	dump_qso_current();
+	dump_qso_current(out);
 	break;
       }
       if (strcmp("dumpnext",cmd)==0) {
 	info_disp.pos+=sizeof(qso.all);
-	dump_qso_current();
+	dump_qso_current(out);
 	break;
       }
       if (strcmp("dumpprev",cmd)==0) {
 	info_disp.pos-=sizeof(qso.all);
 	if (info_disp.pos<0) info_disp.pos=0;
-	dump_qso_current();
+	dump_qso_current(out);
 	break;
       }
       if (strcmp("dumplast", cmd) == 0) {      
@@ -576,7 +605,7 @@ void cmd_interp(char *cmd) {
 	if (info_disp.pos < 0) {
 	  info_disp.pos = 0;
 	}
-	dump_qso_current();
+	dump_qso_current(out);
 	break;
       }
 
@@ -589,34 +618,34 @@ void cmd_interp(char *cmd) {
 	    if (info_disp.pos < 0) {
 	      info_disp.pos = 0;
 	    }
-	    dump_qso_current();
+	    dump_qso_current(out);
 	  } else {
-	    plogw->ostream->print(tmp);
-	    plogw->ostream->println(", beyond range <");
-	    plogw->ostream->print(pos/sizeof(qso.all));
+	    out->print(tmp);
+	    out->println(", beyond range <");
+	    out->print(pos/sizeof(qso.all));
 	  }
 	} else {
-	    plogw->ostream->println("dump qso#(0-)");
+	    out->println("dump qso#(0-)");
 	}
 	break;
       }
       
       if (strncmp("dumpqso", cmd, 7) == 0) {
-        plogw->ostream->println("dumpqso command");
-        plogw->ostream->println(cmd + 8);
+        out->println("dumpqso command");
+        out->println(cmd + 8);
 	if (strlen(cmd)>7) {
-	  dump_qso_bak(cmd + 8);
+	  dump_qso_bak(cmd + 8, out);
 	} else {
-	  plogw->ostream->println("dumping current qso log.");	  
-	  dump_qso_log();
+	  out->println("dumping current qso log.");	  
+	  dump_qso_log(out);
 	}
         break;
       }
 
       
       if (strncmp("readqso", cmd, 7) == 0) {
-        plogw->ostream->println("readqso command");
-        read_qso_log(READQSO_PRINT);
+        out->println("readqso command");
+        read_qso_log(READQSO_PRINT, out);
         break;
       }
       if (strcasecmp(cmd, "listqsofile") == 0) {
@@ -629,7 +658,7 @@ void cmd_interp(char *cmd) {
         char *endp = NULL;
         long n = strtol(arg, &endp, 10);
         if (arg == endp || *endp != '\0' || n < 0 || n > 999) {
-          plogw->ostream->println("Usage: SWITCHLOGnnn");
+          out->println("Usage: SWITCHLOGnnn");
           snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
                    "Usage:\nSWITCHLOGnnn");
           upd_display_info_flash(dp->lcdbuf);
@@ -639,7 +668,7 @@ void cmd_interp(char *cmd) {
         break;
       }
       if (strncmp("mailqso", cmd, 7) == 0) {
-        plogw->ostream->println("mailsqso command");
+        out->println("mailsqso command");
 	//        mail_qso_log();
         break;
       }
@@ -664,9 +693,9 @@ void cmd_interp(char *cmd) {
       if (strncmp("assign", cmd, 6) == 0) {
         // assign variables similarly to load/save file.
         if (!plogw->f_console_emu) {
-          plogw->ostream->print("assign:");
-          plogw->ostream->print(cmd + 7);
-          plogw->ostream->println(":");
+          out->print("assign:");
+          out->print(cmd + 7);
+          out->println(":");
         }
         assign_settings(cmd + 7, settings_dict);
         break;
@@ -687,36 +716,36 @@ void cmd_interp(char *cmd) {
         int tmp, tmp1;
         if (sscanf(cmd + 10, "%d", &tmp) == 1) {
 	  if (tmp <0 || tmp >= N_CONTEST) {
-	    plogw->ostream->println("contest_id out of range");
+	    out->println("contest_id out of range");
 	    break;
 	  }
 	  plogw->contest_id =tmp;
 	  set_contest_id();
-	  plogw->ostream->print("contest:");
-	  plogw->ostream->println(plogw->contest_name+2);
+	  out->print("contest:");
+	  out->println(plogw->contest_name+2);
         } else {
-          plogw->ostream->println("contest_id contest_id#");
+          out->println("contest_id contest_id#");
         }
         break;
       }
       if (strcmp("show_multi",cmd)==0) {      
-	print_multi_list();
+	print_multi_list(out);
 	break;
       }
       if (strcmp(cmd,"disptype1")==0) {
-	plogw->ostream->print("reset_display() type1");
+	out->print("reset_display() type1");
 	display_type=1;
 	init_display();
 	break;
       }
       if (strcmp(cmd,"disptype0")==0) {
-	plogw->ostream->print("reset_display() type0");
+	out->print("reset_display() type0");
 	display_type=0;
 	init_display();
 	break;
       }
       if (strcmp(cmd,"disptype2")==0) {
-	plogw->ostream->print("reset_display() type2");
+	out->print("reset_display() type2");
 	display_type=2;
 	init_display();
 	break;
@@ -732,7 +761,7 @@ void cmd_interp(char *cmd) {
 	break;
       }
       if (strcmp("show_summary",cmd)==0) {
-	show_summary();
+	show_summary(out);
 	break;
       }	
       if (strcmp("callhist_enable",cmd)==0) {
@@ -742,11 +771,11 @@ void cmd_interp(char *cmd) {
           plogw->enable_callhist = 1;
         }
         if (!plogw->f_console_emu) {
-          plogw->ostream->print("callhist en =");
-          plogw->ostream->println(plogw->enable_callhist);
+          out->print("callhist en =");
+          out->println(plogw->enable_callhist);
         }
         if (plogw->enable_callhist) {
-          if (!plogw->f_console_emu) plogw->ostream->println("open callhist");
+          if (!plogw->f_console_emu) out->println("open callhist");
           int n = 0;
           if (callhist_at == 1) {
             if (load_callhist_subcpu(callhistfn)) {
@@ -755,25 +784,25 @@ void cmd_interp(char *cmd) {
           } else {
             n = read_callhist_list(callhistfn);
           }
-          plogw->ostream->printf("callhist at=%s entries=%d\n",
+          out->printf("callhist at=%s entries=%d\n",
                                  callhist_at ? "SUBCPU" : "MAIN", n);
         } else {
-          if (!plogw->f_console_emu) plogw->ostream->println("close callhist");
+          if (!plogw->f_console_emu) out->println("close callhist");
           close_callhist();
         }
         sprintf(dp->lcdbuf, "callhist en:%d\nDone.\n", plogw->enable_callhist);
-        if (!plogw->f_console_emu) plogw->ostream->println(dp->lcdbuf);
+        if (!plogw->f_console_emu) out->println(dp->lcdbuf);
         break;
       }	
       if (strcmp("settings", cmd) == 0) {
-        dump_settings(plogw->ostream, settings_dict);
+        dump_settings(out, settings_dict);
         break;
       }
       if (strncmp("save", cmd, 4) == 0) {
         // release other settings  including sat
         release_memory();
         save_settings(cmd + 4);
-        if (!plogw->f_console_emu) plogw->ostream->println("save");
+        if (!plogw->f_console_emu) out->println("save");
         break;
       }
       if (strcmp("switch_bands",cmd)==0) {
@@ -788,7 +817,7 @@ void cmd_interp(char *cmd) {
 	strcpy(radio->rig_name + 2, cmd+8);
 	set_rig_from_name(radio);
 	sprintf(dp->lcdbuf,"Rig set:%s",radio->rig_name+2);
-	plogw->ostream->println(dp->lcdbuf);
+	out->println(dp->lcdbuf);
 	break;
       }
       if (strncmp("switch_radio", cmd, 12) == 0) {
@@ -796,7 +825,7 @@ void cmd_interp(char *cmd) {
         if (sscanf(cmd + 12, "%d", &tmp) == 1) {
           switch_radios(tmp, -1);
         } else {
-          plogw->ostream->println("switch_radio radio#");
+          out->println("switch_radio radio#");
         }
         break;
       }
@@ -805,7 +834,7 @@ void cmd_interp(char *cmd) {
         if (sscanf(cmd + 12, "%d", &tmp) == 1) {
           enable_radios(tmp, -1);
         } else {
-          plogw->ostream->println("enable_radio radio#");
+          out->println("enable_radio radio#");
         }
         break;
       }
@@ -840,11 +869,11 @@ void cmd_interp(char *cmd) {
 	SD.remove("/wifiset.txt");
 	SD.remove("/spiffs.bin");
 	SD.remove("/rigs.txt");	
-        plogw->ostream->println("reset_settings by removing files settings.txt ch.txt wifiset.txt");
+        out->println("reset_settings by removing files settings.txt ch.txt wifiset.txt");
 	break;
       }
       if (strcmp(cmd,"restart_dvplogger")==0) {
-        plogw->ostream->println("restarting DVPlogger by esp32 reset...");
+        out->println("restarting DVPlogger by esp32 reset...");
 	delay(1000);
 	ESP.restart();
 	break;
@@ -860,7 +889,7 @@ void cmd_interp(char *cmd) {
 	  set_rtcclock(cmd+5); // yymmddhhmmss to set 	  
 	} else {
 	  print_rtcclock();
-	  plogw->ostream->println("set by time yyyy-mm-ddThh:mm:ss  . ");
+	  out->println("set by time yyyy-mm-ddThh:mm:ss  . ");
 	}
 	break;
       }
@@ -879,16 +908,16 @@ void cmd_interp(char *cmd) {
         break;
       }
       if (strcmp("callhist_search", cmd) == 0) {
-        plogw->ostream->println("callhist_search command");
+        out->println("callhist_search command");
         cmd_interp_state = 2;
         break;
       }
       // other commands follow
-      plogw->ostream->println("???");
+      out->println("???");
       break;
     case 1:  // after callhist_set commsnd
       if (strcmp("end", cmd) == 0) {
-        plogw->ostream->println("callhist_set end");
+        out->println("callhist_set end");
 	close_callhistf();
 	//        callhistf.close();
         callhistf_stat = 0;
@@ -901,11 +930,16 @@ void cmd_interp(char *cmd) {
       break;
     case 2:  // call history search
       if (strcmp("end", cmd) == 0) {
-        plogw->ostream->println("callhist_search end");
+        out->println("callhist_search end");
         cmd_interp_state = 0;
         break;
       }
       search_callhist(strtoupper(cmd));
       break;
   }
+}
+
+
+void cmd_interp(char *cmd) {
+  cmd_interp(cmd, plogw->ostream ? plogw->ostream : console);
 }

@@ -73,16 +73,16 @@ void testFileIO(fs::FS &fs, const char *path) {
       len -= toRead;
     }
     end = millis() - start;
-    if (!plogw->f_console_emu) plogw->ostream->printf("%u bytes read for %u ms\n", flen, end);
+    if (!plogw->f_console_emu) console->printf("%u bytes read for %u ms\n", flen, end);
     file.close();
   } else {
-    if (!plogw->f_console_emu) plogw->ostream->println("Failed to open file for reading");
+    if (!plogw->f_console_emu) console->println("Failed to open file for reading");
   }
 
 
   file = fs.open(path, FILE_WRITE);
   if (!file) {
-    if (!plogw->f_console_emu) plogw->ostream->println("Failed to open file for writing");
+    if (!plogw->f_console_emu) console->println("Failed to open file for writing");
     return;
   }
 
@@ -92,7 +92,7 @@ void testFileIO(fs::FS &fs, const char *path) {
     file.write(buf, 512);
   }
   end = millis() - start;
-  if (!plogw->f_console_emu) plogw->ostream->printf("%u bytes written for %u ms\n", 2048 * 512, end);
+  if (!plogw->f_console_emu) console->printf("%u bytes written for %u ms\n", 2048 * 512, end);
   file.close();
 }
 
@@ -119,29 +119,29 @@ void init_sd() {
   SPI2.begin(sd_sck, sd_miso, sd_mosi, sd_ss);
   pinMode(sd_ss, OUTPUT);
   if (!SD.begin(sd_ss, SPI2, 12000000)) {
-    plogw->ostream->println("Card Mount Failed");
+    console->println("Card Mount Failed");
     return;
   }
   uint8_t cardType = SD.cardType();
 
   if (cardType == CARD_NONE) {
-    plogw->ostream->println("No SD card attached");
+    console->println("No SD card attached");
     return;
   }
 
-  plogw->ostream->print("SD Card Type: ");
+  console->print("SD Card Type: ");
   if (cardType == CARD_MMC) {
-    plogw->ostream->println("MMC");
+    console->println("MMC");
   } else if (cardType == CARD_SD) {
-    plogw->ostream->println("SDSC");
+    console->println("SDSC");
   } else if (cardType == CARD_SDHC) {
-    plogw->ostream->println("SDHC");
+    console->println("SDHC");
   } else {
-    plogw->ostream->println("UNKNOWN");
+    console->println("UNKNOWN");
   }
 
   uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-  plogw->ostream->printf("SD Card Size: %lluMB\n", cardSize);
+  console->printf("SD Card Size: %lluMB\n", cardSize);
 }
 
 
@@ -153,32 +153,33 @@ void deinit_sd()
   SD.end();  // SPIバスを解放し、再初期化できるようにする
 }
 
-void listDir(fs::FS &fs, const char *dirname, uint8_t levels) {
-  plogw->ostream->printf("Listing directory: %s\n", dirname);
+void listDir(fs::FS &fs, const char *dirname, uint8_t levels, Stream *out) {
+  if (!out) out = console;
+  out->printf("Listing directory: %s\n", dirname);
 
   File root = fs.open(dirname);
   if (!root) {
-    plogw->ostream->println("Failed to open directory");
+    out->println("Failed to open directory");
     return;
   }
   if (!root.isDirectory()) {
-    plogw->ostream->println("Not a directory");
+    out->println("Not a directory");
     return;
   }
 
   File file = root.openNextFile();
   while (file) {
     if (file.isDirectory()) {
-      plogw->ostream->print("  DIR : ");
-      plogw->ostream->println(file.name());
+      out->print("  DIR : ");
+      out->println(file.name());
       if (levels) {
-        listDir(fs, file.path(), levels - 1);
+        listDir(fs, file.path(), levels - 1, out);
       }
     } else {
-      plogw->ostream->print("  FILE: ");
-      plogw->ostream->print(file.name());
-      plogw->ostream->print("  SIZE: ");
-      plogw->ostream->println(file.size());
+      out->print("  FILE: ");
+      out->print(file.name());
+      out->print("  SIZE: ");
+      out->println(file.size());
     }
     file = root.openNextFile();
   }

@@ -107,6 +107,8 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, voice_memory_enable);
 
 REGISTER_SETTING_OFFSET(settings_dict, plogw, cluster_name, 2, DICT_VALUE_TYPE_CHARARRAY);
 REGISTER_SETTING_OFFSET(settings_dict, plogw, cluster_cmd, 2, DICT_VALUE_TYPE_CHARARRAY);
+REGISTER_SETTING_OFFSET(settings_dict, plogw, cluster2_name, 2, DICT_VALUE_TYPE_CHARARRAY);
+REGISTER_SETTING_OFFSET(settings_dict, plogw, cluster2_cmd, 2, DICT_VALUE_TYPE_CHARARRAY);
 REGISTER_SETTING_OFFSET(settings_dict, plogw, email_addr, 2, DICT_VALUE_TYPE_CHARARRAY);
 
 // コメントアウト部分
@@ -217,6 +219,16 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
 
   settings_dict[n_settings_dict].name = "cluster_cmd";
   settings_dict[n_settings_dict].value = (void *)plogw->cluster_cmd + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_name";
+  settings_dict[n_settings_dict].value = (void *)plogw->cluster2_name + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_cmd";
+  settings_dict[n_settings_dict].value = (void *)plogw->cluster2_cmd + 2;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
   n_settings_dict++;
 
@@ -527,6 +539,7 @@ int load_settings(char *fn) {
   //  multiwifi_addap(plogw->wifi_ssid+2,plogw->wifi_passwd+2);  // do not try to remember wifi settings here but wifiset.txt
   set_contest_id();
   set_cluster();
+  set_cluster2();
   reconnect_zserver();
   
   return 1;

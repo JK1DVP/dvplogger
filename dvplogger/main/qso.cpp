@@ -505,7 +505,8 @@ void reformat_qso_entry(union qso_union_tag *qso) {
 
 
 // read the previous qso and print
-void read_qso_log(int option) {
+void read_qso_log(int option, Stream *out) {
+  if (!out) out = console;
   // seek to the first byte and dump
 
   int pos, memo_pos;
@@ -528,7 +529,7 @@ void read_qso_log(int option) {
 
   while (1) {
     if (!qsologf.seek(pos)) {
-      if (!plogw->f_console_emu) plogw->ostream->println("file seek failed");
+      if (!plogw->f_console_emu) out->println("file seek failed");
       goto end;
     }
     //    Serial.print("-");    
@@ -538,14 +539,14 @@ void read_qso_log(int option) {
     if (ret != len) {
       //
       if (!plogw->f_console_emu) {
-        plogw->ostream->print("qso not read bytes=");
-        plogw->ostream->println(ret);
+        out->print("qso not read bytes=");
+        out->println(ret);
       }
       goto end;
     } else {
-      //      plogw->ostream->print("read ");
-      //      plogw->ostream->print(ret);
-      //      plogw->ostream->println("bytes");
+      //      out->print("read ");
+      //      out->print(ret);
+      //      out->println("bytes");
     } 
     if (option & READQSO_PRINT) {
       sprintf(dp->lcdbuf, "Reading QSO\nRead %d bytes", pos);
@@ -556,11 +557,11 @@ void read_qso_log(int option) {
     if (qso.entry.type[0] != 'Q') {
       // not vaild qso
       if (!plogw->f_console_emu) {
-	plogw->ostream->print("type:");		
-	plogw->ostream->print(qso.entry.type[0]);
-	plogw->ostream->print(" all:");			
-	plogw->ostream->print((char *)(qso.all));	
-	plogw->ostream->println(":not valid qso encountered");
+	out->print("type:");		
+	out->print(qso.entry.type[0]);
+	out->print(" all:");			
+	out->print((char *)(qso.all));	
+	out->println(":not valid qso encountered");
       }
       //      goto end; // before finish
       //      skip
@@ -568,15 +569,15 @@ void read_qso_log(int option) {
       continue;
     }
     // print content
-    //    plogw->ostream->print("Pos:");plogw->ostream->println(pos);
-    //    plogw->ostream->println("");
+    //    out->print("Pos:");out->println(pos);
+    //    out->println("");
 
     reformat_qso_entry(&qso);
     //    Serial.print("b");
 
     // operations
 
-    if (option & READQSO_PRINT) print_qso_entry(&qso);
+    if (option & READQSO_PRINT) print_qso_entry(&qso, out);
     if (option & READQSO_MAKEDUPE) makedupe_qso_entry();
     esp_task_wdt_reset();  // WDTをリセット
 
@@ -591,10 +592,10 @@ end:
   sprintf(dp->lcdbuf, "Reading QSO\nFinished\nPos=%d\n",pos);
 
   upd_display_info_flash(dp->lcdbuf);
-  if (!plogw->f_console_emu) plogw->ostream->println("end of read_qso_log");
-  plogw->ostream->print("Pos:");plogw->ostream->println(pos);    
+  if (!plogw->f_console_emu) out->println("end of read_qso_log");
+  out->print("Pos:");out->println(pos);    
   if (!qsologf.seek(memo_pos)) {
-    if (!plogw->f_console_emu) plogw->ostream->println("file seek to end failed");
+    if (!plogw->f_console_emu) out->println("file seek to end failed");
   }
   delay(300);
   upd_display_info_contest_settings(so2r.radio_selected());
@@ -1397,11 +1398,12 @@ void sprint_qso_entry(char *buf,union qso_union_tag *qso) {
   //  plogw->ostream->println(buf);
   
 }
-void print_qso_entry(union qso_union_tag *qso) {
+void print_qso_entry(union qso_union_tag *qso, Stream *out) {
+  if (!out) out = console;
   sprint_qso_entry(buf,qso);
-  //  Serial.print("f");    
-  plogw->ostream->write(buf,strlen(buf));
-  //  Serial.print("g");  
+  //  Serial.print("f");
+  out->write(buf,strlen(buf));
+  //  Serial.print("g");
 }
 
 
@@ -2085,7 +2087,8 @@ void make_zlogqsodata(char *buf)
 }
 
 
-void dump_qso_current() {
+void dump_qso_current(Stream *out) {
+  if (!out) out = console;
   // dump current qso
   int pos, memo_pos;
   int len;
@@ -2096,46 +2099,47 @@ void dump_qso_current() {
   // pos = pos - len;  // start from the end record
   //pos = 0; // start from the beginning
   pos = info_disp.pos;
-  plogw->ostream->print("pos= ");
-  plogw->ostream->print(info_disp.pos);
-  plogw->ostream->print(" # ");
-  plogw->ostream->println(info_disp.pos/sizeof(qso.all));    
+  out->print("pos= ");
+  out->print(info_disp.pos);
+  out->print(" # ");
+  out->println(info_disp.pos/sizeof(qso.all));    
   
   if (!qsologf.seek(pos)) {
-    if (!plogw->f_console_emu) plogw->ostream->println("file seek failed");
+    if (!plogw->f_console_emu) out->println("file seek failed");
     goto end;
   }
   ret = qsologf.read(qso.all, len);
   if (ret != len) {
     //
     if (!plogw->f_console_emu) {
-      plogw->ostream->print("qso not read bytes=");
-      plogw->ostream->println(ret);
+      out->print("qso not read bytes=");
+      out->println(ret);
     }
     goto end;
   }
   // check type
   if (qso.entry.type[0] != 'Q') {
     // not vaild qso
-    if (!plogw->f_console_emu) plogw->ostream->println("not valid qso encountered");
+    if (!plogw->f_console_emu) out->println("not valid qso encountered");
     //     goto end;
   }
   // print content
-  plogw->ostream->write(qso.all,len); // flush
+  out->write(qso.all,len); // flush
 end:
   if (!qsologf.seek(memo_pos)) {
-    if (!plogw->f_console_emu) plogw->ostream->println("file seek to end failed");
+    if (!plogw->f_console_emu) out->println("file seek to end failed");
   }
 }
 
-void dump_qso_log() {
+void dump_qso_log(Stream *out) {
+  if (!out) out = console;
   // seek to the first byte and dump
   if (!qsologf.seek(0)) {
-    if (!plogw->f_console_emu) plogw->ostream->println("file seek failed");
+    if (!plogw->f_console_emu) out->println("file seek failed");
   }
   if (!plogw->f_console_emu) {
-    plogw->ostream->print("printing contents of ");
-    plogw->ostream->println(qsologfn);
+    out->print("printing contents of ");
+    out->println(qsologfn);
   }
   int count;
   count = 0;
@@ -2145,8 +2149,8 @@ void dump_qso_log() {
     char c;
     c = qsologf.read();
     if (count_buf>=512) {
-      plogw->ostream->write(buf,count_buf); // flush
-      plogw->ostream->flush();
+      out->write(buf,count_buf); // flush
+      out->flush();
       delay(1); // task switch
       count_buf=0;
       pbuf=buf;
@@ -2156,23 +2160,24 @@ void dump_qso_log() {
     
   }
   // flush remaining
-  plogw->ostream->write(buf,count_buf); // flush
+  out->write(buf,count_buf); // flush
   
   
   if (!plogw->f_console_emu) {
-    plogw->ostream->println("\nend printing.");
-    plogw->ostream->print("position in file:");
-    plogw->ostream->println(qsologf.position());
+    out->println("\nend printing.");
+    out->print("position in file:");
+    out->println(qsologf.position());
   }
 }
 
-void dump_qso_bak(char *numstr) {
+void dump_qso_bak(char *numstr, Stream *out) {
+  if (!out) out = console;
   char fname[30];
   sprintf(fname, "/qsobak.%s", numstr);
   if (SD.exists(fname)) {
 
-    plogw->ostream->println(fname);
-    plogw->ostream->println("-- begin --");
+    out->println(fname);
+    out->println("-- begin --");
     File file = SD.open(fname, "r");
 
     int count_buf;char *pbuf;
@@ -2184,23 +2189,23 @@ void dump_qso_bak(char *numstr) {
 
 
       if (count_buf>=512) {
-	plogw->ostream->write(buf,count_buf); // flush
-	plogw->ostream->flush();
+	out->write(buf,count_buf); // flush
+	out->flush();
 	count_buf=0;
 	pbuf=buf;
       }
       *pbuf++=c; // store
       count_buf++;
       
-      //      plogw->ostream->print(c);
+      //      out->print(c);
     }
     // flush remaining
-    plogw->ostream->write(buf,count_buf); // flush
+    out->write(buf,count_buf); // flush
     
-    plogw->ostream->println("\n-- end --");
+    out->println("\n-- end --");
     file.close();
   } else {
-    plogw->ostream->print(fname);
-    plogw->ostream->println("not exist");
+    out->print(fname);
+    out->println("not exist");
   }
 }

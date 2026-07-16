@@ -317,8 +317,9 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
 }
 
 
-void print_multi_list()
+void print_multi_list(Stream *out)
 {
+  if (!out) out = console;
   struct radio *radio;
   radio=so2r.radio_selected();
   // show multi list below
@@ -326,7 +327,7 @@ void print_multi_list()
     if ( (multi_list.multi[radio->bandid-1] != NULL) ) {
 
       sprintf(dp->lcdbuf, "Multi in %s MHz", band_str[radio->bandid - 1]);
-      plogw->ostream->println(dp->lcdbuf);
+      out->println(dp->lcdbuf);
       //      display_printStr(dp->lcdbuf, 13);
 
       char buf1[10];
@@ -342,7 +343,7 @@ void print_multi_list()
 	sprintf(buf1, "%c%s ", multi_list.multi_worked[radio->bandid - 1][i] == 1 ? '*' : ' ', multi_list.multi[radio->bandid-1]->mul[i]);
 	len = strlen(buf1);
 	if (count + len > 80) {  // use next row
-	  plogw->ostream->println(dp->lcdbuf);
+	  out->println(dp->lcdbuf);
 	  *dp->lcdbuf = '\0';
 	  count = 0;
 	  // check row
@@ -354,7 +355,7 @@ void print_multi_list()
 	strcat(dp->lcdbuf, buf1);
 	count += len;
       }
-      plogw->ostream->println(dp->lcdbuf);
+      out->println(dp->lcdbuf);
 
     }
 

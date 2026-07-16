@@ -425,7 +425,7 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	
 	// list ptr_curr Shift+ keyer mode interfere setting the window characters
 	// sent_exch, Remarks, rig_name, cluster_name, email-addr, cluster_cmd, wifi_ssid, wifi_passwd, rig_spec, zserver_name, my_name
-	if (!((radio->ptr_curr == 5) || (radio->ptr_curr == 6) || (radio->ptr_curr == 20) || (radio->ptr_curr == 21) || (radio->ptr_curr == 22) || (radio->ptr_curr == 23) || (radio->ptr_curr == 25) || (radio->ptr_curr == 26) || (radio->ptr_curr == 27) || (radio->ptr_curr == 28) || (radio->ptr_curr == 29) || (radio->ptr_curr == 40) || ((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)) || ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)))) {
+	if (!((radio->ptr_curr == 5) || (radio->ptr_curr == 6) || (radio->ptr_curr == 20) || (radio->ptr_curr == 21) || (radio->ptr_curr == 22) || (radio->ptr_curr == 23) || (radio->ptr_curr == 25) || (radio->ptr_curr == 26) || (radio->ptr_curr == 27) || (radio->ptr_curr == 28) || (radio->ptr_curr == 29) || (radio->ptr_curr == 40) || (radio->ptr_curr == 41) || (radio->ptr_curr == 42) || ((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)) || ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)))) {
 	  if (key == 0x37) {
 	    // Shift-.  Shift-, manual band change up/down
 	    radio->bandid_bandmap++;
@@ -1788,6 +1788,14 @@ void process_enter(int option) {
     send_cluster_cmd();
     upd_display();
     break;
+  case 41:  // cluster 2 name
+    set_cluster2();
+    upd_display();
+    break;
+  case 42:  // cluster 2 command
+    send_cluster2_cmd();
+    upd_display();
+    break;
   case 25:  // wifi_ssid
     multiwifi_addap(plogw->wifi_ssid+2,plogw->wifi_passwd+2);
     break;
@@ -1858,6 +1866,11 @@ void process_enter(int option) {
     // check for commands
     if (strcmp(radio->callsign + 2, "DISCONN") == 0) {
       disconnect_cluster();
+      clear_buf(radio->callsign);
+      break;
+    }
+    if (strcmp(radio->callsign + 2, "DISCON2") == 0) {
+      disconnect_cluster2();
       clear_buf(radio->callsign);
       break;
     }
@@ -2549,6 +2562,8 @@ int check_edit_mode()  // CW key input and Remarks  return 1 (insert) else retur
   if (radio->ptr_curr == 28) return 1;  // zserver_name
   if (radio->ptr_curr == 29) return 1;  // my_name
   if (radio->ptr_curr == 40) return 0;  // contest_name
+  if (radio->ptr_curr == 41) return 1;  // cluster2 name
+  if (radio->ptr_curr == 42) return 1;  // cluster2 command
 
   if ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)) return 1;  // CW key msg
   if ((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)) return 1;  // CW key msg
@@ -2557,7 +2572,7 @@ int check_edit_mode()  // CW key input and Remarks  return 1 (insert) else retur
 
 
 int ptr_curr_req_uppercase(struct radio *radio) {
-  if ((radio->ptr_curr != 6) && (radio->ptr_curr != 20) &&(radio->ptr_curr != 21) && (radio->ptr_curr != 22) && (radio->ptr_curr != 23) && (radio->ptr_curr != 25) && (radio->ptr_curr != 26) && (radio->ptr_curr != 27) && (radio->ptr_curr != 28) && (radio->ptr_curr != 29) && (radio->ptr_curr != 40) )   {
+  if ((radio->ptr_curr != 6) && (radio->ptr_curr != 20) &&(radio->ptr_curr != 21) && (radio->ptr_curr != 22) && (radio->ptr_curr != 23) && (radio->ptr_curr != 25) && (radio->ptr_curr != 26) && (radio->ptr_curr != 27) && (radio->ptr_curr != 28) && (radio->ptr_curr != 29) && (radio->ptr_curr != 40) && (radio->ptr_curr != 41) && (radio->ptr_curr != 42) )   {
     return 1;
   } else {
     return 0;
@@ -2571,6 +2586,7 @@ int ptr_curr_req_nospace(struct radio *radio) {
       && (!((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)))
       && (radio->ptr_curr != 6)
       && (radio->ptr_curr != 23)
+      && (radio->ptr_curr != 42)
       && (radio->ptr_curr != 28)
       && (radio->ptr_curr != 29)
       && (radio->ptr_curr != 9)
@@ -2688,6 +2704,12 @@ void logw_handler(char key, char c)
 	break;
       case 40:  // contest_name
 	pwin = plogw->contest_name;
+	break;
+      case 41:  // cluster2_name
+	pwin = plogw->cluster2_name;
+	break;
+      case 42:  // cluster2_cmd
+	pwin = plogw->cluster2_cmd;
 	break;
 	
       default:
@@ -2929,6 +2951,12 @@ void switch_logw_entry(int option) {
       radio->ptr_curr = 23;
       break;
     case 23:  // cluster_cmd
+      radio->ptr_curr = 41;
+      break;
+    case 41:  // cluster2_name
+      radio->ptr_curr = 42;
+      break;
+    case 42:  // cluster2_cmd
       radio->ptr_curr = 22;
       break;
     case 22:  // email_addr
@@ -3014,6 +3042,12 @@ void switch_logw_entry(int option) {
       radio->ptr_curr = 21;
       break;
     case 22:  // email_addr
+      radio->ptr_curr = 42;
+      break;
+    case 42:  // cluster2_cmd
+      radio->ptr_curr = 41;
+      break;
+    case 41:  // cluster2_name
       radio->ptr_curr = 23;
       break;
     case 24:  // power_code

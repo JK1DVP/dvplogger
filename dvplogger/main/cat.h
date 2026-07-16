@@ -138,7 +138,7 @@ void init_cat_serialport();
 void init_rig() ;
 void init_all_radio() ;
 void print_radio_info(int idx_radio);
-void print_serial_instance();
+void print_serial_instance(Stream *out = nullptr);
 void print_rig_spec_str(int rig_idx,char *buf); // reverse set rig_spec_string from rig_spec
 
 int check_rig_conflict(int rig_idx,struct rig *rig_spec);

@@ -99,6 +99,27 @@ const struct contest_definition contest_defs[N_CONTEST+1] = {
 };
 //  { 0,"NOMULTI"   ,CW_PH_DUPE_NG,1,0,&multi_test_line,-1,-1,NULL,-1,-1 }, 
 
+int contest_definition_count() {
+  int count = 0;
+  while (count < N_CONTEST && contest_defs[count].id != -1) ++count;
+  return count;
+}
+
+int contest_definition_id(int index) {
+  if (index < 0 || index >= contest_definition_count()) return -1;
+  return contest_defs[index].id;
+}
+
+const char *contest_definition_name(int index) {
+  if (index < 0 || index >= contest_definition_count()) return "";
+  return contest_defs[index].name;
+}
+
+int contest_definition_mask(int index) {
+  if (index < 0 || index >= contest_definition_count()) return 0;
+  return contest_defs[index].mask;
+}
+
 
 int is_international_contest()
 {

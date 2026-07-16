@@ -3173,14 +3173,15 @@ struct serial_spec {
 
 // set radio's civport_num (hardware pins) allocated to the phisical seirial_num (0 Serial 1 Serial1 2 Serial2 3 Serial3(software) 4 Serial4(software) and set serial parameters
 
-void print_serial_instance()
+void print_serial_instance(Stream *out)
 {
-  console->print("Serial Instance-port map\n");
+  if (!out) out = console;
+  out->print("Serial Instance-port map\n");
   for (int j=0;j<4;j++) {
-    console->print((int)(serial_spec.port[j]));
-    console->print(" ");
+    out->print((int)(serial_spec.port[j]));
+    out->print(" ");
   }
-  console->println("");
+  out->println("");
   
 }
 void config_serial_instance(Stream **civport,int civport_num,int serial_num,int baud,int reverse)

@@ -303,6 +303,12 @@ void upd_display_stat() {
         case 40:
           statstr = "Test";
           break;
+        case 41:
+          statstr = "Clst2";
+          break;
+        case 42:
+          statstr = "C2Cm";
+          break;
       }
     }
   }
@@ -466,6 +472,12 @@ void upd_cursor() {
           break;
         case 40:  // contest_name
           x = upd_cursor_calc(plogw->contest_name[1], 16);
+          break;
+        case 41:
+          x = upd_cursor_calc(plogw->cluster2_name[1], 16);
+          break;
+        case 42:
+          x = upd_cursor_calc(plogw->cluster2_cmd[1], 16);
           break;
         default:
           return;
@@ -641,6 +653,12 @@ void upd_display() {
           break;
         case 40:  // Contest Name
           upd_display_put_lcdbuf(plogw->contest_name + 2, plogw->contest_name[1], 16, 0);
+          break;
+        case 41:
+          upd_display_put_lcdbuf(plogw->cluster2_name + 2, plogw->cluster2_name[1], 16, 0);
+          break;
+        case 42:
+          upd_display_put_lcdbuf(plogw->cluster2_cmd + 2, plogw->cluster2_cmd[1], 16, 0);
           break;
       }
     }
@@ -1276,13 +1294,14 @@ void upd_display_info_multi_bands(struct radio *radio) {
 }
 
 
-void show_summary() {
+void show_summary(Stream *out) {
+  if (!out) out = console;
   struct radio *radio;
 
   radio = so2r.radio_selected();
 
   // show information about contest settings  dupe check, name of the contest and multi worked
-  if (!plogw->f_console_emu) plogw->ostream->println("display info to work bandmap()  ");
+  if (!plogw->f_console_emu) out->println("display info to work bandmap()  ");
 
   // show worked stations and multi
   unsigned int bandmask = 0b1111111111111;
@@ -1325,7 +1344,7 @@ void show_summary() {
     // nw: number of to be worked station for the band
 
     sprintf(dp->lcdbuf, "%s %3dQ>%2d %2dM", bandid_str[j], nq, nw, nm);
-    plogw->ostream->println(dp->lcdbuf);
+    out->println(dp->lcdbuf);
 
     // next row
     nidx++;

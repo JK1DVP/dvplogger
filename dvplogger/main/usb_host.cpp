@@ -539,12 +539,13 @@ bool CP2105setBaud(uint8_t port, uint32_t baudrate) {
   return rcode == 0;
 }
 
-void CP2105status() {
-  console->printf("CP2105 ready=%d addr=0x%02x CATport=%u\n",
+void CP2105status(Stream *out) {
+  if (!out) out = console;
+  out->printf("CP2105 ready=%d addr=0x%02x CATport=%u\n",
                   Cp2105.isReady() ? 1 : 0,
                   Cp2105.GetAddress(), cp2105_cat_port);
   for (uint8_t port = 0; port < CP2105::PORTS; port++) {
-    console->printf(" port%u ready=%d if=%u IN=%u/%u OUT=%u/%u baud=%lu%s\n",
+    out->printf(" port%u ready=%d if=%u IN=%u/%u OUT=%u/%u baud=%lu%s\n",
                     port, Cp2105.portReady(port) ? 1 : 0,
                     Cp2105.interfaceNumber(port),
                     Cp2105.inEndpoint(port), Cp2105.inMaxPacket(port),

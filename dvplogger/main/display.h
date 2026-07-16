@@ -44,7 +44,7 @@ void upd_display_info_contest_settings(struct radio *radio) ;
 void upd_display_info_contest_band_nearby(struct radio *radio);
 void upd_display_info_multi_nearby(struct radio *radio);
 void upd_display_info_multi_bands(struct radio *radio);
-void show_summary() ;
+void show_summary(Stream *out = nullptr) ;
 void upd_display_info_to_work_bandmap() ;
 void upd_display_info_qso(int option) ;
 void upd_display_info() ;

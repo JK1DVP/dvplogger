@@ -26,6 +26,6 @@
 
 void init_sd();
 void deinit_sd();
-void listDir(fs::FS &fs, const char *dirname, uint8_t levels) ;
+void listDir(fs::FS &fs, const char *dirname, uint8_t levels, Stream *out = nullptr) ;
 
 #endif

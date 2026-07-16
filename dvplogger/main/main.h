@@ -21,11 +21,13 @@
 
 #ifndef FILE_MAIN_H
 #define FILE_MAIN_H
+class Stream;
 void localip_to_string(char *buf);
 void print_wifiinfo();
-void request_memstat_main_subcpu(bool update_lcd = true);
-void start_memstat_watch();
-void stop_memstat_watch();
+void request_memstat_main_subcpu(bool update_lcd = true, Stream *output = nullptr);
+void start_memstat_watch(Stream *output = nullptr);
+void stop_memstat_watch(Stream *output = nullptr);
 void process_memstat_watch();
+void rebind_memstat_output(Stream *old_output, Stream *new_output);
 //extern xTaskHandle gxHandle_USBloop;
 #endif

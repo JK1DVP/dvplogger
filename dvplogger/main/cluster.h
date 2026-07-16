@@ -43,6 +43,11 @@ extern const char * callsign ;
 extern const char * cluster_cmd[3] ;
 void set_cluster() ;
 void send_cluster_cmd() ;
+void send_cluster2_cmd() ;
+void set_cluster2() ;
+void disconnect_cluster2() ;
+void disconnect_cluster2_temp() ;
+int connect_cluster2() ;
 extern int f_show_cluster;
 
 

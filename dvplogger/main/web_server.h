@@ -22,4 +22,6 @@
 #ifndef FILE_WEB_SERVER_H
 #define FILE_WEB_SERVER_H
 void init_webserver();
+void process_web_terminal_log_queue();
+void process_web_bandmap();
 #endif

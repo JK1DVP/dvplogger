@@ -483,6 +483,8 @@ struct logwindow {
   char hostname[LEN_HOST_NAME + 3];  
   char cluster_name[LEN_HOST_NAME + 3];
   char cluster_cmd[LEN_CLUSTER_CMD + 3]; //
+  char cluster2_name[LEN_HOST_NAME + 3];
+  char cluster2_cmd[LEN_CLUSTER_CMD + 3]; //
   char my_name[LEN_CALL_WINDOW + 3];
   
   char jcc[LEN_JCC_WINDOW + 3];

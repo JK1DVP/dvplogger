@@ -30,7 +30,7 @@ void clear_multi_worked() ;
 int multi_check_option(char *s,int bandid,int option);   // s: exch (such as in plogw->recv_exch +2)
 int multi_check(char *s,int bandid);   // s: exch (such as in plogw->recv_exch +2)
 //int multi_check(char *s);
-void print_multi_list();
+void print_multi_list(Stream *out = nullptr);
 int multi_check_old() ;
 extern struct multi_list multi_list;
 void entry_multiplier(struct radio *radio);

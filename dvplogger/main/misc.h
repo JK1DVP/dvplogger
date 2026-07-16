@@ -33,5 +33,5 @@ void print_bin(char *print_to, unsigned int bin, int digits) ;
 void set_location_gl_calc(char *locator) ;
 void release_memory() ;
 void print_memory();
-void i2c_scan();
+void i2c_scan(Stream *out = nullptr);
 #endif

@@ -31,6 +31,7 @@
 #include "variables.h"
 #include "cmd_interp.h"
 #include "ui.h"
+#include "main.h"
 #include "usb_host.h"
 #include "tcp_server.h"
 #include "console.h"
@@ -42,6 +43,8 @@
 #include <AsyncTCP.h>
 #include <Stream.h>
 #include "esp_task_wdt.h"
+#include <new>
+#include <limits.h>
 
 
 // AsyncTCPBufferedStream.h
@@ -74,8 +77,19 @@ public:
     }
 
     ~AsyncTCPBufferedStream() {
-        if (senderHandle) vTaskDelete(senderHandle);
-        if (sendQueue) vQueueDelete(sendQueue);
+        stopping = true;
+        if (senderHandle) {
+            vTaskDelete(senderHandle);
+            senderHandle = nullptr;
+        }
+        if (sendQueue) {
+            SendBuffer pending;
+            while (xQueueReceive(sendQueue, &pending, 0) == pdTRUE) {
+                free(pending.data);
+            }
+            vQueueDelete(sendQueue);
+            sendQueue = nullptr;
+        }
     }
 
     void setFlushThreshold(size_t bytes, TickType_t intervalTicks) {
@@ -135,6 +149,7 @@ private:
     TaskHandle_t senderHandle = nullptr;
     size_t maxQueueSize;
     volatile bool _writing;
+    volatile bool stopping = false;
     TickType_t ackTimeout;
 
     uint8_t bufferBuf[1024];
@@ -145,9 +160,14 @@ private:
 
     void senderTaskImpl() {
         SendBuffer buf;
-        while (xQueueReceive(sendQueue, &buf, portMAX_DELAY)) {
-            while (client->space() < buf.length) {
+        while (!stopping && xQueueReceive(sendQueue, &buf, portMAX_DELAY) == pdTRUE) {
+            while (!stopping && client && client->connected() &&
+                   client->space() < buf.length) {
                 vTaskDelay(1);
+            }
+            if (stopping || !client || !client->connected()) {
+                free(buf.data);
+                continue;
             }
             _writing = true;
             client->write((const char*)buf.data, buf.length);
@@ -180,258 +200,392 @@ private:
 //int serverClients_status[MAX_SRV_CLIENTS] ;
 //int timeout_tcpserver = 0;
 
-#define TCP_SERVER_PORT 23 // telnet port
-
+#define TCP_SERVER_PORT 23
 #define N_TCPCLIENTS 2
-int permits=N_TCPCLIENTS;
+#define TELNET_EVENT_DATA_SIZE 64
+#define TELNET_EVENT_QUEUE_LEN 16
+#define TELNET_COMMAND_SIZE 128
 
-AsyncClient *clientPool[N_TCPCLIENTS];
-AsyncTCPBufferedStream *streamWrapper[N_TCPCLIENTS];
-int serverClients_status[N_TCPCLIENTS];
+enum TelnetEventType : uint8_t {
+  TELNET_EVENT_DATA,
+  TELNET_EVENT_DISCONNECT,
+  TELNET_EVENT_ERROR,
+  TELNET_EVENT_TIMEOUT,
+  TELNET_EVENT_CONNECT
+};
 
-// changed to use AsyncTCP to serve
-void process_clientData(int i, char *buf,int len); // i index of the client referred in serverClients_status[]
-static void handleData(void *arg, AsyncClient *client, void *data, size_t len)
-{
-  //  Serial.printf("\n data received from client %s \n", client->remoteIP().toString().c_str());
-  //  Serial.write((uint8_t *)data, len);
+struct TelnetEvent {
+  TelnetEventType type;
+  uint8_t slot;
+  uint8_t len;
+  int16_t value;
+  AsyncClient *client;
+  char data[TELNET_EVENT_DATA_SIZE];
+};
 
-  //our big json string test
-  //  String jsonString = "{\"data_from_module_type\":5,\"hub_unique_id\":\"hub-bfd\",\"slave_unique_id\":\"\",\"water_sensor\":{\"unique_id\":\"water-sensor-ba9\",\"firmware\":\"0.0.1\",\"hub_unique_id\":\"hub-bfd\",\"ip_address\":\"192.168.4.2\",\"mdns\":\"water-sensor-ba9.local\",\"pair_status\":127,\"ec\":{\"value\":0,\"calib_launch\":0,\"sensor_k_origin\":1,\"sensor_k_calibration\":1,\"calibration_solution\":1,\"regulation_state\":1,\"max_pumps_durations\":5000,\"set_point\":200},\"ph\":{\"value\":0,\"calib_launch\":0,\"regulation_state\":1,\"max_pumps_durations\":5000,\"set_point\":700},\"water\":{\"temperature\":0,\"pump_enable\":false}}}";
-	// reply to client
-  //  if (client->space() > strlen(jsonString.c_str()) && client->canSend())
-  //    {
-  //      client->add(jsonString.c_str(), strlen(jsonString.c_str()));
-  //      client->send();
-  //    }
-  for (int i=0;i<N_TCPCLIENTS;i++) {
-    if (clientPool[i]==client) {
-      process_clientData(i, (char *)data,len); // i index of the client referred in serverClients_status[]
+struct TelnetClientState {
+  char command[TELNET_COMMAND_SIZE + 1];
+  uint16_t command_len;
+  uint8_t protocol_state;
+  uint8_t modifier;
+};
+
+static AsyncClient *clientPool[N_TCPCLIENTS];
+static AsyncTCPBufferedStream *streamWrapper[N_TCPCLIENTS];
+static TelnetClientState telnetState[N_TCPCLIENTS];
+static QueueHandle_t telnetEventQueue = nullptr;
+static AsyncServer *telnetServer = nullptr;
+static portMUX_TYPE telnetPoolMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t telnetDroppedEvents = 0;
+static volatile bool telnetDisconnectPending[N_TCPCLIENTS] = {false, false};
+static int permits = N_TCPCLIENTS;
+// Only one Telnet terminal is logically active.  The second slot exists only
+// long enough to accept a replacement connection and disconnect the old one.
+static int activeTelnetSlot = -1;
+
+static int findClientSlot(AsyncClient *client) {
+  int slot = -1;
+  portENTER_CRITICAL(&telnetPoolMux);
+  for (int i = 0; i < N_TCPCLIENTS; ++i) {
+    if (clientPool[i] == client) {
+      slot = i;
       break;
     }
   }
+  portEXIT_CRITICAL(&telnetPoolMux);
+  return slot;
 }
 
-
-static void handleError(void *arg, AsyncClient *client, int8_t error)
-{
-  Serial.printf("\n connection error %s from client %s \n", client->errorToString(error), client->remoteIP().toString().c_str());
+static bool enqueueTelnetEvent(const TelnetEvent& ev) {
+  if (!telnetEventQueue || xQueueSend(telnetEventQueue, &ev, 0) != pdTRUE) {
+    ++telnetDroppedEvents;
+    return false;
+  }
+  return true;
 }
 
-static void handleDisconnect(void *arg, AsyncClient *client)
-{
-  Serial.printf("\n client %s disconnected \n", client->remoteIP().toString().c_str());
+static void handleData(void *, AsyncClient *client, void *data, size_t len) {
+  int slot = findClientSlot(client);
+  if (slot < 0 || !data) return;
 
-  client->close(true);
-  int flag=0;
-  for (int i=0;i<N_TCPCLIENTS;i++) {  
-    if (clientPool[i]==client) {
-      clientPool[i]=NULL;
-      delete streamWrapper[i];
-      flag=1;
+  const char *src = static_cast<const char *>(data);
+  while (len > 0) {
+    TelnetEvent ev{};
+    ev.type = TELNET_EVENT_DATA;
+    ev.slot = (uint8_t)slot;
+    ev.client = client;
+    ev.len = (uint8_t)min(len, (size_t)TELNET_EVENT_DATA_SIZE);
+    memcpy(ev.data, src, ev.len);
+    if (!enqueueTelnetEvent(ev)) break;
+    src += ev.len;
+    len -= ev.len;
+  }
+}
+
+static void handleError(void *, AsyncClient *client, int8_t error) {
+  int slot = findClientSlot(client);
+  if (slot < 0) return;
+  TelnetEvent ev{};
+  ev.type = TELNET_EVENT_ERROR;
+  ev.slot = (uint8_t)slot;
+  ev.client = client;
+  ev.value = error;
+  enqueueTelnetEvent(ev);
+}
+
+static void handleDisconnect(void *, AsyncClient *client) {
+  int slot = findClientSlot(client);
+  if (slot < 0) return;
+  // A disconnect must not be lost even when the event queue is full.
+  telnetDisconnectPending[slot] = true;
+}
+
+static void handleTimeOut(void *, AsyncClient *client, uint32_t time) {
+  int slot = findClientSlot(client);
+  if (slot < 0) return;
+  TelnetEvent ev{};
+  ev.type = TELNET_EVENT_TIMEOUT;
+  ev.slot = (uint8_t)slot;
+  ev.client = client;
+  ev.value = (int16_t)min(time, (uint32_t)INT16_MAX);
+  enqueueTelnetEvent(ev);
+}
+
+static void handleNewClient(void *, AsyncClient *client) {
+  if (!client) return;
+
+  int slot = -1;
+  portENTER_CRITICAL(&telnetPoolMux);
+  for (int i = 0; i < N_TCPCLIENTS; ++i) {
+    if (clientPool[i] == nullptr) {
+      clientPool[i] = client;
+      slot = i;
+      --permits;
       break;
     }
   }
-  if (!flag) {
-    Serial.println("corresponding client not found in clientPool (strange)");
-  }
-  delete client;
-  permits++;
-}
+  portEXIT_CRITICAL(&telnetPoolMux);
 
-static void handleTimeOut(void *arg, AsyncClient *client, uint32_t time)
-{
-  Serial.printf("\n client ACK timeout ip: %s \n", client->remoteIP().toString().c_str());
-}
-
-static void handleNewClient(void *arg, AsyncClient *client)
-{
-  if (!permits) {
+  if (slot < 0) {
     client->close(true);
     delete client;
     return;
   }
 
-  int flag=0;
-  for (int i=0;i<N_TCPCLIENTS;i++) {
-    if (clientPool[i]==NULL) {
-      clientPool[i]=client;
-      streamWrapper[i] = new AsyncTCPBufferedStream(client);
-
-      permits--;
-      flag=1;
-      break;
-    }
+  streamWrapper[slot] = new (std::nothrow) AsyncTCPBufferedStream(client);
+  if (!streamWrapper[slot]) {
+    portENTER_CRITICAL(&telnetPoolMux);
+    clientPool[slot] = nullptr;
+    ++permits;
+    portEXIT_CRITICAL(&telnetPoolMux);
+    client->close(true);
+    delete client;
+    return;
   }
-  if (!flag) {
-    Serial.println("no free clientPool found (strange)");
-  }
-  
-  Serial.printf("\n new client has been connected to server, ip: %s permits %d", client->remoteIP().toString().c_str(),permits);
 
-  char buf[30];
-  sprintf(buf,"permits=%d\n",permits);
-  client->write(buf,strlen(buf));
-  
-  // register events
-  client->onData(&handleData, NULL);
-  client->onError(&handleError, NULL);
-  client->onDisconnect(&handleDisconnect, NULL);
-  client->onTimeout(&handleTimeOut, NULL);
+  memset(&telnetState[slot], 0, sizeof(telnetState[slot]));
+  client->onData(&handleData, nullptr);
+  client->onError(&handleError, nullptr);
+  client->onDisconnect(&handleDisconnect, nullptr);
+  client->onTimeout(&handleTimeOut, nullptr);
+
+  TelnetEvent ev{};
+  ev.type = TELNET_EVENT_CONNECT;
+  ev.slot = (uint8_t)slot;
+  ev.client = client;
+  enqueueTelnetEvent(ev);
 }
 
+static void closeTelnetClient(int slot, AsyncClient *expected) {
+  if (slot < 0 || slot >= N_TCPCLIENTS) return;
 
-void process_clientData(int i, char *buf,int len) // i index of the client referred in serverClients_status[]
-{
-  int ret;
-  char c;
-  static uint8_t mod_c; // storage of received modifier character  
-  for (int j=0;j<len;j++) {
-    //            c = serverClients[i].read();
-    c = buf[j];
+  AsyncClient *client = nullptr;
+  AsyncTCPBufferedStream *stream = nullptr;
+  portENTER_CRITICAL(&telnetPoolMux);
+  if (clientPool[slot] == expected) {
+    client = clientPool[slot];
+    stream = streamWrapper[slot];
+    clientPool[slot] = nullptr;
+    streamWrapper[slot] = nullptr;
+    ++permits;
+  }
+  portEXIT_CRITICAL(&telnetPoolMux);
 
-    if (plogw->f_console_emu) {
-      //      plogw->ostream = &serverClients[i];
-      //      emulate_keyboard(c);
-      continue;
+  if (!client) return;
+
+  if (activeTelnetSlot == slot) activeTelnetSlot = -1;
+
+  // Return asynchronous/debug output to the hardware serial console when the
+  // active Telnet session goes away.
+  if (console == stream) console = &Serial;
+  if (plogw && plogw->ostream == stream) plogw->ostream = &Serial;
+  rebind_memstat_output(stream, &Serial);
+
+  delete stream;
+  client->onData(nullptr, nullptr);
+  client->onError(nullptr, nullptr);
+  client->onDisconnect(nullptr, nullptr);
+  client->onTimeout(nullptr, nullptr);
+  if (client->connected()) client->close(true);
+  delete client;
+  memset(&telnetState[slot], 0, sizeof(telnetState[slot]));
+}
+
+static void executeTelnetCommand(int slot) {
+  TelnetClientState& state = telnetState[slot];
+  state.command[state.command_len] = '\0';
+  AsyncTCPBufferedStream *stream = streamWrapper[slot];
+  AsyncClient *client = clientPool[slot];
+  if (!stream || !client) {
+    state.command_len = 0;
+    return;
+  }
+
+  if (strcmp(state.command, "exit") == 0) {
+    stream->println("exit from the terminal");
+    stream->flush();
+    client->close(true);
+    state.command_len = 0;
+    return;
+  }
+
+  cmd_interp(state.command, stream);
+  stream->flush();
+  state.command_len = 0;
+}
+
+static void processTelnetByte(int slot, uint8_t c) {
+  TelnetClientState& state = telnetState[slot];
+
+  // Existing private keyboard framing: 239/mod/key and 238/mod/key.
+  if (state.protocol_state == 2) {
+    state.modifier = c;
+    state.protocol_state = 4;
+    return;
+  }
+  if (state.protocol_state == 3) {
+    state.modifier = c;
+    state.protocol_state = 5;
+    return;
+  }
+  if (state.protocol_state == 4) {
+    MODIFIERKEYS modkey;
+    *((uint8_t *)&modkey) = state.modifier;
+    uint8_t ascii = kbd_oemtoascii2(state.modifier, c);
+    on_key_down(modkey, c, ascii);
+    state.protocol_state = 0;
+    return;
+  }
+  if (state.protocol_state == 5) {
+    state.protocol_state = 0;
+    return;
+  }
+  if (c == 239) {
+    state.protocol_state = 2;
+    return;
+  }
+  if (c == 238) {
+    state.protocol_state = 3;
+    return;
+  }
+
+  // Minimal telnet IAC suppression. The following two option bytes are ignored.
+  if (state.protocol_state == 10) {
+    state.protocol_state = 11;
+    return;
+  }
+  if (state.protocol_state == 11) {
+    state.protocol_state = 0;
+    return;
+  }
+  if (c == 255) {
+    state.protocol_state = 10;
+    return;
+  }
+
+  if (c == '\n') return;
+  if (c == '\r') {
+    executeTelnetCommand(slot);
+    return;
+  }
+  if (c == 8 || c == 127) {
+    if (state.command_len > 0) --state.command_len;
+    return;
+  }
+  if (!isprint(c)) return;
+
+  if (state.command_len < TELNET_COMMAND_SIZE) {
+    state.command[state.command_len++] = (char)c;
+  } else {
+    state.command_len = 0;
+    if (streamWrapper[slot]) {
+      streamWrapper[slot]->println("command too long; discarded");
+      streamWrapper[slot]->flush();
     }
-	  
-    if (isprint(c)) {
-      plogw->ostream->print(c);
-    } else {
-      plogw->ostream->print(" "); plogw->ostream->print(c, HEX); plogw->ostream->print(" ");
-    }
-    // check keycode over tcp
-    if (serverClients_status[i] == 0) {
-      if (c >= 238) {
-	if (c == 239) {
-	  // key pressed
-	  serverClients_status[i] = 2;
-	  break;
-	}
-	if (c == 238) {
-	  // key released
-	  serverClients_status[i] = 3;
-	  break;
-	}
-	// check telnet commands
-	if (c == 255) {
-	  // IAC
-	}
-	serverClients_status[i] = 0;
-	continue;
+  }
+}
+
+void process_tcpserver() {
+  if (!telnetEventQueue) return;
+
+  for (int i = 0; i < N_TCPCLIENTS; ++i) {
+    if (telnetDisconnectPending[i]) {
+      telnetDisconnectPending[i] = false;
+      AsyncClient *client = clientPool[i];
+      if (client) {
+        console->printf("telnet: disconnected slot=%d\n", i);
+        closeTelnetClient(i, client);
       }
-    } else if (serverClients_status[i] == 1) {
-      // telnet commands
-      continue;
-    } else if (serverClients_status[i] == 4) {
-      // void KbdRptParser::OnKeyDown(uint8_t mod, uint8_t key) {
-      // mod : or'ed 0x01 control 0x02 left_shift 0x04 alt 0x08 command 0x10 right_shift ? 0x40 alt 0x80 command
-      // key : USB HID scan code for the key
-      //KbdRptParser::OnKeyDown((unit8_t mod),(uint8_t c));
-      uint8_t mod;
-      mod = 0;
-      MODIFIERKEYS modkey;
-      *((uint8_t *)&modkey) = mod_c;
-      uint8_t c_to_ascii = kbd_oemtoascii2(mod,c);
-      //on_key_down(modkey, (uint8_t)key, (uint8_t)c);
-
-      on_key_down(modkey, (uint8_t)c, (uint8_t) c_to_ascii);
-      // key pressed event
-      serverClients_status[i] = 0; // finished processing keydown sequence
-      continue;
-    } else if (serverClients_status[i] == 5) {
-      // key released event
-      continue;
-    } else if (serverClients_status[i] == 2) {
-      // after recieved
-      mod_c = c;
-      serverClients_status[i] = 4;
-      continue;
-    } else if (serverClients_status[i] == 3) {
-      mod_c = c;
-      serverClients_status[i] = 5;
-      continue;
     }
+  }
 
-    // not special character put into ring line buffer
-    write_ringbuf(&(plogw->tcp_ringbuf), c);
-    // and check line
-    ret = readfrom_ringbuf(&plogw->tcp_ringbuf, plogw->tcp_cmdbuf + plogw->tcp_cmdbuf_ptr, (char)0x0d, (char)0x0a, plogw->tcp_cmdbuf_len - plogw->tcp_cmdbuf_ptr);
-    if (ret < 0) {
-      // one line read
-      
-      plogw->ostream->print("tcp readline:");
-      plogw->ostream->println(plogw->tcp_cmdbuf);
-      plogw->ostream =streamWrapper[i]; // redirect to TCP client
-      // check 'exit' command 
-      if (strcmp(plogw->tcp_cmdbuf,"exit")==0) {
-	plogw->ostream->println("exit from the terminal");
-	clientPool[i]->close(true);
-	delete clientPool[i];	
-	clientPool[i]=NULL;
-	delete streamWrapper[i];
-	serverClients_status[i]=0;
-	plogw->ostream=console;	      
-      } else {
+  TelnetEvent ev;
+  int budget = 16;
+  while (budget-- > 0 && xQueueReceive(telnetEventQueue, &ev, 0) == pdTRUE) {
+    if (ev.slot >= N_TCPCLIENTS || clientPool[ev.slot] != ev.client) continue;
 
-	// WDT timeout longer for this part only
-	// インタプリタ処理を呼び出す前にWDTタイムアウトを長く設定
-	esp_task_wdt_init(10, true);  // タイムアウトを10秒に延長
-	esp_task_wdt_reset();  // WDTをリセット
-	
-	cmd_interp(plogw->tcp_cmdbuf); // pass to command interpreter
+    switch (ev.type) {
+      case TELNET_EVENT_DATA:
+        for (uint8_t i = 0; i < ev.len; ++i) processTelnetByte(ev.slot, (uint8_t)ev.data[i]);
+        break;
+      case TELNET_EVENT_CONNECT: {
+        // A newly connected terminal always takes ownership.  Keep two
+        // internal slots only so that the replacement can connect before the
+        // previous terminal is forcibly closed.
+        int oldSlot = activeTelnetSlot;
+        if (oldSlot >= 0 && oldSlot != ev.slot &&
+            clientPool[oldSlot] && streamWrapper[oldSlot]) {
+          streamWrapper[oldSlot]->println("another terminal connected; exiting");
+          streamWrapper[oldSlot]->flush();
+          AsyncClient *oldClient = clientPool[oldSlot];
+          closeTelnetClient(oldSlot, oldClient);
+        }
 
-	// インタプリタ処理を呼び出す前にWDTタイムアウトを長く設定
-	esp_task_wdt_init(10, true);  // タイムアウトを10秒に延長
-	esp_task_wdt_reset();  // WDTをリセット
-	
-	plogw->ostream = console; // change output stream back to serial port
+        Serial.printf("telnet: connected %s slot=%u permits=%d\n",
+                      ev.client->remoteIP().toString().c_str(), ev.slot, permits);
+        if (streamWrapper[ev.slot] && clientPool[ev.slot] == ev.client) {
+          activeTelnetSlot = ev.slot;
+          console = streamWrapper[ev.slot];
+          if (plogw) plogw->ostream = streamWrapper[ev.slot];
+          streamWrapper[ev.slot]->println("connected; this terminal is now active");
+          streamWrapper[ev.slot]->flush();
+        }
+        break;
       }
-      *plogw->tcp_cmdbuf = '\0';
-      plogw->tcp_cmdbuf_ptr = 0;
-    } else {
-      if (ret > 0 ) {
-	plogw->tcp_cmdbuf_ptr += ret;
-      }
-      if (plogw->tcp_cmdbuf_ptr == plogw->tcp_cmdbuf_len) {
-	plogw->tcp_cmdbuf_ptr = 0;
-      }
+      case TELNET_EVENT_ERROR:
+        console->printf("telnet: error slot=%u code=%d\n", ev.slot, ev.value);
+        break;
+      case TELNET_EVENT_TIMEOUT:
+        console->printf("telnet: ACK timeout slot=%u\n", ev.slot);
+        break;
+      case TELNET_EVENT_DISCONNECT:
+        // Disconnects are handled through telnetDisconnectPending.
+        break;
+    }
+  }
+
+  if (telnetDroppedEvents) {
+    uint32_t dropped = telnetDroppedEvents;
+    telnetDroppedEvents = 0;
+    console->printf("telnet: %lu event(s) dropped\n", (unsigned long)dropped);
+  }
+}
+
+void write_allTCPclients(char *buf, int len) {
+  if (!buf || len <= 0) return;
+  for (int i = 0; i < N_TCPCLIENTS; ++i) {
+    if (streamWrapper[i] && clientPool[i] && clientPool[i]->connected()) {
+      streamWrapper[i]->write((const uint8_t *)buf, (size_t)len);
+      streamWrapper[i]->flush();
     }
   }
 }
 
+void print_allTCPclients(char *buf) {
+  if (buf) write_allTCPclients(buf, strlen(buf));
+}
 
-
-
-
-void write_allTCPclients(char *buf,int len) // send buf to all client
-{
-  for (int i=0;i<N_TCPCLIENTS;i++) {
-    if (clientPool[i]!=NULL) {
-      clientPool[i]->write(buf,len);
-    }
+void init_tcpserver() {
+  telnetEventQueue = xQueueCreate(TELNET_EVENT_QUEUE_LEN, sizeof(TelnetEvent));
+  if (!telnetEventQueue) {
+    console->println("telnet: cannot allocate event queue");
+    return;
   }
-}
-  
-void print_allTCPclients(char *buf)
-{
-  write_allTCPclients(buf,strlen(buf));
-}
 
-void init_tcpserver()
-{
-  AsyncServer *server = new AsyncServer(TCP_SERVER_PORT); // start listening on tcp port 7050
-  for (int i=0;i<N_TCPCLIENTS;i++) {
-    clientPool[i]=NULL;
-    serverClients_status[i]=0;
-    streamWrapper[i]=NULL;
+  for (int i = 0; i < N_TCPCLIENTS; ++i) {
+    clientPool[i] = nullptr;
+    streamWrapper[i] = nullptr;
+    memset(&telnetState[i], 0, sizeof(telnetState[i]));
+    telnetDisconnectPending[i] = false;
   }
-  
-  server->onClient(&handleNewClient, server);
-  server->begin();
+
+  telnetServer = new (std::nothrow) AsyncServer(TCP_SERVER_PORT);
+  if (!telnetServer) {
+    console->println("telnet: cannot allocate AsyncServer");
+    vQueueDelete(telnetEventQueue);
+    telnetEventQueue = nullptr;
+    return;
+  }
+  telnetServer->onClient(&handleNewClient, telnetServer);
+  telnetServer->begin();
 }
-
-
-////// older, will be integrated new handle data functions
-

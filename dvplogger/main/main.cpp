@@ -117,9 +117,22 @@ static bool memstat_request_pending = false;
 static bool memstat_update_lcd = true;
 static uint32_t memstat_request_ms = 0;
 static uint32_t memstat_next_ms = 0;
+static Stream *memstat_output = nullptr;
 
-void request_memstat_main_subcpu(bool update_lcd)
+static Stream *memstat_reply_stream()
 {
+  return memstat_output ? memstat_output : console;
+}
+
+void rebind_memstat_output(Stream *old_output, Stream *new_output)
+{
+  if (memstat_output == old_output) memstat_output = new_output;
+}
+
+void request_memstat_main_subcpu(bool update_lcd, Stream *output)
+{
+  if (output) memstat_output = output;
+  Stream *out = memstat_reply_stream();
   if (f_mux_transport) {
     const char *request = "memstat";
     memstat_update_lcd = update_lcd;
@@ -128,11 +141,11 @@ void request_memstat_main_subcpu(bool update_lcd)
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
                            (unsigned char *)request, strlen(request));
     if (update_lcd) {
-      console->println("requested main/sub CPU memory status");
+      out->println("requested main/sub CPU memory status");
     }
   } else {
     memstat_request_pending = false;
-    console->println("MUXTRANS is not active");
+    out->println("MUXTRANS is not active");
     if (update_lcd) {
       sprintf(dp->lcdbuf, "MEMSTAT\nMUXTRANS inactive\n");
       upd_display_info_flash(dp->lcdbuf);
@@ -140,19 +153,21 @@ void request_memstat_main_subcpu(bool update_lcd)
   }
 }
 
-void start_memstat_watch()
+void start_memstat_watch(Stream *output)
 {
+  if (output) memstat_output = output;
   memstat_watch_enabled = true;
   memstat_request_pending = false;
   memstat_next_ms = millis();
-  console->println("memstat watch: started (1 second interval)");
+  memstat_reply_stream()->println("memstat watch: started (1 second interval)");
 }
 
-void stop_memstat_watch()
+void stop_memstat_watch(Stream *output)
 {
+  if (output) memstat_output = output;
   memstat_watch_enabled = false;
   memstat_request_pending = false;
-  console->println("memstat watch: stopped");
+  memstat_reply_stream()->println("memstat watch: stopped");
 }
 
 void process_memstat_watch()
@@ -163,14 +178,14 @@ void process_memstat_watch()
   if (memstat_request_pending) {
     if ((uint32_t)(now - memstat_request_ms) >= 3000) {
       memstat_request_pending = false;
-      console->println("memstat watch: subcpu response timeout");
+      memstat_reply_stream()->println("memstat watch: subcpu response timeout");
       memstat_next_ms = now;
     }
     return;
   }
 
   if ((int32_t)(now - memstat_next_ms) >= 0) {
-    request_memstat_main_subcpu(false);
+    request_memstat_main_subcpu(false, memstat_output);
     memstat_next_ms = now + 1000;
   }
 }
@@ -195,12 +210,13 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
     process_dupechk_partial_response_maincpu(buf);
   } else if (strncmp(packet->buf, "memstat:", 8) == 0) {
     memstat_request_pending = false;
+    Stream *out = memstat_reply_stream();
     unsigned int sub_free8, sub_min8, sub_largest8;
     unsigned int sub_internal, sub_spiram;
     unsigned int sub_nmaxqso, sub_ncallsign;
 
     if (packet->idx < 8) {
-      console->println("invalid subcpu memstat packet");
+      out->println("invalid subcpu memstat packet");
       return;
     }
 
@@ -230,12 +246,12 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
       unsigned int main_spiram =
           heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-      console->printf(
+      out->printf(
           "maincpu heap: free8=%u min8=%u largest8=%u "
           "internal=%u internal_min=%u internal_largest=%u spiram=%u\n",
           main_free8, main_min8, main_largest8,
           main_internal, main_internal_min, main_internal_largest, main_spiram);
-      console->printf(
+      out->printf(
           "subcpu heap: free=%u min=%u largest=%u "
           "internal=%u spiram=%u dupe=%u/%u\n",
           sub_free8, sub_min8, sub_largest8,
@@ -269,8 +285,8 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
         upd_display_info_flash(dp->lcdbuf);
       }
     } else {
-      console->print("invalid subcpu memstat response: ");
-      console->println(buf);
+      out->print("invalid subcpu memstat response: ");
+      out->println(buf);
     }
     return;
   } else if (strncmp(packet->buf,"duper:",6)==0) {
@@ -534,6 +550,11 @@ void loop() {
   } else {
   }
   process_memstat_watch();
+
+  // Drain messages and commands produced by AsyncTCP callbacks in main-loop context.
+  process_web_terminal_log_queue();
+  process_web_bandmap();
+  process_tcpserver();
 
   decoder.morse_decode_task(); // called in main loop
   decoder.monitor_task(); // morse decoder display task 

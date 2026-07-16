@@ -21,6 +21,8 @@
 
 #ifndef FILE_CMD_INTERP_H
 #define FILE_CMD_INTERP_H
+
+#include <Print.h>
 extern void play_cw_cmd(char *cmd);
 extern void play_wpm_cmd(char *cmd);
 extern void play_queue_cmd();
@@ -28,5 +30,6 @@ extern void play_stop_cmd();
 extern void play_string_cmd(char *cmd);
 extern void play_wpm_set();
 
-void cmd_interp(char *cmd) ;
+void cmd_interp(char *cmd, Stream *output);
+void cmd_interp(char *cmd);
 #endif

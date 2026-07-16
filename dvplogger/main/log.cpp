@@ -335,6 +335,8 @@ void init_logwindow() {
   init_buf(plogw->hostname, LEN_HOST_NAME);  
   init_buf(plogw->zserver_name, LEN_HOST_NAME);
   init_buf(plogw->cluster_cmd, LEN_CLUSTER_CMD);
+  init_buf(plogw->cluster2_name, LEN_HOST_NAME);
+  init_buf(plogw->cluster2_cmd, LEN_CLUSTER_CMD);
   init_buf(plogw->sent_exch, LEN_SENT_EXCH_WINDOW);
   init_buf(plogw->contest_name,LEN_CONTEST_NAME);
 
@@ -371,6 +373,8 @@ void init_logwindow() {
   strcpy(plogw->my_name + 2, "NoName");
   strcpy(plogw->cluster_name + 2, "arc.jg1vgx.net:7000");                 // default ip address for cluster
   strcpy(plogw->cluster_cmd + 2, "set dx fil cty=ja and SpotterCty=ja");  // default additional command for cluster
+  strcpy(plogw->cluster2_name + 2, "");  // disabled until configured
+  strcpy(plogw->cluster2_cmd + 2, "set dx fil cty=ja and SpotterCty=ja");
 
   plogw->seqnr = 0;
   for (int i=0;i<N_BAND;i++) {
@@ -818,7 +822,7 @@ int dupe_callhist_check(const char *call,unsigned char bandmode, unsigned char m
   //  struct radio *radio;
   //  radio = so2r.radio_selected();
   *exch_history=NULL;  
-  console->println("dupe_callhist_check()");
+  if (verbose &4) console->println("dupe_callhist_check()");
   //  return 0; 
 
   // 入力の健全性check

@@ -31,4 +31,5 @@
 void write_allTCPclients(char *buf,int len); // send buf to all client
 void print_allTCPclients(char *buf);
 void init_tcpserver();
+void process_tcpserver();
 #endif

@@ -231,26 +231,27 @@ void print_memory()
 }
 
 
-void i2c_scan()
+void i2c_scan(Stream *out)
 {
+  if (!out) out = console;
   
   byte error, address;
   int nDevices = 0;
 
   //  delay(5000);
 
-  console->println("Scanning for I2C devices ...");
+  out->println("Scanning for I2C devices ...");
   for (address = 0x01; address < 0x7f; address++) {
     Wire.beginTransmission(address);
     error = Wire.endTransmission();
     if (error == 0) {
-      console->printf("I2C device found at address 0x%02X\n", address);
+      out->printf("I2C device found at address 0x%02X\n", address);
       nDevices++;
     } else if (error != 2) {
-      console->printf("Error %d at address 0x%02X\n", error, address);
+      out->printf("Error %d at address 0x%02X\n", error, address);
     }
   }
   if (nDevices == 0) {
-    console->println("No I2C devices found");
+    out->println("No I2C devices found");
   }
 }

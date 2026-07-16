@@ -45,59 +45,70 @@
 char cluster_server[40] = "arc.jg1vgx.net";
 int cluster_port = 7000;
 char cluster_buf[NCHR_CLUSTER_RINGBUF];
-
 struct cluster cluster;
 
-//WiFiClient client;
+static constexpr uint8_t N_CLUSTER_CONNECTIONS = 2;
+static constexpr size_t CLUSTER_RX_EVENT_DATA = 128;
+static constexpr size_t CLUSTER_RX_QUEUE_LEN = 16;
 
-void renew_timeout_cluster()
-{
-    cluster.timeout_alive = millis() + 300000;  // 10 minutes countdown timer      
+struct ClusterRuntime {
+  struct cluster *state;
+  AsyncClient *client;
+  char server[40];
+  int port;
+  uint8_t id;
+};
+
+static struct cluster cluster2;
+static char cluster2_buf[NCHR_CLUSTER_RINGBUF];
+static ClusterRuntime cluster_rt[N_CLUSTER_CONNECTIONS];
+
+static inline void renew_timeout_cluster(ClusterRuntime *rt) {
+  rt->state->timeout_alive = millis() + 300000;
 }
 
-int passed_timeout_cluster()
-{
-  if (cluster.timeout_alive < millis()) {
-    return 1;
-  } else {
-    return 0;
-  }
+static inline bool passed_timeout_cluster(ClusterRuntime *rt) {
+  return rt->state->timeout_alive < millis();
 }
 
 // cluster.cpp
 #include "freertos/FreeRTOS.h"
-#include "freertos/stream_buffer.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include <string>
 
 static const char* TAG = "cluster";
-static StreamBufferHandle_t s_cluster_rx_sb = nullptr;
 
+struct ClusterRxEvent {
+  uint8_t source;
+  uint8_t len;
+  uint8_t data[CLUSTER_RX_EVENT_DATA];
+};
+
+static QueueHandle_t s_cluster_rx_queue = nullptr;
 // チューニング推奨：回線速度と処理レイテンシに応じて
-//static constexpr size_t CLUSTER_RX_SB_SIZE = 8 * 1024;  // ストリームバッファ容量
-//static constexpr size_t CLUSTER_RX_CHUNK   = 512;       // 受信側一時バッファ長
-static constexpr size_t CLUSTER_RX_SB_SIZE = 4 * 1024;  // ストリームバッファ容量
-static constexpr size_t CLUSTER_RX_CHUNK   = 256;       // 受信側一時バッファ長
 
 // 受信コールバック（AsyncTCP）
 void handleData_cluster(void *arg, AsyncClient *client, void *data, size_t len)
 {
-  //	console->printf("\n data received from %s \n", client->remoteIP().toString().c_str());
+  ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
+  if (!rt || rt->state->stat != 5 || !s_cluster_rx_queue) return;
 
-  if (cluster.stat == 5) {
-    //
-    renew_timeout_cluster();
-
-    if (!s_cluster_rx_sb) return;
-
-    // 非ブロッキングで詰める（ここで時間を使わない）
-    size_t sent = xStreamBufferSend(s_cluster_rx_sb, data, len, 0);
-    if (sent < len) {
-      ESP_LOGW(TAG, "RX overflow: dropped %u (free=%u)",
-	       (unsigned)(len - sent),
-	       (unsigned)xStreamBufferSpacesAvailable(s_cluster_rx_sb));  // ← ここ
+  renew_timeout_cluster(rt);
+  const uint8_t *src = static_cast<const uint8_t *>(data);
+  while (len > 0) {
+    ClusterRxEvent ev{};
+    ev.source = rt->id;
+    ev.len = (uint8_t)min(len, CLUSTER_RX_EVENT_DATA);
+    memcpy(ev.data, src, ev.len);
+    if (xQueueSend(s_cluster_rx_queue, &ev, 0) != pdTRUE) {
+      ESP_LOGW(TAG, "RX queue overflow: cluster=%u dropped=%u",
+               (unsigned)(rt->id + 1), (unsigned)len);
+      break;
     }
+    src += ev.len;
+    len -= ev.len;
   }
 }
 
@@ -111,15 +122,15 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
   }
 	
   if (verbose & 16) {
-    plogw->ostream->println("C readline:");
-    plogw->ostream->println(cmdbuf);
+    console->println("C readline:");
+    console->println(cmdbuf);
   }
   if (len<75) {
     // short line
-    plogw->ostream->print(":");	  	  
-    plogw->ostream->print(cmdbuf);	  
-    plogw->ostream->print(":short cluster cmdbuf line len=");
-    plogw->ostream->println(len);
+    console->print(":");	  	  
+    console->print(cmdbuf);	  
+    console->print(":short cluster cmdbuf line len=");
+    console->println(len);
     return;
   }
   // check content
@@ -129,8 +140,8 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
       // CW
       if (f_show_cluster >= 1) {
 	if (!plogw->f_console_emu) {
-	  plogw->ostream->print("CLUSTER INFO CW:");
-	  plogw->ostream->println(cmdbuf);
+	  console->print("CLUSTER INFO CW:");
+	  console->println(cmdbuf);
 	}
       }
       // get call freq time info from the DX line and store it to bandmap structure
@@ -139,8 +150,8 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
     } else {
       if (f_show_cluster >= 2) {
 	if (!plogw->f_console_emu) {
-	  plogw->ostream->print("CLUSTER INFO OTHER:");
-	  plogw->ostream->println(cmdbuf);
+	  console->print("CLUSTER INFO OTHER:");
+	  console->println(cmdbuf);
 	}
       }
       //upd_bandmap_cluster(cmdbuf);
@@ -148,8 +159,8 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
   } else {
     if (f_show_cluster > 2) {
       if (!plogw->f_console_emu) {
-	plogw->ostream->print("CLUSTER:");
-	plogw->ostream->println(cmdbuf);
+	console->print("CLUSTER:");
+	console->println(cmdbuf);
       }
     }
   }
@@ -169,100 +180,73 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
 //extern void upd_bandmap_cluster(const char* line);
 
 static void cluster_worker_task(void* /*pv*/) {
-    std::string acc;           // 行の断片を貯めるアキュムレータ
-    acc.reserve(1024);
-
-    uint8_t buf[CLUSTER_RX_CHUNK];
+    std::string acc[N_CLUSTER_CONNECTIONS];
+    for (auto &a : acc) a.reserve(1024);
+    ClusterRxEvent ev;
 
     for (;;) {
-        // 受信待ち（ずっと待つ）
-        size_t n = xStreamBufferReceive(s_cluster_rx_sb, buf, sizeof(buf), portMAX_DELAY);
-        if (n == 0) continue;
+        if (xQueueReceive(s_cluster_rx_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
+        if (ev.source >= N_CLUSTER_CONNECTIONS) continue;
+        std::string &a = acc[ev.source];
+        a.append(reinterpret_cast<const char*>(ev.data), ev.len);
 
-        // 断片を追記
-        acc.append(reinterpret_cast<const char*>(buf), n);
-
-        // 改行で行に切る（\r\n / \n の両対応）
         size_t start = 0;
         while (true) {
-            size_t nl = acc.find('\n', start);
+            size_t nl = a.find('\n', start);
             if (nl == std::string::npos) {
-                // 末尾に未完な断片が残っていれば保持（先頭以外は捨てる）
-                if (start > 0) acc.erase(0, start);
+                if (start > 0) a.erase(0, start);
+                if (a.size() > 2048) {
+                    ESP_LOGW(TAG, "overlong line dropped: cluster=%u", (unsigned)(ev.source + 1));
+                    a.clear();
+                }
                 break;
             }
-            std::string line = acc.substr(start, nl - start);
+            std::string line = a.substr(start, nl - start);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-
-            // ここで未知行や欠損行を足切り
-            if (!line.empty()) {
-                // 例: 型判定（必要に応じて）
-                // char t = line[0];
-                // if (t=='D' || t=='X' || t=='S' /* ... */) { ... }
-                upd_bandmap_cluster1(line.c_str());  // lineの寿命はこのスコープ内
-            }
-
+            if (!line.empty()) upd_bandmap_cluster1(line.c_str());
             start = nl + 1;
-
-	    /*
-    char c;
-    int ret;
-    for (int i=0;i<len;i++) {
-      c=(char)((uint8_t *)data)[i];
-      
-      write_ringbuf(&cluster.ringbuf, c);
-
-      ret = readfrom_ringbuf(&cluster.ringbuf, cluster.cmdbuf + cluster.cmdbuf_ptr, (char)0x0d, (char)0x0a, cluster.cmdbuf_len - cluster.cmdbuf_ptr);
-      if (ret < 0) {
-	// one line read
-
-	*/
-	}
+        }
     }
 }
 
-
 void cluster_io_init() {
-    if (!s_cluster_rx_sb) {
-        s_cluster_rx_sb = xStreamBufferCreate(CLUSTER_RX_SB_SIZE, 1 /*trigger level*/);
-        configASSERT(s_cluster_rx_sb != nullptr);
-        // パーサタスク（ネットワークより少し低い〜同等の優先度でOK）
+    if (!s_cluster_rx_queue) {
+        s_cluster_rx_queue = xQueueCreate(CLUSTER_RX_QUEUE_LEN, sizeof(ClusterRxEvent));
+        configASSERT(s_cluster_rx_queue != nullptr);
         xTaskCreatePinnedToCore(cluster_worker_task, "cluster_worker",
-				//                         6144, nullptr, 9, nullptr, tskNO_AFFINITY);
-				6144, nullptr, 4, nullptr, tskNO_AFFINITY);				
+                               6144, nullptr, 4, nullptr, tskNO_AFFINITY);
     }
 }
 
 void onDisconnect_cluster(void *arg, AsyncClient *client)
 {
-  cluster.stat = 0;
-  cluster.timeout = millis() + 2000;
+  ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
+  if (!rt) return;
+  rt->state->stat = 0;
+  rt->state->timeout = millis() + 2000;
   if (!plogw->f_console_emu) {
-    plogw->ostream->print("disconnected from cluster ");
+    console->printf("disconnected from cluster %u\n", (unsigned)(rt->id + 1));
   }
 }
 
 void onConnect_cluster(void *arg, AsyncClient *client)
 {
+  ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
+  if (!rt) return;
   if (!plogw->f_console_emu) {
-    plogw->ostream->print("connected to cluster ");
-    plogw->ostream->print(cluster_server);
-    plogw->ostream->print(" port:");
-    plogw->ostream->println(cluster_port);
+    console->printf("connected to cluster %u %s port:%d\n",
+                    (unsigned)(rt->id + 1), rt->server, rt->port);
   }
-  sprintf(dp->lcdbuf, "Cluster\nConnected\n%s\nPort %d\nMyIP:%s", cluster_server, cluster_port,WiFi.localIP().toString().c_str());
+  sprintf(dp->lcdbuf, "Cluster %u\nConnected\n%s\nPort %d\nMyIP:%s",
+          (unsigned)(rt->id + 1), rt->server, rt->port,
+          WiFi.localIP().toString().c_str());
   upd_display_info_flash(dp->lcdbuf);
-  plogw->ostream->println("connected to cluster.");
-  cluster.stat = 1;
-  cluster.timeout = millis() + 2000;
-  //  cluster.timeout_alive = millis() + 120000;
-  renew_timeout_cluster();
-  
-  //  console->printf("\n client has been connected to  on port \n") ;
-  //  replyToServer(client);
+  rt->state->stat = 1;
+  rt->state->timeout = millis() + 2000;
+  renew_timeout_cluster(rt);
 }
 
-AsyncClient *client_tcp = new AsyncClient;
+AsyncClient *client_tcp = nullptr;
 
 void sprint_cluster_info(char *buf,struct bandmap_entry *entry, int bandid, int idx )
 {
@@ -280,29 +264,11 @@ void sprint_cluster_info(char *buf,struct bandmap_entry *entry, int bandid, int 
 
 void print_cluster_info(struct bandmap_entry *entry, int bandid, int idx )
 {
-
-  if (!plogw->f_console_emu) {  
-    plogw->ostream->print(":F ");
-    plogw->ostream->print(entry->freq);
-    plogw->ostream->print(" t ");
-    plogw->ostream->print(entry->time);
-    plogw->ostream->print(" mode ");
-    plogw->ostream->print(entry->mode);
-    plogw->ostream->print(" Remarks:");
-    plogw->ostream->print(entry->remarks);
-    plogw->ostream->print(": type ");
-    plogw->ostream->print(entry->type);
-    plogw->ostream->print(" bandid=");
-    plogw->ostream->print(bandid);
-    plogw->ostream->print(" station ");
-    plogw->ostream->print((String)entry->station);
-    plogw->ostream->print(" nentry ");
-    plogw->ostream->print(bandmap[bandid - 1].nentry);
-    plogw->ostream->print(" idx ");
-    plogw->ostream->print(idx);
-    plogw->ostream->println("");
-  }
-
+  // The :F cluster report is a machine/diagnostic report and is intentionally
+  // kept on the hardware serial console even while Telnet owns normal logs.
+  char buf[256];
+  sprint_cluster_info(buf, entry, bandid, idx);
+  Serial.print(buf);
 }
 
 
@@ -330,8 +296,8 @@ void get_info_cluster(const char *ssrc) {
 
   if (verbose & 16) {
     if (!plogw->f_console_emu) {
-      plogw->ostream->print("C:");
-      plogw->ostream->println(s);
+      console->print("C:");
+      console->println(s);
     }
   }
 
@@ -342,9 +308,9 @@ void get_info_cluster(const char *ssrc) {
     s1 = strtok(NULL, " ");  // s1 points to freq
   } else return;
   if (s1 == NULL) return;
-  // plogw->ostream->print("FSTR:"); plogw->ostream->print((String)s1); plogw->ostream->print(":");
+  // console->print("FSTR:"); console->print((String)s1); console->print(":");
   frequency = check_frequency((String)(s1));
-  // plogw->ostream->print(" freq double "); plogw->ostream->print(frequency);
+  // console->print(" freq double "); console->print(frequency);
   ifreq = frequency * (1000/FREQ_UNIT);  // frequency in FREQ_UNIT conversion
 
   //  console->print("ifreq:");
@@ -353,8 +319,8 @@ void get_info_cluster(const char *ssrc) {
   bandid = freq2bandid(ifreq);
   if (bandid == 0) {
     if (verbose & 16) {
-      plogw->ostream->print("invalid band for freq:");
-      plogw->ostream->println(ifreq);
+      console->print("invalid band for freq:");
+      console->println(ifreq);
     }
     return;
   }
@@ -362,9 +328,9 @@ void get_info_cluster(const char *ssrc) {
   // check bandmap mask
   if ((bandmap_mask & (1 << (bandid - 1))) != 0) {
     if (verbose & 16) {
-      plogw->ostream->print("band is masked:");
-      plogw->ostream->print(bandid);
-      plogw->ostream->println(" no update");
+      console->print("band is masked:");
+      console->print(bandid);
+      console->println(" no update");
     }
     return;
   }
@@ -374,8 +340,8 @@ void get_info_cluster(const char *ssrc) {
     // check contest frequency
     if (!in_contest_frequency(ifreq)) {
       if (verbose & 16) {
-        plogw->ostream->print(ifreq);
-        plogw->ostream->println(" outside contest freq.");
+        console->print(ifreq);
+        console->println(" outside contest freq.");
       }
       return;
     }
@@ -386,7 +352,7 @@ void get_info_cluster(const char *ssrc) {
   if (s1 == NULL) return;
   // stn = trim(s1);
   stn=s1;
-  //plogw->ostream->print(" stn "); plogw->ostream->print(stn);
+  //console->print(" stn "); console->print(stn);
 
   // mode
   s1 = strtok(NULL, "");  // s1 points to mode and remarks
@@ -394,7 +360,7 @@ void get_info_cluster(const char *ssrc) {
   if (s1 == NULL) return;
 
   //md = trim(s1);
-  //plogw->ostream->print(" mode "); plogw->ostream->print(md);
+  //console->print(" mode "); console->print(md);
   md = "";
   if (strstr(s1, "CW") != NULL) {
     md = "CW";
@@ -426,16 +392,16 @@ void get_info_cluster(const char *ssrc) {
   idx = search_bandmap(bandid, stn, modeid);
 
   if (verbose & 16) {
-    plogw->ostream->print("search_bandmap:");
-    plogw->ostream->println(idx);
+    console->print("search_bandmap:");
+    console->println(idx);
   }
   if (idx != -1) {
     // found existing entry
     // replace the entry with current one
     entry = bandmap[bandid - 1].entry + idx;
     if (verbose & 16) {
-      plogw->ostream->print("existing entry idx:");
-      plogw->ostream->println(idx);
+      console->print("existing entry idx:");
+      console->println(idx);
     }
   } else {
     // new entry
@@ -443,8 +409,8 @@ void get_info_cluster(const char *ssrc) {
     idx = new_entry_bandmap(bandid,200);  // return entry which is not used
     entry = bandmap[bandid - 1].entry + idx;
     if (verbose & 16) {
-      plogw->ostream->print("new entry idx:");
-      plogw->ostream->println(idx);
+      console->print("new entry idx:");
+      console->println(idx);
     }
   }
 
@@ -458,8 +424,8 @@ void get_info_cluster(const char *ssrc) {
     
     entry_allband = bandmap[N_BAND].entry + idx_allband;
     if (verbose & 16) {
-      plogw->ostream->print("existing entry allband idx:");
-      plogw->ostream->println(idx_allband);
+      console->print("existing entry allband idx:");
+      console->println(idx_allband);
     }
   } else {
     // new entry
@@ -468,8 +434,8 @@ void get_info_cluster(const char *ssrc) {
       entry_allband = bandmap[N_BAND].entry + idx_allband;
       
       if (verbose & 16) {
-	plogw->ostream->print("new entry allband idx:");
-	plogw->ostream->println(idx_allband);
+	console->print("new entry allband idx:");
+	console->println(idx_allband);
       }
     } else {
       entry_allband=NULL;
@@ -498,8 +464,8 @@ void get_info_cluster(const char *ssrc) {
     }
     */
     if (verbose & 16) {
-      plogw->ostream->print("WORKED already");
-      plogw->ostream->println(stn);
+      console->print("WORKED already");
+      console->println(stn);
     }
   }
   // reset new multi flag
@@ -511,14 +477,14 @@ void get_info_cluster(const char *ssrc) {
   */
   if (exch_history!=NULL) {
     sprintf(buf,"exch history found for %s: %s\n",stn,exch_history);
-    plogw->ostream->print(buf);
+    console->print(buf);
 
     // check exch for multi
     int multi;
     multi=multi_check(exch_history,bandid);
     if (multi<0) {
       sprintf(buf,"not valid multi: %s\n",exch_history);
-      plogw->ostream->print(buf);
+      console->print(buf);
     } else {
       // check if this is new multi
       if (multi_list.multi_worked[bandid-1][multi]==0) {
@@ -532,11 +498,11 @@ void get_info_cluster(const char *ssrc) {
       } else {
 	sprintf(buf,"this entry %s is NOT NEW (multi=%d) \n",exch_history,multi);
       }
-      plogw->ostream->print(buf);
+      console->print(buf);
     }
   } else {
     //    sprintf(buf,"no exch history found for %s\n",stn);
-    //    plogw->ostream->print(buf);
+    //    console->print(buf);
     
   }
 
@@ -579,15 +545,12 @@ void get_info_cluster(const char *ssrc) {
   if (plogw->f_console_emu) {
     char buf[20];
     sprintf(buf, "\033[%d;%dH", 17, 1);
-    plogw->ostream->print(buf);
+    console->print(buf);
   }
 
 
-  // print info to console
-  char buf1[100];
-  sprint_cluster_info(buf1,entry, bandid, idx );
-  // print info to tcp clients
-  print_allTCPclients(buf1);
+  // Keep the cluster :F report on the hardware serial console only.
+  print_cluster_info(entry, bandid, idx);
   
   /*
   for (int i = 0; i < MAX_SRV_CLIENTS; i++) {
@@ -597,7 +560,6 @@ void get_info_cluster(const char *ssrc) {
     }
   }
   */
-  plogw->ostream = console;
 
 
   // notify necessity for the display update
@@ -623,191 +585,180 @@ void upd_bandmap_cluster(const char *s) {
 
 
 int f_show_cluster = 0;
-void cluster_process() {
-  //plogw->ostream->print(cluster_stat);
-  int ret;
+static const char *cluster_user_cmd(uint8_t id) {
+  return id == 0 ? plogw->cluster_cmd + 2 : plogw->cluster2_cmd + 2;
+}
 
-  switch (cluster.stat) {
-    case 0:  // not logged in
-      //      plogw->ostream->print("cluster.stat=");plogw->ostream->println(cluster.stat);
-      //      plogw->ostream->print("wifi_status=");plogw->ostream->println(wifi_status);      
-      if (wifi_status == 0 ) {
-        cluster.stat = 10;
-        cluster.timeout = millis() + 1000;
-        break;
-      } else {
-	if (!client_tcp->connected()) {
-	  connect_cluster();
-	  cluster.stat =10;
-	  cluster.timeout = millis() + 10000;	  
-        } 
+static void cluster_process_one(ClusterRuntime *rt) {
+  struct cluster *st = rt->state;
+  if (!rt->client || rt->server[0] == '\0') {
+    st->stat = 11;
+    return;
+  }
+
+  switch (st->stat) {
+    case 0:
+      if (wifi_status == 0) {
+        st->stat = 10;
+        st->timeout = millis() + 1000;
+      } else if (!rt->client->connected()) {
+        console->printf("connecting to cluster %u %s port %d\n",
+                        (unsigned)(rt->id + 1), rt->server, rt->port);
+        rt->client->connect(rt->server, rt->port);
+        st->stat = 10;
+        st->timeout = millis() + 10000;
       }
       break;
     case 10:
-      if (cluster.timeout < millis()) {
-        cluster.stat = 0;  // try again
-      }
+      if (st->timeout < millis()) st->stat = 0;
       break;
-    case 11:  // after forced disconnection, not try to connect
+    case 11:
       break;
-    case 1:  // connected and wait for a while to send callsign
-      if (cluster.timeout < millis()) {
-	//        client_tcp->println(String(callsign));
-	println_tcpserver(client_tcp,callsign);
-        if (!plogw->f_console_emu) {
-          plogw->ostream->print(String(callsign));
-          plogw->ostream->println("... sent to cluster");
-        }
-        cluster.stat = 2;
-        cluster.timeout = millis() + 500;
+    case 1:
+      if (st->timeout < millis()) {
+        println_tcpserver(rt->client, callsign);
+        if (!plogw->f_console_emu)
+          console->printf("%s... sent to cluster %u\n", callsign, (unsigned)(rt->id + 1));
+        st->stat = 2;
+        st->timeout = millis() + 500;
       }
       break;
     case 2:
     case 3:
     case 4:
-      if (cluster.timeout < millis()) {
-	//        client_tcp->println(cluster_cmd[cluster.stat - 2]);
-	println_tcpserver(client_tcp,cluster_cmd[cluster.stat - 2]);
-        if (!plogw->f_console_emu) {
-          plogw->ostream->println(cluster_cmd[cluster.stat - 2]);
-          plogw->ostream->print("cluster.stat=");
-          plogw->ostream->println(cluster.stat);
-        }
-        cluster.stat++;
-        cluster.timeout = millis() + 500;
+      if (st->timeout < millis()) {
+        println_tcpserver(rt->client, cluster_cmd[st->stat - 2]);
+        if (!plogw->f_console_emu)
+          console->printf("cluster %u: %s\n", (unsigned)(rt->id + 1), cluster_cmd[st->stat - 2]);
+        st->stat++;
+        st->timeout = millis() + 500;
       }
       break;
-    case 6:  // send command written in plogw->cluster_cmd
-      if (client_tcp->connected()) {
-	//        client_tcp->println(plogw->cluster_cmd + 2);
-	println_tcpserver(client_tcp,plogw->cluster_cmd + 2);
-        if (!plogw->f_console_emu) {
-          plogw->ostream->println(plogw->cluster_cmd + 2);
-          plogw->ostream->print("cluster.stat=");
-          plogw->ostream->println(cluster.stat);
-        }
+    case 6:
+      if (rt->client->connected()) {
+        const char *cmd = cluster_user_cmd(rt->id);
+        if (*cmd) println_tcpserver(rt->client, cmd);
+        if (!plogw->f_console_emu)
+          console->printf("cluster %u command: %s\n", (unsigned)(rt->id + 1), cmd);
       }
-      cluster.stat = 5;
-      //      cluster.timeout_alive = millis() + 120000;
-      renew_timeout_cluster();
+      st->stat = 5;
+      renew_timeout_cluster(rt);
       break;
     case 5:
-      /// cluster is connected and receive information
-      if (!client_tcp->connected()) {
-        if (verbose & 16) plogw->ostream->println("disconnecting from cluster .2");
-	disconnect_cluster_temp();
-        cluster.stat = 0;
-      } else {
-        // cluster print
-	if (passed_timeout_cluster()) {
-          plogw->ostream->println("cluster inactive for 10 minutes. try to disconnect and reconnect.");
-	  disconnect_cluster_temp();
-          // re-connection atempted
-          cluster.stat = 0;
-          break;
-        }
+      if (!rt->client->connected()) {
+        rt->client->stop();
+        st->stat = 0;
+      } else if (passed_timeout_cluster(rt)) {
+        console->printf("cluster %u inactive for 5 minutes; reconnecting\n", (unsigned)(rt->id + 1));
+        rt->client->stop();
+        st->stat = 0;
       }
+      break;
   }
 }
 
-////////
+void cluster_process() {
+  for (uint8_t i = 0; i < N_CLUSTER_CONNECTIONS; ++i) cluster_process_one(&cluster_rt[i]);
+}
+
+static void init_cluster_state(struct cluster *st, char *ring_storage) {
+  st->ringbuf.buf = ring_storage;
+  st->ringbuf.len = NCHR_CLUSTER_RINGBUF;
+  st->ringbuf.wptr = 0;
+  st->ringbuf.rptr = 0;
+  st->timeout = 0;
+  st->stat = 0;
+  st->cmdbuf_ptr = 0;
+  st->cmdbuf_len = NCHR_CLUSTER_CMD;
+  memset(st->cmdbuf, '\0', NCHR_CLUSTER_CMD + 1);
+}
 
 void init_cluster_info() {
-  cluster.ringbuf.buf = cluster_buf;
-  cluster.ringbuf.len = NCHR_CLUSTER_RINGBUF;
-  cluster.ringbuf.wptr = 0;
-  cluster.ringbuf.rptr = 0;
-  cluster.timeout = 0;
-  cluster.stat = 0;
-  cluster.cmdbuf_ptr = 0;
-  cluster.cmdbuf_len = NCHR_CLUSTER_CMD;
-  memset(cluster.cmdbuf, '\0', NCHR_CLUSTER_CMD + 1);
-
   cluster_io_init();
+  init_cluster_state(&cluster, cluster_buf);
+  init_cluster_state(&cluster2, cluster2_buf);
 
-  // define handler
-  client_tcp->onData(handleData_cluster, client_tcp);
-  client_tcp->onConnect(onConnect_cluster, client_tcp);
-  client_tcp->onDisconnect(onDisconnect_cluster, client_tcp);  
+  memset(cluster_rt, 0, sizeof(cluster_rt));
 
-}
+  cluster_rt[0].state = &cluster;
+  cluster_rt[0].client = new AsyncClient;
+  cluster_rt[0].port = 7000;
+  cluster_rt[0].id = 0;
 
+  cluster_rt[1].state = &cluster2;
+  cluster_rt[1].client = new AsyncClient;
+  cluster_rt[1].port = 7000;
+  cluster_rt[1].id = 1;
 
-void disconnect_cluster() {
-  client_tcp->stop();
-  plogw->ostream->println("disconnected from cluster");
-  cluster.stat = 11;  // force keep disconnection state
-}
+  client_tcp = cluster_rt[0].client;
 
-void disconnect_cluster_temp() {
-  client_tcp->stop();
-  plogw->ostream->println("disconnected from cluster");
-}
-
-
-int connect_cluster() {
-  if (wifi_status == 1) {
-    if (!client_tcp->connected() ) {
-      plogw->ostream->print("connecting to cluster ");
-      plogw->ostream->print(cluster_server);
-      plogw->ostream->print(" port ");
-      plogw->ostream->println(cluster_port);                  
-      client_tcp->connect(cluster_server, cluster_port);
-      return 1;
-    } else {
-      if (!plogw->f_console_emu) {
-	plogw->ostream->println("already connected\n");
-	disconnect_cluster_temp();
-	plogw->ostream->println("disconnect from cluster temporalily ");
-	cluster.stat = 0;
-      }
-      return 0;
-    }
-  } else {
-    return 0;
+  for (uint8_t i = 0; i < N_CLUSTER_CONNECTIONS; ++i) {
+    cluster_rt[i].client->onData(handleData_cluster, &cluster_rt[i]);
+    cluster_rt[i].client->onConnect(onConnect_cluster, &cluster_rt[i]);
+    cluster_rt[i].client->onDisconnect(onDisconnect_cluster, &cluster_rt[i]);
   }
+  set_cluster();
+  set_cluster2();
 }
 
+static void disconnect_cluster_id(uint8_t id, bool hold) {
+  ClusterRuntime *rt = &cluster_rt[id];
+  if (rt->client) rt->client->stop();
+  console->printf("disconnected from cluster %u\n", (unsigned)(id + 1));
+  rt->state->stat = hold ? 11 : 0;
+}
 
+void disconnect_cluster() { disconnect_cluster_id(0, true); }
+void disconnect_cluster_temp() { disconnect_cluster_id(0, false); }
+void disconnect_cluster2() { disconnect_cluster_id(1, true); }
+void disconnect_cluster2_temp() { disconnect_cluster_id(1, false); }
+
+static int connect_cluster_id(uint8_t id) {
+  ClusterRuntime *rt = &cluster_rt[id];
+  if (wifi_status != 1 || !rt->client || !rt->server[0]) return 0;
+  if (!rt->client->connected()) {
+    rt->state->stat = 0;
+    return 1;
+  }
+  disconnect_cluster_id(id, false);
+  return 0;
+}
+
+int connect_cluster() { return connect_cluster_id(0); }
+int connect_cluster2() { return connect_cluster_id(1); }
 
 const char *callsign = "JK1DVP";
 const char *cluster_cmd[3] = { "set dx ext skimmerquality",
                                 "set dx fil not skimdupe and not skimbusted and not skimqsy and cty=ja and SpotterCty=ja",
-                                "sh dx fil"
-                              };
+                                "sh dx fil" };
 
+void send_cluster_cmd() { if (cluster.stat == 5) cluster.stat = 6; }
+void send_cluster2_cmd() { if (cluster2.stat == 5) cluster2.stat = 6; }
 
-void send_cluster_cmd() {
-  if (cluster.stat == 5) cluster.stat = 6;
+static void set_cluster_id(uint8_t id, const char *setting) {
+  ClusterRuntime *rt = &cluster_rt[id];
+  if (!rt->state) return;
+  char tmp[LEN_HOST_NAME + 1];
+  strlcpy(tmp, setting ? setting : "", sizeof(tmp));
+  char *colon = strrchr(tmp, ':');
+  rt->port = 7000;
+  if (colon) {
+    *colon++ = '\0';
+    if (*colon) rt->port = atoi(colon);
+  }
+  strlcpy(rt->server, tmp, sizeof(rt->server));
+  if (id == 0) {
+    strlcpy(cluster_server, rt->server, sizeof(cluster_server));
+    cluster_port = rt->port;
+  }
+  if (rt->client && rt->client->connected()) rt->client->stop();
+  rt->state->stat = rt->server[0] ? 0 : 11;
+  if (!plogw->f_console_emu)
+    console->printf("cluster %u server:%s port:%d%s\n", (unsigned)(id + 1),
+                    rt->server, rt->port, rt->server[0] ? "" : " (disabled)");
 }
 
+void set_cluster() { set_cluster_id(0, plogw->cluster_name + 2); }
+void set_cluster2() { set_cluster_id(1, plogw->cluster2_name + 2); }
 
-void set_cluster() {
-  char *p;
-  strcpy(cluster_server, plogw->cluster_name + 2);
-  p = strtok(cluster_server, ":");
-  if (p != NULL) {
-    p = strtok(NULL, ":");
-    if (p != NULL) {
-      cluster_port = atoi(p);
-    } else {
-      cluster_port = 7000;
-    }
-  } else {
-    // port not specified
-    cluster_port = 7000;  // default value
-  }
-  if (!plogw->f_console_emu) {
-    plogw->ostream->print("cluster_server:");
-    plogw->ostream->print(cluster_server);
-    plogw->ostream->print(" port:");
-    plogw->ostream->println(cluster_port);
-  }
-  if (client_tcp->connected()) {
-    //    client.stop();
-    disconnect_cluster_temp();
-    if (!plogw->f_console_emu) plogw->ostream->println("disconnected cluster");
-  }
-  cluster.stat = 0;
-}
 

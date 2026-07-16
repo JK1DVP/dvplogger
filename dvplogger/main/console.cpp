@@ -35,12 +35,15 @@
 
 // receive command from serial terminal
 void console_process() {
-  while (plogw->ostream->available() > 0) {
-    char c = plogw->ostream->read();
+  // Serial command input remains available even while the active log console
+  // has been redirected to the single Telnet client.
+  Stream *serial_terminal = &Serial;
+  while (serial_terminal->available() > 0) {
+    char c = serial_terminal->read();
     if (verbose & 32) {
       char buf[20];
       sprintf(buf, "[%02X(%c)]", c, isprint(c) ? c : ' ');
-      plogw->ostream->print(buf);
+      serial_terminal->print(buf);
     }
 
 
@@ -53,7 +56,7 @@ void console_process() {
       // carriage return end of a line
       plogw->cmdbuf[plogw->cmd_ptr] = '\0';
       // send received line to command interpreter
-      cmd_interp(plogw->cmdbuf);
+      cmd_interp(plogw->cmdbuf, serial_terminal);
       // clear buffer
       plogw->cmd_ptr = 0;
       continue;

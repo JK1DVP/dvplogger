@@ -612,7 +612,7 @@ uint8_t HIDBoot<BOOT_PROTOCOL>::Poll() {
                                 }
                         }
 
-                        if(!rcode && read && (UsbDEBUGlvl > 0x7f)) {
+                        if(false && !rcode && read && (UsbDEBUGlvl > 0x7f)) {
                                 for(uint8_t i = 0; i < read; i++) {
                                         PrintHex<uint8_t > (buf[i], 0x80);
                                         USBTRACE1(" ", 0x80);
