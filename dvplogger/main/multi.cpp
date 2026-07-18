@@ -1,7 +1,7 @@
 /*
  * dvplogger - field companion for ham radio operator
  * dvplogger - アマチュア無線家のためのフィールド支援ツール
- * Copyright (c) 2021-2025 Eiichiro Araki
+ * Copyright (c) 2021-2026 Eiichiro Araki
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -666,25 +666,3 @@ const struct multi_item multi_iburihidakaout = {
 };
 
   
-/*
-  const struct multi_item multi_ja8int = {
-  {
-"101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "202", "203", "204", "205", "206", "207", "208", "209", "210", "211", "212", "213", "214", "215", "216", "217", "218", "219", "220", "221", "222", "223", "224", "225", "226", "227", "228", "229", "230", "231", "233", "234", "235", "236", "303", "304", "331", "332", "333", "334", "337", "343", "345", "346", "347", "361", "362", "363", "364", "367", "370", "371", "391", "392", "393", "394", "395", "396", "397", "398", "399", "400", "401", "402", "403", "404", "405", "406", "407", "408", "409", "423", "424", "425", "427", "428", "429", "430", "431", "432", "433", "434", "436", "437", "438", "452", "453", "454", "455", "456", "457", "458", "459", "460", "461", "462", "463", "464", "465", "468", "469", "470", "471", "472", "481", "482", "483", "484", "485", "486", "487", "511", "512", "513", "514", "516", "517", "518", "519", "520", "543", "544", "545", "546", "547", "549", "550", "552", "555", "559", "560", "561", "562", "563", "564", "571", "575", "578", "581", "584", "585", "586", "601", "602", "604", "607", "608", "609", "610", "631", "632", "633", "634", "635", "636", "637", "638", "639", "641", "642", "643", "644", "645", "646", "647", "648", "649", "661", "662", "663", "664", "665", "667", "668", "691", "692", "693", "694", 
-    "02", "03", "04", "05", "06", "07", "08", "09", "10",
-    "11", "12", "13","14", "15", "16", "17", "18", "19",
-    "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",
-    "30", "31", "32", "33", "34", "35", "36", "37", "38", "39",
-    "40", "41", "42", "43", "44", "45", "46", "47" , "48", ""
-},
-{
-"sapporoC", "sapporoN", "sapporoE", "sapporoShiroishi", "sapporoToyohira", "sapporoS", "sapporoW", "sapporoAtsubetsu", "sapporoTeine", "sapporoKiyoda", "hakodateC", "otaruC", "asahikawaC", "muroranC", "kushiroC", "obihiroC", "kitamiC", "yuubariC", "iwamizawaC", "abashiriC", "rumoiC", "tomakomaiC", "wakkanaiC", "bibaiC", "ashibetsuC", "ebetsuC", "akabiraC", "mombetsuC", "shibetsuC", "nayoroC", "mikasaC", "nemuroC", "chitoseC", "takikawaC", "sunagawaC", "utashinaiC", "fukagawaC", "furanoC", "noboribetsuC", "eniwaC", "dateC", "kitahiroshimaC", "ishikarishi", "hokutoC", "tobetsuT", "shinshinotsuV", "matsumaeT", "fukushimaT", "shiriuchiT", "kikonaiT", "nanaeT", "shikabeT", "moriT", "yakumoT", "oshamambeT", "esashiT", "uenokuniT", "assabuT", "otobecho", "okushiriT", "imaganeT", "setanaT", "shimamakimura", "suttsuT", "kuromatsunaiT", "rankoshiT", "nisekoT", "makkariV", "rusutsuV", "kimobetsuT", "kyougokuT", "kutchanT", "kyouwaT", "iwanaiT", "hakuV", "kamoenaiV", "shakotanT", "furubiraT", "nikiT", "yoichiT", "akaigawaV", "namporoT", "naieT", "kamisunagawaT", "yuniT", "naganumaT", "kuriyamaT", "tsukigataT", "urausuT", "shintotsukawaT", "moseushiT", "chippubetsuT", "uryuuT", "hokuryuuT", "numataT", "takasuT", "higashikaguraT", "tomaT", "pippuT", "aibetsuT", "kamikawaT", "higashikawaT", "bieiT", "kamifuranoT", "nakafuranoT", "minamifuranoT", "shimukappuV", "wassamuT", "kembuchiT", "shimokawaT", "bifukaT", "otoineppuV", "nakagawaT", "horokanaiT", "mashikeT", "kodairaT", "tomamaeT", "hahoroT", "shosambetsuV", "embetsuT", "teshioT", "sarufutsuV", "hamatombetsuT", "nakatombetsuT", "esashiT", "toyotomiT", "rebunT", "rishiriT", "rishirifujiT", "horonobeT", "bihorocho", "tsubetsuT", "shariT", "kiyosatoT", "koshimizuT", "kunneppucho", "okitocho", "saromaT", "enkaruT", "yuubetsuT", "takigamiT", "okoppecho", "nishiokoppeV", "omucho", "ozoraT", "toyouraT", "sobetsuT", "shiraoiT", "atsumaT", "toyakoT", "abiraT", "mukawaT", "hidakaT", "hiratoriT", "niikappucho", "urakawaT", "samaniT", "erimoT", "shinhidakaT", "otoshinacho", "shihoroT", "kamishihoroT", "shikaoiT", "shintokuT", "shimizucho", "memuroT", "nakasatsunaiV", "sarabetsuV", "taijuT", "hirooT", "makubetsuT", "ikedacho", "toyokoroT", "hombetsuT", "ashoroT", "rikubetsuT", "urahoroT", "kushiroT", "akkeshiT", "hamanakaT", "shibechaT", "teshikutsucho", "tsuruiV", "shironukacho", "bekkaiT", "nakashibetsuT", "shibetsuT", "rausuT",
-    "Aomori", "Iwate", "Akita", "Yamagata", "Miyagi", "Fukushima", "Niigata",
-    "Nagano", "Tokyo", "Kanagawa", "Chiba", "Saitama","Ibaraki", "Tochigi", "Gunma", "Yamanashi",
-    "Shizuoka", "Gifu", "Aichi", "Mie", "Kyoto", "Shiga", "Nara", "Osaka",
-    "Wakayama", "Hyogo", "Toyama", "Fukui", "Ishikawa", "Okayama", "Shimane", "Yamaguchi",
-    "Tottori", "Hiroshima", "Kagawa", "Tokushima", "Ehime", "Kochi", "Fukuoka", "Saga", "Nagasaki", "Kumamoto",
-    "Oita", "Miyazaki", "Kagoshima", "Okinawa", "Ogasawara", ""
-  }
-};
- 
-*/

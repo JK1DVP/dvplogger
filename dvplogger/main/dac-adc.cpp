@@ -1,7 +1,7 @@
 /*
  * dvplogger - field companion for ham radio operator
  * dvplogger - アマチュア無線家のためのフィールド支援ツール
- * Copyright (c) 2021-2025 Eiichiro Araki
+ * Copyright (c) 2021-2026 Eiichiro Araki
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

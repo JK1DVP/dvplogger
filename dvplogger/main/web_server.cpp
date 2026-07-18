@@ -1,7 +1,7 @@
 /*
  * dvplogger - field companion for ham radio operator
  * dvplogger - アマチュア無線家のためのフィールド支援ツール
- * Copyright (c) 2021-2025 Eiichiro Araki
+ * Copyright (c) 2021-2026 Eiichiro Araki
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -47,6 +47,7 @@
 #include "dupechk.h"
 #include "multi_process.h"
 #include <algorithm>
+#include <memory>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -766,15 +767,19 @@ button{padding:5px 10px;white-space:nowrap}.dupe-ok{color:#075f16;font-weight:bo
 
 static const char contests_page_footer[] PROGMEM = R"rawliteral(
 </tbody></table></div><h3>User contest (.MD)</h3>
-<p>Enter the filename without <code>User</code> and <code>.MD</code>. The preset is saved separately for each User filename.</p>
-<form method="GET" action="/select_user_contest">
+<p>Enter the filename without <code>User</code> and <code>.MD</code>. Two User contest settings are retained independently.</p>
 <div class="contest-wrap"><table class="user-table"><colgroup>
 <col class="col-user-name"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-exch"><col class="col-action">
-</colgroup><thead><tr><th>User MD filename</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody><tr>
-<td><div class="user-name-field"><span>User</span><input name="filename" maxlength="8" value="%USER_FILENAME%" placeholder="TOKYO" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></div></td>
-<td><input name="f1" maxlength="30" value="%USER_F1%"></td><td><input name="f2" maxlength="30" value="%USER_F2%"></td><td><input name="f3" maxlength="30" value="%USER_F3%"></td><td><input name="f5" maxlength="30" value="%USER_F5%"></td><td><input name="exch" maxlength="17" value="%USER_EXCH%"></td>
-<td><button type="submit">Select &amp; Save</button></td></tr></tbody></table></div>
-</form>
+</colgroup><thead><tr><th>User MD filename</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody>
+<tr%USER1_CLASS%>
+<td><form id="user_contest_form_1" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="0"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_1" name="filename" maxlength="8" value="%USER1_FILENAME%" placeholder="PRESET1" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></div></td>
+<td><input form="user_contest_form_1" name="f1" maxlength="30" value="%USER1_F1%"></td><td><input form="user_contest_form_1" name="f2" maxlength="30" value="%USER1_F2%"></td><td><input form="user_contest_form_1" name="f3" maxlength="30" value="%USER1_F3%"></td><td><input form="user_contest_form_1" name="f5" maxlength="30" value="%USER1_F5%"></td><td><input form="user_contest_form_1" name="exch" maxlength="17" value="%USER1_EXCH%"></td>
+<td><button form="user_contest_form_1" type="submit">%USER1_ACTION%</button></td></tr>
+<tr%USER2_CLASS%>
+<td><form id="user_contest_form_2" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="1"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_2" name="filename" maxlength="8" value="%USER2_FILENAME%" placeholder="PRESET2" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></div></td>
+<td><input form="user_contest_form_2" name="f1" maxlength="30" value="%USER2_F1%"></td><td><input form="user_contest_form_2" name="f2" maxlength="30" value="%USER2_F2%"></td><td><input form="user_contest_form_2" name="f3" maxlength="30" value="%USER2_F3%"></td><td><input form="user_contest_form_2" name="f5" maxlength="30" value="%USER2_F5%"></td><td><input form="user_contest_form_2" name="exch" maxlength="17" value="%USER2_EXCH%"></td>
+<td><button form="user_contest_form_2" type="submit">%USER2_ACTION%</button></td></tr>
+</tbody></table></div>
 <p class="note">The MD file must exist as <code>/FILENAME.MD</code>. Allowed filename characters: A-Z, 0-9, _ and -.</p>
 
 <h3>CW message macros</h3>
@@ -819,11 +824,15 @@ struct ContestWebPreset {
 static constexpr int MAX_CONTEST_WEB_PRESETS = N_CONTEST + 8;
 static ContestWebPreset contest_web_presets[MAX_CONTEST_WEB_PRESETS];
 static bool contest_web_presets_loaded = false;
+static constexpr int N_USER_CONTEST_SLOTS = 2;
+static char contest_web_user_slot[N_USER_CONTEST_SLOTS][9];
 static const char *CONTEST_PRESET_FILE = "/CONTEST.TXT";
 static const char *CONTEST_PRESET_VFS_FILE = "/sd/CONTEST.TXT";
 static String contest_web_last_status = "No contest action has been received since boot.";
 static bool contest_web_file_loaded = false;
 static size_t contest_web_file_size = 0;
+
+static bool valid_web_user_md_basename(const String &filename);
 
 static void set_contest_web_status(const String &message) {
   contest_web_last_status = message;
@@ -911,15 +920,41 @@ static ContestWebPreset *find_contest_web_preset(const char *name, bool create) 
   return free_slot;
 }
 
+static void initialize_user_contest_slot_defaults() {
+  static const char *default_filename[N_USER_CONTEST_SLOTS] = {
+    "PRESET1", "PRESET2"
+  };
+
+  for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
+    if (!contest_web_user_slot[i][0]) {
+      strlcpy(contest_web_user_slot[i], default_filename[i],
+              sizeof(contest_web_user_slot[i]));
+    }
+
+    String contest_name = String("User") + contest_web_user_slot[i];
+    if (find_contest_web_preset(contest_name.c_str(), false)) continue;
+
+    ContestWebPreset *p = find_contest_web_preset(contest_name.c_str(), true);
+    if (!p) continue;
+    copy_web_value(p->f1, sizeof(p->f1), String(plogw->cw_msg[0] + 2));
+    copy_web_value(p->f2, sizeof(p->f2), String(plogw->cw_msg[1] + 2));
+    copy_web_value(p->f3, sizeof(p->f3), String(plogw->cw_msg[2] + 2));
+    copy_web_value(p->f5, sizeof(p->f5), String(plogw->cw_msg[4] + 2));
+    copy_web_value(p->exch, sizeof(p->exch), String(plogw->sent_exch + 2));
+  }
+}
+
 static void load_contest_web_presets() {
   if (contest_web_presets_loaded) return;
   contest_web_presets_loaded = true;
   memset(contest_web_presets, 0, sizeof(contest_web_presets));
+  memset(contest_web_user_slot, 0, sizeof(contest_web_user_slot));
   File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
   if (!f) {
     contest_web_file_loaded = false;
     contest_web_file_size = 0;
-    set_contest_web_status(String("preset file not found at ") + CONTEST_PRESET_FILE + "; starting with empty presets");
+    initialize_user_contest_slot_defaults();
+    set_contest_web_status(String("preset file not found at ") + CONTEST_PRESET_FILE + "; using default User presets");
     return;
   }
   contest_web_file_loaded = true;
@@ -928,7 +963,23 @@ static void load_contest_web_presets() {
   while (f.available()) {
     String line = f.readStringUntil('\n');
     if (line.endsWith("\r")) line.remove(line.length() - 1);
-    if (!line.length() || line.charAt(0) == '#') continue;
+    if (!line.length()) continue;
+
+    bool slot_line = false;
+    for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
+      String prefix = String("#USER_SLOT") + String(i + 1) + "=";
+      if (!line.startsWith(prefix)) continue;
+      String filename = line.substring(prefix.length());
+      filename.trim();
+      filename.toUpperCase();
+      if (valid_web_user_md_basename(filename)) {
+        strlcpy(contest_web_user_slot[i], filename.c_str(), sizeof(contest_web_user_slot[i]));
+      }
+      slot_line = true;
+      break;
+    }
+    if (slot_line || line.charAt(0) == '#') continue;
+
     int p1 = line.indexOf('\t');
     int p2 = p1 < 0 ? -1 : line.indexOf('\t', p1 + 1);
     int p3 = p2 < 0 ? -1 : line.indexOf('\t', p2 + 1);
@@ -950,6 +1001,7 @@ static void load_contest_web_presets() {
     }
   }
   f.close();
+  initialize_user_contest_slot_defaults();
 }
 
 static bool save_contest_web_presets() {
@@ -969,8 +1021,15 @@ static bool save_contest_web_presets() {
     set_contest_web_status(String("save failed: fopen(") + CONTEST_PRESET_VFS_FILE + ",w) failed, errno=" + String(errno));
     return false;
   }
-  size_t written = 0;
-  int n = fprintf(fp, "# contest-name\tF1\tF2\tF3\tF5\tsent-exchange\n");
+  int n = fprintf(fp, "#USER_SLOT1=%s\n#USER_SLOT2=%s\n",
+                  contest_web_user_slot[0], contest_web_user_slot[1]);
+  if (n < 0) {
+    fclose(fp);
+    set_contest_web_status(String("save failed while writing User slots to ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
+    return false;
+  }
+  size_t written = (size_t)n;
+  n = fprintf(fp, "# contest-name\tF1\tF2\tF3\tF5\tsent-exchange\n");
   if (n > 0) written += (size_t)n;
   for (int i = 0; i < MAX_CONTEST_WEB_PRESETS; ++i) {
     const ContestWebPreset &p = contest_web_presets[i];
@@ -1060,8 +1119,12 @@ static void setupContestPageHandler() {
   load_contest_web_presets();
 
   web_server.on("/contests", HTTP_GET, [](AsyncWebServerRequest *request) {
-    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; char text[3584]; };
-    State state;
+    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; char text[6144]; };
+    std::shared_ptr<State> state = std::make_shared<State>();
+    if (!state) {
+      request->send(503, "text/plain", "Not enough memory to build contest page");
+      return;
+    }
     AsyncWebServerResponse *response=request->beginChunkedResponse("text/html",
       [state](uint8_t *buffer,size_t maxLen,size_t chunkIndex) mutable -> size_t {
         (void)chunkIndex; size_t written=0;
@@ -1073,28 +1136,50 @@ static void setupContestPageHandler() {
             text.replace("%LAST_STATUS%", html_attr_escape(contest_web_last_status.c_str()));
           }
           else {
-            const char *userfile=""; if(is_user_md_contest_name(plogw->contest_name+2)) userfile=plogw->contest_name+6;
-            text.replace("%USER_FILENAME%",html_attr_escape(userfile));
-            ContestWebPreset *p=find_contest_web_preset(plogw->contest_name+2,false);
-            text.replace("%USER_F1%",html_attr_escape(p?p->f1:plogw->cw_msg[0]+2));
-            text.replace("%USER_F2%",html_attr_escape(p?p->f2:plogw->cw_msg[1]+2));
-            text.replace("%USER_F3%",html_attr_escape(p?p->f3:plogw->cw_msg[2]+2));
-            text.replace("%USER_F5%",html_attr_escape(p?p->f5:plogw->cw_msg[4]+2));
-            text.replace("%USER_EXCH%",html_attr_escape(p?p->exch:plogw->sent_exch+2));
+            for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
+              String filename = contest_web_user_slot[i];
+              if (!filename.length() && i == 0 && !contest_web_user_slot[1][0] &&
+                  is_user_md_contest_name(plogw->contest_name + 2)) {
+                filename = plogw->contest_name + 6;
+              }
+
+              String contest_name;
+              if (filename.length()) contest_name = String("User") + filename;
+              bool current = contest_name.length() &&
+                             strcasecmp(plogw->contest_name + 2, contest_name.c_str()) == 0;
+              ContestWebPreset *p = contest_name.length()
+                                      ? find_contest_web_preset(contest_name.c_str(), false)
+                                      : NULL;
+              const char *f1 = p ? p->f1 : (current ? plogw->cw_msg[0] + 2 : "");
+              const char *f2 = p ? p->f2 : (current ? plogw->cw_msg[1] + 2 : "");
+              const char *f3 = p ? p->f3 : (current ? plogw->cw_msg[2] + 2 : "");
+              const char *f5 = p ? p->f5 : (current ? plogw->cw_msg[4] + 2 : "");
+              const char *ex = p ? p->exch : (current ? plogw->sent_exch + 2 : "");
+              String tag = String("%USER") + String(i + 1);
+
+              text.replace(tag + "_CLASS%", current ? " class=\"current\"" : "");
+              text.replace(tag + "_FILENAME%", html_attr_escape(filename.c_str()));
+              text.replace(tag + "_F1%", html_attr_escape(f1));
+              text.replace(tag + "_F2%", html_attr_escape(f2));
+              text.replace(tag + "_F3%", html_attr_escape(f3));
+              text.replace(tag + "_F5%", html_attr_escape(f5));
+              text.replace(tag + "_EXCH%", html_attr_escape(ex));
+              text.replace(tag + "_ACTION%", current ? "Save / Re-select" : "Select &amp; Save");
+            }
           }
-          text.toCharArray(state.text,sizeof(state.text)); state.length=strnlen(state.text,sizeof(state.text)); state.offset=0;
+          text.toCharArray(state->text,sizeof(state->text)); state->length=strnlen(state->text,sizeof(state->text)); state->offset=0;
         };
-        auto copy=[&]()->bool { size_t remain=state.length-state.offset,room=maxLen-written,n=remain<room?remain:room; if(n){memcpy(buffer+written,state.text+state.offset,n);written+=n;state.offset+=n;} if(state.offset==state.length){state.offset=0;state.length=0;return true;} return false; };
-        while(written<maxLen && state.stage!=State::Done){
-          switch(state.stage){
+        auto copy=[&]()->bool { size_t remain=state->length-state->offset,room=maxLen-written,n=remain<room?remain:room; if(n){memcpy(buffer+written,state->text+state->offset,n);written+=n;state->offset+=n;} if(state->offset==state->length){state->offset=0;state->length=0;return true;} return false; };
+        while(written<maxLen && state->stage!=State::Done){
+          switch(state->stage){
           case State::Header:
-            if (!state.length) prepare(contests_page_header, false);
-            if (copy()) state.stage = State::Entry;
+            if (!state->length) prepare(contests_page_header, false);
+            if (copy()) state->stage = State::Entry;
             break;
           case State::Entry:
-            if(state.index>=contest_definition_count()){state.stage=State::Footer;break;}
-            if(!state.length){
-              int id=contest_definition_id(state.index); const char *name=contest_definition_name(state.index);
+            if(state->index>=contest_definition_count()){state->stage=State::Footer;break;}
+            if(!state->length){
+              int id=contest_definition_id(state->index); const char *name=contest_definition_name(state->index);
               bool current=plogw->contest_id==id && strcasecmp(plogw->contest_name+2,name)==0;
               ContestWebPreset *p=find_contest_web_preset(name,false);
               const char *f1=p?p->f1:(current?plogw->cw_msg[0]+2:plogw->cw_msg[0]+2);
@@ -1102,8 +1187,8 @@ static void setupContestPageHandler() {
               const char *f3=p?p->f3:(current?plogw->cw_msg[2]+2:plogw->cw_msg[2]+2);
               const char *f5=p?p->f5:(current?plogw->cw_msg[4]+2:plogw->cw_msg[4]+2);
               const char *ex=p?p->exch:(current?plogw->sent_exch+2:plogw->sent_exch+2);
-              bool dupe_ok=contest_definition_mask(state.index)==CW_PH_DUPE_OK;
-              String form_id = String("contest_form_") + String(state.index);
+              bool dupe_ok=contest_definition_mask(state->index)==CW_PH_DUPE_OK;
+              String form_id = String("contest_form_") + String(state->index);
               String row=String("<tr")+(current?" class=\"current\"":"")+"><td><form id=\""+form_id+"\" method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"></form>"+String(id)+"</td><td class=\"name\">"+html_attr_escape(name)+"</td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(dupe_ok?"OK C/P":"NG C/P")+"</td>";
               row += "<td><input form=\""+form_id+"\" name=\"f1\" maxlength=\"30\" value=\""+html_attr_escape(f1)+"\"></td>";
               row += "<td><input form=\""+form_id+"\" name=\"f2\" maxlength=\"30\" value=\""+html_attr_escape(f2)+"\"></td>";
@@ -1113,13 +1198,13 @@ static void setupContestPageHandler() {
               row += String("<td><button form=\"") + form_id + "\" type=\"submit\">"
                      + (current ? "Save / Re-select" : "Select & Save")
                      + "</button></td></tr>\n";
-              row.toCharArray(state.text,sizeof(state.text)); state.length=strnlen(state.text,sizeof(state.text)); state.offset=0;
+              row.toCharArray(state->text,sizeof(state->text)); state->length=strnlen(state->text,sizeof(state->text)); state->offset=0;
             }
-            if (copy()) ++state.index;
+            if (copy()) ++state->index;
             break;
           case State::Footer:
-            if (!state.length) prepare(contests_page_footer, true);
-            if (copy()) state.stage = State::Done;
+            if (!state->length) prepare(contests_page_footer, true);
+            if (copy()) state->stage = State::Done;
             break;
           case State::Done: break;
           }
@@ -1160,13 +1245,18 @@ static void setupContestPageHandler() {
   web_server.on("/select_user_contest", HTTP_GET, [](AsyncWebServerRequest *request) {
     Serial.printf("WEB CONTEST: request /select_user_contest params=%u\n", (unsigned)request->params());
     AsyncWebParameter *filename_param=contest_request_param(request,"filename");
+    AsyncWebParameter *slot_param=contest_request_param(request,"slot");
     if(!filename_param){set_contest_web_status("User request rejected: missing filename");request->send(400,"text/plain",contest_web_last_status);return;}
+    if(!slot_param){set_contest_web_status("User request rejected: missing slot");request->send(400,"text/plain",contest_web_last_status);return;}
+    int slot=slot_param->value().toInt();
+    if(slot<0 || slot>=N_USER_CONTEST_SLOTS){set_contest_web_status(String("User request rejected: invalid slot ")+slot_param->value());request->send(400,"text/plain",contest_web_last_status);return;}
     String filename=filename_param->value(); filename.toUpperCase();
     if(!valid_web_user_md_basename(filename)){set_contest_web_status(String("User request rejected: invalid filename ")+filename);request->send(400,"text/plain",contest_web_last_status);return;}
     if(user_md_contest_loading()){request->send(409,"text/plain","Another User contest is still loading");return;}
     String contestName=String("User")+filename;
     ContestWebPreset *p=NULL;
     if(!update_preset_from_request(request,contestName.c_str(),&p)){request->send(400,"text/plain","Missing or invalid preset values");return;}
+    strlcpy(contest_web_user_slot[slot],filename.c_str(),sizeof(contest_web_user_slot[slot]));
     if(!save_contest_web_presets()){request->send(500,"text/plain",contest_web_last_status);return;}
     strncpy(plogw->contest_name+2,contestName.c_str(),LEN_CONTEST_NAME); plogw->contest_name[2+LEN_CONTEST_NAME]='\0';
     set_current_contest_messages(*p);
@@ -2779,7 +2869,7 @@ static void setup_web_bandmap_handlers() {
               sizeof(command.station));
 
       if (command.bandid < 1 || command.bandid >= N_BAND ||
-          command.station[0] == '\0' || command.mode >= NMODEID) {
+          command.station[0] == '\0'  || command.mode >= NMODEID) {
         request->send(400, "text/plain", "invalid spot");
         return;
       }
@@ -2826,7 +2916,7 @@ static void setup_web_bandmap_handlers() {
     }
 
     if (command.bandid < 1 || command.bandid >= N_BAND ||
-        command.station[0] == ' ' || command.mode >= NMODEID) {
+        command.station[0] == '\0' || command.mode >= NMODEID) {
       request->send(400, "text/plain", "invalid spot");
       return;
     }

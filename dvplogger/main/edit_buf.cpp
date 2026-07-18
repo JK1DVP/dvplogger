@@ -1,7 +1,7 @@
 /*
  * dvplogger - field companion for ham radio operator
  * dvplogger - アマチュア無線家のためのフィールド支援ツール
- * Copyright (c) 2021-2025 Eiichiro Araki
+ * Copyright (c) 2021-2026 Eiichiro Araki
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -526,48 +526,12 @@ bool compose_marked_line(const char *cbuf, const Preedit *pre,
   return true;
 }
 
-/*
-char line[128];
-int pre_s = 0, pre_l = 0, caret = 0;
-
-compose_line_with_preedit((const char*)buf, &g_pre,
-                          line, sizeof(line),
-                          &pre_s, &pre_l, &caret);
-
-// 1) そのまま描画
-drawText(line);
-
-// 2) preedit の部分だけ反転/下線
-drawUnderline(line, pre_s, pre_l);
-
-// 3) キャレットを描画（‘|’を重ね書き or ピクセルカーソル）
-drawCaretAtByte(line, caret);
-*/
 
 
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
 
-/*
-// UTF-8 1文字のバイト数を返す
-static int utf8_charlen(uint8_t c) {
-    if ((c & 0x80) == 0x00) return 1; // ASCII
-    if ((c & 0xE0) == 0xC0) return 2;
-    if ((c & 0xF0) == 0xE0) return 3;
-    if ((c & 0xF8) == 0xF0) return 4;
-    return 1; // 不正 → 1バイトとして扱う
-}
-*/
-/**
- * UTF-8 部分文字列 [i, j) を out に書き込む
- * i: 開始文字位置 (0-based, 含む)
- * j: 終了文字位置 (0-based, 含まない)
- * out_size: 出力バッファのサイズ（バイト）
- * 
- * out は常に NUL 終端される。
- * 戻り値: out に書き込まれた「実バイト数」(NUL除く)
- */
 size_t utf8_substr_range(const char *s, int i, int j,
                          char *out, size_t out_size) {
     if (!s || !out || out_size == 0 || i < 0 || j < i) {
@@ -605,7 +569,6 @@ size_t utf8_substr_range(const char *s, int i, int j,
 #include <stdint.h>
 #include <string.h>
 
-/* ---------- UTF-8 デコード（堅牢め） ---------- */
 static int utf8_decode_advance(const char *s, int max, uint32_t *out_cp) {
     if (max <= 0 || !s || !*s) return 0;
     const unsigned char *p = (const unsigned char *)s;
@@ -644,9 +607,6 @@ static int utf8_decode_advance(const char *s, int max, uint32_t *out_cp) {
     return 1;
 }
 
-/* ---------- 幅計算（CJK=2、曖昧=2、簡易結合=0） ---------- */
-/* ※ 日本語 UI を想定した実用レンジ。より厳密にしたい場合は
-   Markus Kuhn の mk_wcwidth テーブルを採用してください（Public Domain）。 */
 static int is_combining_min(uint32_t u) {
     /* 最低限の結合文字帯（主にダイアクリティカル）だけ 0 幅にする */
     if ((u >= 0x0300 && u <= 0x036F) ||   // Combining Diacritical Marks
@@ -684,7 +644,6 @@ static int mk_wcwidth_cjk(uint32_t u) {
     return 1;
 }
 
-/* ---------- 公開：UTF-8 先頭から i 文字ぶんの表示幅 ---------- */
 int utf8_display_width_upto_cjk(const char *s, int i_chars) {
     if (!s || i_chars <= 0) return 0;
     int cols = 0, done = 0;
@@ -699,7 +658,6 @@ int utf8_display_width_upto_cjk(const char *s, int i_chars) {
     return cols;
 }
 
-/* 区間 [i, j) の表示幅 */
 int utf8_display_width_range_cjk(const char *s, int i_chars, int j_chars) {
     if (!s || j_chars <= i_chars) return 0;
     int wi = utf8_display_width_upto_cjk(s, i_chars);
@@ -707,7 +665,6 @@ int utf8_display_width_range_cjk(const char *s, int i_chars, int j_chars) {
     return (wj - wi);
 }
 
-/* 位置情報：i 文字地点の「バイトオフセット」と「累積表示幅」 */
 typedef struct {
     int byte_offset;   // s 先頭からのバイト位置
     int display_cols;  // 先頭からの表示幅（mk_wcwidth_cjk の合計）
@@ -728,27 +685,10 @@ Utf8PosCJK utf8_pos_at_char_cjk(const char *s, int i_chars) {
     r.byte_offset = (int)(p - s);
     return r;
 }
-/* usage example 
-const char *t = "ABCこんにちは🌏"; // 半角+全角+Emoji
-int w0 = utf8_display_width_upto_cjk(t, 3);  // "ABC" → 3
-int w1 = utf8_display_width_upto_cjk(t, 6);  // "ABCこん" → 3 + 2*3 = 9
-int w2 = utf8_display_width_upto_cjk(t, 7);  // "ABCこんに" → 11
-int w3 = utf8_display_width_upto_cjk(t, 8);  // "ABCこんにち" → 13
-int w4 = utf8_display_width_upto_cjk(t, 9);  // "ABCこんにちは" → 15
-int w5 = utf8_display_width_upto_cjk(t,10);  // 末尾の 🌏 を含む → +2
-
-Utf8PosCJK pos = utf8_pos_at_char_cjk(t, 9); // 9文字地点のオフセットと幅
-// pos.byte_offset を描画キャレットのバイト位置に、pos.display_cols を列位置に使える
-*/
 #include <stdint.h>
 #include <string.h>
 
-/* 既存のヘルパ想定：
-   int utf8_decode_advance(const char *s, int max, uint32_t *out_cp);
-   int mk_wcwidth_cjk(uint32_t u);
-*/
 
-/* 先頭から n 文字ぶんの「累積列幅」と「バイトオフセット」を取得 */
 static void width_and_offset_upto_n(const char *s, int n,
                                     int *out_cols, int *out_byte_off) {
     const char *p = s;
@@ -764,7 +704,6 @@ static void width_and_offset_upto_n(const char *s, int n,
     if (out_byte_off) *out_byte_off = (int)(p - s);
 }
 
-/* 総文字数を数える（コードポイント数） */
 static int utf8_count_chars(const char *s) {
     const char *p = s; int cnt = 0;
     while (*p) {
@@ -775,11 +714,6 @@ static int utf8_count_chars(const char *s) {
     return cnt;
 }
 
-/**
- * 列幅 target_cols に対応する「文字位置」を二分探索で求める。
- * - 戻り値の char_index は、累積幅が target_cols を超えない最大の文字数。
- * - つまり「target_cols 列ぶん表示したときに切れる安全な文字境界」。
- */
 Utf8PosAtColCJK utf8_pos_at_column_cjk(const char *s, int target_cols) {
     Utf8PosAtColCJK r = {0,0,0,0,0,0,0};
     if (!s || target_cols <= 0) {
@@ -843,21 +777,7 @@ Utf8PosAtColCJK utf8_pos_at_column_cjk(const char *s, int target_cols) {
     r.at_exact       = (best_cols == target_cols);
     return r;
 }
-/* usage example
-const char *t = "ABCこんにちは🌏";
-int target = 10; // 10列分で切りたい
 
-Utf8PosAtColCJK pos = utf8_pos_at_column_cjk(t, target);
-// pos.char_index    … 10列に収まる最大の文字数
-//   pos.byte_offset   … その位置のバイト位置（安全に切れる）
-//   pos.display_cols  … 実際に使った列幅 (<= 10)
-//   pos.next_char_cols… 次の1文字の幅（2 なら次を入れると 12 列になる など）
-*/
-
-/**
- * 列幅レンジ [colL, colR) を「文字境界」で切り出す安全な [i,j) を求める。
- * 返り値：書き出したバイト数（out に UTF-8 で格納）。常に NUL 終端。
- */
 size_t utf8_slice_by_columns_cjk(const char *s, int colL, int colR,
                                  char *out, size_t out_sz) {
     if (!s || !out || out_sz == 0 || colR <= colL) {
@@ -882,22 +802,6 @@ size_t utf8_slice_by_columns_cjk(const char *s, int colL, int colR,
 }
 
 
-/**
- * 本文 buf と preedit を連結した「表示用ライン」を out に構築。
- * さらに、preedit/ caret の「バイト位置」と「列幅位置」、そして **行全体の列幅** を返す。
- *
- * buf: [0]=capacity(bytes), [1]=cursor(文字数; code point), [2..]=UTF-8 本文
- * pre: ローマ字プレエディット（ASCII/UTF-8可）
- * out: 連結した UTF-8 文字列（[LEFT][PREEDIT][RIGHT]）
- * out_sz: out の容量（NUL込み）※ out が小さい場合は右側を切り詰めます
- *
- * 出力:
- *  - out_preedit_start_byte / out_preedit_len_bytes / out_caret_byte … out 内のバイト位置
- *  - out_preedit_start_cols / out_preedit_len_cols / out_caret_cols … CJK=2 の列幅
- *  - out_total_cols … 行全体の列幅（**out の切り詰めに関係なく、論理的な総幅**）
- *
- * 戻り値: true=成功（truncation の可能性あり）/ false=引数不正
- */
 bool compose_line_with_preedit_cjk(
     const char *cbuf,
     const Preedit *pre,
@@ -983,21 +887,6 @@ bool compose_line_with_preedit_cjk(
 
 
 
-/**
- * s: 「compose_line_with_preedit_cjk」で組んだ 1 本の行（十分大きなバッファで作ることを推奨）
- * total_cols: その行の総列幅（compose から受け取る）
- * caret_col: その行における caret の「論理列」
- * max_cols: 画面の最大列（表示幅）
- * desired_local_caret_col: 画面内で caret を置きたい列（0～max_cols-1）。たとえば固定で 8 など。
- *
- * 出力:
- *   out: 切り出し済みの表示用 UTF-8 行（NUL終端）
- *   out_sz: out の容量
- *   out_colL: 窓の左端の論理列
- *   out_caret_local_col: out 内での caret の列位置（0～）
- *
- * 返り値: out に書いたバイト数（NUL除く）
- */
 
 
 size_t window_line_by_columns_caret_cjk(
@@ -1086,24 +975,6 @@ size_t window_line_by_columns_caret_cjk(
 //drawCaretAtColumn(caret_local);
 //*/
 
-/**
- * シンプル窓決定:
- *   1) caret_col と desired_local_caret_col から左端 colL を計算
- *   2) 列幅レンジ [colL, colL+window_width) を抽出
- *   3) caret_local を「窓内の列位置」として返す
- *
- * 前提:
- *   - total_cols: 行全体の論理列幅（compose_line_with_preedit_cjk から受け取る）
- *   - caret_col:  行全体での caret の論理列位置（同上）
- *   - max_cols:   画面（窓）の最大列数
- *   - desired_local_caret_col: 窓の中で caret を置きたい列（0..max_cols）
- *
- * 戻り:
- *   - out: 抽出された UTF-8 文字列（NUL 終端）
- *   - *out_colL: 窓の左端論理列
- *   - *out_caret_local_col: 窓内 caret 列（0..window_width）
- *   - 戻り値: out に書いたバイト数（NUL 除く）
- */
 size_t window_from_caret_simple_cjk(
     const char *s, int total_cols, int caret_col,
     int max_cols, int desired_local_caret_col,

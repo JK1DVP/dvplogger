@@ -1,7 +1,7 @@
 /*
  * dvplogger - field companion for ham radio operator
  * dvplogger - アマチュア無線家のためのフィールド支援ツール
- * Copyright (c) 2021-2025 Eiichiro Araki
+ * Copyright (c) 2021-2026 Eiichiro Araki
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -59,7 +59,6 @@ size_t utf8_substr_range(const char *s, int i, int j,
 
 int utf8_display_width_upto_cjk(const char *s, int i_chars) ;
 
-/* 結果パック：target_cols に収まる最大の文字位置を返す */
 typedef struct {
     int char_index;    /* 先頭からの文字数（コードポイント数）。[0..total_chars] */
     int byte_offset;   /* s 先頭からのバイト位置（char_index の先頭） */
@@ -73,30 +72,10 @@ typedef struct {
 Utf8PosAtColCJK utf8_pos_at_column_cjk(const char *s, int target_cols) ;
 
 
-/**
- * 列幅レンジ [colL, colR) を「文字境界」で切り出す安全な [i,j) を求める。
- * 返り値：書き出したバイト数（out に UTF-8 で格納）。常に NUL 終端。
- */
 
 size_t utf8_slice_by_columns_cjk(const char *s, int colL, int colR,
                                  char *out, size_t out_sz) ;
 
-/**
- * 本文 buf と preedit を連結した「表示用ライン」を out に構築。
- * さらに、preedit/ caret の「バイト位置」と「列幅位置」、そして **行全体の列幅** を返す。
- *
- * buf: [0]=capacity(bytes), [1]=cursor(文字数; code point), [2..]=UTF-8 本文
- * pre: ローマ字プレエディット（ASCII/UTF-8可）
- * out: 連結した UTF-8 文字列（[LEFT][PREEDIT][RIGHT]）
- * out_sz: out の容量（NUL込み）※ out が小さい場合は右側を切り詰めます
- *
- * 出力:
- *  - out_preedit_start_byte / out_preedit_len_bytes / out_caret_byte … out 内のバイト位置
- *  - out_preedit_start_cols / out_preedit_len_cols / out_caret_cols … CJK=2 の列幅
- *  - out_total_cols … 行全体の列幅（**out の切り詰めに関係なく、論理的な総幅**）
- *
- * 戻り値: true=成功（truncation の可能性あり）/ false=引数不正
- */
 bool compose_line_with_preedit_cjk(
     const char *cbuf,
     const Preedit *pre,
