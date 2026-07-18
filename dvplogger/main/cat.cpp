@@ -3931,6 +3931,18 @@ void init_rigspec() {
   rig_spec[18].pttmethod = 2;
   rig_spec[18].transverter_freq[0][0] = 0;
   rig_spec[18].band_mask = ~(0b111111111|BAND_MASK_WARC);
+
+  strcpy(rig_spec[19].name , "KX3"); // Elecraft KX3
+  rig_spec[19].cat_type = CAT_TYPE_ELECRAFT_KX;  // cat
+  rig_spec[19].civaddr = 0;
+  rig_spec[19].civport_num=3; 
+  rig_spec[19].civport_reversed=0;  // assume TTL serial port
+  rig_spec[19].civport_baud = 4800;      // default
+  rig_spec[19].cwport = 1;  // 
+  rig_spec[19].rig_type = RIG_TYPE_ELECRAFT_KX;
+  rig_spec[19].pttmethod = 2;
+  rig_spec[19].transverter_freq[0][0] = 0;
+  rig_spec[19].band_mask = ~(0b001111111|BAND_MASK_WARC); // HF-6m+WARC
   
 }
 
@@ -4472,10 +4484,10 @@ void civ_process() {
 	get_cat_kenwood(radio);
 	print_cat(radio);
 	break;
-	  case CAT_TYPE_ELECRAFT_KX: // elecraft
-	  get_cat_elecraft(radio);
-	  print_cat(radio);
-	  break;
+      case CAT_TYPE_ELECRAFT_KX: // elecraft
+	get_cat_elecraft(radio);
+	print_cat(radio);
+	break;
       }
       clear_civ(radio);
     }
