@@ -268,7 +268,7 @@ void init_logwindow() {
   plogw->show_qso_interval=0;
   plogw->qso_interval_timer=0;
 
-  plogw->autopoweroff=60;
+  plogw->autopoweroff=0;
   plogw->count_autopoweroff=0;
 
   //  init_sequence_manager();
