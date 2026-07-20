@@ -1873,6 +1873,16 @@ void expand_sent_exch(char *out, size_t out_size)
     expand_macro_string(out,out_size,tmpbuf);
 }
 
+// Copy a callsign into the historical fixed-width QSO record field.
+// Longer interactive/CALLHIST callsigns are intentionally truncated here so
+// that existing QSO.TXT records remain binary-layout compatible.
+static void copy_qso_callsign(char *dst, const char *src) {
+  if (dst == NULL) return;
+  if (src == NULL) src = "";
+  strncpy(dst, src, LEN_QSO_CALLSIGN);
+  dst[LEN_QSO_CALLSIGN] = '\0';
+}
+
 // create a single QSO log file entry (fixed length string)
 void make_qsolog_entry() {
   struct radio *radio;
@@ -1906,14 +1916,14 @@ void make_qsolog_entry() {
     strcpy(qso.entry.opmode, radio->opmode);
     strcpy(qso.entry.mode, modetype_str[modetype_string(radio->opmode)]);
   }
-  strcpy(qso.entry.mycall, plogw->my_callsign + 2);
+  copy_qso_callsign(qso.entry.mycall, plogw->my_callsign + 2);
   strcpy(qso.entry.sentrst, radio->sent_rst + 2);
   
   char sentexch_buf[100];
   expand_sent_exch(sentexch_buf, sizeof(sentexch_buf));
   strcpy(qso.entry.sentexch, sentexch_buf);
 //  strcpy(qso.entry.sentexch, expand_sent_exch());
-  strcpy(qso.entry.hiscall, radio->callsign + 2);
+  copy_qso_callsign(qso.entry.hiscall, radio->callsign + 2);
   strcpy(qso.entry.rcvrst, radio->recv_rst + 2);
   strcpy(qso.entry.rcvexch, radio->recv_exch + 2);
   qso.entry.remarks[0] = '\0';

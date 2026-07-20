@@ -217,6 +217,10 @@ struct rig {
 #define VFO_B 1
 
 #define LEN_CALLSIGN 16
+// QSO.TXT is a fixed-layout 256-byte record.  Keep callsign fields at the
+// historical 10-character width even though interactive/CALLHIST callsigns
+// may be longer.  Changing this value shifts every following QSO field.
+#define LEN_QSO_CALLSIGN 10
 #define LEN_EXCH 10
 #define LEN_REMARKS 80
 
@@ -616,12 +620,12 @@ union qso_union_tag {
     char mode[3]; // contest op mode  CW, PH, DG ...
     char opmode[6]; // actual operation mode CW, LSB, USB ...
 //    char mycall[11];
-    char mycall[LEN_CALLSIGN+1];
+    char mycall[LEN_QSO_CALLSIGN+1];
     char sentrst[4];
 //    char sentexch[11];
 //    char hiscall[11];
     char sentexch[LEN_EXCH+1];
-    char hiscall[LEN_CALLSIGN+1];
+    char hiscall[LEN_QSO_CALLSIGN+1];
     char rcvrst[4];
 //    char rcvexch[11];
     char rcvexch[LEN_EXCH+1];
