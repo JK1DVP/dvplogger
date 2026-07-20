@@ -217,10 +217,11 @@ struct rig {
 #define VFO_B 1
 
 #define LEN_CALLSIGN 16
-// QSO.TXT is a fixed-layout 256-byte record.  Keep callsign fields at the
-// historical 10-character width even though interactive/CALLHIST callsigns
-// may be longer.  Changing this value shifts every following QSO field.
-#define LEN_QSO_CALLSIGN 10
+// QSO.TXT is a fixed-layout 256-byte record.  Historical records reserve
+// 13 bytes for each callsign field (up to 12 characters plus padding).
+// Keep this independent from LEN_CALLSIGN; changing it shifts all following
+// QSO fields and breaks MAKEDUPE and past-QSO display compatibility.
+#define LEN_QSO_CALLSIGN 12
 #define LEN_EXCH 10
 #define LEN_REMARKS 80
 

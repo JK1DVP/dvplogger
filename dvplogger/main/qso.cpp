@@ -1873,9 +1873,9 @@ void expand_sent_exch(char *out, size_t out_size)
     expand_macro_string(out,out_size,tmpbuf);
 }
 
-// Copy a callsign into the historical fixed-width QSO record field.
-// Longer interactive/CALLHIST callsigns are intentionally truncated here so
-// that existing QSO.TXT records remain binary-layout compatible.
+// Copy a callsign into the historical 13-byte fixed-width QSO field.
+// Longer interactive/CALLHIST callsigns are intentionally truncated to 12
+// characters here so existing QSO.TXT field offsets remain compatible.
 static void copy_qso_callsign(char *dst, const char *src) {
   if (dst == NULL) return;
   if (src == NULL) src = "";
