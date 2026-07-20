@@ -21,13 +21,48 @@
 
 #ifndef FILE_MISC_H
 #define FILE_MISC_H
-#define N_TIME_MEASURE_BANK 20
+#define N_TIME_MEASURE_BANK 32
+
+enum TimeProfileBank {
+  PROF_LOOP_TOTAL = 0,
+  PROF_MUX_RECV,
+  PROF_MEMSTAT,
+  PROF_WEB_TERMINAL,
+  PROF_WEB_BANDMAP,
+  PROF_TCP_SERVER,
+  PROF_MORSE_DECODE,
+  PROF_MORSE_MONITOR,
+  PROF_CARDKEY,
+  PROF_KEY_MAIN,
+  PROF_KEY_EXTERNAL,
+  PROF_QSO_FILE,
+  PROF_USER_MD,
+  PROF_CONTROL_TX,
+  PROF_TIMEKEEP_DISPLAY,
+  PROF_TIMEKEEP,
+  PROF_SO2R_1,
+  PROF_CIV,
+  PROF_WIFI,
+  PROF_INTERVAL,
+  PROF_SIGNAL,
+  PROF_ROTATOR,
+  PROF_SO2R_2,
+  PROF_SATELLITE,
+  PROF_CLUSTER,
+  PROF_ZSERVER,
+  PROF_CW_DISPLAY,
+  PROF_CONSOLE,
+  PROF_PADDLE_DIAG,
+  PROF_MAKEDUPE,
+  PROF_BANK_COUNT
+};
 void copy_token(char *dest,char *src,int idx,char *sep) ;
 void time_measure_clear(int bank);
 void time_measure_start(int bank);
-void time_measure_start_name(int bank,char *name);
+void time_measure_start_name(int bank, const char *name);
 void time_measure_stop(int bank);
 int time_measure_get(int bank);
+const char *time_measure_get_name(int bank);
 unsigned int reverse_bits(unsigned int bin,int digits);
 void print_bin(char *print_to, unsigned int bin, int digits) ;
 void set_location_gl_calc(char *locator) ;

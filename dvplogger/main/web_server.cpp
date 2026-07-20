@@ -529,7 +529,10 @@ InputRestrict pwin_type_index(int i) {
   switch (i) {
   case 0:return Callsign; // My Call
   case 1:return Nospace; // SentExch
-  case 7:return Allowall; // Cluster Cmd
+  case 7:return Nospace; // Cluster Name
+  case 8:return Allowall; // Cluster Cmd
+  case 20:return Nospace; // Cluster2 Name
+  case 21:return Allowall; // Cluster2 Cmd
   case 5:return Nospace; // "Wifi_SSID";
   case 6:return Nospace; // "Wifi_Passwd";
   default : return Allowall;
@@ -559,6 +562,8 @@ const char *pwin_name_index(int i) {
   case 17:return "CW Message 4 F5";
   case 18:return "CW Message 5 F6";
   case 19:return "CW Message 6 F7";        
+  case 20:return "Cluster2 Name";
+  case 21:return "Cluster2 Cmd";
   default : return "--";
   }
   
@@ -586,6 +591,8 @@ char *pwin_index(int i) {
   case 17:return plogw->cw_msg[4]; // cw_msg[4]
   case 18:return plogw->cw_msg[5]; // cw_msg[5]                    
   case 19:return plogw->cw_msg[6]; // cw_msg[6]                    
+  case 20:return plogw->cluster2_name;
+  case 21:return plogw->cluster2_cmd;
   default:return NULL;
   }
 }
@@ -746,41 +753,45 @@ input{box-sizing:border-box;padding:5px;font-size:.95em;width:100%;min-width:9em
 button{padding:5px 10px;white-space:nowrap}.dupe-ok{color:#075f16;font-weight:bold}.dupe-ng{color:#9b1c1c;font-weight:bold}
 #status{min-height:1.4em;font-weight:bold}.note{font-size:.9em}.name{white-space:nowrap}
 .contest-wrap{overflow-x:auto;width:100%}.contest-table{table-layout:fixed;min-width:1180px}
-.contest-table .col-id{width:38px}.contest-table .col-name{width:150px}.contest-table .col-dupe{width:80px}
-.contest-table .col-msg{width:175px}.contest-table .col-exch{width:150px}.contest-table .col-action{width:145px}
-.user-table{table-layout:fixed;min-width:1120px}
+.contest-table .col-id{width:38px}.contest-table .col-name{width:220px}.contest-table .col-dupe{width:80px}
+.contest-table .col-f1{width:175px}.contest-table .col-f2,.contest-table .col-f3{width:135px}
+.contest-table .col-f5{width:160px}.contest-table .col-exch{width:145px}
+.contest-name-field{display:flex;align-items:center;gap:8px;white-space:nowrap}.contest-name-field .name-text{flex:1;min-width:0}
+.nav-links{display:flex;gap:1rem;align-items:center;margin:.2rem 0 1rem}.nav-links a{white-space:nowrap}
+.user-table{table-layout:fixed;min-width:1200px}
 .user-table .col-user-name{width:220px}.user-table .col-msg{width:175px}
-.user-table .col-exch{width:150px}.user-table .col-action{width:145px}
+.user-table .col-exch{width:150px}.user-table .col-dupe{width:110px}
 .user-name-field{display:flex;align-items:center;gap:4px;white-space:nowrap}
 .user-name-field input{min-width:0;flex:1}
 .help{max-width:900px}.help th:first-child,.help td:first-child{white-space:nowrap}.examples code{white-space:nowrap}
 </style></head><body><h2>Contest selection</h2>
+<nav class="nav-links"><a href="/">Home</a><a href="/bandmap">Bandmap</a></nav>
 <p>Current contest: <strong>%CURRENT_CONTEST%</strong></p>
 <p class="note"><strong>%SD_STATUS%</strong><br>Last action: %LAST_STATUS%</p><p id="status"></p>
 <p class="note">Select &amp; Save stores the F1, F2, F3, F5 and sent exchange preset on the SD card, then activates the contest.</p>
 <div class="contest-wrap"><table class="contest-table"><colgroup>
 <col class="col-id"><col class="col-name"><col class="col-dupe">
-<col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg">
-<col class="col-exch"><col class="col-action"></colgroup>
-<thead><tr><th>ID</th><th>Contest</th><th>Dupe</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody>
+<col class="col-f1"><col class="col-f2"><col class="col-f3"><col class="col-f5">
+<col class="col-exch"></colgroup>
+<thead><tr><th>ID</th><th>Contest / Select</th><th>Dupe</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th></tr></thead><tbody>
 )rawliteral";
 
 static const char contests_page_footer[] PROGMEM = R"rawliteral(
 </tbody></table></div><h3>User contest (.MD)</h3>
 <p>Enter the filename without <code>User</code> and <code>.MD</code>. Two User contest settings are retained independently.</p>
 <div class="contest-wrap"><table class="user-table"><colgroup>
-<col class="col-user-name"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-exch"><col class="col-action">
-</colgroup><thead><tr><th>User MD filename</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th><th>Action</th></tr></thead><tbody>
+<col class="col-user-name"><col class="col-dupe"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-exch">
+</colgroup><thead><tr><th>User MD filename / Select</th><th>CW/Phone DUPE rule</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th></tr></thead><tbody>
 <tr%USER1_CLASS%>
-<td><form id="user_contest_form_1" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="0"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_1" name="filename" maxlength="8" value="%USER1_FILENAME%" placeholder="PRESET1" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></div></td>
-<td><input form="user_contest_form_1" name="f1" maxlength="30" value="%USER1_F1%"></td><td><input form="user_contest_form_1" name="f2" maxlength="30" value="%USER1_F2%"></td><td><input form="user_contest_form_1" name="f3" maxlength="30" value="%USER1_F3%"></td><td><input form="user_contest_form_1" name="f5" maxlength="30" value="%USER1_F5%"></td><td><input form="user_contest_form_1" name="exch" maxlength="17" value="%USER1_EXCH%"></td>
-<td><button form="user_contest_form_1" type="submit">%USER1_ACTION%</button></td></tr>
+<td><form id="user_contest_form_1" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="0"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_1" name="filename" maxlength="8" value="%USER1_FILENAME%" placeholder="PRESET1" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_1" type="submit">%USER1_ACTION%</button></div></td>
+<td><label><input form="user_contest_form_1" type="checkbox" name="dupe_separate" value="1" %USER1_DUPE_CHECKED% style="width:auto;min-width:0"> Allow each mode</label></td>
+<td><input form="user_contest_form_1" name="f1" maxlength="30" value="%USER1_F1%"></td><td><input form="user_contest_form_1" name="f2" maxlength="30" value="%USER1_F2%"></td><td><input form="user_contest_form_1" name="f3" maxlength="30" value="%USER1_F3%"></td><td><input form="user_contest_form_1" name="f5" maxlength="30" value="%USER1_F5%"></td><td><input form="user_contest_form_1" name="exch" maxlength="17" value="%USER1_EXCH%"></td></tr>
 <tr%USER2_CLASS%>
-<td><form id="user_contest_form_2" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="1"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_2" name="filename" maxlength="8" value="%USER2_FILENAME%" placeholder="PRESET2" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"></div></td>
-<td><input form="user_contest_form_2" name="f1" maxlength="30" value="%USER2_F1%"></td><td><input form="user_contest_form_2" name="f2" maxlength="30" value="%USER2_F2%"></td><td><input form="user_contest_form_2" name="f3" maxlength="30" value="%USER2_F3%"></td><td><input form="user_contest_form_2" name="f5" maxlength="30" value="%USER2_F5%"></td><td><input form="user_contest_form_2" name="exch" maxlength="17" value="%USER2_EXCH%"></td>
-<td><button form="user_contest_form_2" type="submit">%USER2_ACTION%</button></td></tr>
+<td><form id="user_contest_form_2" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="1"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_2" name="filename" maxlength="8" value="%USER2_FILENAME%" placeholder="PRESET2" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_2" type="submit">%USER2_ACTION%</button></div></td>
+<td><label><input form="user_contest_form_2" type="checkbox" name="dupe_separate" value="1" %USER2_DUPE_CHECKED% style="width:auto;min-width:0"> Allow each mode</label></td>
+<td><input form="user_contest_form_2" name="f1" maxlength="30" value="%USER2_F1%"></td><td><input form="user_contest_form_2" name="f2" maxlength="30" value="%USER2_F2%"></td><td><input form="user_contest_form_2" name="f3" maxlength="30" value="%USER2_F3%"></td><td><input form="user_contest_form_2" name="f5" maxlength="30" value="%USER2_F5%"></td><td><input form="user_contest_form_2" name="exch" maxlength="17" value="%USER2_EXCH%"></td></tr>
 </tbody></table></div>
-<p class="note">The MD file must exist as <code>/FILENAME.MD</code>. Allowed filename characters: A-Z, 0-9, _ and -.</p>
+<p class="note">If <code>/FILENAME.MD</code> is absent, the contest is activated without multiplier checking; dupe checking remains enabled. Allowed filename characters: A-Z, 0-9, _ and -.</p>
 
 <h3>CW message macros</h3>
 <p class="note">Enter the sent exchange itself (for example <code>11</code> or <code>1115</code>) in the <strong>Sent EXCH</strong> box. Use <code>$W</code> in a CW message to transmit that value. Number abbreviation follows the DVPlogger CW-number abbreviation setting.</p>
@@ -807,7 +818,6 @@ static const char contests_page_footer[] PROGMEM = R"rawliteral(
 <tr><td>F5</td><td><code>$C $V$W$P</code></td><td><code>JA1ABC 5NN1115M</code></td></tr>
 </tbody></table>
 <p class="note">Spaces written in the message are transmitted as word spaces. Macros may be joined without spaces, as in <code>$V$W$P</code>.</p>
-<p><a href="/">Back to Home</a></p>
 </body></html>
 )rawliteral";
 
@@ -819,6 +829,7 @@ struct ContestWebPreset {
   char f3[LEN_CWMSG_WINDOW + 1];
   char f5[LEN_CWMSG_WINDOW + 1];
   char exch[LEN_SENT_EXCH_WINDOW + 1];
+  bool dupe_separate;
 };
 
 static constexpr int MAX_CONTEST_WEB_PRESETS = N_CONTEST + 8;
@@ -985,6 +996,7 @@ static void load_contest_web_presets() {
     int p3 = p2 < 0 ? -1 : line.indexOf('\t', p2 + 1);
     int p4 = p3 < 0 ? -1 : line.indexOf('\t', p3 + 1);
     int p5 = p4 < 0 ? -1 : line.indexOf('\t', p4 + 1);
+    int p6 = p5 < 0 ? -1 : line.indexOf('\t', p5 + 1);
     if (p1 < 1 || p2 < 0 || p3 < 0) continue;
     String name = line.substring(0, p1);
     ContestWebPreset *p = find_contest_web_preset(name.c_str(), true);
@@ -994,7 +1006,13 @@ static void load_contest_web_presets() {
       copy_web_value(p->f2, sizeof(p->f2), line.substring(p2 + 1, p3));
       copy_web_value(p->f3, sizeof(p->f3), line.substring(p3 + 1, p4));
       copy_web_value(p->f5, sizeof(p->f5), line.substring(p4 + 1, p5));
-      copy_web_value(p->exch, sizeof(p->exch), line.substring(p5 + 1));
+      if (p6 >= 0) {
+        copy_web_value(p->exch, sizeof(p->exch), line.substring(p5 + 1, p6));
+        p->dupe_separate = line.substring(p6 + 1).toInt() != 0;
+      } else {
+        copy_web_value(p->exch, sizeof(p->exch), line.substring(p5 + 1));
+        p->dupe_separate = false;
+      }
     } else {
       copy_web_value(p->f3, sizeof(p->f3), line.substring(p2 + 1, p3));
       copy_web_value(p->exch, sizeof(p->exch), line.substring(p3 + 1));
@@ -1029,13 +1047,14 @@ static bool save_contest_web_presets() {
     return false;
   }
   size_t written = (size_t)n;
-  n = fprintf(fp, "# contest-name\tF1\tF2\tF3\tF5\tsent-exchange\n");
+  n = fprintf(fp, "# contest-name\tF1\tF2\tF3\tF5\tsent-exchange\tdupe-separate\n");
   if (n > 0) written += (size_t)n;
   for (int i = 0; i < MAX_CONTEST_WEB_PRESETS; ++i) {
     const ContestWebPreset &p = contest_web_presets[i];
     if (!p.used) continue;
-    n = fprintf(fp, "%s\t%s\t%s\t%s\t%s\t%s\n",
-                p.name, p.f1, p.f2, p.f3, p.f5, p.exch);
+    n = fprintf(fp, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+                p.name, p.f1, p.f2, p.f3, p.f5, p.exch,
+                p.dupe_separate ? 1 : 0);
     if (n < 0) {
       fclose(fp);
       set_contest_web_status(String("save failed while writing ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
@@ -1094,6 +1113,7 @@ static bool update_preset_from_request(AsyncWebServerRequest *request, const cha
   AsyncWebParameter *f3 = contest_request_param(request, "f3");
   AsyncWebParameter *f5 = contest_request_param(request, "f5");
   AsyncWebParameter *exch = contest_request_param(request, "exch");
+  AsyncWebParameter *dupe_separate = contest_request_param(request, "dupe_separate");
   if (!f1 || !f2 || !f3 || !f5 || !exch) return false;
   ContestWebPreset *p = find_contest_web_preset(name, true);
   if (!p) return false;
@@ -1102,6 +1122,7 @@ static bool update_preset_from_request(AsyncWebServerRequest *request, const cha
   copy_web_value(p->f3, sizeof(p->f3), f3->value());
   copy_web_value(p->f5, sizeof(p->f5), f5->value());
   copy_web_value(p->exch, sizeof(p->exch), exch->value());
+  p->dupe_separate = dupe_separate && dupe_separate->value() == "1";
   if (result) *result = p;
   return true;
 }
@@ -1164,6 +1185,7 @@ static void setupContestPageHandler() {
               text.replace(tag + "_F3%", html_attr_escape(f3));
               text.replace(tag + "_F5%", html_attr_escape(f5));
               text.replace(tag + "_EXCH%", html_attr_escape(ex));
+              text.replace(tag + "_DUPE_CHECKED%", (p && p->dupe_separate) ? "checked" : "");
               text.replace(tag + "_ACTION%", current ? "Save / Re-select" : "Select &amp; Save");
             }
           }
@@ -1189,15 +1211,14 @@ static void setupContestPageHandler() {
               const char *ex=p?p->exch:(current?plogw->sent_exch+2:plogw->sent_exch+2);
               bool dupe_ok=contest_definition_mask(state->index)==CW_PH_DUPE_OK;
               String form_id = String("contest_form_") + String(state->index);
-              String row=String("<tr")+(current?" class=\"current\"":"")+"><td><form id=\""+form_id+"\" method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"></form>"+String(id)+"</td><td class=\"name\">"+html_attr_escape(name)+"</td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(dupe_ok?"OK C/P":"NG C/P")+"</td>";
+              String action_label = current ? "Save / Re-select" : "Select & Save";
+              String row=String("<tr")+(current?" class=\"current\"":"")+"><td><form id=\""+form_id+"\" method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"></form>"+String(id)+"</td><td class=\"name\"><div class=\"contest-name-field\"><span class=\"name-text\">"+html_attr_escape(name)+"</span><button form=\""+form_id+"\" type=\"submit\">"+action_label+"</button></div></td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(dupe_ok?"OK C/P":"NG C/P")+"</td>";
               row += "<td><input form=\""+form_id+"\" name=\"f1\" maxlength=\"30\" value=\""+html_attr_escape(f1)+"\"></td>";
               row += "<td><input form=\""+form_id+"\" name=\"f2\" maxlength=\"30\" value=\""+html_attr_escape(f2)+"\"></td>";
               row += "<td><input form=\""+form_id+"\" name=\"f3\" maxlength=\"30\" value=\""+html_attr_escape(f3)+"\"></td>";
               row += "<td><input form=\""+form_id+"\" name=\"f5\" maxlength=\"30\" value=\""+html_attr_escape(f5)+"\"></td>";
               row += "<td><input form=\""+form_id+"\" name=\"exch\" maxlength=\"17\" value=\""+html_attr_escape(ex)+"\"></td>";
-              row += String("<td><button form=\"") + form_id + "\" type=\"submit\">"
-                     + (current ? "Save / Re-select" : "Select & Save")
-                     + "</button></td></tr>\n";
+              row += "</tr>\n";
               row.toCharArray(state->text,sizeof(state->text)); state->length=strnlen(state->text,sizeof(state->text)); state->offset=0;
             }
             if (copy()) ++state->index;
@@ -1261,6 +1282,7 @@ static void setupContestPageHandler() {
     strncpy(plogw->contest_name+2,contestName.c_str(),LEN_CONTEST_NAME); plogw->contest_name[2+LEN_CONTEST_NAME]='\0';
     set_current_contest_messages(*p);
     upd_display_info_contest_settings(so2r.radio_selected());
+    set_user_md_fallback_dupe_mask(p->dupe_separate ? CW_PH_DUPE_OK : CW_PH_DUPE_NG);
     if(!start_user_md_contest(plogw->contest_name+2)){set_contest_web_status(String("saved preset, but failed to start loading /")+filename+".MD");request->send(400,"text/plain",contest_web_last_status);return;}
     set_contest_web_status(String("saved preset and started loading /")+filename+".MD, F2=\""+(plogw->cw_msg[1]+2)+"\", EXCH=\""+(plogw->sent_exch+2)+"\"");
     request->redirect("/contests");
@@ -2488,7 +2510,9 @@ static bool valid_web_bandmap_callsign(const char *station) {
 static void update_web_bandmap_entry_flags(struct bandmap_entry *entry,
                                            uint8_t bandid) {
   if (!entry || entry->mode >= NMODEID) return;
-  entry->flag &= ~(BANDMAP_ENTRY_FLAG_WORKED | BANDMAP_ENTRY_FLAG_NEWMULTI);
+  // WORKED is monotonic during a contest.  Preserve it across refreshes;
+  // a transient DUPE-query timeout must not expose the spot again.
+  entry->flag &= ~BANDMAP_ENTRY_FLAG_NEWMULTI;
 
   char *exch_history = nullptr;
   const int bandmode = bandmode_param(bandid, modetype[entry->mode]);
@@ -2582,7 +2606,7 @@ static const char web_bandmap_page[] PROGMEM = R"rawliteral(
 <title>DVPlogger Bandmap</title>
 <style>
 body{font-family:sans-serif;margin:10px;background:#f4f4f4;color:#111}
-h1{font-size:1.35rem;margin:.3rem 0 .8rem}.toolbar{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.7rem}
+h1{font-size:1.35rem;margin:.3rem 0 .35rem}.nav-links{display:flex;gap:1rem;align-items:center;margin:0 0 .8rem}.nav-links a{white-space:nowrap}.toolbar{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.7rem}
 select,button{font-size:1rem;padding:.35rem}.maps{display:flex;gap:10px;overflow-x:auto;align-items:flex-start;padding-bottom:8px}
 .band{flex:0 0 285px;background:#fff;border:1px solid #bbb;border-radius:5px;max-height:78vh;overflow-y:auto}
 .band h2{position:sticky;top:0;background:#e8e8e8;margin:0;padding:.45rem;font-size:1.05rem;border-bottom:1px solid #bbb;z-index:1}
@@ -2591,6 +2615,7 @@ select,button{font-size:1rem;padding:.35rem}.maps{display:flex;gap:10px;overflow
 .spot.newmulti:hover{background:#ffe57a}.freq{font-family:monospace}.call{font-weight:bold}.multi{color:#a00018;font-weight:bold;text-align:center}.age{text-align:right;color:#555}.empty{padding:.8rem;color:#777}
 #status{font-size:.85rem;color:#555;margin-left:.3rem}.more{border:0;background:transparent;padding:0;font-size:1.25rem;line-height:1;cursor:pointer}.menu{position:fixed;display:none;z-index:20;background:#fff;border:1px solid #999;border-radius:5px;box-shadow:0 3px 14px #5558;min-width:170px}.menu button{display:block;width:100%;border:0;background:#fff;text-align:left;padding:.65rem}.menu button:hover{background:#eee}.modal{display:none;position:fixed;inset:0;background:#0007;z-index:30;align-items:center;justify-content:center}.dialog{background:#fff;border-radius:7px;padding:1rem;min-width:min(310px,88vw);box-shadow:0 5px 20px #0008}.dialog h3{margin:.1rem 0 .8rem}.dialog input{box-sizing:border-box;width:100%;font-size:1.1rem;padding:.45rem;text-transform:uppercase}.actions{display:flex;justify-content:flex-end;gap:.6rem;margin-top:1rem}.danger{color:#a00018;font-weight:bold}
 </style></head><body><h1>DVPlogger Bandmap</h1>
+<nav class="nav-links"><a href="/">Home</a><a href="/contests">Contest</a></nav>
 <div class="toolbar"><select id="b0"></select><select id="b1"></select><select id="b2"></select><select id="b3"></select>
 <button id="reload">更新</button><span id="status"></span></div><div id="maps" class="maps"></div><div id="spotMenu" class="menu"><button id="menuDelete" class="danger">Delete Spot</button><button id="menuCorrect">Callsign correction</button></div><div id="spotModal" class="modal"><div class="dialog"><h3 id="modalTitle"></h3><div id="modalText"></div><input id="callInput" maxlength="12" autocomplete="off" autocapitalize="characters"><div class="actions"><button id="modalCancel">Cancel</button><button id="modalApply">Apply</button></div></div></div>
 <script>

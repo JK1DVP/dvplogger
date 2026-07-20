@@ -47,7 +47,45 @@
 
 QueueHandle_t xQueueCATUSBRx,xQueueCATUSBTx;
 
-Ticker civ_reader;
+static void verbose_cat_rx_dump(const struct radio *radio,
+                                const char *source,
+                                const uint8_t *buf,
+                                size_t len)
+{
+  if (!(verbose & 1) || buf == NULL || len == 0) return;
+
+  const int rig_idx = radio ? radio->rig_idx : -1;
+  console->printf("CAT RX rig=%d source=%s len=%u ascii=\"",
+                  rig_idx, source ? source : "?",
+                  (unsigned int)len);
+
+  for (size_t i = 0; i < len; i++) {
+    const uint8_t c = buf[i];
+    switch (c) {
+    case '\r': console->print("\\r"); break;
+    case '\n': console->print("\\n"); break;
+    case '\t': console->print("\\t"); break;
+    case '\\': console->print("\\\\"); break;
+    case '"': console->print("\\\""); break;
+    default:
+      if (c >= 0x20 && c <= 0x7e) console->write(c);
+      else console->print('.');
+      break;
+    }
+  }
+
+  console->print("\" hex=");
+  for (size_t i = 0; i < len; i++) {
+    console->printf("%02X", buf[i]);
+    if (i + 1 < len) console->write(' ');
+  }
+  console->println();
+}
+
+// HardwareSerial CAT/CI-V reception is handled by a dedicated FreeRTOS task.
+// Keep one task for all physical UARTs so each UART has exactly one reader.
+static TaskHandle_t cat_uart_rx_task_handle = NULL;
+static volatile bool cat_uart_rx_task_enabled = false;
 // software serial
 #include <SoftwareSerial.h>
 //SoftwareSerial Serial4; // to remap console i/o to use Serial to communicate with extension board
@@ -120,6 +158,7 @@ void set_frequency_rig_radio(unsigned int freq, struct radio *radio) {
   if (!radio->enabled) return;
 
   radio->f_freqchange_program = 1;
+  radio->freqchange_program_guard = 500;
   // check manual radio
   if (radio->rig_spec->cat_type == 3) {
     // manual rig
@@ -156,16 +195,39 @@ void add_civ_buf(byte c) {
   }
 }
 
+static void cat_uart_rx_task(void *arg);
+
 void attach_interrupt_civ()
 {
-  // attach interrupt handler
-  civ_reader.attach_ms(1, receive_civport_1);
+  // This function is called again when a rig/port is reconfigured.  Reuse the
+  // existing task instead of creating duplicate UART readers.
+  cat_uart_rx_task_enabled = true;
 
+  if (cat_uart_rx_task_handle == NULL) {
+    BaseType_t rc = xTaskCreatePinnedToCore(
+      cat_uart_rx_task,
+      "cat_uart_rx",
+      3072,
+      NULL,
+      3,
+      &cat_uart_rx_task_handle,
+      1
+    );
+
+    if (rc != pdPASS) {
+      cat_uart_rx_task_handle = NULL;
+      cat_uart_rx_task_enabled = false;
+      Serial.println("ERROR: failed to create CAT UART RX task");
+    }
+  }
 }
+
 void detach_interrupt_civ()
 {
-  // attach interrupt handler
-  civ_reader.detach();
+  // Keep the task allocated because attach_interrupt_civ() may be called again
+  // during rig reconfiguration.  Disabling reception avoids task churn and
+  // guarantees that a second reader is never created.
+  cat_uart_rx_task_enabled = false;
 }
 
 
@@ -393,66 +455,303 @@ void send_civ_buf(Stream *civport) {
 
 
 
-void send_cat_cmd(struct radio *radio, char *cmd) {
-  //  console->print("A");
-  // check port
-  switch(radio->rig_spec->civport_num) {
+#define YAESU_QUERY_TIMEOUT_MS 300U
+#define YAESU_QUERY_INTERVAL_MS 20U
+
+enum {
+  YAESU_QUERY_IF = 0,
+  YAESU_QUERY_SM,
+  YAESU_QUERY_TX,
+  YAESU_QUERY_RA,
+  YAESU_QUERY_PA,
+  YAESU_QUERY_PC,
+  YAESU_QUERY_ID,
+  YAESU_QUERY_COUNT
+};
+
+static const char *const yaesu_query_commands[YAESU_QUERY_COUNT] = {
+  "IF;", "SM0;", "TX;", "RA0;", "PA0;", "PC;", "ID;"
+};
+
+static const char *const yaesu_query_prefixes[YAESU_QUERY_COUNT] = {
+  "IF", "SM", "TX", "RA", "PA", "PC", "ID"
+};
+
+static bool is_yaesu_ascii_radio(const struct radio *radio)
+{
+  return radio != NULL && radio->rig_spec != NULL &&
+         (radio->rig_spec->cat_type == CAT_TYPE_YAESU_NEW ||
+          radio->rig_spec->cat_type == CAT_TYPE_YAESU_OLD);
+}
+
+static int yaesu_query_slot(const char *cmd)
+{
+  for (int i = 0; i < YAESU_QUERY_COUNT; ++i) {
+    if (strcmp(cmd, yaesu_query_commands[i]) == 0) return i;
+  }
+  return -1;
+}
+
+static bool cat_cmd_send_raw(struct radio *radio, const char *cmd)
+{
+  bool sent = false;
+  switch (radio->rig_spec->civport_num) {
   case -2: // MANUAL
   case -1: // USB
-  case 0: // port0 console (should not set)
-    // do not send to these port (may be different later) 24/11/24 EAraki
+  case 0:  // port0 console (should not set)
     break;
-  case 1: // port1 BT
-    // use mux transport
+  case 1:  // port1 BT
     if (f_mux_transport) {
-      mux_transport.send_pkt(MUX_PORT_BT_SERIAL_MAIN,MUX_PORT_BT_SERIAL_EXT,(unsigned char *)cmd,strlen(cmd));
+      mux_transport.send_pkt(MUX_PORT_BT_SERIAL_MAIN, MUX_PORT_BT_SERIAL_EXT,
+                             (unsigned char *)cmd, strlen(cmd));
+      sent = true;
     } else {
-      // direct send
-      //      radio->rig_spec->civport->print(cmd);
       Serial2.print(cmd);
+      sent = true;
     }
     break;
   case 2: // port2 CIV
   case 3: // port3 TTL-SER
-    if (radio->rig_spec->civport!=NULL) {
-      //      console->print("B");
+    if (radio->rig_spec->civport != NULL) {
       radio->rig_spec->civport->print(cmd);
+      sent = true;
     } else {
       console->println("!port is NULL");
     }
     break;
-    //#endif
-  case 4: // extension board CAT2 through port 1 (not read directory from port1 but data pushed from demux service)
+  case 4: // extension board CAT2 through MUX transport
     if (f_mux_transport) {
-      // use mux transport
-      mux_transport.send_pkt(MUX_PORT_CAT2_MAIN,MUX_PORT_CAT2_EXT,(unsigned char *)cmd,strlen(cmd));
-      //civport->write(civ_buf, civ_buf_idx);			     
-    } else {
-      // may not send directly
+      mux_transport.send_pkt(MUX_PORT_CAT2_MAIN, MUX_PORT_CAT2_EXT,
+                             (unsigned char *)cmd, strlen(cmd));
+      sent = true;
     }
     break;
   }
-  //  console->print("C");  
-  if (verbose & 1) {
+
+  if (sent && (verbose & 1)) {
     plogw->ostream->print("send cat cmd port:");
     plogw->ostream->print(radio->rig_spec->civport_num);
-    plogw->ostream->print(" cmd:");    
+    plogw->ostream->print(" cmd:");
     plogw->ostream->println(cmd);
   }
-  /* previously ...
-  if (radio->rig_spec->civport != NULL) {
-    // send to serial
-    radio->rig_spec->civport->print(cmd);
+  return sent;
+}
+
+static void yaesu_query_service(struct radio *radio)
+{
+  if (!is_yaesu_ascii_radio(radio)) return;
+
+  uint32_t now = millis();
+
+  if (radio->yaesu_query_pending_prefix[0] != '\0') {
+    if ((int32_t)(now - radio->yaesu_query_pending_until) < 0) return;
+
     if (verbose & 1) {
-      plogw->ostream->print("send cat cmd serial:");
-      plogw->ostream->println(cmd);
+      plogw->ostream->print("CAT query pending timeout rig=");
+      plogw->ostream->print(radio->rig_idx);
+      plogw->ostream->print(" response:");
+      plogw->ostream->println(radio->yaesu_query_pending_prefix);
+    }
+    radio->yaesu_query_pending_prefix[0] = '\0';
+    radio->yaesu_query_next_send_at = now + YAESU_QUERY_INTERVAL_MS;
+  }
+
+  if ((int32_t)(now - radio->yaesu_query_next_send_at) < 0) return;
+  if (radio->yaesu_query_request_mask == 0) return;
+
+  // Round-robin selection prevents frequently requested IF/SM/TX queries
+  // from starving slower status queries such as ID, PA, RA and PC.
+  for (int n = 0; n < YAESU_QUERY_COUNT; ++n) {
+    int slot = (radio->yaesu_query_next_slot + n) % YAESU_QUERY_COUNT;
+    uint16_t bit = (uint16_t)1U << slot;
+    if ((radio->yaesu_query_request_mask & bit) == 0) continue;
+
+    radio->yaesu_query_request_mask &= ~bit;
+    if (cat_cmd_send_raw(radio, yaesu_query_commands[slot])) {
+      strncpy(radio->yaesu_query_pending_prefix,
+              yaesu_query_prefixes[slot],
+              sizeof(radio->yaesu_query_pending_prefix));
+      radio->yaesu_query_pending_prefix[
+          sizeof(radio->yaesu_query_pending_prefix) - 1] = '\0';
+      radio->yaesu_query_pending_until = now + YAESU_QUERY_TIMEOUT_MS;
+      radio->yaesu_query_next_slot = (slot + 1) % YAESU_QUERY_COUNT;
     }
     return;
-  } else {
-    usb_send_cat_buf(cmd);
   }
-  */
 }
+
+static void yaesu_query_response_received(struct radio *radio)
+{
+  if (!is_yaesu_ascii_radio(radio)) return;
+  if (radio->yaesu_query_pending_prefix[0] == '\0') return;
+
+  if (strncmp(radio->cmdbuf, radio->yaesu_query_pending_prefix, 2) != 0)
+    return;
+
+  radio->yaesu_query_pending_prefix[0] = '\0';
+  radio->yaesu_query_next_send_at = millis() + YAESU_QUERY_INTERVAL_MS;
+}
+
+void send_cat_cmd(struct radio *radio, char *cmd)
+{
+  int slot = is_yaesu_ascii_radio(radio) ? yaesu_query_slot(cmd) : -1;
+  if (slot >= 0) {
+    // Coalesce duplicate requests.  The scheduler sends one query at a time.
+    radio->yaesu_query_request_mask |= (uint16_t)1U << slot;
+    yaesu_query_service(radio);
+    return;
+  }
+
+  // Set commands and protocols other than Yaesu ASCII retain their previous
+  // immediate-send behavior; many set commands do not return a response.
+  cat_cmd_send_raw(radio, cmd);
+}
+
+// Return the ESP32 hardware UART used by a radio, or NULL for USB,
+// MUX transport, SoftwareSerial and unconnected/manual ports.
+static HardwareSerial *hardware_serial_port(struct radio *radio)
+{
+  if (radio == NULL || radio->rig_spec == NULL) return NULL;
+
+  Stream *port = radio->rig_spec->civport;
+  switch (radio->rig_spec->civport_num) {
+  case 1: // direct Bluetooth serial; Serial2 is reserved for MUX when enabled
+    if (f_mux_transport != 0) return NULL;
+    port = &Serial2;
+    break;
+  case -1: // USB
+  case 4:  // MUX transport
+  case -2: // manual
+    return NULL;
+  default:
+    break;
+  }
+
+  if (port == &Serial)  return &Serial;
+  if (port == &Serial1) return &Serial1;
+  if (port == &Serial2) return &Serial2;
+  return NULL; // includes Serial3 (SoftwareSerial)
+}
+
+// Called by the dedicated FreeRTOS task.  Read each physical HardwareSerial
+// exactly once, irrespective of CAT protocol, and only enqueue raw bytes.
+// Framing and CAT/CI-V interpretation remain in civ_process() in the main loop.
+// Return true when at least one byte was read, allowing the task to yield
+// aggressively only while traffic is present.
+static bool receive_hardware_serial_task_once()
+{
+  HardwareSerial *handled[3] = { NULL, NULL, NULL };
+  int nhandled = 0;
+  bool received = false;
+
+  for (int i = 0; i < N_RADIO; i++) {
+    if (!unique_num_radio(i)) continue;
+
+    struct radio *radio = &radio_list[i];
+    if (!radio->enabled || radio->rig_spec == NULL || radio->bt_buf == NULL) continue;
+
+    HardwareSerial *port = hardware_serial_port(radio);
+    if (port == NULL) continue;
+
+    bool already_handled = false;
+    for (int j = 0; j < nhandled; j++) {
+      if (handled[j] == port) {
+        already_handled = true;
+        break;
+      }
+    }
+    if (already_handled) continue;
+    if (nhandled < 3) handled[nhandled++] = port;
+
+    while (port->available()) {
+      int value = port->read();
+      if (value < 0) break;
+      received = true;
+
+      int next = (radio->w_ptr + 1) & 0xff;
+      if (next == radio->r_ptr) {
+        // Do not overwrite unread data.  Leave a count which can be inspected
+        // from the main context while debugging a stalled consumer.
+        radio->cat_rx_overflow++;
+        continue;
+      }
+
+      radio->bt_buf[radio->w_ptr] = (char)(uint8_t)value;
+      radio->w_ptr = next;
+    }
+  }
+
+  return received;
+}
+
+static void cat_uart_rx_task(void *arg)
+{
+  (void)arg;
+
+  for (;;) {
+    if (!cat_uart_rx_task_enabled) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    receive_hardware_serial_task_once();
+
+    // Always block for one RTOS tick after draining the UARTs.  The ESP-IDF
+    // UART driver buffers bytes during this delay, and the block allows the
+    // lower-priority main loop to consume the software ring buffer.
+    vTaskDelay(1);
+  }
+}
+
+void receive_cat_data_interrupt(struct radio *radio) {
+  if (!radio->enabled) return;
+  // check port
+  Stream *port;
+  port=radio->rig_spec->civport;
+  switch(radio->rig_spec->civport_num) {
+  case 1: // serial BT
+    return;
+    break;
+  case 4: // can only read in mux transport
+    return;
+    break;
+  default:
+    break;
+  }
+  // HardwareSerial is drained exclusively by the CAT UART RX task.
+  // Keeping a single reader prevents byte reordering between task and loop.
+  if (hardware_serial_port(radio) != NULL) return;
+
+  if (port != NULL) {
+    char c;
+    int count;
+    count=0;
+    //    uint8_t rx_dump[64];
+    size_t rx_dump_len = 0;
+    while (port->available()) {
+      c = port->read();
+      //      if (rx_dump_len < sizeof(rx_dump)) rx_dump[rx_dump_len++] = (uint8_t)c;
+      if (!isprint((unsigned char)c)) continue;
+      radio->bt_buf[radio->w_ptr] = c;
+      radio->w_ptr++;
+      radio->w_ptr %= 256;
+      count++;
+    }
+    //    verbose_cat_rx_dump(radio, "serial", rx_dump, rx_dump_len);
+    //    if (count>0) {
+      //      console->print("receive_cat_data():");
+      //      plogw->ostream->println(count);
+    //    }
+    //    // record max number of received characters during the civport interrupt for debugging
+    //    if (count>receive_civport_count) receive_civport_count=count;
+    
+    return;
+  } else {
+    //    usb_receive_cat_data(radio);
+    return;
+  }
+}
+
 
 void receive_cat_data(struct radio *radio) {
   if (!radio->enabled) return;
@@ -470,18 +769,26 @@ void receive_cat_data(struct radio *radio) {
   default:
     break;
   }
+  // HardwareSerial is drained exclusively by the CAT UART RX task.
+  // Keeping a single reader prevents byte reordering between task and loop.
+  if (hardware_serial_port(radio) != NULL) return;
+
   if (port != NULL) {
     char c;
     int count;
     count=0;
+    uint8_t rx_dump[64];
+    size_t rx_dump_len = 0;
     while (port->available()) {
       c = port->read();
-      if (!isprint(c)) continue;
+      if (rx_dump_len < sizeof(rx_dump)) rx_dump[rx_dump_len++] = (uint8_t)c;
+      if (!isprint((unsigned char)c)) continue;
       radio->bt_buf[radio->w_ptr] = c;
       radio->w_ptr++;
       radio->w_ptr %= 256;
       count++;
     }
+    verbose_cat_rx_dump(radio, "serial", rx_dump, rx_dump_len);
     if (count>0) {
       //      console->print("receive_cat_data():");
       //      plogw->ostream->println(count);
@@ -1244,6 +1551,9 @@ void set_frequency(int freq, struct radio *radio) {
       radio->f_freqchange_program = 0;
       radio->freqchange_timer = 0;
       radio->freqchange_retry = 0;
+      radio->freqchange_program_guard = 500;
+      radio->freq_change_count = 0;
+      radio->freq_change_candidate = 0;
       radio->freq = radio->freq_target;
       radio->freq_prev = radio->freq;  // make the frequency tracking as normal
       if (verbose & 16) plogw->ostream->println("freq_change_completed");
@@ -1266,23 +1576,44 @@ void set_frequency(int freq, struct radio *radio) {
   } else {
     radio->f_freqchange_pending = 0;  // adhoc
 
-    if (freq!=radio->freq) {
-      // frequency changed
-      if (radio->freq_change_count==0 && !is_manual_rig(radio) ) {
-	radio->freq_change_count++;
-	console->print("set_frequency():ignore change freq=");
-	console->print(freq);
-	console->print(" count=");console->println(radio->freq_change_count);
-	// ignore this 
-	return;
-      } else {
-	// changed for sure
-	console->print("set_frequency():confirm change freq=");
-	console->println(freq);
-	radio->freq_change_count=0;	
+    if (freq != radio->freq) {
+      // A program-originated CAT set may be followed by delayed/stale frequency
+      // reports.  Do not interpret those as a human dial movement.
+      if (!is_manual_rig(radio) && radio->freqchange_program_guard > 0) {
+        radio->freq_change_count = 0;
+        radio->freq_change_candidate = 0;
+        if (verbose & 16) {
+          console->print("set_frequency():ignore guarded freq=");
+          console->println(freq);
+        }
+        return;
       }
+
+      // Confirm a manual dial movement only when the *same* new frequency is
+      // received twice.  The old code merely counted any two different
+      // values, so two CAT glitches could force CQ -> S&P.
+      if (!is_manual_rig(radio)) {
+        if (radio->freq_change_count == 0 ||
+            radio->freq_change_candidate != (unsigned int)freq) {
+          radio->freq_change_candidate = freq;
+          radio->freq_change_count = 1;
+          if (verbose & 16) {
+            console->print("set_frequency():candidate freq=");
+            console->println(freq);
+          }
+          return;
+        }
+      }
+
+      if (verbose & 16) {
+        console->print("set_frequency():confirm change freq=");
+        console->println(freq);
+      }
+      radio->freq_change_count = 0;
+      radio->freq_change_candidate = 0;
     } else {
-      radio->freq_change_count=0;
+      radio->freq_change_count = 0;
+      radio->freq_change_candidate = 0;
     }
     // set received frequency
     radio->freq_prev = radio->freq;
@@ -2761,6 +3092,7 @@ void receive_civport(struct radio *radio) {
 	
 	if (verbose &1)
 	  console->printf("xQueueReceive() : CATUSBRx ret = %d size =%d\n", ret,catmsg.size);
+        verbose_cat_rx_dump(radio, "usb", catmsg.buf, catmsg.size);
 	count=0;
 	for (i=0;i<catmsg.size;i++) {
 	  radio->bt_buf[radio->w_ptr] = catmsg.buf[i];
@@ -2780,6 +3112,10 @@ void receive_civport(struct radio *radio) {
     break;
   }
   if (port == NULL) return;
+
+  // Local hardware UARTs are read only by the dedicated CAT UART RX task.  USB, MUX and
+  // SoftwareSerial continue through their existing paths above/below.
+  if (hardware_serial_port(radio) != NULL) return;
   
   type = radio->rig_spec->cat_type;
   if ((type == 1) || (type == 2) || (type == 3)) {
@@ -2804,43 +3140,15 @@ void receive_civport(struct radio *radio) {
 
 
 void receive_civport_interrupt(struct radio *radio) {
-  switch(radio->rig_spec->civport_num) {
-  case 1:
-    // serial BT port
-    if (f_mux_transport==0) receive_civport(radio);    // read
-    break;
-  case -1: // USB
-    receive_civport(radio);
-    break;
-  default:
-    if (radio->rig_spec->civport == NULL) return;
-    //    if ((radio->rig_spec->civport == &Serial3)|| (radio->rig_spec->civport) == &Serial4) return; // software serial ports does not read in Ticker call
-    if ((radio->rig_spec->civport == &Serial3)) return; // software serial ports does not read in Ticker call    
-    //    receive_civport(radio); // stopped receiving serial in interrupt because reading serial in both interrupt and loop result in  corrupted order of data. 25/9/22 
-    
-  }
+  // Kept for source compatibility.  Hardware UART reception is now performed
+  // once per physical port by the dedicated CAT UART RX task.
+  (void)radio;
 }
 
 void receive_civport_1() {
-  struct radio *radio;
-  // check rig #0
-  radio = &radio_list[0];
-  if (radio->enabled) receive_civport_interrupt(radio);
-  
-  // check rig#1
-  if (radio_list[1].rig_spec_idx != radio_list[0].rig_spec_idx) {
-    // ignore if same rig is set for the both rig_ctrl[0] and [1]
-    // read
-    radio = &radio_list[1];
-    if (radio->enabled) receive_civport_interrupt(radio);
-  }
-  // check rig #2
-  if ((radio_list[2].rig_spec_idx != radio_list[0].rig_spec_idx) && (radio_list[2].rig_spec_idx != radio_list[1].rig_spec_idx)) {
-    // ignore if same rig is set for the both [0] and [1]
-    // read
-    radio = &radio_list[2];
-    if (radio->enabled) receive_civport_interrupt(radio);
-  }
+  // Compatibility entry point retained for older callers and diagnostics.
+  // Normal reception is performed continuously by cat_uart_rx_task().
+  receive_hardware_serial_task_once();
 }
 
 void clear_civ(struct radio *radio) {
@@ -3248,10 +3556,14 @@ void config_serial_instance(Stream **civport,int civport_num,int serial_num,int 
     if (reverse) {
       //      uart_set_line_inverse(uart_port_t uart_num, uint32_t inverse_mask)
       uart_set_line_inverse(0, UART_SIGNAL_RXD_INV|UART_SIGNAL_TXD_INV);
+      Serial.setRxBufferSize(128);
       Serial.begin(baud,SERIAL_8N1, rxPin, txPin, true);
+      uart_set_rx_full_threshold(UART_NUM_0, 32);
     } else {
       uart_set_line_inverse(0, UART_SIGNAL_INV_DISABLE);
-      Serial.begin(baud,SERIAL_8N1, rxPin, txPin, false);      
+      Serial.setRxBufferSize(128);
+      Serial.begin(baud,SERIAL_8N1, rxPin, txPin, false);
+      uart_set_rx_full_threshold(UART_NUM_0, 32);      
     }
     *civport=&Serial;
     serial_spec.port[serial_num]=civport_num; // update connection information
@@ -3260,11 +3572,13 @@ void config_serial_instance(Stream **civport,int civport_num,int serial_num,int 
   case 1: // Serial1
     detach_interrupt_civ();
     delay(10);    
-    Serial1.end();    
+    Serial1.end();
+    Serial1.setRxBufferSize(128);
     Serial1.begin(baud,SERIAL_8N1,
 		  rxPin,
 		  txPin,
 		  reverse);
+    uart_set_rx_full_threshold(UART_NUM_1, 32);
     *civport=&Serial1;
     serial_spec.port[serial_num]=civport_num; // update connection information
     attach_interrupt_civ();    
@@ -3273,10 +3587,12 @@ void config_serial_instance(Stream **civport,int civport_num,int serial_num,int 
     detach_interrupt_civ();
     delay(10);        
     Serial2.end();
+    Serial2.setRxBufferSize(128);
     Serial2.begin(baud,SERIAL_8N1,
 		  rxPin,
 		  txPin,
 		  reverse);
+    uart_set_rx_full_threshold(UART_NUM_2, 32);
     *civport=&Serial2;
     serial_spec.port[serial_num]=civport_num; // update connection information
     attach_interrupt_civ();    
@@ -3549,8 +3865,8 @@ void init_mux_serial() {
 // deinitialize mux serial port for esp32 flash sub cpu and stop tiker tasks 
 void deinit_mux_serial()
 {
-  civ_reader.detach();
-
+  //  civ_reader.detach();
+  detach_interrupt_civ();
   Serial2.end();
 
 }
@@ -4292,7 +4608,14 @@ void init_radio(struct radio *radio, const char *rig_name) {
   radio->smeter_azimuth[3] = -1;
   radio->f_smeter_record_ready = 0;
   radio->freq_change_count=0;
+  radio->freq_change_candidate=0;
+  radio->freqchange_program_guard=0;
   radio->cat_status=0;
+  radio->yaesu_query_request_mask = 0;
+  radio->yaesu_query_pending_prefix[0] = '\0';
+  radio->yaesu_query_pending_until = 0;
+  radio->yaesu_query_next_send_at = 0;
+  radio->yaesu_query_next_slot = 0;
 
   radio->bandid_bandmap = 0;
 
@@ -4455,16 +4778,21 @@ void signal_process()
 void civ_process() {
   struct radio *radio;
 
-  int nrig;
-  if (radio_list[0].rig_spec_idx == radio_list[1].rig_spec_idx) {
-    nrig = 1;
-  } else {
-    nrig = 2;
-  }
+  // receive_civ() consumes one byte per call.  Drain several bytes on each
+  // main-loop pass so the 1 ms HardwareSerial producer cannot outrun the
+  // command parser when the loop is temporarily busy.  Keep a finite budget
+  // so a continuously active CAT port cannot monopolize the main loop.
+  const int byte_budget_per_radio = 128;
+
   for (int i = 0; i < N_RADIO; i++) {
     if (!unique_num_radio(i)) continue;
     radio = &radio_list[i];  // main rig reception
-    if (receive_civ(radio)) {
+    yaesu_query_service(radio);
+
+    int byte_budget = byte_budget_per_radio;
+    while ((byte_budget-- > 0) && (radio->r_ptr != radio->w_ptr)) {
+      if (!receive_civ(radio)) continue;
+
       switch (radio->rig_spec->cat_type) {
       case CAT_TYPE_CIV:  // icom
 	print_civ(radio);
@@ -4477,6 +4805,7 @@ void civ_process() {
 	break;
       case CAT_TYPE_YAESU_NEW:  // Yaesu
       case CAT_TYPE_YAESU_OLD:
+        yaesu_query_response_received(radio);
 	get_cat(radio);
 	print_cat(radio);
 	break;
@@ -4527,8 +4856,15 @@ int receive_civ(struct radio *radio) {
 
   char c;
   while (radio->r_ptr != radio->w_ptr) {
-    if (radio->cmd_ptr >= 256) {
-      radio->cmd_ptr = 0;
+    // Leave one byte for the NUL terminator used by ASCII CAT protocols.
+    // If a terminator was lost, discard the partial frame rather than writing
+    // beyond cmdbuf or joining it indefinitely to following responses.
+    if (radio->cmd_ptr >= (int)sizeof(radio->cmdbuf) - 1) {
+      if (verbose & 1) {
+        plogw->ostream->print("!CAT command buffer overflow rig=");
+        plogw->ostream->println(radio->rig_idx);
+      }
+      clear_civ(radio);
     }
     c = radio->bt_buf[radio->r_ptr];
     radio->r_ptr = (radio->r_ptr + 1) % 256;

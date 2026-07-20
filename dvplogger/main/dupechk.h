@@ -25,11 +25,15 @@
 unsigned char bandmode(struct radio *radio) ;
 unsigned char bandmode_param(int bandid,int modetype) ;
 bool dupe_check_nocallhist(char *call, byte bandmode, byte mask) ;
+bool dupe_check_with_exch(const char *call, byte bandmode, byte mask,
+                          char *exch, size_t exch_size);
 void process_dupechk_query_subcpu(char *s);
 void process_dupechk_partial_query_subcpu(char *s);
 int query_dupechk_partial_subcpu(const char *call, byte bandmode, byte mask,
                                  struct check_entry_list *entry_list);
 void process_dupechk_partial_response_maincpu(char *s);
+void request_async_dupe_partial(struct radio *radio, bool include_partial);
+bool request_sp_send_after_dupe(struct radio *radio);
 
 bool dupe_check(struct radio *radio,char *call, byte bandmode, byte mask, bool callhist_check) ;
 bool dupe_check_get_callhist(char *call, byte bandmode, byte mask, bool callhist_check,char *getexch,bool *f_getexch,bool *f_callhist);

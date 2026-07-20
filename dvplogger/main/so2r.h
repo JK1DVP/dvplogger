@@ -238,12 +238,9 @@ public:
 	radio->smeter_peak = SMETER_MINIMUM_DBM;  // very small value
       }
       qso_stat(SendCallExch);
-      // dupe check
-      if (dupe_check(radio,radio->callsign + 2, bandmode(radio), plogw->mask, 1)) {  // cw/ssb both ok ... 0xff cw/ssb not ok 0xff-3
-	radio->dupe = 1;
-      } else {
-	radio->dupe = 0;
-      }
+      // CQ response must remain immediate.  DUPE/partial/CALLHIST results
+      // arrive asynchronously and update the display when ready.
+      request_async_dupe_partial(radio, true);
 
       radio->ptr_curr = 1;
       upd_display();    

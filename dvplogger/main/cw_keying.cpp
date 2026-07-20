@@ -226,6 +226,9 @@ void interrupt_cw_send() {
     if (radio->freqchange_timer > 0) {
       radio->freqchange_timer--;
     }
+    if (radio->freqchange_program_guard > 0) {
+      radio->freqchange_program_guard--;
+    }
 
     if (radio->civ_response_timer > 0) {
       radio->civ_response_timer--;

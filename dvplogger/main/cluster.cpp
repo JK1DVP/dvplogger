@@ -448,7 +448,10 @@ void get_info_cluster(const char *ssrc) {
   bandmode = bandmode_param(bandid,modetype);
   char *exch_history;
   int dupe;
-  entry->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+  // Do not clear an existing WORKED flag when the same spot is refreshed.
+  // A DUPE query can temporarily fail or race with the just-completed QSO
+  // being entered on the subcpu; clearing here would make a worked station
+  // reappear as unworked.
   /*
   if (entry_allband!=NULL) {
     entry_allband->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;

@@ -65,13 +65,12 @@ void copy_token(char *dest,char *src,int idx,char *sep) {
 
 int time_measure_bank[N_TIME_MEASURE_BANK];
 int time_measure_bank_tmp[N_TIME_MEASURE_BANK];
-char time_measure_bank_name[N_TIME_MEASURE_BANK][6]; // name of the measurement
+char time_measure_bank_name[N_TIME_MEASURE_BANK][16]; // name of the measurement
 
 void time_measure_clear(int bank)
 {
   if (bank<0|| bank >=N_TIME_MEASURE_BANK) return;
   time_measure_bank[bank]=0;
-  *time_measure_bank_name[bank]='\0';
 }
 
 void time_measure_start(int bank)
@@ -80,11 +79,12 @@ void time_measure_start(int bank)
   time_measure_bank_tmp[bank]=micros();
 }
 
-void time_measure_start_name(int bank,char *name)
+void time_measure_start_name(int bank, const char *name)
 {
   if (bank<0|| bank >=N_TIME_MEASURE_BANK) return;
   time_measure_bank_tmp[bank]=micros();
-  strncpy(time_measure_bank_name[bank],name,5);
+  strncpy(time_measure_bank_name[bank], name, sizeof(time_measure_bank_name[bank]) - 1);
+  time_measure_bank_name[bank][sizeof(time_measure_bank_name[bank]) - 1] = '\0';
 }
 
 void time_measure_stop(int bank)
@@ -101,7 +101,13 @@ void time_measure_stop(int bank)
 int time_measure_get(int bank)
 {
   if (bank<0|| bank >=N_TIME_MEASURE_BANK) return 0;
-  return     time_measure_bank[bank];
+  return time_measure_bank[bank];
+}
+
+const char *time_measure_get_name(int bank)
+{
+  if (bank < 0 || bank >= N_TIME_MEASURE_BANK) return "";
+  return time_measure_bank_name[bank];
 }
 
 

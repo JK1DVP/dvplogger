@@ -832,6 +832,17 @@ int dupe_callhist_check(const char *call,unsigned char bandmode, unsigned char m
   }
   
 
+  // When the large QSO history/CALLHIST lives on the SubCPU, use the
+  // unified query.  The old code below only searches the main CPU's
+  // callhist_list and therefore could not mark CALLHIST-derived new multis.
+  if (dupechk->dupechk_at == 1) {
+    static char remote_exch[LEN_EXCH + 1];
+    ret = dupe_check_with_exch(call, bandmode, mask,
+                               remote_exch, sizeof(remote_exch));
+    if (remote_exch[0]) *exch_history = remote_exch;
+    return ret;
+  }
+
   int f_callhist = 1;
   // check all qso
   ret = 0;

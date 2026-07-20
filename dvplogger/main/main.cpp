@@ -545,28 +545,41 @@ struct paddle_queue paddle_queue_recv;
 
 int prev_n_adc_i2s_read=0;
 void loop() {
-  if (f_mux_transport) {
-    mux_transport.recv_pkt();
-  } else {
-  }
+  time_measure_start_name(PROF_LOOP_TOTAL, "loop");
+
+  time_measure_start_name(PROF_MUX_RECV, "mux_recv");
+  if (f_mux_transport) mux_transport.recv_pkt();
+  time_measure_stop(PROF_MUX_RECV);
+
+  time_measure_start_name(PROF_MEMSTAT, "memstat");
   process_memstat_watch();
+  time_measure_stop(PROF_MEMSTAT);
 
-  // Drain messages and commands produced by AsyncTCP callbacks in main-loop context.
+  time_measure_start_name(PROF_WEB_TERMINAL, "web_term");
   process_web_terminal_log_queue();
+  time_measure_stop(PROF_WEB_TERMINAL);
+
+  time_measure_start_name(PROF_WEB_BANDMAP, "web_band");
   process_web_bandmap();
+  time_measure_stop(PROF_WEB_BANDMAP);
+
+  time_measure_start_name(PROF_TCP_SERVER, "tcp");
   process_tcpserver();
+  time_measure_stop(PROF_TCP_SERVER);
 
-  decoder.morse_decode_task(); // called in main loop
-  decoder.monitor_task(); // morse decoder display task 
+  time_measure_start_name(PROF_MORSE_DECODE, "decode");
+  decoder.morse_decode_task();
+  time_measure_stop(PROF_MORSE_DECODE);
 
+  time_measure_start_name(PROF_MORSE_MONITOR, "monitor");
+  decoder.monitor_task();
+  time_measure_stop(PROF_MORSE_MONITOR);
 
-  // cardkey
-  if (f_cardkey_present) {
-    cardkey_process();
-  }
-  
-  // Check the latest iambic-keyer diagnostic sample at a modest rate.
-  // Paddle processing itself remains in iambic_keyer_handler().
+  time_measure_start_name(PROF_CARDKEY, "cardkey");
+  if (f_cardkey_present) cardkey_process();
+  time_measure_stop(PROF_CARDKEY);
+
+  time_measure_start_name(PROF_PADDLE_DIAG, "paddle");
   if ((verbose & 2048) && xQueuePaddle != NULL) {
     static uint32_t next_paddle_report_ms = 0;
     uint32_t now_ms = millis();
@@ -578,52 +591,89 @@ void loop() {
       }
     }
   }
-  //  btserial_process();
-  
-  
-  Prs.process_keyrpt_queue(); // process keyboard input
-  Prs1.process_keyrpt_queue(); // process keyboard input from external
+  time_measure_stop(PROF_PADDLE_DIAG);
 
-  process_qso_file_operation(); // advance one SD-backed QSO file operation step
+  time_measure_start_name(PROF_KEY_MAIN, "key_main");
+  Prs.process_keyrpt_queue();
+  time_measure_stop(PROF_KEY_MAIN);
 
+  time_measure_start_name(PROF_KEY_EXTERNAL, "key_ext");
+  Prs1.process_keyrpt_queue();
+  time_measure_stop(PROF_KEY_EXTERNAL);
+
+  time_measure_start_name(PROF_QSO_FILE, "qso_file");
+  process_qso_file_operation();
+  time_measure_stop(PROF_QSO_FILE);
+
+  time_measure_start_name(PROF_USER_MD, "user_md");
   process_user_md_contest();
+  time_measure_stop(PROF_USER_MD);
 
-  Control_TX_process();  
-  time_measure_start(1);    timekeep();  time_measure_stop(1);  
-  time_measure_start(2);
-  //  if (so2r.radio_mode == SO2R::RADIO_MODE_SO2R) { // maybe need to run task in all radio_mode 25/8/13
+  time_measure_start_name(PROF_MAKEDUPE, "makedupe");
+  process_pending_makedupe_rebuild();
+  time_measure_stop(PROF_MAKEDUPE);
+
+  time_measure_start_name(PROF_CONTROL_TX, "control_tx");
+  Control_TX_process();
+  time_measure_stop(PROF_CONTROL_TX);
+
+  time_measure_start_name(PROF_TIMEKEEP, "timekeep");
+  timekeep();
+  time_measure_stop(PROF_TIMEKEEP);
+
+  time_measure_start_name(PROF_SO2R_1, "so2r_1");
   so2r.task();
-  //  }
-  time_measure_stop(2);  
-  time_measure_start(3);   civ_process();time_measure_stop(3);
-  
+  time_measure_stop(PROF_SO2R_1);
 
-  
-  time_measure_start(4);   
+  time_measure_start_name(PROF_CIV, "civ");
+  civ_process();
+  time_measure_stop(PROF_CIV);
+
+  time_measure_start_name(PROF_WIFI, "wifi");
   if (wifi_timeout < millis()) {
     wifi_timeout = millis() + 2000;
     check_wifi();
   }
-  time_measure_stop(4);  
-  //  console->println(digitalRead(15));
-  time_measure_start(5);   interval_process(); time_measure_stop(5);  
-  time_measure_start(6);   signal_process();  time_measure_stop(6);  
-  time_measure_start(7);   rotator_sweep_process();  time_measure_stop(7);  
-  //  time_measure_start(8);   repeat_func_process();  time_measure_stop(8);
-  //  time_measure_start(8);   sequence_manager();  time_measure_stop(8);
-  time_measure_start(8);   so2r.task();  time_measure_stop(8);      
+  time_measure_stop(PROF_WIFI);
 
-  if (plogw->sat) {
-    sat_find_nextaos_sequence();
-  }
-  time_measure_start(9);   cluster_process();  time_measure_stop(9);  
+  time_measure_start_name(PROF_INTERVAL, "interval");
+  interval_process();
+  time_measure_stop(PROF_INTERVAL);
+
+  time_measure_start_name(PROF_SIGNAL, "signal");
+  signal_process();
+  time_measure_stop(PROF_SIGNAL);
+
+  time_measure_start_name(PROF_ROTATOR, "rotator");
+  rotator_sweep_process();
+  time_measure_stop(PROF_ROTATOR);
+
+  time_measure_start_name(PROF_SO2R_2, "so2r_2");
+  so2r.task();
+  time_measure_stop(PROF_SO2R_2);
+
+  time_measure_start_name(PROF_SATELLITE, "satellite");
+  if (plogw->sat) sat_find_nextaos_sequence();
+  time_measure_stop(PROF_SATELLITE);
+
+  time_measure_start_name(PROF_CLUSTER, "cluster");
+  cluster_process();
+  time_measure_stop(PROF_CLUSTER);
+
+  time_measure_start_name(PROF_ZSERVER, "zserver");
   zserver_process();
-  time_measure_start(10);   display_cwbuf();  time_measure_stop(10);  
-  //  time_measure_start(11);   tcpserver_process();   time_measure_stop(11);  // replaced with AsyncTCP based process
-  time_measure_start(12);   console_process();   time_measure_stop(12);  
-  //  time_measure_start(13);   loop_usb();   time_measure_stop(13); --> moved to freertos task
+  time_measure_stop(PROF_ZSERVER);
+
+  time_measure_start_name(PROF_CW_DISPLAY, "cw_display");
+  display_cwbuf();
+  time_measure_stop(PROF_CW_DISPLAY);
+
+  time_measure_start_name(PROF_CONSOLE, "console");
+  console_process();
+  time_measure_stop(PROF_CONSOLE);
+
+  time_measure_stop(PROF_LOOP_TOTAL);
   main_loop_revs++;
-  //  #endif
   delay(1);
 }
 

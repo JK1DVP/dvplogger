@@ -555,8 +555,9 @@ void write_allTCPclients(char *buf, int len) {
   if (!buf || len <= 0) return;
   for (int i = 0; i < N_TCPCLIENTS; ++i) {
     if (streamWrapper[i] && clientPool[i] && clientPool[i]->connected()) {
+      // BufferedPrintStream already flushes by size or timeout.  Forcing a
+      // network flush here makes QSO confirmation wait on every Telnet client.
       streamWrapper[i]->write((const uint8_t *)buf, (size_t)len);
-      streamWrapper[i]->flush();
     }
   }
 }

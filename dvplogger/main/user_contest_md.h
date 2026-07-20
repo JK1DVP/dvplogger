@@ -27,6 +27,9 @@
 
 bool is_user_md_contest_name(const char *contest_name);
 bool start_user_md_contest(const char *contest_name);
+// Used when the selected User contest has no .MD file.  The logger remains
+// active with dupe checking but without multiplier validation/counting.
+void set_user_md_fallback_dupe_mask(int mask);
 void process_user_md_contest();
 bool user_md_contest_loading();
 int user_md_multi_check(const char *exchange, int bandid);

@@ -33,6 +33,7 @@
 #include "dupechk.h"
 #include "display.h"
 #include "contest.h"
+#include "qso.h"
 #include "user_contest_md.h"
 #include "cp932_utf8.h"
 
@@ -425,7 +426,32 @@ static void activate_loaded_table() {
                          plogw->mask == CW_PH_DUPE_OK ? "separate" : "combined");
 }
 
+static int fallback_dupe_mask = CW_PH_DUPE_NG;
+
+static void activate_no_multi_contest() {
+  release_user_md_contest();
+  init_multi(NULL, 1, N_BAND - 1);
+  plogw->contest_id = USER_MD_CONTEST_ID;
+  plogw->multi_type = MULTI_TYPE_NORMAL;
+  plogw->mask = fallback_dupe_mask;
+  plogw->cw_pts = 1;
+  sync_dupechk_mask_subcpu(plogw->mask);
+
+  char msg[128];
+  snprintf(msg, sizeof(msg), "contest\\n%s\\nselected.\\nD:%s\\nMult:none",
+           plogw->contest_name + 2,
+           plogw->mask == CW_PH_DUPE_OK ? "OK C/P" : "NG C/P");
+  upd_display_info_flash(msg);
+  plogw->ostream->printf("%s not found: User contest active without multipliers, CW/Phone %s\\n",
+                         ctx.filename,
+                         plogw->mask == CW_PH_DUPE_OK ? "separate" : "combined");
+}
+
 } // namespace
+
+void set_user_md_fallback_dupe_mask(int mask) {
+  fallback_dupe_mask = (mask == CW_PH_DUPE_OK) ? CW_PH_DUPE_OK : CW_PH_DUPE_NG;
+}
 
 bool is_user_md_contest_name(const char *contest_name) {
   return contest_name != NULL && strncasecmp(contest_name, "User", 4) == 0;
@@ -469,7 +495,11 @@ void process_user_md_contest() {
     case USER_MD_OPEN:
       ctx.file = SD.open(ctx.filename, FILE_READ);
       if (!ctx.file || ctx.file.isDirectory()) {
-        set_error("MD file not found");
+        if (ctx.file) ctx.file.close();
+        activate_no_multi_contest();
+        reset_loading_objects();
+        ctx.state = USER_MD_IDLE;
+        request_makedupe_rebuild();
         break;
       }
       ctx.file_size = ctx.file.size();
@@ -527,6 +557,7 @@ void process_user_md_contest() {
       activate_loaded_table();
       reset_loading_objects();
       ctx.state = USER_MD_IDLE;
+      request_makedupe_rebuild();
       break;
 
     case USER_MD_ERROR: {

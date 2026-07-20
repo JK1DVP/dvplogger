@@ -226,49 +226,54 @@ void interval_process() {
     // print_time_measure results and clear counter
     //    usb_task_memory_watermark=uxTaskGetStackHighWaterMark(gxHandle_USBloop);
     //    plogw->ostream->print("usb task mem=");plogw->ostream->print(usb_task_memory_watermark);
-    if (verbose & 1024) plogw->ostream->print(" usec:");
-    char tmp_buf[10];
-    for (int i=0;i<15;i++) {
-      sprintf(tmp_buf,"%4d ",time_measure_get(i));
-      if (verbose & 1024)       plogw->ostream->print(tmp_buf);
-      time_measure_clear(i);
-    }
     if (verbose & 1024) {
+      plogw->ostream->print(" profile:");
+      for (int i = 0; i < PROF_BANK_COUNT; ++i) {
+        const char *name = time_measure_get_name(i);
+        if (name[0] == '\0') continue;
+        plogw->ostream->print(' ');
+        plogw->ostream->print(name);
+        plogw->ostream->print('=');
+        plogw->ostream->print(time_measure_get(i));
+      }
       plogw->ostream->print(" revs=");
-      plogw->ostream->print(main_loop_revs);
-      plogw->ostream->println("");
+      plogw->ostream->println(main_loop_revs);
     }
+    for (int i = 0; i < PROF_BANK_COUNT; ++i) time_measure_clear(i);
     main_loop_revs=0;
 
   }
 
+  // Keep the existing main-loop receive paths for USB and SoftwareSerial.
+  // Local HardwareSerial ports are drained exclusively by the CAT UART RX task;
+  // receive_cat_data() returns immediately for those ports.
+  for (int i = 0; i < N_RADIO; i++) {
+    if (!unique_num_radio(i)) continue;
+
+    radio = &radio_list[i];
+
+    if (!radio->enabled || radio->rig_spec == NULL) continue;
+
+    if (radio->rig_spec->cat_type != 0) {
+      // Yaesu / Kenwood / other ASCII CAT over USB/SoftwareSerial.
+      receive_cat_data(radio);
+    }
+  }
+
+  // Keep the existing 50 ms service interval for non-HardwareSerial CI-V
+  // paths (notably USB and SoftwareSerial).
   if (timeout_cat < millis()) {
     for (int i = 0; i < N_RADIO; i++) {
       if (!unique_num_radio(i)) continue;
 
       radio = &radio_list[i];
 
-      if (!radio->enabled || radio->rig_spec == NULL) {
-	continue;
-      }
+      if (!radio->enabled || radio->rig_spec == NULL) continue;
 
       if (radio->rig_spec->cat_type == 0) {
-	// ICOM CI-V
-	receive_civport(radio);
-      } else {
-	// Yaesu / Kenwood / other ASCII CAT
-	receive_cat_data(radio);
+        receive_civport(radio);
       }
     }
-
-    /*    
-    for (int i = 0; i < N_RADIO; i++) {
-      if (!unique_num_radio(i)) continue;
-      radio = &radio_list[i];
-      //      console->print(i);      
-      receive_cat_data(radio);
-    }
-    */
     timeout_cat = millis() + 50;
   }
 

@@ -555,6 +555,24 @@ int set_station_entry(struct radio *radio, char *station, unsigned int freq, con
   return 1;
 }
 
+
+void mark_bandmap_call_worked(const char *station, int bandid, int qso_bandmode) {
+  if (!station || !*station || bandid < 1 || bandid > N_BAND) return;
+
+  const int band_index = bandid - 1;
+  for (int i = 0; i < bandmap[band_index].nentry; ++i) {
+    struct bandmap_entry *entry = bandmap[band_index].entry + i;
+    if (!entry->station[0] || entry->mode >= NMODEID) continue;
+    if (strcasecmp(entry->station, station) != 0) continue;
+
+    const int spot_bandmode = bandmode_param(bandid, modetype[entry->mode]);
+    if ((spot_bandmode & plogw->mask) == (qso_bandmode & plogw->mask)) {
+      entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+    }
+  }
+  bandmap_disp.f_update = 1;
+}
+
 void pick_entry_bandmap() {
   struct radio *radio;
   radio = so2r.radio_selected();
@@ -562,9 +580,26 @@ void pick_entry_bandmap() {
   console->println(radio->rig_idx);
   
   if (*bandmap_disp.on_cursor_station == '\0') return;
-  // check if selected_radio do not have bandmask bit set
+
   int tmp;
   tmp = freq2bandid(bandmap_disp.on_cursor_freq);
+  if (tmp < 1 || tmp > N_BAND) return;
+
+  const int spot_mode = modetype[bandmap_disp.on_cursor_modeid];
+  const int spot_bandmode = bandmode_param(tmp, spot_mode);
+  if (dupe_check_nocallhist(bandmap_disp.on_cursor_station, spot_bandmode,
+                            plogw->mask)) {
+    mark_bandmap_call_worked(bandmap_disp.on_cursor_station, tmp,
+                             spot_bandmode);
+    if (!plogw->f_console_emu) {
+      plogw->ostream->print("bandmap pick rejected: DUPE ");
+      plogw->ostream->println(bandmap_disp.on_cursor_station);
+    }
+    upd_display_bandmap();
+    return;
+  }
+
+  // check if selected_radio do not have bandmask bit set
   if (!select_appropriate_radio(tmp)) {  // これをpick したbandid で運用されているradio が選ばれるはずがそうなっていない。26/7/8
     if (!plogw->f_console_emu) {      
       plogw->ostream->print("no appropriate rig for bandid");

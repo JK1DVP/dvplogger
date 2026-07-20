@@ -216,7 +216,7 @@ struct rig {
 #define VFO_A 0
 #define VFO_B 1
 
-#define LEN_CALLSIGN 12
+#define LEN_CALLSIGN 16
 #define LEN_EXCH 10
 #define LEN_REMARKS 80
 
@@ -296,6 +296,8 @@ struct radio {
   int f_freqchange_pending; // set when frequency change attempt from program is ongoing
   int f_freqchange_program;
   int freq_change_count;
+  unsigned int freq_change_candidate; // candidate frequency for manual dial-change confirmation
+  int freqchange_program_guard; // suppress late CAT echoes after a program-originated frequency change
   int bandid; // bandid for the current frequency from 1
   int bandid_prev;
   
@@ -353,10 +355,22 @@ struct radio {
   int f_civ_response_expected;
   int civ_response_timer;
   int cat_status; // general purpose variable for cat operation (for example FT817 needs to remember what response is expected)
+
+  // Yaesu ASCII CAT query scheduler.  Query requests are coalesced and
+  // only one command is kept in flight until its matching response arrives.
+  uint16_t yaesu_query_request_mask;
+  char yaesu_query_pending_prefix[3];
+  uint32_t yaesu_query_pending_until;
+  uint32_t yaesu_query_next_send_at;
+  uint8_t yaesu_query_next_slot;
     
   // buffer for radio control ci-v and cat
   char *bt_buf;
-  int r_ptr = 0, w_ptr = 0;
+  // HardwareSerial RX is produced by a dedicated FreeRTOS task and consumed
+  // by the main loop.  Keep the indices volatile so both contexts observe
+  // the current ring-buffer positions.
+  volatile int r_ptr = 0, w_ptr = 0;
+  volatile uint32_t cat_rx_overflow = 0;
   char cmdbuf[256];
   int cmd_ptr = 0;
 

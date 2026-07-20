@@ -1225,13 +1225,36 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 
 	// multi display
       case 0x17:  // ctrl-t: selected multiplier worked status on each band
-        radio->multi = multi_check_option(radio->recv_exch + 2, radio->bandid, 1);
-        upd_display_info_multi_bands(radio);
+        if (modkey_shift(modkey)) {
+          // Ctrl-Shift-T: move the retained multiplier index backward.
+          if (info_disp.multi_ofs > 0) info_disp.multi_ofs--;
+          int saved_multi = radio->multi;
+          radio->multi = -1;  // force display from retained index
+          upd_display_info_multi_bands(radio);
+          radio->multi = saved_multi;
+        } else {
+          radio->multi = multi_check_option(radio->recv_exch + 2, radio->bandid, 1);
+          upd_display_info_multi_bands(radio);
+        }
         break;
 
       case 0x1c:  // ctrl-y: nearby multipliers on the current band
-        radio->multi = multi_check_option(radio->recv_exch + 2, radio->bandid, 1);
-        upd_display_info_multi_nearby(radio);
+        if (modkey_shift(modkey)) {
+          // Ctrl-Shift-Y: move the retained multiplier index forward.
+          int band_index = radio->bandid - 1;
+          if (band_index >= 0 && band_index < N_BAND &&
+              multi_list.multi[band_index] != NULL &&
+              info_disp.multi_ofs + 1 < multi_list.n_multi[band_index]) {
+            info_disp.multi_ofs++;
+          }
+          int saved_multi = radio->multi;
+          radio->multi = -1;  // force display from retained index
+          upd_display_info_multi_bands(radio);
+          radio->multi = saved_multi;
+        } else {
+          radio->multi = multi_check_option(radio->recv_exch + 2, radio->bandid, 1);
+          upd_display_info_multi_nearby(radio);
+        }
         break;
 
       case 0x1b:  // ctrl-x: contest summary and nearby band status
@@ -1681,18 +1704,12 @@ void process_enter(int option) {
 	if (!plogw->f_console_emu) plogw->ostream->println("multi entered ");
       }
 
-      // check bandmap and update flags
-      int idx;
-      idx = search_bandmap(radio->bandid, radio->callsign + 2, modeid_string(radio->opmode));
-      if (idx != -1) {
-	//
-	struct bandmap_entry *p;
-	p = bandmap[radio->bandid - 1].entry + idx;
-	p->flag |= BANDMAP_ENTRY_FLAG_WORKED;
-	console->print("search_bandmap found the station in");console->println(idx);
-      } else {
-	console->println("search_bandmap didn't find the station ");
-      }
+      // Mark every matching spot that is a DUPE under the current
+      // contest band/mode mask.  A station may have several spots at
+      // different frequencies, so updating only search_bandmap()'s first
+      // match leaves stale unworked entries visible.
+      mark_bandmap_call_worked(radio->callsign + 2, radio->bandid,
+                               bandmode(radio));
 
       // bandmap update
       if (radio->cq[radio->modetype] == LOG_SandP) {
@@ -1712,7 +1729,8 @@ void process_enter(int option) {
 	if (!plogw->f_console_emu) plogw->ostream->println("bandmap updated  ");
       }
 
-      upd_display_info_contest_settings(so2r.radio_qso_process());
+      // A full upd_display() follows immediately after the entry is wiped.
+      // Avoid drawing the contest information once here and again there.
     } else {
       sprintf(dp->lcdbuf, "OFF Contest=%d !!!\nNo Dupe/Multi/Score\nperformed.",plogw->f_off_contest);
       upd_display_info_flash(dp->lcdbuf);
@@ -2528,8 +2546,10 @@ void process_enter(int option) {
 	// CQ -> send his callsign and number and move to exch
 	ui_response_call_and_move_to_exch(radio); // send call and number and move to exch
       } else {
-	// S&P -> send my callsign
-	ui_send_mycall(radio);
+        // S&P: never call an unchecked station.  If the combined query is
+        // still running, only this transmit request is deferred; keyboard
+        // processing continues and no "unknown" indication is displayed.
+        if (request_sp_send_after_dupe(radio)) ui_send_mycall(radio);
       }
     }
     break;
@@ -2621,6 +2641,14 @@ void logw_handler(char key, char c)
 
   struct radio *radio;
   radio = so2r.radio_selected();
+  char callsign_before[LEN_CALL_WINDOW + 1];
+  bool callsign_content_changed = false;
+  if (radio->ptr_curr == 0) {
+    strncpy(callsign_before, radio->callsign + 2, LEN_CALL_WINDOW);
+    callsign_before[LEN_CALL_WINDOW] = '\0';
+  } else {
+    callsign_before[0] = '\0';
+  }
   char *pwin;  // pointer to the window
   // handle input character  in window
   // ptr_curr: 10-14(N_CWMSG-1)  cw_msg window
@@ -2794,25 +2822,21 @@ void logw_handler(char key, char c)
   }
 
   
+  // Expensive DUPE/partial checks are needed only when the callsign text
+  // actually changed. Cursor movement and ignored keys used to repeat both
+  // synchronous sub-CPU queries with exactly the same input.
+  if (radio->ptr_curr == 0) {
+    callsign_content_changed =
+      strcmp(callsign_before, radio->callsign + 2) != 0;
+  }
+
   // on-demand processes after editing
   switch (radio->ptr_curr) {
   case 0:  // call sign window
-    if (strlen(radio->callsign + 2) >= 5) {
-      // dupecheck
-      if (dupe_check(radio,radio->callsign + 2, bandmode(radio), plogw->mask, 0)) {  // cw/ssb both ok ... 0xff cw/ssb not ok 0xff-3
-	radio->dupe = 1;
-	// duped callsign and frequency is registered in the bandmap in S&P //(only for phone?)
-	//	  if (radio->modetype==LOG_MODETYPE_PH) {
-	if (radio->cq[radio->modetype] == LOG_SandP) {
-	  register_current_callsign_bandmap();
-	}
-      } else {
-	radio->dupe = 0;
-      }
-
-    }
-    // partial check if appricable
-    ui_perform_partial_check(radio);
+    if (!callsign_content_changed) break;
+    // Do not block keyboard handling on subcpu searches.  One combined
+    // asynchronous request supplies DUPE, exact-match EXCH and partial data.
+    request_async_dupe_partial(radio, true);
       
       
     break;
@@ -2890,13 +2914,8 @@ void switch_logw_entry(int option) {
       // check callsign for callhist, my history and fill in my exchange
       // dupe check
       if (strlen(radio->callsign + 2) >= 3) {
-	if (dupe_check(radio,radio->callsign + 2, bandmode(radio), plogw->mask, 1)) {  // cw/ssb both ok ... 0xff cw/ssb not ok 0xff-3
-	  radio->dupe = 1;
-	} else {
-	  radio->dupe = 0;
-	}
-	// 
-	check_call_show_dx_entity_info(radio);
+        request_async_dupe_partial(radio, true);
+        check_call_show_dx_entity_info(radio);
       }
       radio->ptr_curr = 1;
       break;

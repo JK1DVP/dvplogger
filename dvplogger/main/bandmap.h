@@ -38,6 +38,7 @@ void delete_entry_bandmap() ;
 void set_current_rig_priority() ;
 void pick_entry_bandmap() ;
 void pick_onfreq_station() ;
+void mark_bandmap_call_worked(const char *station, int bandid, int qso_bandmode);
 void init_bandmap_entry(struct bandmap_entry *p) ;
 void init_bandmap() ;
 void set_info_bandmap(int bandid, char *stn, int modeid, unsigned int ifreq, char *remarks);

@@ -1149,11 +1149,18 @@ void upd_display_info_multi_nearby(struct radio *radio) {
     return;
   }
 
+  // Follow a valid multiplier in EXCH.  If EXCH does not currently contain
+  // a valid multiplier, retain the last displayed index so the multiplier
+  // pages remain useful while editing an incomplete exchange.
   int selected = radio->multi;
-  if (selected < 0 || selected >= multi_list.n_multi[band_index]) {
-    display_printStr("mult:Not valid", 10);
-    finish_multi_info_display();
-    return;
+  if (selected >= 0 && selected < multi_list.n_multi[band_index]) {
+    info_disp.multi_ofs = selected;
+  } else {
+    selected = info_disp.multi_ofs;
+    if (selected < 0) selected = 0;
+    if (selected >= multi_list.n_multi[band_index])
+      selected = multi_list.n_multi[band_index] - 1;
+    info_disp.multi_ofs = selected;
   }
 
   snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "mult: %s %s",
@@ -1187,13 +1194,24 @@ void upd_display_info_multi_bands(struct radio *radio) {
   int current_band = radio->bandid - 1;
   if (current_band < 0 || current_band >= N_BAND ||
       multi_list.multi[current_band] == NULL ||
-      radio->multi < 0 || radio->multi >= multi_list.n_multi[current_band]) {
-    display_printStr("mult:Not valid", 10);
+      multi_list.n_multi[current_band] <= 0) {
+    display_printStr("mult:No CHECK", 10);
     finish_multi_info_display();
     return;
   }
 
+  // Follow a valid multiplier in EXCH; otherwise keep the previously shown
+  // index.  Ctrl-Shift-T/Y can move this retained index manually.
   int selected = radio->multi;
+  if (selected >= 0 && selected < multi_list.n_multi[current_band]) {
+    info_disp.multi_ofs = selected;
+  } else {
+    selected = info_disp.multi_ofs;
+    if (selected < 0) selected = 0;
+    if (selected >= multi_list.n_multi[current_band])
+      selected = multi_list.n_multi[current_band] - 1;
+    info_disp.multi_ofs = selected;
+  }
   const char *selected_mul = multi_list.multi[current_band]->mul[selected];
   snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "mult: %s %s", selected_mul,
            multi_list.multi[current_band]->name[selected]);

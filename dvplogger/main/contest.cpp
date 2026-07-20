@@ -31,6 +31,7 @@
 #include "multi.h"
 #include "display.h"
 #include "contest.h"
+#include "qso.h"
 #include "so2r.h"
 #include "user_contest_md.h"
 
@@ -88,7 +89,7 @@ const struct contest_definition contest_defs[N_CONTEST+1] = {
   {32,"OkhotskInt" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_okhotskint,-1,-1,NULL,-1,-1 },
   {33,"JA5Out" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_ja5out,-1,-1,NULL,-1,-1 },      
   {34,"JA5Int" ,CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_ja5int,-1,-1,NULL,-1,-1 },
-  {35,"Shiga",CW_PH_DUPE_NG,1,(MULTI_TYPE_KENGAI | (23<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 23 is Shiga Ken number
+  {35,"Shiga",CW_PH_DUPE_NG,1,(MULTI_TYPE_KENNAI | (23<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 23 is Shiga Ken number
   {36,"AomoriInt",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_aomori_int,-1,-1,  NULL,-1,-1 }, 
   {41,"AomoriOut",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_aomori_out,-1,-1,  NULL,-1,-1 }, 
   {38,"IburiHidakaOut",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_iburihidakaout,-1,-1,  NULL,-1,-1 }, 
@@ -190,7 +191,8 @@ void set_contest_id() {
       if (contest_defs[i].multi2!=NULL) {
 	init_multi(contest_defs[i].multi2,contest_defs[i].multi2_start_band,contest_defs[i].multi2_stop_band);
       }
-      upd_display_info_contest_settings(so2r.radio_selected());      
+      upd_display_info_contest_settings(so2r.radio_selected());
+      request_makedupe_rebuild();
       return;
     }
   }

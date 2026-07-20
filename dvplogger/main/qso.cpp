@@ -50,7 +50,14 @@
 #include "so2r.h"
 
 
-File qsologf;            // qso logf
+File qsologf;
+
+// A synchronous SD flush can take long enough to block the keyboard path.
+// Commit the record immediately, but defer the media flush briefly so the
+// next key/PTT event can be handled first.
+static bool qso_log_flush_pending = false;
+static uint32_t qso_log_flush_due_ms = 0;
+static const uint32_t QSO_LOG_FLUSH_DELAY_MS = 250;            // qso logf
 
 bool qso_log_is_open()
 {
@@ -774,6 +781,10 @@ void open_qsolog() {
 
 void close_qsolog() {
   if (qsologf) {
+    if (qso_log_flush_pending) {
+      qsologf.flush();
+      qso_log_flush_pending = false;
+    }
     qsologf.close();
     if (verbose&4) 	    console->println("closed qsolog.");
   }
@@ -1023,6 +1034,35 @@ static void append_qso_backup_line(int number) {
   }
 }
 
+
+static volatile bool pending_makedupe_rebuild = false;
+
+void request_makedupe_rebuild()
+{
+  pending_makedupe_rebuild = true;
+}
+
+bool qso_file_operation_busy()
+{
+  return qso_file_op.state != QSO_FILE_OP_IDLE;
+}
+
+void process_pending_makedupe_rebuild()
+{
+  if (!pending_makedupe_rebuild) return;
+  if (qso_file_operation_busy() || !qso_log_is_open()) return;
+
+  pending_makedupe_rebuild = false;
+  plogw->ostream->printf("Contest changed to %s: rebuilding dupe/multiplier data\n",
+                         plogw->contest_name + 2);
+  upd_display_info_flash("Contest changed\nRebuilding dupe/multi");
+  init_score();
+  clear_multi_worked();
+  init_dupechk_maincpu();
+  reset_dupechk_subcpu();
+  read_qso_log(READQSO_MAKEDUPE);
+}
+
 void list_qso_backup_files() {
   if (qso_file_op.state != QSO_FILE_OP_IDLE) {
     char display_buf[64];
@@ -1062,6 +1102,12 @@ bool switch_qso_log(int backup_number) {
 
 void process_qso_file_operation() {
   union qso_union_tag rec;
+
+  if (qso_log_flush_pending &&
+      (int32_t)(millis() - qso_log_flush_due_ms) >= 0) {
+    if (qsologf) qsologf.flush();
+    qso_log_flush_pending = false;
+  }
 
   if (qso_file_op.state != QSO_FILE_OP_IDLE) show_qso_file_op_progress(false);
 
@@ -1752,9 +1798,13 @@ void print_qso_logfile() {
     plogw->ostream->print(ret);
     plogw->ostream->println("bytes");
   }
-  qsologf.flush();
+  // Do not block the key-input path on an SD media flush.  The record is
+  // already copied into the filesystem buffer; process_qso_file_operation()
+  // performs the actual flush after a short grace period.
+  qso_log_flush_pending = true;
+  qso_log_flush_due_ms = millis() + QSO_LOG_FLUSH_DELAY_MS;
   if (verbose&4) 	{
-    if (!plogw->f_console_emu) plogw->ostream->println("print_qso_logfile():4");
+    if (!plogw->f_console_emu) plogw->ostream->println("print_qso_logfile():4 flush deferred");
   }
 
   if (!plogw->f_console_emu) plogw->ostream->write(qso.all, len);

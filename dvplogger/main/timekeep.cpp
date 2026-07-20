@@ -308,7 +308,7 @@ void timekeep() {
     }
 
 
-    time_measure_start(14);
+    time_measure_start_name(PROF_TIMEKEEP_DISPLAY, "time_disp");
     /*    sprintf(plogw->tm, "%02d/%02d/%02d-%02d:%02d:%02d", rtctime.year() % 100, rtctime.month(), rtctime.day(),
 	  rtctime.hour(), rtctime.minute(), rtctime.second());*/
     // now refers to my_rtc
@@ -347,7 +347,7 @@ void timekeep() {
       }
 
     }
-    time_measure_stop(14);
+    time_measure_stop(PROF_TIMEKEEP_DISPLAY);
   }
 }
 
