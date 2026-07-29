@@ -794,6 +794,18 @@ void KbdRptParser::init_extKbd()
   
 void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on) 
 {
+  /*
+   * The extension-board keyboard reports each key transition separately.
+   * Treating CapsLock as Ctrl later through f_capslock is racy for chords:
+   * the CapsLock key event can be queued/released independently of Shift+key.
+   * Convert CapsLock to the real Left-Ctrl HID modifier here, before modifier
+   * state and key-down events are generated.  This makes Caps+Shift+2 behave
+   * exactly like Ctrl+Shift+2 and also keeps the existing Ctrl shortcuts.
+   */
+  if (hid_code == UHS_HID_BOOT_KEY_CAPS_LOCK) {
+    hid_code = 0xe0;  // Left Ctrl HID usage
+  }
+
   // receive hid_code and on to process OnControlKeysChanged(prevState, curState)
   // OnKeyDown(), OnKeyUp() updating prevState.bInfo[i] ...
 

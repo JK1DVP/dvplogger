@@ -28,6 +28,7 @@
 #include "decl.h"
 #include "variables.h"
 #include "zserver.h"
+#include "misc.h"
 #include "display.h"
 #include "network.h"
 #include "AsyncTCP.h"
@@ -79,6 +80,7 @@ struct zmerge_context {
   bool repair_mode;
   uint32_t deadline;
   uint32_t next_send;
+  uint32_t last_lcd_update;
   uint32_t *server_ids;
   uint8_t *server_seen;
   size_t server_count;
@@ -123,6 +125,46 @@ static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
 static bool zmerge_append_pending_record();
 static bool zmerge_alloc_work_buffers();
 static void zmerge_free_work_buffers();
+
+static void zmerge_lcd(const char *line1, const char *line2, uint32_t timeout_ms=2000)
+{
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "%s\n%s", line1 ? line1 : "", line2 ? line2 : "");
+  upd_display_info_flash(dp->lcdbuf);
+  info_disp.timer = timeout_ms;
+}
+
+static void zmerge_show_progress(bool force=false)
+{
+  const uint32_t now = millis();
+  if (!force && (uint32_t)(now - zmerge.last_lcd_update) < 500) return;
+  zmerge.last_lcd_update = now;
+
+  switch (zmerge.phase) {
+    case 1:
+      zmerge_lcd("ZMERGE", "Waiting for server");
+      break;
+    case 2:
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "ZMERGE IDs\nServer: %u", (unsigned)zmerge.server_count);
+      upd_display_info_flash(dp->lcdbuf);
+      info_disp.timer = 1500;
+      break;
+    case 3:
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "ZMERGE local: %lu\nUpload: %lu",
+               zmerge.total_records, zmerge.sent_records);
+      upd_display_info_flash(dp->lcdbuf);
+      info_disp.timer = 1500;
+      break;
+    case 4:
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "ZMERGE server\nDownload: %lu/%u",
+               zmerge.received_records, (unsigned)zmerge.server_count);
+      upd_display_info_flash(dp->lcdbuf);
+      info_disp.timer = 1500;
+      break;
+  }
+}
 
 static bool zmerge_alloc_work_buffers()
 {
@@ -598,6 +640,29 @@ static void zmerge_finish(bool success, const char *reason)
                              zmerge.skipped_deleted);
     }
   }
+  if (!success) {
+    zmerge_lcd("ZMERGE failed", reason ? reason : "Unknown error", 4000);
+  } else if (zmerge.repair_mode) {
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "ZMERGE repair done\nRemoved: %lu", zmerge.repair_stats.removed_records);
+    upd_display_info_flash(dp->lcdbuf);
+    info_disp.timer = 4000;
+  } else if (zmerge.dry_run) {
+    unsigned long server_only = (zmerge.server_count > zmerge.common_records)
+                                ? zmerge.server_count - zmerge.common_records : 0;
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "ZMERGE dry done\nLocal:%lu Server:%lu",
+             zmerge.local_only_records, server_only);
+    upd_display_info_flash(dp->lcdbuf);
+    info_disp.timer = 4000;
+  } else {
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "ZMERGE complete\nUp:%lu Down:%lu",
+             zmerge.sent_records, zmerge.received_records);
+    upd_display_info_flash(dp->lcdbuf);
+    info_disp.timer = 4000;
+  }
+
   // Stop the AsyncTCP callback from queueing merge lines before freeing buffers.
   zserver.stat = zserver_client->connected() ? 4 : 0;
   zmerge_reset(true);
@@ -693,19 +758,23 @@ bool zserver_start_merge(bool dry_run)
 {
   if (zmerge.phase != 0) {
     plogw->ostream->println("zmerge: already running");
+    zmerge_lcd("ZMERGE", "Already running", 3000);
     return false;
   }
   if (zserver.stat != 4 || !zserver_client->connected()) {
     plogw->ostream->println("zmerge: Z-Server is not connected and initialized");
+    zmerge_lcd("ZMERGE unavailable", "Z-Server not linked", 4000);
     return false;
   }
   if (!qso_log_is_open()) {
     plogw->ostream->println("zmerge: QSO log is not open");
+    zmerge_lcd("ZMERGE unavailable", "QSO log not open", 4000);
     return false;
   }
   zmerge_reset(false);
   if (!zmerge_alloc_work_buffers()) {
     plogw->ostream->println("zmerge: cannot allocate work buffers in PSRAM");
+    zmerge_lcd("ZMERGE failed", "No work memory", 4000);
     return false;
   }
   plogw->ostream->printf("zmerge: PSRAM work buffers allocated (%u bytes)\n",
@@ -715,6 +784,8 @@ bool zserver_start_merge(bool dry_run)
   zmerge.phase = 1;
   zmerge.dry_run = dry_run;
   zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
+  zmerge.last_lcd_update = 0;
+  zmerge_show_progress(true);
   zserver.stat = 5;
   println_tcpserver(zserver_client, "#ZLOG# BEGINMERGE");
   plogw->ostream->println(dry_run ? "zmerge dry: BEGINMERGE sent" : "zmerge: BEGINMERGE sent");
@@ -755,7 +826,9 @@ int connect_zserver() {
 	plogw->ostream->print(" port:");
 	plogw->ostream->println(zserver_port);
       }
+      memtrace_event("before zserver connect");
       zserver_client->connect(zserver_server, zserver_port);
+      memtrace_event("after zserver connect call");
       return 1;
     } else {
       if (!plogw->f_console_emu) {
@@ -836,6 +909,7 @@ void handleData_zserver(void *arg, AsyncClient *client, void *data, size_t len)
   
 void onDisconnect_zserver(void *arg, AsyncClient *client)
 {
+  memtrace_event("zserver disconnected");
   //  zserver.stat = 0;
   //  zserver.timeout = millis() + 2000;
   if (zmerge.phase != 0) zmerge.abort_requested = true;
@@ -846,6 +920,7 @@ void onDisconnect_zserver(void *arg, AsyncClient *client)
 
 void onConnect_zserver(void *arg, AsyncClient *client)
 {
+  memtrace_event("zserver connected");
   if (!plogw->f_console_emu) {
     plogw->ostream->print("connected to zserver ");
     plogw->ostream->print(zserver_server);
@@ -975,6 +1050,7 @@ void zserver_process() {
     } 
     break;
   case 5: { // merging log with zserver
+    zmerge_show_progress(false);
     if (zmerge.abort_requested || !zserver_client->connected()) {
       zmerge_finish(false, "connection lost");
       break;

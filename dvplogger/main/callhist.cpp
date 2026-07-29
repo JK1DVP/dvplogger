@@ -214,6 +214,21 @@ void copy_tail_character(char *dest, char *s) {
 
 
 void init_callhist() {
+  // When Call History lives on the SUBCPU, the MAIN-side table is unused.
+  // Avoid allocating it in both LOWMEM and normal modes.
+  if (callhist_at == 1) {
+    if (callhist != NULL) {
+      free(callhist);
+      callhist = NULL;
+    }
+    ncallhist = 0;
+    if (f_low_memory_mode) {
+      plogw->ostream->println("LOWMEM: MAIN Call History buffer disabled");
+    } else {
+      plogw->ostream->println("Call History on SUBCPU: MAIN buffer disabled");
+    }
+    return;
+  }
   //  callhist = (struct callhist *)malloc(sizeof(struct callhist) * nmaxcallhist);
   if (callhist!=NULL) {
     free(callhist);

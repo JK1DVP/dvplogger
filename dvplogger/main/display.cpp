@@ -33,6 +33,7 @@
 #endif
 #ifdef U8X8_HAVE_HW_I2C
 #include <Wire.h>
+#include "i2c_guard.h"
 #endif
 
 // normal 1.3inch OLED display
@@ -57,12 +58,92 @@ class U8G2 *u8g2_r;
 #include "dupechk.h"
 #include "cw_keying.h"
 #include "so2r.h"
+#include "freertos/queue.h"
 //#include <u8g2_font_t0_8_mf.h>
 
-uint8_t *dispbuf_r, *dispbuf_l;
+uint8_t *dispbuf_r=nullptr, *dispbuf_l=nullptr;
+
+enum DisplayRequestType : uint8_t {
+  DISPLAY_REQ_UPDATE = 1,
+  DISPLAY_REQ_INFO_FLASH,
+  DISPLAY_REQ_CONTEST_SETTINGS,
+  DISPLAY_REQ_BANDMAP,
+  DISPLAY_REQ_CWBUF
+};
+
+struct DisplayRequest {
+  uint8_t type;
+  int8_t radio_idx;
+  char text[192];
+};
+
+static QueueHandle_t s_display_queue = nullptr;
+static TaskHandle_t s_display_owner = nullptr;
+static volatile uint32_t s_display_dropped = 0;
+
+void init_display_dispatch()
+{
+  s_display_owner = xTaskGetCurrentTaskHandle();
+  if (s_display_queue == nullptr) {
+    s_display_queue = xQueueCreate(8, sizeof(DisplayRequest));
+  }
+}
+
+bool display_is_main_loop()
+{
+  return s_display_owner == nullptr || xTaskGetCurrentTaskHandle() == s_display_owner;
+}
+
+static bool defer_display(uint8_t type, const char *text = nullptr, int radio_idx = -1)
+{
+  if (display_is_main_loop()) return false;
+  if (s_display_queue == nullptr) return true;
+  DisplayRequest req{};
+  req.type = type;
+  req.radio_idx = radio_idx;
+  if (text) strlcpy(req.text, text, sizeof(req.text));
+  if (xQueueSend(s_display_queue, &req, 0) != pdTRUE) ++s_display_dropped;
+  return true;
+}
+
+void process_display_requests()
+{
+  if (!display_is_main_loop() || s_display_queue == nullptr) return;
+  DisplayRequest req;
+  int budget = 8;
+  while (budget-- > 0 && xQueueReceive(s_display_queue, &req, 0) == pdTRUE) {
+    switch (req.type) {
+      case DISPLAY_REQ_UPDATE: upd_display(); break;
+      case DISPLAY_REQ_INFO_FLASH: upd_display_info_flash(req.text); break;
+      case DISPLAY_REQ_CONTEST_SETTINGS:
+        if (req.radio_idx >= 0 && req.radio_idx < 3)
+          upd_display_info_contest_settings(&radio_list[req.radio_idx]);
+        break;
+      case DISPLAY_REQ_BANDMAP: upd_display_bandmap(); break;
+      case DISPLAY_REQ_CWBUF: display_cw_buf_lcd(req.text); break;
+    }
+  }
+  if (s_display_dropped) {
+    console->printf("display queue: %lu request(s) dropped\n", (unsigned long)s_display_dropped);
+    s_display_dropped = 0;
+  }
+}
+
+static void i2c_guarded_send_buffer(U8G2 *display, const char *owner)
+{
+  if (display == nullptr) return;
+  if (!i2c_bus_lock(owner, pdMS_TO_TICKS(10))) return;
+  uint32_t started_us = micros();
+  display->sendBuffer();
+  uint32_t elapsed_us = micros() - started_us;
+  i2c_bus_unlock(owner);
+  i2c_diag_io(owner, elapsed_us);
+}
+
 
 #define WCOL_STR "                 "
 void display_cw_buf_lcd(char *buf) {
+  if (defer_display(DISPLAY_REQ_CWBUF, buf)) return;
   int LCD_CW_POSY ;
   LCD_CW_POSY=dp->hcol[0]*4;
   //#define LCD_CW_POSY (24 + 13 + 13)
@@ -87,7 +168,7 @@ void display_cw_buf_lcd(char *buf) {
     u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*10/10, 128);
     break;
   }
-  u8g2_r->sendBuffer();  // transfer internal memory to the display
+  i2c_guarded_send_buffer(u8g2_r, "oled_r");  // transfer internal memory to the display
   if (plogw->f_console_emu) {
     char buf[20], buf1[40];
     sprintf(buf, "\033[%d;%dH", int(LCD_CW_POSY / dp->hcol[0]) + 1, 40);
@@ -112,6 +193,7 @@ void select_right_display() {
 
 // print string to the specified column in the display
 void display_printStr(char *s, byte ycol) {
+  if (!display_is_main_loop()) return;
 
   if (ycol >= 10) {
     // select left
@@ -151,6 +233,7 @@ void display_printStr(char *s, byte ycol) {
 // Display a newline-delimited string on the left display.
 // The input may point to a string literal, so it must not be modified.
 void upd_display_info_flash(const char *s) {
+  if (defer_display(DISPLAY_REQ_INFO_FLASH, s)) return;
   select_left_display();
   u8g2_l->clearBuffer();  // clear the internal memory
   if (plogw->f_console_emu) {
@@ -176,7 +259,7 @@ void upd_display_info_flash(const char *s) {
   }
 
   info_disp.show_info = INFO_DISP_FLASH;
-  u8g2_l->sendBuffer();  // transfer internal memory to the display
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
   // set timer
   info_disp.timer = 5000;
 }
@@ -509,6 +592,7 @@ void upd_display_freq(unsigned int freq, char *opmode, int col) {
 }
 
 void upd_display() {
+  if (defer_display(DISPLAY_REQ_UPDATE)) return;
   struct radio *radio;
   radio = so2r.radio_selected();
   if (verbose &4) {
@@ -670,19 +754,21 @@ void upd_display() {
 
   upd_display_stat();
 
-  u8g2_r->sendBuffer();  // transfer internal memory to the display
-  // u8g2_l->sendBuffer();          // transfer internal memory to the display
+  i2c_guarded_send_buffer(u8g2_r, "oled_r");  // transfer internal memory to the display
+  // i2c_guarded_send_buffer(u8g2_l, "oled_l");          // transfer internal memory to the display
 }
 
 
 void right_display_sendBuffer()
 {
-    u8g2_r->sendBuffer();  // transfer internal memory to the display
+  if (!display_is_main_loop()) return;
+    i2c_guarded_send_buffer(u8g2_r, "oled_r");  // transfer internal memory to the display
 
 }
 void left_display_sendBuffer()
 {
-    u8g2_l->sendBuffer();  // transfer internal memory to the display
+  if (!display_is_main_loop()) return;
+    i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
 
 }
 
@@ -697,6 +783,16 @@ void right_display_clearBuffer()
 
 
 void init_display() {
+
+  if (dispbuf_r) {
+    free(dispbuf_r);
+    dispbuf_r = nullptr;
+  }
+  if (dispbuf_l) {
+    free(dispbuf_l);
+    dispbuf_l = nullptr;
+  }
+ 
   dp = &disp;
 
   switch(display_type) {
@@ -794,7 +890,7 @@ void init_display() {
   console->println("初期化中...");
   u8g2_l->drawStr(0, 23, JK1DVPLOG_VERSION_STRING);  
 
-  u8g2_l->sendBuffer();  // transfer internal memory to the display
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
   console->println("disp initialized.");
 }
 
@@ -970,7 +1066,7 @@ void upd_display_info_contest_band_nearby(struct radio *radio) {
     display_printStr(dp->lcdbuf, 12 + row);
   }
 
-  u8g2_l->sendBuffer();
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");
   info_disp.show_info = INFO_DISP_CONTEST_SETTINGS;
   info_disp.timer = 5000;
 }
@@ -978,6 +1074,7 @@ void upd_display_info_contest_band_nearby(struct radio *radio) {
 
 
 void upd_display_info_contest_settings(struct radio *radio) {
+  if (defer_display(DISPLAY_REQ_CONTEST_SETTINGS, nullptr, radio ? radio->rig_idx : -1)) return;
 
   //  struct radio *radio;
 
@@ -1056,7 +1153,7 @@ void upd_display_info_contest_settings(struct radio *radio) {
 
     for (int i = info_disp.multi_ofs; i < multi_list.n_multi[radio->bandid-1]; i++) {
       if (i >= multi_list.n_multi[radio->bandid-1]) break;
-      sprintf(buf1, "%c%s ", multi_list.multi_worked[radio->bandid - 1][i] == 1 ? '*' : ' ', multi_list.multi[radio->bandid-1]->mul[i]);
+      sprintf(buf1, "%c%s ", multi_worked_get(&multi_list, radio->bandid - 1, i) ? '*' : ' ', multi_list.multi[radio->bandid-1]->mul[i]);
       len = strlen(buf1);
       if (count + len > 16) {  // use next row
         display_printStr(dp->lcdbuf, 14 + countrow);
@@ -1077,7 +1174,7 @@ void upd_display_info_contest_settings(struct radio *radio) {
 
   }
 
-  u8g2_l->sendBuffer();  // transfer internal memory to the display
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
   // set timer
   info_disp.show_info = INFO_DISP_CONTEST_SETTINGS;   
   info_disp.timer = 5000;
@@ -1091,7 +1188,7 @@ static void begin_multi_info_display() {
 }
 
 static void finish_multi_info_display() {
-  u8g2_l->sendBuffer();
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");
   info_disp.show_info = INFO_DISP_CONTEST_SETTINGS;
   info_disp.timer = 5000;
 }
@@ -1179,7 +1276,7 @@ void upd_display_info_multi_nearby(struct radio *radio) {
   for (int i = start; i < multi_list.n_multi[band_index] && row < 6; i++) {
     char item[20];
     snprintf(item, sizeof(item), "%c%s ",
-             multi_list.multi_worked[band_index][i] ? '*' : ' ',
+             multi_worked_get(&multi_list, band_index, i) ? '*' : ' ',
              multi_list.multi[band_index]->mul[i]);
     print_wrapped_multi_item(&row, &column, item);
   }
@@ -1273,7 +1370,7 @@ void upd_display_info_multi_bands(struct radio *radio) {
       int idx = find_multi_index_on_band(band, mul);
       if (multi_list.multi[band] == NULL || idx < 0) {
         status[band] = '-';
-      } else if (multi_list.multi_worked[band][idx]) {
+      } else if (multi_worked_get(&multi_list, band, idx)) {
         status[band] = '*';
       } else {
         status[band] = '_';
@@ -1434,7 +1531,7 @@ void upd_display_info_to_work_bandmap() {
     nidx++;
     if (nidx >= 6) break;
   }
-  u8g2_l->sendBuffer();  // transfer internal memory to the display
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
   info_disp.show_info = INFO_DISP_SUMMARY; 
   // set timer
   info_disp.timer = 5000;
@@ -1504,7 +1601,7 @@ void upd_display_info_qso(int option) {
       }
 
       upd_disp_info_qso_entry();
-      u8g2_l->sendBuffer();  // transfer internal memory to the display
+      i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
       // set timer
       info_disp.timer = 5000;
       break;
@@ -1578,7 +1675,7 @@ void upd_display_info() {
       return;
       break;
   }
-  u8g2_l->sendBuffer();  // transfer internal memory to the display
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
 }
 void clear_display_emu(int side) {
   int ix, iy;
@@ -1614,7 +1711,21 @@ void upd_disp_info_qso_entry() {
 }
 
 
+static void bandmap_display_heap_trace(const char *tag) {
+  if (defer_display(DISPLAY_REQ_BANDMAP)) return;
+  console->printf("[BANDMAPTRACE] display %-18s free=%u largest=%u min=%u\n",
+                  tag,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+}
+
 void upd_display_bandmap() {
+  static uint32_t trace_sequence = 0;
+  const uint32_t this_trace = ++trace_sequence;
+  const size_t trace_free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t trace_largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (this_trace <= 5) bandmap_display_heap_trace("enter");
   // plogw->ostream->println("upd_display_bandmap()");
   // plogw->ostream->print("top_column:");
   // plogw->ostream->println(bandmap_disp.top_column);
@@ -1648,10 +1759,12 @@ void upd_display_bandmap() {
   // sort the entry
 
   sort_bandmap(bandid);
+  if (this_trace <= 5) bandmap_display_heap_trace("after sort");
 
   select_left_display();
 
   left_display_clearBuffer();
+  if (this_trace <= 5) bandmap_display_heap_trace("after clear buffer");
 
   if (plogw->f_console_emu) {
     clear_display_emu(1);
@@ -1836,6 +1949,18 @@ void upd_display_bandmap() {
     display_printStr(dp->lcdbuf, 10);
   }
 
-  u8g2_l->sendBuffer();  // transfer internal memory to the display
+  if (this_trace <= 5) bandmap_display_heap_trace("before sendBuffer");
+  i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display
+
+  const size_t trace_free_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t trace_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (this_trace <= 5 || trace_free_after + 512 < trace_free_before ||
+      trace_largest_after + 512 < trace_largest_before) {
+    bandmap_display_heap_trace("leave");
+    console->printf("[BANDMAPTRACE] display delta seq=%lu free=%d largest=%d\n",
+                    (unsigned long)this_trace,
+                    (int)trace_free_after - (int)trace_free_before,
+                    (int)trace_largest_after - (int)trace_largest_before);
+  }
 }
 

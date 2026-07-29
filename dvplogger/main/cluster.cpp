@@ -34,7 +34,7 @@
 #include "multi.h"
 #include "multi_process.h"
 #include "tcp_server.h"
-//#include "misc.h"
+#include "misc.h"
 #include "network.h"
 #include "AsyncTCP.h"
 #include "so2r.h"
@@ -47,6 +47,8 @@ int cluster_port = 7000;
 char cluster_buf[NCHR_CLUSTER_RINGBUF];
 struct cluster cluster;
 
+char cluster2_startup_cmd[N_CLUSTER2_STARTUP_CMDS][LEN_CLUSTER_CMD + 3];
+
 static constexpr uint8_t N_CLUSTER_CONNECTIONS = 2;
 static constexpr size_t CLUSTER_RX_EVENT_DATA = 128;
 static constexpr size_t CLUSTER_RX_QUEUE_LEN = 16;
@@ -57,6 +59,7 @@ struct ClusterRuntime {
   char server[40];
   int port;
   uint8_t id;
+  uint8_t startup_index;
 };
 
 static struct cluster cluster2;
@@ -112,7 +115,9 @@ void handleData_cluster(void *arg, AsyncClient *client, void *data, size_t len)
   }
 }
 
-void upd_bandmap_cluster1(const char *cmdbuf) {
+void upd_bandmap_cluster1(uint8_t source, const char *cmdbuf) {
+  const uint8_t cluster_no = source + 1;
+  const uint8_t show_level = source < 2 ? cluster_verbose_level[source] : 0;
   int len;
   len=strlen(cmdbuf);
   if (len > 39 + 3) {
@@ -122,15 +127,15 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
   }
 	
   if (verbose & 16) {
-    console->println("C readline:");
+    console->printf("[CL%u RX raw] ", (unsigned)cluster_no);
     console->println(cmdbuf);
   }
   if (len<75) {
     // short line
-    console->print(":");	  	  
-    console->print(cmdbuf);	  
-    console->print(":short cluster cmdbuf line len=");
-    console->println(len);
+    if (show_level >= 3) {
+      console->printf("[CL%u RX short len=%d] %s\n",
+                      (unsigned)cluster_no, len, cmdbuf);
+    }
     return;
   }
   // check content
@@ -138,9 +143,9 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
     // DX line
     if ((strncmp(cmdbuf + 39, "CW", 2) == 0) || (strstr(cmdbuf + 39, "WPM") != NULL)) {
       // CW
-      if (f_show_cluster >= 1) {
+      if (show_level >= 1) {
 	if (!plogw->f_console_emu) {
-	  console->print("CLUSTER INFO CW:");
+	  console->printf("[CL%u RX CW] ", (unsigned)cluster_no);
 	  console->println(cmdbuf);
 	}
       }
@@ -148,18 +153,18 @@ void upd_bandmap_cluster1(const char *cmdbuf) {
       upd_bandmap_cluster(cmdbuf);
 
     } else {
-      if (f_show_cluster >= 2) {
+      if (show_level >= 2) {
 	if (!plogw->f_console_emu) {
-	  console->print("CLUSTER INFO OTHER:");
+	  console->printf("[CL%u RX DX] ", (unsigned)cluster_no);
 	  console->println(cmdbuf);
 	}
       }
       //upd_bandmap_cluster(cmdbuf);
     }
   } else {
-    if (f_show_cluster > 2) {
+    if (show_level >= 3) {
       if (!plogw->f_console_emu) {
-	console->print("CLUSTER:");
+	console->printf("[CL%u RX] ", (unsigned)cluster_no);
 	console->println(cmdbuf);
       }
     }
@@ -203,7 +208,7 @@ static void cluster_worker_task(void* /*pv*/) {
             }
             std::string line = a.substr(start, nl - start);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (!line.empty()) upd_bandmap_cluster1(line.c_str());
+            if (!line.empty()) upd_bandmap_cluster1(ev.source, line.c_str());
             start = nl + 1;
         }
     }
@@ -220,10 +225,12 @@ void cluster_io_init() {
 
 void onDisconnect_cluster(void *arg, AsyncClient *client)
 {
+  memtrace_event("cluster disconnected");
   ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
   if (!rt) return;
   rt->state->stat = 0;
   rt->state->timeout = millis() + 2000;
+  rt->startup_index = 0;
   if (!plogw->f_console_emu) {
     console->printf("disconnected from cluster %u\n", (unsigned)(rt->id + 1));
   }
@@ -231,6 +238,7 @@ void onDisconnect_cluster(void *arg, AsyncClient *client)
 
 void onConnect_cluster(void *arg, AsyncClient *client)
 {
+  memtrace_event("cluster connected");
   ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
   if (!rt) return;
   if (!plogw->f_console_emu) {
@@ -241,6 +249,7 @@ void onConnect_cluster(void *arg, AsyncClient *client)
           (unsigned)(rt->id + 1), rt->server, rt->port,
           WiFi.localIP().toString().c_str());
   upd_display_info_flash(dp->lcdbuf);
+  rt->startup_index = 0;
   rt->state->stat = 1;
   rt->state->timeout = millis() + 2000;
   renew_timeout_cluster(rt);
@@ -490,7 +499,7 @@ void get_info_cluster(const char *ssrc) {
       console->print(buf);
     } else {
       // check if this is new multi
-      if (multi_list.multi_worked[bandid-1][multi]==0) {
+      if (!multi_worked_get(&multi_list, bandid-1, multi)) {
 	sprintf(buf,"this entry %s is a new multi (multi=%d)\n",exch_history,multi);
 	entry->flag |= BANDMAP_ENTRY_FLAG_NEWMULTI;
 	/*
@@ -587,9 +596,61 @@ void upd_bandmap_cluster(const char *s) {
 }
 
 
-int f_show_cluster = 0;
+uint8_t cluster_verbose_level[2] = {0, 0};
+
+void print_cluster_verbose_status(Stream *out) {
+  if (!out) out = console;
+  out->printf("clusterverbose: cluster1=%u cluster2=%u\n",
+              (unsigned)cluster_verbose_level[0],
+              (unsigned)cluster_verbose_level[1]);
+  out->println("levels: 0=off, 1=CW spots, 2=all DX spots, 3=all RX and TX/control");
+}
+
+bool set_cluster_verbose_level(int cluster_no, int level, Stream *out) {
+  if (!out) out = console;
+  if (cluster_no < 1 || cluster_no > 2 || level < 0 || level > 3) {
+    out->println("usage: clusterverbose [1|2] [0-3]");
+    print_cluster_verbose_status(out);
+    return false;
+  }
+  cluster_verbose_level[cluster_no - 1] = (uint8_t)level;
+  out->printf("cluster %d verbose level=%d\n", cluster_no, level);
+  return true;
+}
 static const char *cluster_user_cmd(uint8_t id) {
   return id == 0 ? plogw->cluster_cmd + 2 : plogw->cluster2_cmd + 2;
+}
+
+void initialize_cluster2_startup_commands() {
+  static bool initialized = false;
+  if (initialized) return;
+  initialized = true;
+
+  static const char *defaults[N_CLUSTER2_STARTUP_CMDS] = {
+    "<MYCALL>",
+    "SKIMMER/SETT",
+    "SH/DX",
+    "",
+    ""
+  };
+
+  for (uint8_t i = 0; i < N_CLUSTER2_STARTUP_CMDS; ++i) {
+    cluster2_startup_cmd[i][0] = LEN_CLUSTER_CMD + 1;
+    cluster2_startup_cmd[i][1] = 0;
+    strlcpy(cluster2_startup_cmd[i] + 2, defaults[i],
+            sizeof(cluster2_startup_cmd[i]) - 2);
+  }
+}
+
+static String expand_cluster2_startup_command(const char *src) {
+  String command = src ? src : "";
+  const char *mycall = plogw->my_callsign + 2;
+
+  if (!mycall || !*mycall) mycall = callsign;
+
+  command.replace("<MYCALL>", mycall);
+  command.replace("$MYCALL", mycall);
+  return command;
 }
 
 static void cluster_process_one(ClusterRuntime *rt) {
@@ -605,9 +666,12 @@ static void cluster_process_one(ClusterRuntime *rt) {
         st->stat = 10;
         st->timeout = millis() + 1000;
       } else if (!rt->client->connected()) {
-        console->printf("connecting to cluster %u %s port %d\n",
-                        (unsigned)(rt->id + 1), rt->server, rt->port);
+        if (cluster_verbose_level[rt->id] >= 3)
+          console->printf("[CL%u CONNECT] %s port %d\n",
+                          (unsigned)(rt->id + 1), rt->server, rt->port);
+        memtrace_event(rt->id == 0 ? "before cluster1 connect" : "before cluster2 connect");
         rt->client->connect(rt->server, rt->port);
+        memtrace_event(rt->id == 0 ? "after cluster1 connect" : "after cluster2 connect");
         st->stat = 10;
         st->timeout = millis() + 10000;
       }
@@ -619,9 +683,41 @@ static void cluster_process_one(ClusterRuntime *rt) {
       break;
     case 1:
       if (st->timeout < millis()) {
+        if (rt->id == 1) {
+          while (rt->startup_index < N_CLUSTER2_STARTUP_CMDS &&
+                 cluster2_startup_cmd[rt->startup_index][2] == '\0') {
+            ++rt->startup_index;
+          }
+
+          if (rt->startup_index < N_CLUSTER2_STARTUP_CMDS) {
+            const uint8_t command_index = rt->startup_index;
+            String command = expand_cluster2_startup_command(
+              cluster2_startup_cmd[command_index] + 2);
+
+            if (command.length() && rt->client->connected()) {
+              println_tcpserver(rt->client, command.c_str());
+
+              if (cluster_verbose_level[rt->id] >= 3 &&
+                  !plogw->f_console_emu) {
+                console->printf("[CL2 INIT %u] %s\n",
+                                (unsigned)(command_index + 1),
+                                command.c_str());
+              }
+            }
+
+            ++rt->startup_index;
+            st->timeout = millis() + 500;
+          } else {
+            st->stat = 5;
+            renew_timeout_cluster(rt);
+          }
+
+          break;
+        }
+
         println_tcpserver(rt->client, callsign);
-        if (!plogw->f_console_emu)
-          console->printf("%s... sent to cluster %u\n", callsign, (unsigned)(rt->id + 1));
+        if (cluster_verbose_level[rt->id] >= 3 && !plogw->f_console_emu)
+          console->printf("[CL%u TX] %s\n", (unsigned)(rt->id + 1), callsign);
         st->stat = 2;
         st->timeout = millis() + 500;
       }
@@ -631,8 +727,8 @@ static void cluster_process_one(ClusterRuntime *rt) {
     case 4:
       if (st->timeout < millis()) {
         println_tcpserver(rt->client, cluster_cmd[st->stat - 2]);
-        if (!plogw->f_console_emu)
-          console->printf("cluster %u: %s\n", (unsigned)(rt->id + 1), cluster_cmd[st->stat - 2]);
+        if (cluster_verbose_level[rt->id] >= 3 && !plogw->f_console_emu)
+          console->printf("[CL%u TX] %s\n", (unsigned)(rt->id + 1), cluster_cmd[st->stat - 2]);
         st->stat++;
         st->timeout = millis() + 500;
       }
@@ -641,8 +737,8 @@ static void cluster_process_one(ClusterRuntime *rt) {
       if (rt->client->connected()) {
         const char *cmd = cluster_user_cmd(rt->id);
         if (*cmd) println_tcpserver(rt->client, cmd);
-        if (!plogw->f_console_emu)
-          console->printf("cluster %u command: %s\n", (unsigned)(rt->id + 1), cmd);
+        if (cluster_verbose_level[rt->id] >= 3 && !plogw->f_console_emu)
+          console->printf("[CL%u TX user] %s\n", (unsigned)(rt->id + 1), cmd);
       }
       st->stat = 5;
       renew_timeout_cluster(rt);
@@ -677,21 +773,26 @@ static void init_cluster_state(struct cluster *st, char *ring_storage) {
 }
 
 void init_cluster_info() {
+  memtrace_event("cluster before io init");
   cluster_io_init();
+  memtrace_event("cluster after io init");
   init_cluster_state(&cluster, cluster_buf);
   init_cluster_state(&cluster2, cluster2_buf);
 
   memset(cluster_rt, 0, sizeof(cluster_rt));
 
   cluster_rt[0].state = &cluster;
+  memtrace_event("before cluster clients");
   cluster_rt[0].client = new AsyncClient;
   cluster_rt[0].port = 7000;
   cluster_rt[0].id = 0;
+  cluster_rt[0].startup_index = 0;
 
   cluster_rt[1].state = &cluster2;
   cluster_rt[1].client = new AsyncClient;
   cluster_rt[1].port = 7000;
   cluster_rt[1].id = 1;
+  cluster_rt[1].startup_index = 0;
 
   client_tcp = cluster_rt[0].client;
 
@@ -702,6 +803,7 @@ void init_cluster_info() {
   }
   set_cluster();
   set_cluster2();
+  memtrace_event("after cluster clients");
 }
 
 static void disconnect_cluster_id(uint8_t id, bool hold) {
@@ -737,6 +839,45 @@ const char *cluster_cmd[3] = { "set dx ext skimmerquality",
 
 void send_cluster_cmd() { if (cluster.stat == 5) cluster.stat = 6; }
 void send_cluster2_cmd() { if (cluster2.stat == 5) cluster2.stat = 6; }
+
+bool send_cluster_terminal_cmd(uint8_t cluster_no, const char *cmd, Stream *out) {
+  if (!out) out = console;
+
+  if (cluster_no < 1 || cluster_no > N_CLUSTER_CONNECTIONS) {
+    out->println("cluster number must be 1 or 2");
+    return false;
+  }
+
+  if (!cmd) cmd = "";
+
+  while (*cmd == ' ' || *cmd == '\t') {
+    ++cmd;
+  }
+
+  if (*cmd == '\0') {
+    out->printf("usage: c%ucmd command\n", (unsigned)cluster_no);
+    return false;
+  }
+
+  ClusterRuntime *rt = &cluster_rt[cluster_no - 1];
+
+  if (!rt->client || !rt->client->connected()) {
+    out->printf("cluster %u is not connected\n",
+                (unsigned)cluster_no);
+    return false;
+  }
+
+  /*
+   * Send directly without changing the persistent Cluster Cmd
+   * settings stored in plogw.
+   */
+  println_tcpserver(rt->client, cmd);
+
+  out->printf("sent to cluster %u: %s\n",
+              (unsigned)cluster_no, cmd);
+
+  return true;
+}
 
 static void set_cluster_id(uint8_t id, const char *setting) {
   ClusterRuntime *rt = &cluster_rt[id];

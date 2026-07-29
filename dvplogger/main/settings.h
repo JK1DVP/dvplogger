@@ -23,7 +23,7 @@
 #define FILE_SETTINGS_H
 
 #include <vector>
-#define N_SETTINGS_DICT 45
+#define N_SETTINGS_DICT 100
 // --- 型定義 ---
 #define DICT_VALUE_TYPE_CHARPTR   0
 #define DICT_VALUE_TYPE_INT       1
@@ -90,4 +90,5 @@ int dump_settings(Stream *f, struct dict_item *dict) ;
 int load_settings(char *fn) ;
 int save_settings(char *fn) ;
 void set_grid_locator_information();
+int load_boot_display_type(const char *path);
 #endif

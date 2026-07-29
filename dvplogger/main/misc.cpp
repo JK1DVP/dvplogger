@@ -261,3 +261,61 @@ void i2c_scan(Stream *out)
     out->println("No I2C devices found");
   }
 }
+
+
+void memtrace_event(const char *tag)
+{
+  if (!f_low_memory_mode || !lowmem_trace) return;
+
+  multi_heap_info_t info;
+  heap_caps_get_info(&info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t free_now = info.total_free_bytes;
+  const size_t largest = info.largest_free_block;
+  const size_t minimum = info.minimum_free_bytes;
+
+  Serial.printf("[MEMTRACE] %-24s free=%u largest=%u min=%u alloc=%u blocks=%u freeblk=%u\n",
+                tag ? tag : "(null)",
+                (unsigned)free_now,
+                (unsigned)largest,
+                (unsigned)minimum,
+                (unsigned)info.total_allocated_bytes,
+                (unsigned)info.allocated_blocks,
+                (unsigned)info.free_blocks);
+}
+
+void memtrace_poll()
+{
+  if (!f_low_memory_mode || !lowmem_trace) return;
+
+  static size_t previous_free = 0;
+  static size_t previous_largest = 0;
+  static uint32_t last_report_ms = 0;
+
+  multi_heap_info_t info;
+  heap_caps_get_info(&info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t free_now = info.total_free_bytes;
+  const size_t largest = info.largest_free_block;
+
+  if (previous_free == 0) {
+    previous_free = free_now;
+    previous_largest = largest;
+    return;
+  }
+
+  const bool free_drop = free_now + 2048 < previous_free;
+  const bool largest_drop = largest + 2048 < previous_largest;
+  const bool critical = free_now < 16000 || largest < 4096;
+  const uint32_t now = millis();
+
+  if ((free_drop || largest_drop || critical) &&
+      (critical ? (now - last_report_ms >= 5000) : true)) {
+    Serial.printf("[MEMTRACE] runtime change           free=%u (%+d) largest=%u (%+d) min=%u\n",
+                  (unsigned)free_now, (int)free_now - (int)previous_free,
+                  (unsigned)largest, (int)largest - (int)previous_largest,
+                  (unsigned)info.minimum_free_bytes);
+    last_report_ms = now;
+  }
+
+  previous_free = free_now;
+  previous_largest = largest;
+}

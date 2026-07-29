@@ -34,6 +34,7 @@
 #include "qso.h"
 #include "so2r.h"
 #include "user_contest_md.h"
+#include "web_server.h"
 
 
 struct contest_definition {
@@ -100,6 +101,64 @@ const struct contest_definition contest_defs[N_CONTEST+1] = {
 };
 //  { 0,"NOMULTI"   ,CW_PH_DUPE_NG,1,0,&multi_test_line,-1,-1,NULL,-1,-1 }, 
 
+
+namespace {
+
+struct contest_selection {
+  int id;
+  char name[sizeof(plogw->contest_name) - 2];
+};
+
+static contest_selection active_contest = {0, ""};
+static contest_selection previous_contest = {0, ""};
+static bool active_contest_valid = false;
+static bool previous_contest_valid = false;
+static bool suppress_contest_history = false;
+
+static bool same_contest(const contest_selection &a, const contest_selection &b) {
+  return a.id == b.id && strcasecmp(a.name, b.name) == 0;
+}
+
+static void contest_name_for_id(int id, char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size == 0) return;
+  dst[0] = '\0';
+
+  if (id == USER_MD_CONTEST_ID &&
+      is_user_md_contest_name(plogw->contest_name + 2)) {
+    strlcpy(dst, plogw->contest_name + 2, dst_size);
+    return;
+  }
+
+  for (int i = 0; i < N_CONTEST; i++) {
+    if (contest_defs[i].id == -1) break;
+    if (contest_defs[i].id == id) {
+      strlcpy(dst, contest_defs[i].name, dst_size);
+      return;
+    }
+  }
+}
+
+static void note_contest_selection(int id, const char *name) {
+  contest_selection next;
+  next.id = id;
+  strlcpy(next.name, name != NULL ? name : "", sizeof(next.name));
+
+  if (!active_contest_valid) {
+    active_contest = next;
+    active_contest_valid = true;
+    return;
+  }
+  if (same_contest(active_contest, next)) return;
+
+  if (!suppress_contest_history) {
+    previous_contest = active_contest;
+    previous_contest_valid = true;
+  }
+  active_contest = next;
+}
+
+}  // namespace
+
 int contest_definition_count() {
   int count = 0;
   while (count < N_CONTEST && contest_defs[count].id != -1) ++count;
@@ -164,9 +223,26 @@ void search_contest_id_from_name()
 
 
 void set_contest_id() {
+  char target_name[sizeof(plogw->contest_name) - 2];
+  contest_name_for_id(plogw->contest_id, target_name, sizeof(target_name));
+
+  // Preserve any Alt-C/runtime edits before leaving the active contest.
+  // CONTEST.TXT remains the persistent source for F1/F2/F3/F5/Sent EXCH.
+  if (active_contest_valid && target_name[0] &&
+      (active_contest.id != plogw->contest_id ||
+       strcasecmp(active_contest.name, target_name) != 0)) {
+    if (!save_contest_runtime_preset(active_contest.name) && plogw->ostream) {
+      plogw->ostream->printf("Contest preset save failed: %s\n",
+                             active_contest.name);
+    }
+  }
+
   if (plogw->contest_id == USER_MD_CONTEST_ID &&
       is_user_md_contest_name(plogw->contest_name + 2)) {
-    start_user_md_contest(plogw->contest_name + 2);
+    if (start_user_md_contest(plogw->contest_name + 2)) {
+      apply_contest_runtime_preset(target_name);
+      note_contest_selection(plogw->contest_id, target_name);
+    }
     return;
   }
   // set contest information based on contest_id referreing to the contest_defs 
@@ -191,6 +267,8 @@ void set_contest_id() {
       if (contest_defs[i].multi2!=NULL) {
 	init_multi(contest_defs[i].multi2,contest_defs[i].multi2_start_band,contest_defs[i].multi2_stop_band);
       }
+      apply_contest_runtime_preset(plogw->contest_name + 2);
+      note_contest_selection(plogw->contest_id, plogw->contest_name + 2);
       upd_display_info_contest_settings(so2r.radio_selected());
       request_makedupe_rebuild();
       return;
@@ -198,5 +276,48 @@ void set_contest_id() {
   }
   plogw->contest_id=0;
   plogw->ostream->println("contest_id not found -> NOMULTI");
+}
+
+bool alternate_contest() {
+  plogw->ostream->printf(
+			 "alternate_contest: active=%d previous=%d current=%d %s\n",
+			 active_contest_valid,
+			 previous_contest_valid,
+			 plogw->contest_id,
+			 plogw->contest_name + 2);
+    
+  if (user_md_contest_loading()) {
+    upd_display_info_flash("Contest switch\nUser MD is loading");
+    info_disp.timer = 2000;
+    return false;
+  }
+  if (!active_contest_valid || !previous_contest_valid) {
+    upd_display_info_flash("Contest alternate\nNo previous contest");
+    info_disp.timer = 2000;
+    return false;
+  }
+
+  const contest_selection old_active = active_contest;
+  const contest_selection target = previous_contest;
+
+  suppress_contest_history = true;
+  plogw->contest_id = target.id;
+  strlcpy(plogw->contest_name + 2, target.name,
+          sizeof(plogw->contest_name) - 2);
+  set_contest_id();
+  suppress_contest_history = false;
+
+  if (!same_contest(active_contest, target)) {
+    return false;
+  }
+  previous_contest = old_active;
+  previous_contest_valid = true;
+
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "Contest switched\n%s", active_contest.name);
+  upd_display_info_flash(dp->lcdbuf);
+  info_disp.timer = 2000;
+  plogw->ostream->printf("Contest alternate: %s\n", active_contest.name);
+  return true;
 }
 

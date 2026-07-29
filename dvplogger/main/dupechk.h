@@ -40,7 +40,7 @@ bool dupe_check_get_callhist(char *call, byte bandmode, byte mask, bool callhist
 void entry_dupechk_subcpu(char *s);
 void entry_dupechk_call_exch_bandmode(char *callsign,char *recv_exch,unsigned char bandmode);
 void entry_dupechk_data(const char *callsign, const char *recv_exch, unsigned char bandmode);
-void reset_dupechk_subcpu();
+bool reset_dupechk_subcpu();
 void notify_dupechk_subcpu_reset();
 void sync_dupechk_mask_subcpu(unsigned char mask);
 void set_dupechk_mask_subcpu(unsigned char mask);

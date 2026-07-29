@@ -21,6 +21,9 @@
 
 #ifndef FILE_DISPLAY_H
 #define FILE_DISPLAY_H
+void init_display_dispatch();
+void process_display_requests();
+bool display_is_main_loop();
 void display_cw_buf_lcd(char *buf);
 void select_left_display() ;
 void select_right_display() ;

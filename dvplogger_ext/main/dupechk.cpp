@@ -509,8 +509,8 @@ void notify_dupechk_subcpu_reset() {
   dupechk_reset_ack = true;
 }
 
-void reset_dupechk_subcpu() {
-  if (dupechk == NULL || dupechk->dupechk_at != 1) return;
+bool reset_dupechk_subcpu() {
+  if (dupechk == NULL || dupechk->dupechk_at != 1) return false;
 
   dupechk_reset_ack = false;
   mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
@@ -524,7 +524,9 @@ void reset_dupechk_subcpu() {
 
   if (!dupechk_reset_ack) {
     console->println("reset_dupechk_subcpu() timeout");
+    return false;
   }
+  return true;
 }
 
 void entry_dupechk_call_exch_bandmode(char *callsign,char *recv_exch,unsigned char bandmode) {

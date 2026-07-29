@@ -28,6 +28,7 @@
 #include "variables.h"
 #include "display.h"
 #include "timekeep.h"
+#include "i2c_guard.h"
 #include <WiFiUdp.h>
 //#include <NTPClient.h>
 #include "misc.h"
@@ -148,20 +149,35 @@ void init_timekeep()
   time(&now);
   setenv("TZ", "JST-9", 1); // set local time to JST
   tzset();
-  
+
   localtime_r(&now, &timeinfo);
   strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-  console->printf( "The current date/time in Japan is: %s\n", strftime_buf); // shown jst
+  console->printf("The current date/time in Japan is: %s\n", strftime_buf);
 
-  
-  rtcclock.begin();
-  // set my_rtc from RTC and start
-  clock=rtcclock.now();
-  my_rtc=myDateTime(clock.year(),clock.month(),clock.day(),clock.hour(),clock.minute(),clock.second());
+  if (i2c_bus_lock("rtc_begin", pdMS_TO_TICKS(50))) {
+    uint32_t t0 = micros();
+    rtcclock.begin();
+    uint32_t dt = micros() - t0;
+    i2c_bus_unlock("rtc_begin");
+    i2c_diag_io("rtc_begin", dt);
+  }
+
+  bool rtc_ok = false;
+  if (i2c_bus_lock("rtc_init", pdMS_TO_TICKS(20))) {
+    uint32_t t0 = micros();
+    clock = rtcclock.now();
+    uint32_t dt = micros() - t0;
+    i2c_bus_unlock("rtc_init");
+    i2c_diag_io("rtc_init", dt);
+    rtc_ok = true;
+  }
+  if (rtc_ok) {
+    my_rtc = myDateTime(clock.year(), clock.month(), clock.day(),
+                        clock.hour(), clock.minute(), clock.second());
+  }
   console->print("my_rtc ");
   console->println(my_rtc.msec);
-  my_rtc_ticker.attach_ms(100,interrupt_my_rtc);
-  
+  my_rtc_ticker.attach_ms(100, interrupt_my_rtc);
 }
 
 
@@ -169,12 +185,20 @@ void init_timekeep()
 
 void print_rtcclock() {
   DateTime clock;
-  clock=rtcclock.now();
+  if (!i2c_bus_lock("rtc_print", pdMS_TO_TICKS(20))) return;
+  uint32_t t0 = micros();
+  clock = rtcclock.now();
+  uint32_t dt = micros() - t0;
+  i2c_bus_unlock("rtc_print");
+  i2c_diag_io("rtc_print", dt);
+
   char s[80];
-  sprintf(s,"rtc read : %02d/%02d/%02d-%02d:%02d:%02d\n", clock.year() % 100, clock.month(), clock.day(),
-	  clock.hour(), clock.minute(), clock.second());
+  sprintf(s, "rtc read : %02d/%02d/%02d-%02d:%02d:%02d\n",
+          clock.year() % 100, clock.month(), clock.day(),
+          clock.hour(), clock.minute(), clock.second());
   plogw->ostream->print(s);
 }
+
 
 
 void print_ntpstatus(Stream *out) {
@@ -201,7 +225,12 @@ void set_rtcclock(char *timestr) { // yymmddhhmmss to set
   sprintf(s,"setting to : %02d/%02d/%02d-%02d:%02d:%02d\n", clock.year() % 100, clock.month(), clock.day(),
 	  clock.hour(), clock.minute(), clock.second());
   plogw->ostream->print(s);  
-  rtcclock.adjust(clock);
+  if (i2c_bus_lock("rtc_set", pdMS_TO_TICKS(20))) {
+    uint32_t t0 = micros();
+    rtcclock.adjust(clock);
+    i2c_bus_unlock("rtc_set");
+    i2c_diag_io("rtc_set", micros() - t0);
+  }
   my_rtc=myDateTime(clock.year(),clock.month(),clock.day(),clock.hour(),clock.minute(),clock.second()); // my_rtc also set to the same time
   
   print_rtcclock();
@@ -216,7 +245,15 @@ void timekeep() {
     
     char datestr[40];
 
-    rtctime = rtcclock.now();
+    if (i2c_bus_lock("rtc_now", pdMS_TO_TICKS(10))) {
+      uint32_t t0 = micros();
+      rtctime = rtcclock.now();
+      i2c_bus_unlock("rtc_now");
+      i2c_diag_io("rtc_now", micros() - t0);
+    } else {
+      rtctime = DateTime(my_rtc.year(), my_rtc.month(), my_rtc.day(),
+                         my_rtc.hour(), my_rtc.minute(), my_rtc.second());
+    }
 
     // check my_rtc and rtctime (DS1307) to keep track with DS1307
     TimeSpan dt1;
@@ -315,7 +352,7 @@ void timekeep() {
     sprintf(plogw->tm, "%02d/%02d/%02d-%02d:%02d:%02d", my_rtc.year() % 100, my_rtc.month(), my_rtc.day(),
 	    my_rtc.hour(), my_rtc.minute(), my_rtc.second());
     if (verbose&1024) console->println(plogw->tm);
-    upd_display_tm();
+    upd_display_tm(); // comment out for reducing main loop time consumption
     right_display_sendBuffer();
     if (f_show_clock == 2) {
 

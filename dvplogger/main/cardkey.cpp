@@ -28,6 +28,7 @@
 #include "variables.h"
 #include "ui.h"
 #include "console.h"
+#include "i2c_guard.h"
 
 // ToDo CW sending with shift only works for alphabetical key: Shift+0-9 should map to symbols(!@#$%^&*{}) (japanese keyboard mapping?) 
 //      document relocated maps Alt-i ... etc
@@ -278,6 +279,8 @@ void emulate_keyboard_cardkey(char c) {
   
 void cardkey_process()
 {
+  if (!i2c_bus_lock("cardkey", 0)) return;
+  uint32_t i2c_t0 = micros();
   Wire.requestFrom(0x5F, 1);
   while(Wire.available())	  {
     char c = Wire.read(); // receive a byte as characterif
@@ -296,13 +299,22 @@ void cardkey_process()
 
     }
   }
+  i2c_bus_unlock("cardkey");
+  i2c_diag_io("cardkey", micros() - i2c_t0);
 }
   
 void init_cardkey()
 {
   // check if cardkey 0x5f present
-  Wire.beginTransmission(0x5f);
-  if (Wire.endTransmission()==0) {
+  bool present = false;
+  if (i2c_bus_lock("cardkey_init", pdMS_TO_TICKS(20))) {
+    uint32_t i2c_t0 = micros();
+    Wire.beginTransmission(0x5f);
+    present = (Wire.endTransmission() == 0);
+    i2c_bus_unlock("cardkey_init");
+    i2c_diag_io("cardkey_init", micros() - i2c_t0);
+  }
+  if (present) {
     f_cardkey_present=1;
     console->println("cardkey present!");    
   } else {

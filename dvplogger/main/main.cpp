@@ -42,6 +42,7 @@
 #include "variables.h"
 #include "multi.h"
 #include <Wire.h>
+#include "i2c_guard.h"
 #include "SPIFFS.h"
 #include <WiFi.h>
 #include "sd_files.h"
@@ -317,6 +318,21 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
     } else {
       console->println("invalid duper response");
     }
+  } else if (strncmp(packet->buf,"dupebulka:",10)==0) {
+    // Accepted-QSO notification from SUBCPU MAKEDUPE bulk processing.
+    // Format: dupebulka:<bandmode>|<received exchange>
+    size_t n = min((size_t)(packet->idx - 10), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 10, n);
+    buf[n] = '\0';
+    char *sep = strchr(buf, '|');
+    if (sep != NULL) {
+      *sep = '\0';
+      int bandmode = atoi(buf);
+      if (bandmode >= 0 && bandmode <= 255) {
+        process_makedupe_multiplier_maincpu(sep + 1,
+                                            (unsigned char)bandmode);
+      }
+    }
   } else if (strncmp(packet->buf,"dupebulk0:",10)==0 ||
              strncmp(packet->buf,"dupebulk1:",10)==0) {
     int group = packet->buf[8] - '0';
@@ -386,6 +402,8 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
 void check_spiram()
 {
   if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM)>0) f_spiram=1; else f_spiram=0;
+  f_low_memory_mode = (f_spiram == 0);
+  Serial.printf("memory mode: %s\r\n", f_low_memory_mode ? "LOW (no PSRAM)" : "NORMAL (PSRAM)");
 
 }
 
@@ -397,7 +415,11 @@ void setup()
   radio_list[0].bt_buf = (char *)malloc(sizeof(char) * 256);
   radio_list[1].bt_buf = (char *)malloc(sizeof(char) * 256);
   radio_list[2].bt_buf = (char *)malloc(sizeof(char) * 256);
+  init_i2c_guard();
+  i2c_set_owner_task();
+  init_display_dispatch();
   Wire.begin();
+  Wire.setTimeOut(50);
 
   init_mcp_port();
 
@@ -429,8 +451,16 @@ void setup()
   
   init_all_radio();
   init_settings_dict();
-
+  /*
+   * SD is needed here only to obtain the display type before initializing
+   * the OLED. If the card is unavailable, the compiled default is used.
+   */
+  init_sd();
+  load_boot_display_type("/settings.txt");
+  
   init_display();
+
+
 
 
   /*
@@ -449,19 +479,38 @@ void setup()
   //  #ifdef notdef
   plogw->ostream->print("rig rigspec check");
 
-  attach_interrupt_civ();
 
   init_cw_keying();
 
   init_iambic_keyer();
   
-  init_sd();
+  //init_sd();
 
   load_rigs("RIGS");
   
   load_settings("settings");
 
+  /*
+   * On units without PSRAM, move the large databases off the MAIN CPU
+   * before AsyncWebServer registers its handlers.  init_qso() ran before
+   * settings were available and may have allocated the normal MAIN-side
+   * Call History buffer.  Freeing it only after init_webserver() leaves the
+   * internal heap too fragmented for HTTP response buffers.
+   */
+  if (f_low_memory_mode) {
+    callhist_at = 1;
+    init_callhist();          // releases the MAIN-side Call History buffer
+    init_dupechk_maincpu();   // one-entry remote-query context; DB is on SUBCPU
+    console->println("LOWMEM early placement: callhist=SUBCPU dupechk=SUBCPU");
+    if (lowmem_trace) console->printf("LOWMEM pre-web heap: free=%u largest=%u min=%u\n",
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+
+  memtrace_event("before init_network");
   init_network();
+  memtrace_event("after init_network");
   init_timekeep();
 
   upd_display();
@@ -479,7 +528,21 @@ void setup()
 
   adc_setup();
   
+  if (f_low_memory_mode && lowmem_trace) {
+    console->printf("LOWMEM before init_webserver: free=%u largest=%u min=%u\n",
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  memtrace_event("before init_webserver");
   init_webserver();
+  memtrace_event("after init_webserver");
+  if (f_low_memory_mode && lowmem_trace) {
+    console->printf("LOWMEM after init_webserver: free=%u largest=%u min=%u\n",
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
 
   init_cardkey();   
 
@@ -509,6 +572,21 @@ void setup()
     console->printf("invalid callhist_at=%d; using MAIN CPU\n", callhist_at);
     callhist_at = 0;
   }
+  if (f_low_memory_mode) {
+    if (callhist_at != 1) {
+      callhist_at = 1;
+      console->println("LOWMEM: Call History forced to SUBCPU");
+    }
+    if (dupechk != NULL && dupechk->dupechk_at != 1) {
+      // MAIN only keeps the one-entry remote-query context.  The actual
+      // DUPE database is rebuilt and maintained on the SUBCPU.
+      init_dupechk_maincpu();
+      console->println("LOWMEM: DUPE check forced to SUBCPU");
+    }
+  }
+  console->printf("database placement: callhist=%s dupechk=%s\n",
+                  callhist_at == 1 ? "SUBCPU" : "MAIN",
+                  (dupechk != NULL && dupechk->dupechk_at == 1) ? "SUBCPU" : "MAIN");
   if (plogw->enable_callhist) {
     int n = 0;
     if (callhist_at == 1) {
@@ -552,17 +630,23 @@ void loop() {
   time_measure_stop(PROF_MUX_RECV);
 
   time_measure_start_name(PROF_MEMSTAT, "memstat");
+  memtrace_poll();
   process_memstat_watch();
   time_measure_stop(PROF_MEMSTAT);
 
+  process_display_requests();
+
   time_measure_start_name(PROF_WEB_TERMINAL, "web_term");
+  process_web_ui_queue();
   process_web_terminal_log_queue();
   time_measure_stop(PROF_WEB_TERMINAL);
+
 
   time_measure_start_name(PROF_WEB_BANDMAP, "web_band");
   process_web_bandmap();
   time_measure_stop(PROF_WEB_BANDMAP);
 
+  
   time_measure_start_name(PROF_TCP_SERVER, "tcp");
   process_tcpserver();
   time_measure_stop(PROF_TCP_SERVER);

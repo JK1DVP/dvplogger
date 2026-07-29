@@ -64,6 +64,50 @@ static bool dupechk_async_active = false;
 static bool dupechk_async_result_valid = false;
 static bool dupechk_async_pending_sp_send = false;
 
+// Protect the main loop from repeated 500 ms stalls when the extension CPU
+// stops answering dupe queries.  After two consecutive timeouts, suppress
+// new queries for a short period and then allow one probe automatically.
+static uint8_t dupechk_timeout_streak = 0;
+static uint32_t dupechk_breaker_until = 0;
+static bool dupechk_remote_unavailable = false;
+static uint32_t dupechk_last_lcd_warning = 0;
+
+static void dupechk_show_remote_error() {
+#ifndef DVPLOGGER_EXT
+  // Do not silently treat a communication failure as "not worked".
+  // Keep the warning visible to the operator, but avoid refreshing the
+  // flash display for every incoming cluster spot.
+  uint32_t now = millis();
+  if (dupechk_last_lcd_warning == 0 ||
+      (uint32_t)(now - dupechk_last_lcd_warning) >= 5000) {
+    upd_display_info_flash("DUPE CHECK ERROR\nSUBCPU NO RESPONSE\nRESULT UNKNOWN");
+    dupechk_last_lcd_warning = now;
+  }
+#endif
+}
+
+static bool dupechk_remote_query_allowed() {
+  if (dupechk_breaker_until == 0) return true;
+  if ((int32_t)(millis() - dupechk_breaker_until) >= 0) {
+    dupechk_breaker_until = 0;
+    return true;
+  }
+  return false;
+}
+
+static void dupechk_remote_query_succeeded() {
+  bool was_unavailable = dupechk_remote_unavailable;
+  dupechk_timeout_streak = 0;
+  dupechk_breaker_until = 0;
+  dupechk_remote_unavailable = false;
+  dupechk_last_lcd_warning = 0;
+#ifndef DVPLOGGER_EXT
+  if (was_unavailable) {
+    upd_display_info_flash("DUPE CHECK\nRECOVERED");
+  }
+#endif
+}
+
 static bool async_query_matches_radio(struct radio *radio) {
   return radio != NULL && dupechk_async_active &&
          radio == dupechk_async_radio &&
@@ -93,6 +137,8 @@ unsigned char bandmode(struct radio *radio) {
 static bool query_dupechk_subcpu(const char *call, byte bandmode, byte mask,
                                  bool want_exch) {
   char buf[80];
+
+  if (!dupechk_remote_query_allowed()) return false;
 
   dupechk->dupechk_query_id++;
   if (dupechk->dupechk_query_id == 0) dupechk->dupechk_query_id = 1;
@@ -127,6 +173,11 @@ int query_dupechk_partial_subcpu(const char *call, byte bandmode, byte mask,
   char buf[80];
 
   if (entry_list == NULL) return 0;
+  if (!dupechk_remote_query_allowed()) {
+    entry_list->nentry = 0;
+    entry_list->dupe = 0;
+    return 0;
+  }
 
   dupechk->dupechk_query_id++;
   if (dupechk->dupechk_query_id == 0) dupechk->dupechk_query_id = 1;
@@ -261,6 +312,14 @@ void request_async_dupe_partial(struct radio *radio, bool include_partial) {
     return;
   }
 
+  if (!dupechk_remote_query_allowed()) {
+    dupechk_async_active = false;
+    dupechk_async_result_valid = false;
+    dupechk_async_pending_sp_send = false;
+    dupechk_partial_entry_list = NULL;
+    return;
+  }
+
   dupechk->dupechk_query_id++;
   if (dupechk->dupechk_query_id == 0) dupechk->dupechk_query_id = 1;
   dupechk->dupechk_status = 1;
@@ -368,6 +427,7 @@ void process_dupechk_partial_response_maincpu(char *s) {
   }
 
   dupechk->dupechk_status = 0;
+  dupechk_remote_query_succeeded();
 
   if (dupechk_async_active && entry_list == &dupechk_async_radio->check_entry_list) {
     struct radio *radio = dupechk_async_radio;
@@ -695,8 +755,8 @@ void notify_dupechk_subcpu_reset() {
   dupechk_reset_ack = true;
 }
 
-void reset_dupechk_subcpu() {
-  if (dupechk == NULL || dupechk->dupechk_at != 1) return;
+bool reset_dupechk_subcpu() {
+  if (dupechk == NULL || dupechk->dupechk_at != 1) return false;
 
   dupechk_reset_ack = false;
   mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
@@ -710,7 +770,9 @@ void reset_dupechk_subcpu() {
 
   if (!dupechk_reset_ack) {
     console->println("reset_dupechk_subcpu() timeout");
+    return false;
   }
+  return true;
 }
 
 void entry_dupechk_call_exch_bandmode(char *callsign,char *recv_exch,unsigned char bandmode) {
@@ -762,6 +824,14 @@ void entry_makedupe_bulk_subcpu(char *s) {
   if (dupechk->ncallsign >= dupechk->nmaxqso) return;
   entry_dupechk_call_exch_bandmode(callsign, recv_exch,
                                    (unsigned char)bandmode);
+
+  // Tell MAIN which QSO was accepted.  MAIN owns the contest multiplier
+  // definitions, so it performs multiplier accounting from this response.
+  char accepted[48];
+  snprintf(accepted, sizeof(accepted), "dupebulka:%u|%.*s",
+           (unsigned int)bandmode, LEN_EXCH, recv_exch);
+  mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                         (unsigned char *)accepted, strlen(accepted));
 
   int bandid = bandmode / 4;
   int modetype = bandmode % 4;
@@ -863,7 +933,15 @@ void task_dupechk()
     // now querying
     if ((int32_t)(millis() - dupechk->dupechk_timeout) >= 0) {
       // timeout reached
-      console->println("task_dupechk() timeout");
+      dupechk_timeout_streak++;
+      dupechk_remote_unavailable = true;
+      dupechk_show_remote_error();
+      if (dupechk_timeout_streak >= 2) {
+        dupechk_breaker_until = millis() + 10000;
+        console->println("task_dupechk() timeout: remote dupe check paused 10 s");
+      } else {
+        console->println("task_dupechk() timeout");
+      }
       dupechk->dupechk_status=0; // reset
       dupechk->dupechk_dupe=0; // communication failure is not a real dupe
       if (dupechk_async_active) {
@@ -877,6 +955,12 @@ void task_dupechk()
 }
 
 void init_dupechk(int nmaxqso,int dupechk_at) {
+  // dupechk_at == 1 means the actual database is on the SUBCPU.  The MAIN
+  // side only needs one work/query entry, regardless of the requested size.
+  if (dupechk_at == 1) {
+    nmaxqso = 1;
+  }
+
   // allocate memory for dupechk pointer
   if (dupechk!=NULL) {
     // free contents
@@ -916,6 +1000,10 @@ void init_dupechk(int nmaxqso,int dupechk_at) {
   dupechk->dupechk_query_id=0;
   dupechk->dupechk_getexch=0;
   dupechk->dupechk_exch[0]='\0';
+  dupechk_timeout_streak = 0;
+  dupechk_breaker_until = 0;
+  dupechk_remote_unavailable = false;
+  dupechk_last_lcd_warning = 0;
   
   for (int i = 0; i < nmaxqso; i++) {
     strcpy(dupechk->callsign[i], "");

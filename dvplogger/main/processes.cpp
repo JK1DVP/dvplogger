@@ -41,6 +41,7 @@
 #include "esp32_flasher.h"
 #include "mcp_interface.h"
 #include "log.h"
+#include "antenna.h"
 
 enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att,Power};
 void send_query_civ(enum QueryCIVType type,struct radio *radio) {
@@ -59,11 +60,61 @@ void send_query_civ(enum QueryCIVType type,struct radio *radio) {
 
 
 int interval_process_stat = 0;
+
+// Lightweight interval_process() latency diagnostics.
+// This deliberately does not use the normal profile banks because the normal
+// profile report itself is printed from interval_process().  When one call is
+// slower than INTERVAL_DIAG_THRESHOLD_US, print the slowest internal stage.
+static const uint32_t INTERVAL_DIAG_THRESHOLD_US = 100000;
+
+struct IntervalDiag {
+  uint32_t start_us;
+  uint32_t mark_us;
+  uint32_t max_us;
+  const char *max_stage;
+};
+
+static inline void interval_diag_begin(IntervalDiag *diag) {
+  diag->start_us = micros();
+  diag->mark_us = diag->start_us;
+  diag->max_us = 0;
+  diag->max_stage = "start";
+}
+
+static inline void interval_diag_mark(IntervalDiag *diag, const char *stage) {
+  const uint32_t now = micros();
+  const uint32_t elapsed = now - diag->mark_us;
+  if (elapsed > diag->max_us) {
+    diag->max_us = elapsed;
+    diag->max_stage = stage;
+  }
+  diag->mark_us = now;
+}
+
+static inline void interval_diag_finish(IntervalDiag *diag) {
+  const uint32_t total = micros() - diag->start_us;
+  if (total >= INTERVAL_DIAG_THRESHOLD_US) {
+    // Use the hardware serial port rather than console/telnet output so a
+    // blocked network stream does not hide or amplify the diagnosis.
+    Serial.printf("INTERVAL SLOW total=%lu us max=%lu us stage=%s stat=%d wifi=%d core=%d\n",
+                  (unsigned long)total,
+                  (unsigned long)diag->max_us,
+                  diag->max_stage,
+                  interval_process_stat,
+                  wifi_enable,
+                  xPortGetCoreID());
+  }
+}
+
 void interval_process() {
+  IntervalDiag interval_diag;
+  interval_diag_begin(&interval_diag);
   struct radio *radio;
   int next_interval;
   static int query_item = 0;
   next_interval = 100;
+  antenna_process();
+  interval_diag_mark(&interval_diag, "antenna");
   if (timeout_interval < millis()) {
     if (verbose & 256) {
       if (so2r.repeat_timer()!=0) {
@@ -77,9 +128,11 @@ void interval_process() {
 
     if (bandmap_disp.f_update) {
       upd_display_bandmap();
+      interval_diag_mark(&interval_diag, "bandmap_display");
       bandmap_disp.f_update = 0;
     }
     upd_display_info();// update info_display (when timer==0)
+    interval_diag_mark(&interval_diag, "display_info");
     
     for (int i = 0; i < N_RADIO; i++) {
       if (!unique_num_radio(i)) continue;
@@ -160,6 +213,7 @@ void interval_process() {
 	}
       }
     }		
+    interval_diag_mark(&interval_diag, "radio_queries");
 
 
     if (interval_process_stat == 4) {
@@ -171,12 +225,15 @@ void interval_process() {
     timeout_interval = millis() + next_interval;
     //	plogw->ostream->print("PTT:");plogw->ostream->print(plogw->ptt_stat);plogw->ostream->print(" S_stat:");plogw->ostream->println(plogw->smeter_stat);
   }
+  interval_diag_mark(&interval_diag, "interval_100ms");
 
   // satellite process 500ms
   if (timeout_interval_sat < millis()) {
     sat_process();
+    interval_diag_mark(&interval_diag, "sat_process");
     timeout_interval_sat = millis() + 500;
   }
+  interval_diag_mark(&interval_diag, "satellite_gate");
 
   // temporally timeout rig enable
   if (timeout_rig_disable_temporally < millis()) {
@@ -186,6 +243,7 @@ void interval_process() {
       enable_radios(so2r.focused_radio(),1);
     }
   }
+  interval_diag_mark(&interval_diag, "rig_reenable");
 
   // second process
   if (timeout_second < millis()) {
@@ -214,6 +272,7 @@ void interval_process() {
       }
     }
     
+    interval_diag_mark(&interval_diag, "autopower");
     timeout_second = millis() + 1000;
 
     if (verbose & VERBOSE_MEM) {
@@ -221,6 +280,7 @@ void interval_process() {
     }
     // check transport status and send command
     mux_transport.sync_transport_modes_master(); // send transport command
+    interval_diag_mark(&interval_diag, "mux_sync");
     
 
     // print_time_measure results and clear counter
@@ -238,15 +298,16 @@ void interval_process() {
       }
       plogw->ostream->print(" revs=");
       plogw->ostream->println(main_loop_revs);
+      interval_diag_mark(&interval_diag, "profile_print");
     }
     for (int i = 0; i < PROF_BANK_COUNT; ++i) time_measure_clear(i);
     main_loop_revs=0;
+    interval_diag_mark(&interval_diag, "profile_clear");
 
   }
+  interval_diag_mark(&interval_diag, "second_gate");
 
-  // Keep the existing main-loop receive paths for USB and SoftwareSerial.
-  // Local HardwareSerial ports are drained exclusively by the CAT UART RX task;
-  // receive_cat_data() returns immediately for those ports.
+  // Receive ASCII CAT data from the configured ports.
   for (int i = 0; i < N_RADIO; i++) {
     if (!unique_num_radio(i)) continue;
 
@@ -259,9 +320,9 @@ void interval_process() {
       receive_cat_data(radio);
     }
   }
+  interval_diag_mark(&interval_diag, "ascii_cat");
 
-  // Keep the existing 50 ms service interval for non-HardwareSerial CI-V
-  // paths (notably USB and SoftwareSerial).
+  // Receive CI-V data at the existing 50 ms service interval.
   if (timeout_cat < millis()) {
     for (int i = 0; i < N_RADIO; i++) {
       if (!unique_num_radio(i)) continue;
@@ -276,6 +337,7 @@ void interval_process() {
     }
     timeout_cat = millis() + 50;
   }
+  interval_diag_mark(&interval_diag, "civ_receive");
 
 
   if (timeout_interval_minute < millis()) {
@@ -293,11 +355,13 @@ void interval_process() {
 
     // frequency notification to zserver
     zserver_freq_notification();
+    interval_diag_mark(&interval_diag, "minute_jobs");
     
     
   }
+  interval_diag_mark(&interval_diag, "minute_gate");
 
-
+  interval_diag_finish(&interval_diag);
   
 }
 

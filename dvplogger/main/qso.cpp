@@ -331,6 +331,51 @@ void init_qso() {
 }
 
 
+void process_makedupe_multiplier_maincpu(const char *recv_exch, unsigned char bandmode) {
+  if (recv_exch == NULL || *recv_exch == '\0') return;
+
+  int bandid = bandmode / 4;
+  if (bandid < 1 || bandid >= N_BAND) return;
+  if (*multi_list.multi == NULL) return;
+
+  int len = strlen(recv_exch);
+  if ((plogw->multi_type == 1) || (plogw->multi_type == 3) ||
+      (plogw->multi_type == 4)) {
+    // JARL contest, ACAG, JA8: remove the final class/power character.
+    len--;
+  }
+  if (len < 1) return;
+
+  char multi_exch[10];
+  size_t copy_len = min((size_t)len, sizeof(multi_exch) - 1);
+  memcpy(multi_exch, recv_exch, copy_len);
+  multi_exch[copy_len] = '\0';
+
+  if (verbose & 1) {
+    plogw->ostream->print("len=");
+    plogw->ostream->print((int)copy_len);
+    plogw->ostream->print(" rcvexch:");
+    plogw->ostream->println(multi_exch);
+  }
+
+  for (int multi = 0; multi < multi_list.n_multi[bandid - 1]; multi++) {
+    if (strcmp(multi_list.multi[bandid - 1]->mul[multi], multi_exch) != 0)
+      continue;
+
+    if (!multi_worked_get(&multi_list, bandid - 1, multi)) {
+      score.nmulti[bandid - 1]++;
+      if (verbose & 1) {
+        plogw->ostream->print("new multi:");
+        plogw->ostream->print(recv_exch);
+        plogw->ostream->print(" nmulti=");
+        plogw->ostream->println(score.nmulti[bandid - 1]);
+      }
+    }
+    multi_worked_set(&multi_list, bandid - 1, multi, true);
+    break;
+  }
+}
+
 void makedupe_qso_entry() {
   // update dupe list from current qso
   // char *call, byte bandid, byte mask)
@@ -387,14 +432,17 @@ void makedupe_qso_entry() {
 
   // const char *modetype_str[4] = {"*", "CW", "PH", "DG"};
   // plogw->ostream->println("makedupe_qso_entry()");
+  bool accepted_qso = false;
   if (dupechk->dupechk_at == 1) {
-    // MAKEDUPE bulk mode: do not query and wait for every QSO.
-    // The subcpu rejects duplicates and returns score totals at the end.
+    // MAKEDUPE bulk mode: the SUBCPU rejects duplicates.  For each accepted
+    // QSO it sends bandmode/exchange back, so multiplier accounting uses the
+    // same acceptance decision as the QSO count.
     entry_makedupe_subcpu_data(qso.entry.hiscall, qso.entry.rcvexch, bandmode);
   } else if (!dupe_check_nocallhist(qso.entry.hiscall, bandmode, plogw->mask)) {
     if (dupechk->ncallsign < dupechk->nmaxqso) {
       entry_dupechk_data(qso.entry.hiscall, qso.entry.rcvexch, bandmode);
       score.worked[modetype == LOG_MODETYPE_CW ? 0 : 1][bandid - 1]++;
+      accepted_qso = true;
     } else {
       plogw->ostream->println(" dupechk overflow ");
     }
@@ -410,63 +458,11 @@ void makedupe_qso_entry() {
   }
 
 
-  // multi check and entry multi
-  int found;
-  found = 0;
-  int multi;
-
-  if (*multi_list.multi != NULL) {
-    int len;
-    char rcvexch[10];
-    len = strlen(qso.entry.rcvexch);
-    if ((plogw->multi_type == 1) || (plogw->multi_type == 3) || (plogw->multi_type == 4) ) {
-      // jarl contest, ACAG , JA8
-      len--;
-    }
-    if (len >= 1) {
-      *rcvexch = '\0';
-
-      strncat(rcvexch, qso.entry.rcvexch, len);
-      if (verbose & 1) {
-        plogw->ostream->print("len=");
-        plogw->ostream->print(len);
-        plogw->ostream->print(" rcvexch:");
-        plogw->ostream->println(rcvexch);
-      }
-      for (multi = 0; multi < multi_list.n_multi[bandid-1]; multi++) {
-        /*	plogw->ostream->print("multi=");
-        	plogw->ostream->println(multi);
-        	plogw->ostream->print(multi_list.multi->mul[multi]);
-        	plogw->ostream->print("<-->");
-        	plogw->ostream->print(qso.entry.rcvexch);
-        	plogw->ostream->println(":");
-        */
-        if (strcmp(multi_list.multi[bandid-1]->mul[multi], rcvexch) == 0) {
-          // hit
-          found = 1;
-          break;
-        }
-      }
-    }
-    if (found) {
-      /*	plogw->ostream->print("bandid=");
-      	plogw->ostream->print(bandid);
-      	plogw->ostream->print(" multi= ");plogw->ostream->println(multi);
-      */
-      // valid multiplier, so entry into multi check list for the band
-
-      if (multi_list.multi_worked[bandid - 1][multi] == 0) {
-        // new multi found
-        score.nmulti[bandid - 1]++;
-        if (verbose & 1) {
-          plogw->ostream->print("new multi:");
-          plogw->ostream->print(qso.entry.rcvexch);
-          plogw->ostream->println(" nmulti=");
-          plogw->ostream->println(score.nmulti[bandid - 1]);
-        }
-      }
-      multi_list.multi_worked[bandid - 1][multi] = 1;
-    }
+  // For MAIN-side dupe checking, account the multiplier immediately.
+  // In SUBCPU bulk mode this is performed only after a dupebulka response.
+  if (accepted_qso) {
+    process_makedupe_multiplier_maincpu(qso.entry.rcvexch,
+                                        (unsigned char)bandmode);
   }
   //upd_display_info_contest_settings();
 }
@@ -1057,6 +1053,10 @@ void process_pending_makedupe_rebuild()
                          plogw->contest_name + 2);
   upd_display_info_flash("Contest changed\nRebuilding dupe/multi");
   init_score();
+  // Rebuild the contest-wide serial number from only the selected contest's
+  // QSO records. init_score() already clears every seqnr_band[] entry, so $Q
+  // is likewise restored independently for each band.
+  plogw->seqnr = 0;
   clear_multi_worked();
   init_dupechk_maincpu();
   reset_dupechk_subcpu();
@@ -1511,112 +1511,167 @@ char *parse_strings(const char *remarks,char *parse_str) {
 }
 
 
+static bool extract_remark_value(const char *remarks, const char *tag,
+                                 char *dest, size_t dest_size) {
+  if (dest == NULL || dest_size == 0) return false;
+  dest[0] = '\0';
+  if (remarks == NULL || tag == NULL) return false;
+
+  const char *p = strstr(remarks, tag);
+  if (p == NULL) return false;
+  p += strlen(tag);
+
+  size_t len = 0;
+  while (*p != '\0' && *p != ' ' && *p != '\r' && *p != '\n') {
+    if (len + 1 < dest_size) dest[len++] = *p;
+    p++;
+  }
+  dest[len] = '\0';
+  return len > 0;
+}
+
+// Append one RFC 4180 style CSV field.  Quotes in a field are doubled and
+// CR/LF are replaced by spaces so that one QSO always occupies one CSV line.
+static void append_hamlog_csv_field(char *buf, const char *value) {
+  if (value == NULL) value = "";
+
+  bool quote = false;
+  for (const char *p = value; *p != '\0'; p++) {
+    if (*p == ',' || *p == '"' || *p == '\r' || *p == '\n') {
+      quote = true;
+      break;
+    }
+  }
+
+  if (quote) strcat(buf, "\"");
+  for (const char *p = value; *p != '\0'; p++) {
+    if (*p == '"') {
+      strcat(buf, "\"\"");
+    } else if (*p == '\r' || *p == '\n') {
+      size_t n = strlen(buf);
+      buf[n] = ' ';
+      buf[n + 1] = '\0';
+    } else {
+      size_t n = strlen(buf);
+      buf[n] = *p;
+      buf[n + 1] = '\0';
+    }
+  }
+  if (quote) strcat(buf, "\"");
+  strcat(buf, ",");
+}
+
 void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
-  char tmpbuf[200];
-  int len;
-  //1.  No                : 1
-  //  sprintf(tmpbuf,"%s,",qso->entry.seqnr);
-  //  strcat(buf,tmpbuf);
+  char tmpbuf[400];
+  char jcc[100];
+  char contest_name[100];
+  char remarks1[400];
+  char remarks2[500];
 
-  //4.  相手局コールサイン     : JA1ZLO
-  sprintf(tmpbuf,"%s,",qso->entry.hiscall);
-  strcat(buf,tmpbuf);
-  
-  //2.  交信日             : 2025/06/15
-  //3.  交信時刻           : 1330
-  //<QSO_DATE:8>20230611
+  buf[0] = '\0';
 
-  struct tm jst_tm;  
-  jst_tm=parse_datetime(qso->entry.tm);
-  // convert to gmt
+  // 4. 相手局コールサイン
+  append_hamlog_csv_field(buf, qso->entry.hiscall);
+
+  struct tm jst_tm = parse_datetime(qso->entry.tm);
   time_t jst_time = mktime(&jst_tm);
-  //  time_t utc_time = jst_time - 9 * 3600;
-  //  console->println(jst_time);
-  //  console->println(utc_time);
-  //  struct tm utc_tm = *localtime(&utc_time);  // UTCに変換
-  struct tm utc_tm = *localtime(&jst_time);  // UTCに変換  
-  sprintf(tmpbuf,"%04d/%02d/%02d,",
-	  utc_tm.tm_year+1900, utc_tm.tm_mon + 1, utc_tm.tm_mday);
-  strcat(buf,tmpbuf);
-  //<TIME_ON:4>0016  
-  sprintf(tmpbuf,"%02d:%02dJ,",utc_tm.tm_hour, utc_tm.tm_min);
-  strcat(buf,tmpbuf);
+  struct tm utc_tm = *localtime(&jst_time);
 
-  //5.  送信RST           : 599
-  //<RST_SENT:2>59
-  sprintf(tmpbuf,"%s,",qso->entry.sentrst);
-  strcat(buf,tmpbuf);
-  
-  //6.  受信RST           : 599
-  //<RST_RCVD:2>59
-  sprintf(tmpbuf,"%s,",qso->entry.rcvrst);
-  strcat(buf,tmpbuf);
-  //7.  周波数（MHz）      : 7
-  //<BAND:2>2m
-  float tmp;
-  int ret;
-  ret=sscanf(qso->entry.freq,"%f",&tmp);
-  sprintf(tmpbuf,"%.5f,",tmp/1000000.0);
-  strcat(buf,tmpbuf);
-  //8.  モード             : CW
-  //<MODE:2>FM
-  sprintf(tmpbuf,"%s,",qso->entry.opmode);
-  strcat(buf,tmpbuf);
-  // code  blank
-  // gl    blank
-  //11. QSL送受           : J   （J:発行済 / N:未発行 / W:希望）
-  char *p;
+  // 2. 交信日
+  snprintf(tmpbuf, sizeof(tmpbuf), "%04d/%02d/%02d",
+           utc_tm.tm_year + 1900, utc_tm.tm_mon + 1, utc_tm.tm_mday);
+  append_hamlog_csv_field(buf, tmpbuf);
 
-  if ((p=strstr(qso->entry.remarks,"JARL"))!=NULL) {
-    strcat(buf,",,J,");
-  } else if ((p=strstr(qso->entry.remarks,"hQSL"))!=NULL) {
-    strcat(buf,",,H,");
+  // 3. 交信時刻
+  snprintf(tmpbuf, sizeof(tmpbuf), "%02d:%02dJ", utc_tm.tm_hour, utc_tm.tm_min);
+  append_hamlog_csv_field(buf, tmpbuf);
+
+  // 5-6. RST
+  append_hamlog_csv_field(buf, qso->entry.sentrst);
+  append_hamlog_csv_field(buf, qso->entry.rcvrst);
+
+  // 7. 周波数（MHz）
+  float freq = 0.0f;
+  sscanf(qso->entry.freq, "%f", &freq);
+  snprintf(tmpbuf, sizeof(tmpbuf), "%.5f", freq / 1000000.0f);
+  append_hamlog_csv_field(buf, tmpbuf);
+
+  // 8. モード
+  append_hamlog_csv_field(buf, qso->entry.opmode);
+
+  // Code, GL
+  append_hamlog_csv_field(buf, "");
+  append_hamlog_csv_field(buf, "");
+
+  // 11. QSL送受
+  if (strstr(qso->entry.remarks, "JARL") != NULL) {
+    append_hamlog_csv_field(buf, "J");
+  } else if (strstr(qso->entry.remarks, "hQSL") != NULL) {
+    append_hamlog_csv_field(buf, "H");
   } else {
-    strcat(buf,",,,");
+    append_hamlog_csv_field(buf, "");
   }
-  // Hisname    blank
-  // QTH        blank
-  strcat(buf,",,");
-  
-  // Remarks1  --> received_exchange % Op Location J: POTA_MY: SOTA_MY: args from Remarks mycall %
-  strcat(buf,"\"");  
-  strcat(buf,qso->entry.rcvexch);
-  strcat(buf," %");
-  if ((p=parse_strings(qso->entry.remarks,"J:"))!=NULL) {
-    strcat(buf,"JCC/JCG:");
-    strcat(buf,p);
-    strcat(buf," ");    
+
+  // HisName
+  append_hamlog_csv_field(buf, "");
+
+  // QTH: Remarks の J: 値をHAMLOGのQTH欄へ入れる。
+  // J: が無い場合は空欄。
+  if (!extract_remark_value(qso->entry.remarks, "J:", jcc, sizeof(jcc))) {
+    jcc[0] = '\0';
   }
-  
-  if ((p=parse_strings(qso->entry.remarks,"POTA_MY:"))!=NULL) {
-    strcat(buf,"POTA_MY:");
-    strcat(buf,p);
-    strcat(buf," ");    
+  append_hamlog_csv_field(buf, jcc);
+
+  // Remarks1: received exchange % location/POTA/SOTA/mycall %
+  remarks1[0] = '\0';
+  strncat(remarks1, qso->entry.rcvexch, sizeof(remarks1) - strlen(remarks1) - 1);
+  strncat(remarks1, " %", sizeof(remarks1) - strlen(remarks1) - 1);
+
+  // Keep the existing JCC/JCG notation in Remarks1 for compatibility.
+  if (jcc[0] != '\0') {
+    strncat(remarks1, "JCC/JCG:", sizeof(remarks1) - strlen(remarks1) - 1);
+    strncat(remarks1, jcc, sizeof(remarks1) - strlen(remarks1) - 1);
+    strncat(remarks1, " ", sizeof(remarks1) - strlen(remarks1) - 1);
   }
-  
-  if ((p=parse_strings(qso->entry.remarks,"SOTA_MY:"))!=NULL) {
-    strcat(buf,"SOTA_MY:");
-    strcat(buf,p);
-    strcat(buf," ");    
+
+  char value[100];
+  if (extract_remark_value(qso->entry.remarks, "POTA_MY:", value, sizeof(value))) {
+    strncat(remarks1, "POTA_MY:", sizeof(remarks1) - strlen(remarks1) - 1);
+    strncat(remarks1, value, sizeof(remarks1) - strlen(remarks1) - 1);
+    strncat(remarks1, " ", sizeof(remarks1) - strlen(remarks1) - 1);
   }
-  strcat(buf,qso->entry.mycall);
-  strcat(buf,"%\",");
-      
-  // Remarks2  --> % contest_name % Remarks Sent_exchange
-  // 0 ???
-  // hamloguser or not
-  strcat(buf,"\"");
-  if (strlen(plogw->contest_name+2)>0) {
-    strcat(buf,"%");
-    strcat(buf,plogw->contest_name+2);
-    strcat(buf,"% ");    
+  if (extract_remark_value(qso->entry.remarks, "SOTA_MY:", value, sizeof(value))) {
+    strncat(remarks1, "SOTA_MY:", sizeof(remarks1) - strlen(remarks1) - 1);
+    strncat(remarks1, value, sizeof(remarks1) - strlen(remarks1) - 1);
+    strncat(remarks1, " ", sizeof(remarks1) - strlen(remarks1) - 1);
   }
-  strcat(buf,qso->entry.sentexch);
-  strcat(buf," ");
-  strcat(buf,qso->entry.remarks);
-  strcat(buf,"\",");
-  // JM1LDV/1,25/08/16,22:23J,599,599,7.01502,CW,CODE,GL,J,HisName,QTH,Remarks1,Remarks2,0,
-  strcat(buf,"\n");
+  strncat(remarks1, qso->entry.mycall, sizeof(remarks1) - strlen(remarks1) - 1);
+  strncat(remarks1, "%", sizeof(remarks1) - strlen(remarks1) - 1);
+  append_hamlog_csv_field(buf, remarks1);
+
+  // Remarks2: use the contest name stored in this QSO's C: tag.
+  // C:- means OFFCONTEST.  For old records without C:, retain the old fallback.
+  bool has_contest_tag = extract_remark_value(qso->entry.remarks, "C:",
+                                               contest_name, sizeof(contest_name));
+  if (!has_contest_tag) {
+    strncpy(contest_name, plogw->contest_name + 2, sizeof(contest_name) - 1);
+    contest_name[sizeof(contest_name) - 1] = '\0';
+  } else if (strcmp(contest_name, "-") == 0) {
+    contest_name[0] = '\0';
+  }
+
+  remarks2[0] = '\0';
+  if (contest_name[0] != '\0') {
+    strncat(remarks2, "%", sizeof(remarks2) - strlen(remarks2) - 1);
+    strncat(remarks2, contest_name, sizeof(remarks2) - strlen(remarks2) - 1);
+    strncat(remarks2, "% ", sizeof(remarks2) - strlen(remarks2) - 1);
+  }
+  strncat(remarks2, qso->entry.sentexch, sizeof(remarks2) - strlen(remarks2) - 1);
+  strncat(remarks2, " ", sizeof(remarks2) - strlen(remarks2) - 1);
+  strncat(remarks2, qso->entry.remarks, sizeof(remarks2) - strlen(remarks2) - 1);
+  append_hamlog_csv_field(buf, remarks2);
+
+  strcat(buf, "\n");
 }
 
 void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) {

@@ -68,6 +68,8 @@ const char *modetype_str[4] = { "*", "CW", "PH", "DG" };
 struct logwindow logw;
 struct logwindow *plogw;
 int f_spiram;
+bool f_low_memory_mode = false;
+int lowmem_trace = 0;  // 0: suppress LOWMEM heap trace, 1: enable
 struct disp disp;
 struct disp *dp;
 struct sat_info sat_info[N_SATELLITES];
@@ -120,6 +122,6 @@ int rtcadj_count = 0;
 //int callhistf_stat = 0;  // 0 not open 1 open for reading 2 open for writing
 char qsologfn[20];    // qso log filename (append)
 char callhistfn[20];  // call history file to read
-int callhist_at=0; // 0: MAIN, 1: SUBCPU
-int dupechk_at=0; // 0: MAIN, 1: SUBCPU 2:this is SUBCPU
+int callhist_at=1; // 0: MAIN, 1: SUBCPU (default: SUBCPU)
+int dupechk_at=1; // 0: MAIN, 1: SUBCPU 2:this is SUBCPU (default: SUBCPU)
 

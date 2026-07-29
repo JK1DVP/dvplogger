@@ -27,6 +27,7 @@
 
 void set_contest_id();
 void search_contest_id_from_name();
+bool alternate_contest();
 int contest_definition_count();
 int contest_definition_id(int index);
 const char *contest_definition_name(int index);

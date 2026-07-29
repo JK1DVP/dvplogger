@@ -84,7 +84,7 @@ void init_multi(const struct multi_item *multi, int start_band, int stop_band) {
       // clear worked list
       for (int i = 0; i < multi_list.n_multi[iband-1]; i++) {
 	//	for (int iband = 0; iband < N_BAND; iband++) {
-	multi_list.multi_worked[iband-1][i] = 0;
+	multi_worked_set(&multi_list, iband-1, i, false);
       }
     }
   }
@@ -94,7 +94,7 @@ void clear_multi_worked() {
   // clear worked list
   for (int iband = 0; iband < N_BAND; iband++) {  
     for (int i = 0; i < multi_list.n_multi[iband-1]; i++) {
-      multi_list.multi_worked[iband-1][i] = 0;
+      multi_worked_set(&multi_list, iband-1, i, false);
     }
   }
 }
@@ -340,7 +340,7 @@ void print_multi_list(Stream *out)
 
       for (int i = 0; i < multi_list.n_multi[radio->bandid-1]; i++) {
 	if (i >= multi_list.n_multi[radio->bandid-1]) break;
-	sprintf(buf1, "%c%s ", multi_list.multi_worked[radio->bandid - 1][i] == 1 ? '*' : ' ', multi_list.multi[radio->bandid-1]->mul[i]);
+	sprintf(buf1, "%c%s ", multi_worked_get(&multi_list, radio->bandid - 1, i) ? '*' : ' ', multi_list.multi[radio->bandid-1]->mul[i]);
 	len = strlen(buf1);
 	if (count + len > 80) {  // use next row
 	  out->println(dp->lcdbuf);
@@ -449,7 +449,7 @@ void entry_multiplier(struct radio *radio) {
     return;
   }
   // new multi check ?
-  if (multi_list.multi_worked[radio->bandid - 1][radio->multi] == 0) {
+  if (!multi_worked_get(&multi_list, radio->bandid - 1, radio->multi)) {
     // new multi found
     // if (verbose & 1) {
     //	  plogw->ostream->print("new multi:");plogw->ostream->println(plogw->multi);
@@ -460,7 +460,7 @@ void entry_multiplier(struct radio *radio) {
     console->print("entry_multiplier() radio=");console->print((int)radio->rig_idx);
     console->print(" bandid=");console->print((int)radio->bandid);console->print(" multi=");console->println((int)radio->multi);
   }
-  multi_list.multi_worked[radio->bandid - 1][radio->multi] = 1;
+  multi_worked_set(&multi_list, radio->bandid - 1, radio->multi, true);
 }
 
 

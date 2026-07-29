@@ -715,6 +715,9 @@ int search_bandmap_allband(int bandid, char *stn, int md) {
 
 
 int new_entry_bandmap(int bandid,int nmax) {
+  // Without PSRAM, keep only a small working set.  The display and core
+  // logging functions remain available while cluster history is truncated.
+  if (f_low_memory_mode && nmax > 40) nmax = 40;
   int idx;
   idx = bandid - 1;
   if (bandid < 0) return -1;
@@ -743,12 +746,13 @@ int new_entry_bandmap(int bandid,int nmax) {
     plogw->ostream->println(nentry_prev);
   }
   
-  if (bandmap[idx].nentry + 50 > nmax) {
+  const int grow = f_low_memory_mode ? 10 : 50;
+  if (bandmap[idx].nentry + grow > nmax) {
     // exceed allowed number of entries
     return -1;  // unsuccessful allocation
   }
     
-  bandmap[idx].nentry += 50;
+  bandmap[idx].nentry += grow;
   // bandmap[idx].nentry += 5; // make it smaller increment to debug
   struct bandmap_entry *p;
   //  p = (struct bandmap_entry *)realloc(bandmap[idx].entry, sizeof(struct bandmap_entry) * bandmap[idx].nentry); // original

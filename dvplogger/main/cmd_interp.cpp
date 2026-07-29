@@ -75,6 +75,9 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"help", "show this command list"},
   {"emu", "enter terminal screen emulation; EXITEMU exits"},
   {"verbose[n]", "toggle verbose output, or set verbose bit mask n"},
+  {"clusterverbose [1|2] [0-3]", "show/set Cluster 1 or 2 traffic display level"},
+  {"c1cmd command", "send one command directly to Cluster 1"},
+  {"c2cmd command", "send one command directly to Cluster 2"},
   {"loadsat", "load saved satellite information"},
   {"savesat", "save satellite information"},
   {"satellite", "load/update TLE data"},
@@ -447,7 +450,6 @@ void cmd_interp(char *cmd, Stream *output) {
 	out->println("esp_flashersd() end... ");		
 	// restore mux serial port
 	init_mux_serial();
-	attach_interrupt_civ();
       	break;
       }
 
@@ -480,7 +482,6 @@ void cmd_interp(char *cmd, Stream *output) {
 	out->println("esp_flasher() end... ");	
 	// restore mux serial port
 	init_mux_serial();
-	attach_interrupt_civ();
       	break;
       }
       if (strncmp(cmd, "verbose", 7) == 0) {
@@ -495,6 +496,20 @@ void cmd_interp(char *cmd, Stream *output) {
           }
         }
         out->printf("verbose=%d\n", verbose);
+        break;
+      }
+      if (strncmp(cmd, "clusterverbose", 14) == 0) {
+        int cluster_no = 0;
+        int level = 0;
+        int n = sscanf(cmd + 14, "%d %d", &cluster_no, &level);
+        if (n == 0) {
+          print_cluster_verbose_status(out);
+        } else if (n == 2) {
+          set_cluster_verbose_level(cluster_no, level, out);
+        } else {
+          out->println("usage: clusterverbose [1|2] [0-3]");
+          print_cluster_verbose_status(out);
+        }
         break;
       }
       if (strncmp(cmd, "nextaos", 7) == 0) {

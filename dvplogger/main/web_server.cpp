@@ -26,7 +26,9 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include "web_server.h"
 #include "decl.h"
+#include "cluster.h"
 #include "SD.h"
 #include "variables.h"
 #include "qso.h"
@@ -45,6 +47,7 @@
 #include "esp_heap_caps.h"
 #include "bandmap.h"
 #include "dupechk.h"
+#include "antenna.h"
 #include "multi_process.h"
 #include <algorithm>
 #include <memory>
@@ -114,6 +117,137 @@ private:
 };
 
 static DeferredWebLogPrint webLog;
+
+static String normalize_op_value(int index, const String &source) {
+  String out;
+  out.reserve(source.length());
+  for (size_t i = 0; i < source.length(); ++i) {
+    unsigned char uc = (unsigned char)source[i];
+    char c = (char)uc;
+    if (index == 0 || index == 1 || index == 4 || index == 5 ||
+        index == 10 || index == 11 || index == 12) {
+      if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    }
+    bool accept = false;
+    switch (index) {
+      case 0: case 1:
+        accept = ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '.');
+        break;
+      case 4:
+        // Sent Exch is a CW macro source.  Preserve characters such as '$'
+        // exactly as entered; expansion is performed only when transmitting.
+        accept = (uc >= 0x21 && uc <= 0x7e);
+        break;
+      case 2: case 3:
+        accept = (c >= '0' && c <= '9');
+        break;
+      case 5: case 10: case 11: case 12:
+        accept = (uc >= 0x21 && uc <= 0x7e);  // printable ASCII except space
+        break;
+      case 13:
+        accept = (uc >= 0x21 && uc <= 0x7e);  // contest name: keep case, omit spaces
+        break;
+      default:
+        accept = (uc >= 0x20 && uc <= 0x7e);
+        break;
+    }
+    if (accept) out += c;
+  }
+  return out;
+}
+
+static void normalize_op_cstr(int index, char *dst, size_t dst_size, const String &source) {
+  String value = normalize_op_value(index, source);
+  strlcpy(dst, value.c_str(), dst_size);
+}
+
+enum WebUiCommandType : uint8_t { WEB_UI_KEY=1, WEB_UI_CONTROL, WEB_UI_ENTER, WEB_UI_SET };
+struct WebUiCommand {
+  uint8_t type;
+  int16_t value;
+  int8_t index;
+  char name[12];
+  // input0 is also used for Sent Exch, which is longer than recv_exch.
+  char input0[LEN_SENT_EXCH_WINDOW + 1];
+  char input1[LEN_EXCH_WINDOW + 1];
+};
+static QueueHandle_t s_web_ui_queue = nullptr;
+
+static bool enqueue_web_ui(const WebUiCommand &cmd) {
+  if (!s_web_ui_queue) s_web_ui_queue = xQueueCreate(12, sizeof(WebUiCommand));
+  return s_web_ui_queue && xQueueSend(s_web_ui_queue, &cmd, 0) == pdTRUE;
+}
+}
+
+void process_web_ui_queue() {
+  if (!s_web_ui_queue) return;
+  WebUiCommand cmd;
+  int budget=8;
+  while (budget-- > 0 && xQueueReceive(s_web_ui_queue, &cmd, 0) == pdTRUE) {
+    struct radio *radio = so2r.radio_selected();
+    if (cmd.type == WEB_UI_KEY) {
+      if (cmd.value >= 112 && cmd.value <= 116) {
+        so2r.cancel_msg_tx();
+        so2r.set_msg_tx_to_focused();
+        so2r.set_rx_in_sending_msg();
+        function_keys(cmd.value - 54, 0);
+      } else if (cmd.value == 27) {
+        so2r.cancel_msg_tx();
+        switch (so2r.radio_mode) {
+          case SO2R::RADIO_MODE_SO2R: so2r.sequence_mode(SO2R::SO2R_CQSandP); break;
+          case SO2R::RADIO_MODE_SO1R:
+          case SO2R::RADIO_MODE_SAT: so2r.sequence_mode(SO2R::Manual); break;
+        }
+        so2r.sequence_stat(SO2R::Default);
+      }
+    } else if (cmd.type == WEB_UI_CONTROL) {
+      if (!strcmp(cmd.name,"Radio")) {
+        so2r.change_focused_radio(cmd.value);
+      } else if (!strcmp(cmd.name,"Mode")) {
+        radio=so2r.radio_selected();
+        int mt=modetype_string(cmd.input0);
+        int filt=radio->filtbank[radio->bandid][radio->cq[mt]][mt];
+        if (!filt) filt=default_filt(cmd.input0);
+        set_mode(cmd.input0,filt,radio);
+        send_mode_set_civ(cmd.input0,filt);
+        upd_display();
+      } else if (!strcmp(cmd.name,"Band")) {
+        radio=so2r.radio_selected();
+        if (cmd.value>=1 && cmd.value<N_BAND && (((1<<(cmd.value-1)) & radio->band_mask)==0))
+          band_change(cmd.value,radio);
+      }
+    } else if (cmd.type == WEB_UI_ENTER) {
+      radio=so2r.radio_selected();
+      strlcpy(radio->callsign+2,cmd.input0,LEN_CALL_WINDOW + 1);
+      strlcpy(radio->recv_exch+2,cmd.input1,LEN_EXCH_WINDOW + 1);
+      if (cmd.index == 0) {
+        // Use the normal Call-window response path so the F5 transmission,
+        // sent-callsign record, and QSO state are updated together.
+        so2r.send_call_exch();
+        upd_display();
+      } else {
+        radio->ptr_curr = 1;
+        process_enter(0);
+      }
+    } else if (cmd.type == WEB_UI_SET) {
+      switch (cmd.index) {
+        case 0: strlcpy(radio->callsign+2, cmd.input0, LEN_CALL_WINDOW + 1); break;
+        case 1: strlcpy(radio->recv_exch+2, cmd.input0, LEN_EXCH_WINDOW + 1); break;
+        case 2: strlcpy(radio->recv_rst+2, cmd.input0, LEN_RST_WINDOW + 1); break;
+        case 3: strlcpy(radio->sent_rst+2, cmd.input0, LEN_RST_WINDOW + 1); break;
+        case 4:
+          // Keep the unexpanded macro text (for example, "11$P") in the
+          // runtime setting.  expand_sent_exch() expands it only for output.
+          strlcpy(plogw->sent_exch + 2, cmd.input0, LEN_SENT_EXCH_WINDOW + 1);
+          plogw->sent_exch[1] = strlen(plogw->sent_exch + 2);
+          // Keep the currently selected contest preset in sync with /op.
+          save_contest_runtime_preset(plogw->contest_name + 2);
+          break;
+        case 5: strlcpy(plogw->my_callsign+2, cmd.input0, LEN_CALL_WINDOW + 1); break;
+      }
+      upd_display();
+    }
+  }
 }
 
 void process_web_terminal_log_queue() {
@@ -162,39 +296,140 @@ void rebootESP(String message) {
 
 String humanReadableSize(const size_t bytes);
 
-// list all of the files, if ishtml=true, return html rather than simple text
-String listFiles(bool ishtml) {
-  String returnText = "";
-  webLog.println("Listing files stored on SPIFFS");
-  File root = SD.open("/");
-  File foundfile = root.openNextFile();
-  if (ishtml) {
-    returnText += "<table><tr><th align='left'>Name</th><th align='left'>Size</th></tr>";
+// Format a byte count without allocating Arduino String objects.
+static void humanReadableSizeToBuffer(size_t bytes, char *out, size_t out_size) {
+  if (!out || out_size == 0) return;
+  if (bytes < 1024) {
+    snprintf(out, out_size, "%u B", (unsigned)bytes);
+  } else if (bytes < (1024UL * 1024UL)) {
+    snprintf(out, out_size, "%.1f KB", (double)bytes / 1024.0);
+  } else if (bytes < (1024UL * 1024UL * 1024UL)) {
+    snprintf(out, out_size, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+  } else {
+    snprintf(out, out_size, "%.1f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
   }
-  while (foundfile) {
-    if (ishtml) {
-      returnText += "<tr align='left'><td>" + String(foundfile.name()) + "</td><td>" + humanReadableSize(foundfile.size()) + "</td></tr>";
-    } else {
-      returnText += "File: " + String(foundfile.name()) + "\n";
-    }
-    foundfile = root.openNextFile();
-  }
-  if (ishtml) {
-    returnText += "</table>";
-  }
-  root.close();
-  foundfile.close();
-  return returnText;
 }
 
-// Make size of files human readable
-// source: https://github.com/CelliesProjects/minimalUploadAuthESP32
-String humanReadableSize(const size_t bytes) {
-  if (bytes < 1024) return String(bytes) + " B";
-  else if (bytes < (1024 * 1024)) return String(bytes / 1024.0) + " KB";
-  else if (bytes < (1024 * 1024 * 1024)) return String(bytes / 1024.0 / 1024.0) + " MB";
-  else return String(bytes / 1024.0 / 1024.0 / 1024.0) + " GB";
+// Stream the SD-card directory as HTML.  Only one table row is retained in
+// RAM, rather than constructing the complete file list in a String.
+static void setupSdFileListHandler() {
+  web_server.on("/filelist", HTTP_GET, [](AsyncWebServerRequest *request) {
+    struct FileListState {
+      enum Stage : uint8_t { Header, OpenEntry, Row, Footer, Done } stage = Header;
+      File root;
+      File entry;
+      size_t offset = 0;
+      size_t length = 0;
+      char text[320];
+    };
+
+    std::shared_ptr<FileListState> state = std::make_shared<FileListState>();
+    if (!state) {
+      request->send(503, "text/plain", "Not enough memory for SD file list");
+      return;
+    }
+
+    state->root = SD.open("/");
+    if (!state->root) {
+      request->send(500, "text/plain", "Failed to open SD card root");
+      return;
+    }
+
+    webLog.println("Listing files stored on SD card (streamed)");
+
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "text/html; charset=utf-8",
+      [state](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+        (void)index;
+        size_t written = 0;
+
+        auto copy_pending = [&]() -> bool {
+          if (state->offset >= state->length) return true;
+          const size_t remain = state->length - state->offset;
+          const size_t available = maxLen - written;
+          const size_t ncopy = remain < available ? remain : available;
+          if (ncopy) {
+            memcpy(buffer + written, state->text + state->offset, ncopy);
+            state->offset += ncopy;
+            written += ncopy;
+          }
+          return state->offset >= state->length;
+        };
+
+        auto set_text = [&](const char *text) {
+          strlcpy(state->text, text, sizeof(state->text));
+          state->length = strlen(state->text);
+          state->offset = 0;
+        };
+
+        while (written < maxLen && state->stage != FileListState::Done) {
+          switch (state->stage) {
+          case FileListState::Header:
+            if (state->length == 0) {
+              set_text("<table><tr><th align='left'>Name</th>"
+                       "<th align='left'>Size</th></tr>");
+            }
+            if (copy_pending()) {
+              state->length = 0;
+              state->stage = FileListState::OpenEntry;
+            }
+            break;
+
+          case FileListState::OpenEntry:
+            state->entry = state->root.openNextFile();
+            if (!state->entry) {
+              state->root.close();
+              state->stage = FileListState::Footer;
+              break;
+            }
+            {
+              char size_text[32];
+              humanReadableSizeToBuffer(state->entry.size(), size_text, sizeof(size_text));
+              snprintf(state->text, sizeof(state->text),
+                       "<tr align='left'><td>%s</td><td>%s</td></tr>",
+                       state->entry.name(), size_text);
+              state->entry.close();
+              state->length = strlen(state->text);
+              state->offset = 0;
+              state->stage = FileListState::Row;
+            }
+            break;
+
+          case FileListState::Row:
+            if (copy_pending()) {
+              state->length = 0;
+              state->stage = FileListState::OpenEntry;
+            }
+            break;
+
+          case FileListState::Footer:
+            if (state->length == 0) set_text("</table>");
+            if (copy_pending()) {
+              state->length = 0;
+              state->stage = FileListState::Done;
+            }
+            break;
+
+          case FileListState::Done:
+            break;
+          }
+        }
+        return written;
+      });
+
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
 }
+
+// Make size of files human readable.  Used only for the three small storage
+// values inserted into the top page; the directory itself is streamed above.
+String humanReadableSize(const size_t bytes) {
+  char text[32];
+  humanReadableSizeToBuffer(bytes, text, sizeof(text));
+  return String(text);
+}
+
 // handles uploads
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
   String logmessage = "Client:" + request->client()->remoteIP().toString() + " " + request->url();
@@ -224,9 +459,6 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
 }
 
 String processor(const String& var) {
-  if (var == "FILELIST") {
-    return listFiles(true);
-  }
   if (var == "FREESPIFFS") {
     return humanReadableSize((SD.totalBytes() - SD.usedBytes()));
   }
@@ -533,13 +765,18 @@ InputRestrict pwin_type_index(int i) {
   case 8:return Allowall; // Cluster Cmd
   case 20:return Nospace; // Cluster2 Name
   case 21:return Allowall; // Cluster2 Cmd
+  case 22:
+  case 23:
+  case 24:
+  case 25:
+  case 26:return Allowall; // Cluster2 startup commands
   case 5:return Nospace; // "Wifi_SSID";
   case 6:return Nospace; // "Wifi_Passwd";
   default : return Allowall;
   }
 }  
 
-const int N_EDITWIN=25;
+const int N_EDITWIN=27;
 const char *pwin_name_index(int i) {
   switch (i) {
   case 0:return "My Call";
@@ -564,6 +801,11 @@ const char *pwin_name_index(int i) {
   case 19:return "CW Message 6 F7";        
   case 20:return "Cluster2 Name";
   case 21:return "Cluster2 Cmd";
+  case 22:return "Cluster2 Startup Command 1";
+  case 23:return "Cluster2 Startup Command 2";
+  case 24:return "Cluster2 Startup Command 3";
+  case 25:return "Cluster2 Startup Command 4";
+  case 26:return "Cluster2 Startup Command 5";
   default : return "--";
   }
   
@@ -593,6 +835,11 @@ char *pwin_index(int i) {
   case 19:return plogw->cw_msg[6]; // cw_msg[6]                    
   case 20:return plogw->cluster2_name;
   case 21:return plogw->cluster2_cmd;
+  case 22:return cluster2_startup_cmd[0];
+  case 23:return cluster2_startup_cmd[1];
+  case 24:return cluster2_startup_cmd[2];
+  case 25:return cluster2_startup_cmd[3];
+  case 26:return cluster2_startup_cmd[4];
   default:return NULL;
   }
 }
@@ -678,7 +925,10 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
   <li><strong>XVTR:<em>transverter_frequencies</em></strong> Frequencies joined by `_` from index 0: IFlo_0 IFhi_0 RFlo_0 RFhi_0 IFlo_1 …</li>
   <li><strong>R:<em>CAT_reverse_polarity</em></strong> (0/1)</li>
   <li><strong>BM:<em>band_mask</em></strong> in_hex</li>
-  <li><strong>TP:<em>cat_type</em>_<em>rig_type</em></strong> <br>(cat_type 0: ICOM CIV, 1:Yaesu(New), 2:Kenwood 3:Manual(NoCAT) 4:Yaesu(old))<br> (rig_type 0:IC-705 1:IC-9700 2:Yaesu 3:Kenwood 5:IC-7300 )</li> 
+  <li><strong>TP:<em>cat_type</em>_<em>rig_type</em></strong><br>
+    cat_type: 0 ICOM CI-V, 1 Yaesu(New), 2 Kenwood, 3 Manual(NoCAT), 4 Yaesu(Old), 5 Elecraft KX, 6 Yaesu FT-817<br>
+    rig_type: 0 IC-705, 1 IC-9700, 2 Yaesu, 3 Kenwood, 4 Manual, 5 IC-7300, 6 Elecraft KX, 7 Xiegu X6100
+  </li>
 </ul>
 <p>Press Enter in input box to reflect changes.</p>
 <p><a href="/" >go back to Home</a></p>
@@ -743,7 +993,7 @@ const char *pattern_both =
 static const char contests_page_header[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DVPlogger Contest Selection</title>
+<title>DVPlogger コンテスト設定</title>
 <style>
 body{font-family:sans-serif;margin:18px;max-width:1250px}
 table{border-collapse:collapse;width:100%;margin:12px 0 24px}
@@ -763,62 +1013,115 @@ button{padding:5px 10px;white-space:nowrap}.dupe-ok{color:#075f16;font-weight:bo
 .user-table .col-exch{width:150px}.user-table .col-dupe{width:110px}
 .user-name-field{display:flex;align-items:center;gap:4px;white-space:nowrap}
 .user-name-field input{min-width:0;flex:1}
-.help{max-width:900px}.help th:first-child,.help td:first-child{white-space:nowrap}.examples code{white-space:nowrap}
-</style></head><body><h2>Contest selection</h2>
-<nav class="nav-links"><a href="/">Home</a><a href="/bandmap">Bandmap</a></nav>
-<p>Current contest: <strong>%CURRENT_CONTEST%</strong></p>
-<p class="note"><strong>%SD_STATUS%</strong><br>Last action: %LAST_STATUS%</p><p id="status"></p>
-<p class="note">Select &amp; Save stores the F1, F2, F3, F5 and sent exchange preset on the SD card, then activates the contest.</p>
+.guide{max-width:1000px;border:1px solid #bbb;border-radius:8px;padding:12px 16px;margin:12px 0;background:#fafafa}.guide h3{margin:.4rem 0}.guide ul{margin:.5rem 0;padding-left:1.4rem}.warn{background:#fff4d6;border-left:5px solid #d29a00;padding:8px 12px;margin:10px 0}.help{max-width:900px}.help th:first-child,.help td:first-child{white-space:nowrap}.examples code{white-space:nowrap}
+</style></head><body><h2>コンテスト設定</h2>
+<nav class="nav-links"><a href="/">ホーム</a><a href="/op">運用画面</a><a href="/bandmap">バンドマップ</a><a href="/contests?lang=en">English</a></nav>
+<p>現在選択中: <strong>%CURRENT_CONTEST%</strong></p>
+<p class="note"><strong>%SD_STATUS%</strong><br>直前の処理: %LAST_STATUS%</p><p id="status"></p>
+<div class="guide"><h3>このページの使い方</h3>
+<ul><li>参加するコンテストの行で、必要に応じてCWメッセージと送出ナンバーを編集します。</li>
+<li>コンテスト名の右にある「選択して保存」を押すと、その行の設定をSDカードの <code>/CONTEST.TXT</code> に保存し、直ちにそのコンテストへ切り替えます。</li>
+<li>コンテストを切り替えると、選択したコンテスト名に対応する過去QSOだけを使ってデュープ・マルチと連番を再構築します。複数コンテストを往復して運用できます。</li>
+<li><strong>Ctrl-2</strong>：登録されているコンテストを順番に切り替えます。</li>
+<li><strong>Ctrl-Shift-2</strong>：現在のコンテストと直前に使用していたコンテストを交互に切り替えます。2つのコンテストを並行して運用するときに便利です。</li></ul>
+<p class="note"><strong>Web画面とキーボードの設定は共通です。</strong>どちらから切り替えても、そのコンテスト用のCWメッセージ、送出ナンバー、連番が復元され、デュープ・マルチ情報が再構築されます。</p>
+<div class="warn"><strong>コンテスト内／外の区別：</strong>通常QSOをコンテスト集計から除外したいときは、端末のコール欄に <code>OFFCONTEST</code> と入力します。再び現在のコンテストへ戻すときは <code>ONCONTEST</code> と入力します。OFFCONTEST中のQSOはRemarksに区別情報が記録され、コンテスト別のデュープ集計から除外されます。</div>
+<p class="note"><strong>選び方の目安：</strong><code>NOMULTI</code> はマルチを使用しない一般QSO向けです。交換ナンバー形式が近い既定コンテストを選ぶか、一覧にない場合は下の「ユーザー定義コンテスト」を使用してください。</p></div>
 <div class="contest-wrap"><table class="contest-table"><colgroup>
 <col class="col-id"><col class="col-name"><col class="col-dupe">
 <col class="col-f1"><col class="col-f2"><col class="col-f3"><col class="col-f5">
 <col class="col-exch"></colgroup>
-<thead><tr><th>ID</th><th>Contest / Select</th><th>Dupe</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th></tr></thead><tbody>
+<thead><tr><th>ID</th><th>コンテスト／選択</th><th>デュープ規則</th><th>CW F1（CQ）</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>送出ナンバー</th></tr></thead><tbody>
 )rawliteral";
 
 static const char contests_page_footer[] PROGMEM = R"rawliteral(
-</tbody></table></div><h3>User contest (.MD)</h3>
-<p>Enter the filename without <code>User</code> and <code>.MD</code>. Two User contest settings are retained independently.</p>
+</tbody></table></div><h3>ユーザー定義コンテスト（.MD）</h3>
+<div class="guide"><p>CTESTWIN等のMD定義ファイルを本体トップページのFile Uploadから、8.3形式の <code>FILENAME.MD</code> としてSDカードへアップロードして使用します。</p>
+<ul><li>ファイル名欄には <code>User</code> と <code>.MD</code> を除いた部分だけを入力します。例：<code>TOKYO.MD</code> なら <code>TOKYO</code>。</li>
+<li>2行は独立した切替枠です。別々のMDファイルとCWメッセージを保存し、ボタン一つで切り替えられます。</li>
+<li>MDファイルが見つからない場合でも、マルチなしのコンテストとして開始できます。デュープ規則は左のチェック欄で指定します。</li></ul></div>
 <div class="contest-wrap"><table class="user-table"><colgroup>
 <col class="col-user-name"><col class="col-dupe"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-exch">
-</colgroup><thead><tr><th>User MD filename / Select</th><th>CW/Phone DUPE rule</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent EXCH</th></tr></thead><tbody>
+</colgroup><thead><tr><th>MDファイル名／選択</th><th>CW／Phoneデュープ</th><th>CW F1（CQ）</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>送出ナンバー</th></tr></thead><tbody>
 <tr%USER1_CLASS%>
-<td><form id="user_contest_form_1" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="0"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_1" name="filename" maxlength="8" value="%USER1_FILENAME%" placeholder="PRESET1" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_1" type="submit">%USER1_ACTION%</button></div></td>
-<td><label><input form="user_contest_form_1" type="checkbox" name="dupe_separate" value="1" %USER1_DUPE_CHECKED% style="width:auto;min-width:0"> Allow each mode</label></td>
+<td><form id="user_contest_form_1" method="GET" action="/select_user_contest"><input type="hidden" name="lang" value="%LANG%"><input type="hidden" name="slot" value="0"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_1" name="filename" maxlength="8" value="%USER1_FILENAME%" placeholder="PRESET1" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_1" type="submit">%USER1_ACTION%</button></div></td>
+<td><label><input form="user_contest_form_1" type="checkbox" name="dupe_separate" value="1" %USER1_DUPE_CHECKED% style="width:auto;min-width:0"> CWとPhoneを別交信として許可</label></td>
 <td><input form="user_contest_form_1" name="f1" maxlength="30" value="%USER1_F1%"></td><td><input form="user_contest_form_1" name="f2" maxlength="30" value="%USER1_F2%"></td><td><input form="user_contest_form_1" name="f3" maxlength="30" value="%USER1_F3%"></td><td><input form="user_contest_form_1" name="f5" maxlength="30" value="%USER1_F5%"></td><td><input form="user_contest_form_1" name="exch" maxlength="17" value="%USER1_EXCH%"></td></tr>
 <tr%USER2_CLASS%>
-<td><form id="user_contest_form_2" method="GET" action="/select_user_contest"><input type="hidden" name="slot" value="1"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_2" name="filename" maxlength="8" value="%USER2_FILENAME%" placeholder="PRESET2" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_2" type="submit">%USER2_ACTION%</button></div></td>
-<td><label><input form="user_contest_form_2" type="checkbox" name="dupe_separate" value="1" %USER2_DUPE_CHECKED% style="width:auto;min-width:0"> Allow each mode</label></td>
+<td><form id="user_contest_form_2" method="GET" action="/select_user_contest"><input type="hidden" name="lang" value="%LANG%"><input type="hidden" name="slot" value="1"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_2" name="filename" maxlength="8" value="%USER2_FILENAME%" placeholder="PRESET2" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_2" type="submit">%USER2_ACTION%</button></div></td>
+<td><label><input form="user_contest_form_2" type="checkbox" name="dupe_separate" value="1" %USER2_DUPE_CHECKED% style="width:auto;min-width:0"> CWとPhoneを別交信として許可</label></td>
 <td><input form="user_contest_form_2" name="f1" maxlength="30" value="%USER2_F1%"></td><td><input form="user_contest_form_2" name="f2" maxlength="30" value="%USER2_F2%"></td><td><input form="user_contest_form_2" name="f3" maxlength="30" value="%USER2_F3%"></td><td><input form="user_contest_form_2" name="f5" maxlength="30" value="%USER2_F5%"></td><td><input form="user_contest_form_2" name="exch" maxlength="17" value="%USER2_EXCH%"></td></tr>
 </tbody></table></div>
-<p class="note">If <code>/FILENAME.MD</code> is absent, the contest is activated without multiplier checking; dupe checking remains enabled. Allowed filename characters: A-Z, 0-9, _ and -.</p>
+<p class="note"><code>/FILENAME.MD</code> がない場合はマルチチェックなしで開始しますが、デュープチェックは有効です。ファイル名に使用できる文字は A-Z、0-9、_、- です。</p>
 
-<h3>CW message macros</h3>
-<p class="note">Enter the sent exchange itself (for example <code>11</code> or <code>1115</code>) in the <strong>Sent EXCH</strong> box. Use <code>$W</code> in a CW message to transmit that value. Number abbreviation follows the DVPlogger CW-number abbreviation setting.</p>
-<table class="help"><thead><tr><th>Macro</th><th>Expanded value</th></tr></thead><tbody>
-<tr><td><code>$I</code></td><td>Your callsign</td></tr>
-<tr><td><code>$C</code></td><td>Other station's callsign</td></tr>
-<tr><td><code>$U</code></td><td><code>CQ</code> in CW/Digital mode</td></tr>
-<tr><td><code>$T</code></td><td><code>TEST</code> in CW/Digital mode</td></tr>
-<tr><td><code>$A</code></td><td><code>TU</code> in CW/Digital mode</td></tr>
-<tr><td><code>$V</code></td><td>Sent RST; normally abbreviated as <code>5NN</code> in CW</td></tr>
-<tr><td><code>$W</code></td><td>Sent EXCH entered in this table</td></tr>
-<tr><td><code>$P</code></td><td>Band-dependent power code</td></tr>
-<tr><td><code>$J</code></td><td>Your JCC/JCG number from the logger settings</td></tr>
-<tr><td><code>$S</code></td><td>Current sequential QSO number</td></tr>
-<tr><td><code>$Q</code></td><td>Next band-specific sequential number, formatted with three digits</td></tr>
-<tr><td><code>$N</code></td><td>Your operator name</td></tr>
+<h3>CWメッセージのマクロ</h3>
+<p class="note"><strong>送出ナンバー</strong>欄には、実際に送る値（例：<code>11</code>、<code>1115</code>）を入力します。CWメッセージ中の <code>$W</code> がこの値へ展開されます。数字の短縮送信はDVPlogger本体のCW数字短縮設定に従います。</p>
+<table class="help"><thead><tr><th>マクロ</th><th>展開内容</th></tr></thead><tbody>
+<tr><td><code>$I</code></td><td>自局コールサイン</td></tr>
+<tr><td><code>$C</code></td><td>相手局コールサイン</td></tr>
+<tr><td><code>$U</code></td><td>CW／Digital時の <code>CQ</code></td></tr>
+<tr><td><code>$T</code></td><td>CW／Digital時の <code>TEST</code></td></tr>
+<tr><td><code>$A</code></td><td>CW／Digital時の <code>TU</code></td></tr>
+<tr><td><code>$V</code></td><td>送信RST。CWでは通常 <code>5NN</code> に短縮</td></tr>
+<tr><td><code>$W</code></td><td>この表の「送出ナンバー」欄</td></tr>
+<tr><td><code>$P</code></td><td>バンドごとの電力コード</td></tr>
+<tr><td><code>$J</code></td><td>本体設定の自局JCC／JCG番号</td></tr>
+<tr><td><code>$S</code></td><td>現在の通しQSO番号</td></tr>
+<tr><td><code>$Q</code></td><td>バンド別の次の連番（3桁）</td></tr>
+<tr><td><code>$N</code></td><td>オペレータ名</td></tr>
 </tbody></table>
 
-<h3>Examples</h3>
-<table class="help examples"><thead><tr><th>Key</th><th>Example</th><th>Typical result</th></tr></thead><tbody>
+<h3>設定例</h3>
+<table class="help examples"><thead><tr><th>キー</th><th>入力例</th><th>送信例</th></tr></thead><tbody>
 <tr><td>F1</td><td><code>$U $T DE $I $I $T</code></td><td><code>CQ TEST DE JK1DVP JK1DVP TEST</code></td></tr>
 <tr><td>F2</td><td><code>$C $V $W</code></td><td><code>JA1ABC 5NN 1115</code></td></tr>
 <tr><td>F3</td><td><code>$A $I $T</code></td><td><code>TU JK1DVP TEST</code></td></tr>
 <tr><td>F5</td><td><code>$C $V$W$P</code></td><td><code>JA1ABC 5NN1115M</code></td></tr>
 </tbody></table>
-<p class="note">Spaces written in the message are transmitted as word spaces. Macros may be joined without spaces, as in <code>$V$W$P</code>.</p>
+<p class="note">メッセージ中の空白は語間として送信されます。<code>$V$W$P</code> のように、マクロを空白なしで連結することもできます。</p>
 </body></html>
+)rawliteral";
+
+
+static const char contests_page_header_en[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DVPlogger Contest Settings</title>
+<style>
+body{font-family:sans-serif;margin:18px;max-width:1250px}table{border-collapse:collapse;width:100%;margin:12px 0 24px}th,td{border:1px solid #aaa;padding:6px;text-align:left;vertical-align:middle}tr.current{font-weight:bold;background:#e8f3ff}input{box-sizing:border-box;padding:5px;font-size:.95em;width:100%;min-width:9em}button{padding:5px 10px;white-space:nowrap}.dupe-ok{color:#075f16;font-weight:bold}.dupe-ng{color:#9b1c1c;font-weight:bold}#status{min-height:1.4em;font-weight:bold}.note{font-size:.9em}.name{white-space:nowrap}.contest-wrap{overflow-x:auto;width:100%}.contest-table{table-layout:fixed;min-width:1180px}.contest-table .col-id{width:38px}.contest-table .col-name{width:220px}.contest-table .col-dupe{width:80px}.contest-table .col-f1{width:175px}.contest-table .col-f2,.contest-table .col-f3{width:135px}.contest-table .col-f5{width:160px}.contest-table .col-exch{width:145px}.contest-name-field{display:flex;align-items:center;gap:8px;white-space:nowrap}.contest-name-field .name-text{flex:1;min-width:0}.nav-links{display:flex;gap:1rem;align-items:center;margin:.2rem 0 1rem}.nav-links a{white-space:nowrap}.user-table{table-layout:fixed;min-width:1200px}.user-table .col-user-name{width:220px}.user-table .col-msg{width:175px}.user-table .col-exch{width:150px}.user-table .col-dupe{width:110px}.user-name-field{display:flex;align-items:center;gap:4px;white-space:nowrap}.user-name-field input{min-width:0;flex:1}.guide{max-width:1000px;border:1px solid #bbb;border-radius:8px;padding:12px 16px;margin:12px 0;background:#fafafa}.guide h3{margin:.4rem 0}.guide ul{margin:.5rem 0;padding-left:1.4rem}.warn{background:#fff4d6;border-left:5px solid #d29a00;padding:8px 12px;margin:10px 0}.help{max-width:900px}.help th:first-child,.help td:first-child{white-space:nowrap}.examples code{white-space:nowrap}
+</style></head><body><h2>Contest Settings</h2>
+<nav class="nav-links"><a href="/">Home</a><a href="/op">Operation</a><a href="/bandmap">Band map</a><a href="/contests?lang=ja">日本語</a></nav>
+<p>Current contest: <strong>%CURRENT_CONTEST%</strong></p>
+<p class="note"><strong>%SD_STATUS%</strong><br>Last action: %LAST_STATUS%</p><p id="status"></p>
+<div class="guide"><h3>How to use this page</h3><ul>
+<li>Edit the CW messages and sent exchange in the desired contest row when necessary.</li>
+<li>Press “Select &amp; Save” to save the row to <code>/CONTEST.TXT</code> on the SD card and immediately switch contests.</li>
+<li>When switching, DVPlogger rebuilds dupe, multiplier and serial-number information from QSOs tagged with that contest name. You can move back and forth between several contests.</li>
+<li><strong>Ctrl-2</strong>: cycle through registered contests.</li>
+<li><strong>Ctrl-Shift-2</strong>: toggle between the current and previously used contest; useful for operating two contests in parallel.</li></ul>
+<p class="note"><strong>Web and keyboard settings are shared.</strong> Either method restores the contest-specific CW messages, sent exchange and serial number, then rebuilds dupe and multiplier information.</p>
+<div class="warn"><strong>Contest / non-contest QSOs:</strong> Enter <code>OFFCONTEST</code> in the callsign field to exclude ordinary QSOs from contest scoring. Enter <code>ONCONTEST</code> to return to the active contest. OFFCONTEST QSOs are marked in Remarks and excluded from contest-specific dupe counting.</div>
+<p class="note"><strong>Selection hint:</strong> <code>NOMULTI</code> is suitable for ordinary QSOs without multipliers. Select a built-in contest with a similar exchange, or use a User-defined contest below.</p></div>
+<div class="contest-wrap"><table class="contest-table"><colgroup><col class="col-id"><col class="col-name"><col class="col-dupe"><col class="col-f1"><col class="col-f2"><col class="col-f3"><col class="col-f5"><col class="col-exch"></colgroup>
+<thead><tr><th>ID</th><th>Contest / Select</th><th>Dupe rule</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent exchange</th></tr></thead><tbody>
+)rawliteral";
+
+static const char contests_page_footer_en[] PROGMEM = R"rawliteral(
+</tbody></table></div><h3>User-defined contests (.MD)</h3>
+<div class="guide"><p>Upload a CTESTWIN-compatible MD definition file from File Upload on the home page. Store it on the SD card as an 8.3 filename such as <code>FILENAME.MD</code>.</p><ul>
+<li>Enter only the part between <code>User</code> and <code>.MD</code>. Example: enter <code>TOKYO</code> for <code>TOKYO.MD</code>.</li>
+<li>The two rows are independent presets. Each can store a different MD file and CW messages for one-button switching.</li>
+<li>If the MD file is missing, DVPlogger can still start the contest without multiplier checking. Set the dupe rule using the checkbox.</li></ul></div>
+<div class="contest-wrap"><table class="user-table"><colgroup><col class="col-user-name"><col class="col-dupe"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-msg"><col class="col-exch"></colgroup>
+<thead><tr><th>MD filename / Select</th><th>CW/Phone dupe</th><th>CW F1 (CQ)</th><th>CW F2</th><th>CW F3</th><th>CW F5</th><th>Sent exchange</th></tr></thead><tbody>
+<tr%USER1_CLASS%><td><form id="user_contest_form_1" method="GET" action="/select_user_contest"><input type="hidden" name="lang" value="%LANG%"><input type="hidden" name="slot" value="0"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_1" name="filename" maxlength="8" value="%USER1_FILENAME%" placeholder="PRESET1" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_1" type="submit">%USER1_ACTION%</button></div></td><td><label><input form="user_contest_form_1" type="checkbox" name="dupe_separate" value="1" %USER1_DUPE_CHECKED% style="width:auto;min-width:0"> Allow separate CW and Phone QSOs</label></td><td><input form="user_contest_form_1" name="f1" maxlength="30" value="%USER1_F1%"></td><td><input form="user_contest_form_1" name="f2" maxlength="30" value="%USER1_F2%"></td><td><input form="user_contest_form_1" name="f3" maxlength="30" value="%USER1_F3%"></td><td><input form="user_contest_form_1" name="f5" maxlength="30" value="%USER1_F5%"></td><td><input form="user_contest_form_1" name="exch" maxlength="17" value="%USER1_EXCH%"></td></tr>
+<tr%USER2_CLASS%><td><form id="user_contest_form_2" method="GET" action="/select_user_contest"><input type="hidden" name="lang" value="%LANG%"><input type="hidden" name="slot" value="1"></form><div class="user-name-field"><span>User</span><input form="user_contest_form_2" name="filename" maxlength="8" value="%USER2_FILENAME%" placeholder="PRESET2" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><button form="user_contest_form_2" type="submit">%USER2_ACTION%</button></div></td><td><label><input form="user_contest_form_2" type="checkbox" name="dupe_separate" value="1" %USER2_DUPE_CHECKED% style="width:auto;min-width:0"> Allow separate CW and Phone QSOs</label></td><td><input form="user_contest_form_2" name="f1" maxlength="30" value="%USER2_F1%"></td><td><input form="user_contest_form_2" name="f2" maxlength="30" value="%USER2_F2%"></td><td><input form="user_contest_form_2" name="f3" maxlength="30" value="%USER2_F3%"></td><td><input form="user_contest_form_2" name="f5" maxlength="30" value="%USER2_F5%"></td><td><input form="user_contest_form_2" name="exch" maxlength="17" value="%USER2_EXCH%"></td></tr></tbody></table></div>
+<p class="note">If <code>/FILENAME.MD</code> is not found, the contest starts without multiplier checking, while dupe checking remains enabled. Valid filename characters are A-Z, 0-9, _ and -.</p>
+<h3>CW message macros</h3><p class="note">Enter the value actually sent (for example <code>11</code> or <code>1115</code>) in “Sent exchange”. <code>$W</code> expands to this value. Abbreviated CW numerals follow the DVPlogger CW-number setting.</p>
+<table class="help"><thead><tr><th>Macro</th><th>Expansion</th></tr></thead><tbody>
+<tr><td><code>$I</code></td><td>Your callsign</td></tr><tr><td><code>$C</code></td><td>Other station's callsign</td></tr><tr><td><code>$U</code></td><td><code>CQ</code> in CW/Digital modes</td></tr><tr><td><code>$T</code></td><td><code>TEST</code> in CW/Digital modes</td></tr><tr><td><code>$A</code></td><td><code>TU</code> in CW/Digital modes</td></tr><tr><td><code>$V</code></td><td>Sent RST; normally shortened to <code>5NN</code> in CW</td></tr><tr><td><code>$W</code></td><td>Sent exchange in this table</td></tr><tr><td><code>$P</code></td><td>Band-specific power code</td></tr><tr><td><code>$J</code></td><td>Your JCC/JCG number from settings</td></tr><tr><td><code>$S</code></td><td>Current overall QSO serial number</td></tr><tr><td><code>$Q</code></td><td>Next band-specific serial number (3 digits)</td></tr><tr><td><code>$N</code></td><td>Operator name</td></tr></tbody></table>
+<h3>Examples</h3><table class="help examples"><thead><tr><th>Key</th><th>Input</th><th>Sent text</th></tr></thead><tbody><tr><td>F1</td><td><code>$U $T DE $I $I $T</code></td><td><code>CQ TEST DE JK1DVP JK1DVP TEST</code></td></tr><tr><td>F2</td><td><code>$C $V $W</code></td><td><code>JA1ABC 5NN 1115</code></td></tr><tr><td>F3</td><td><code>$A $I $T</code></td><td><code>TU JK1DVP TEST</code></td></tr><tr><td>F5</td><td><code>$C $V$W$P</code></td><td><code>JA1ABC 5NN1115M</code></td></tr></tbody></table>
+<p class="note">Spaces in a message are sent as word spaces. Macros may also be concatenated without spaces, as in <code>$V$W$P</code>.</p></body></html>
 )rawliteral";
 
 struct ContestWebPreset {
@@ -832,8 +1135,7 @@ struct ContestWebPreset {
   bool dupe_separate;
 };
 
-static constexpr int MAX_CONTEST_WEB_PRESETS = N_CONTEST + 8;
-static ContestWebPreset contest_web_presets[MAX_CONTEST_WEB_PRESETS];
+static ContestWebPreset contest_web_scratch;
 static bool contest_web_presets_loaded = false;
 static constexpr int N_USER_CONTEST_SLOTS = 2;
 static char contest_web_user_slot[N_USER_CONTEST_SLOTS][9];
@@ -916,49 +1218,75 @@ static String json_string_escape(const char *src) {
   return out;
 }
 
+static bool parse_contest_preset_line(const String &line, const char *wanted_name,
+                                      ContestWebPreset *out) {
+  int p1 = line.indexOf('\t');
+  int p2 = p1 < 0 ? -1 : line.indexOf('\t', p1 + 1);
+  int p3 = p2 < 0 ? -1 : line.indexOf('\t', p2 + 1);
+  int p4 = p3 < 0 ? -1 : line.indexOf('\t', p3 + 1);
+  int p5 = p4 < 0 ? -1 : line.indexOf('\t', p4 + 1);
+  int p6 = p5 < 0 ? -1 : line.indexOf('\t', p5 + 1);
+  if (p1 < 1 || p2 < 0 || p3 < 0) return false;
+  String name = line.substring(0, p1);
+  if (!name.equalsIgnoreCase(wanted_name)) return false;
+
+  memset(out, 0, sizeof(*out));
+  out->used = true;
+  strlcpy(out->name, name.c_str(), sizeof(out->name));
+  copy_web_value(out->f1, sizeof(out->f1), line.substring(p1 + 1, p2));
+  if (p4 >= 0 && p5 >= 0) {
+    copy_web_value(out->f2, sizeof(out->f2), line.substring(p2 + 1, p3));
+    copy_web_value(out->f3, sizeof(out->f3), line.substring(p3 + 1, p4));
+    copy_web_value(out->f5, sizeof(out->f5), line.substring(p4 + 1, p5));
+    if (p6 >= 0) {
+      copy_web_value(out->exch, sizeof(out->exch), line.substring(p5 + 1, p6));
+      out->dupe_separate = line.substring(p6 + 1).toInt() != 0;
+    } else {
+      copy_web_value(out->exch, sizeof(out->exch), line.substring(p5 + 1));
+    }
+  } else {
+    copy_web_value(out->f3, sizeof(out->f3), line.substring(p2 + 1, p3));
+    copy_web_value(out->exch, sizeof(out->exch), line.substring(p3 + 1));
+  }
+  return true;
+}
+
 static ContestWebPreset *find_contest_web_preset(const char *name, bool create) {
   if (!name || !*name) return NULL;
-  ContestWebPreset *free_slot = NULL;
-  for (int i = 0; i < MAX_CONTEST_WEB_PRESETS; ++i) {
-    if (contest_web_presets[i].used) {
-      if (strcasecmp(contest_web_presets[i].name, name) == 0) return &contest_web_presets[i];
-    } else if (!free_slot) free_slot = &contest_web_presets[i];
+  bool found = false;
+  File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
+  if (f) {
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      if (line.endsWith("\r")) line.remove(line.length() - 1);
+      // Keep scanning: the last occurrence is the newest appended value.
+      if (parse_contest_preset_line(line, name, &contest_web_scratch)) found = true;
+    }
+    f.close();
   }
-  if (!create || !free_slot) return NULL;
-  memset(free_slot, 0, sizeof(*free_slot));
-  free_slot->used = true;
-  strlcpy(free_slot->name, name, sizeof(free_slot->name));
-  return free_slot;
+  if (found) return &contest_web_scratch;
+  if (!create) return NULL;
+  memset(&contest_web_scratch, 0, sizeof(contest_web_scratch));
+  contest_web_scratch.used = true;
+  strlcpy(contest_web_scratch.name, name, sizeof(contest_web_scratch.name));
+  return &contest_web_scratch;
 }
 
 static void initialize_user_contest_slot_defaults() {
   static const char *default_filename[N_USER_CONTEST_SLOTS] = {
     "PRESET1", "PRESET2"
   };
-
   for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
     if (!contest_web_user_slot[i][0]) {
       strlcpy(contest_web_user_slot[i], default_filename[i],
               sizeof(contest_web_user_slot[i]));
     }
-
-    String contest_name = String("User") + contest_web_user_slot[i];
-    if (find_contest_web_preset(contest_name.c_str(), false)) continue;
-
-    ContestWebPreset *p = find_contest_web_preset(contest_name.c_str(), true);
-    if (!p) continue;
-    copy_web_value(p->f1, sizeof(p->f1), String(plogw->cw_msg[0] + 2));
-    copy_web_value(p->f2, sizeof(p->f2), String(plogw->cw_msg[1] + 2));
-    copy_web_value(p->f3, sizeof(p->f3), String(plogw->cw_msg[2] + 2));
-    copy_web_value(p->f5, sizeof(p->f5), String(plogw->cw_msg[4] + 2));
-    copy_web_value(p->exch, sizeof(p->exch), String(plogw->sent_exch + 2));
   }
 }
 
 static void load_contest_web_presets() {
   if (contest_web_presets_loaded) return;
   contest_web_presets_loaded = true;
-  memset(contest_web_presets, 0, sizeof(contest_web_presets));
   memset(contest_web_user_slot, 0, sizeof(contest_web_user_slot));
   File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
   if (!f) {
@@ -974,48 +1302,13 @@ static void load_contest_web_presets() {
   while (f.available()) {
     String line = f.readStringUntil('\n');
     if (line.endsWith("\r")) line.remove(line.length() - 1);
-    if (!line.length()) continue;
-
-    bool slot_line = false;
     for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
       String prefix = String("#USER_SLOT") + String(i + 1) + "=";
       if (!line.startsWith(prefix)) continue;
       String filename = line.substring(prefix.length());
-      filename.trim();
-      filename.toUpperCase();
-      if (valid_web_user_md_basename(filename)) {
+      filename.trim(); filename.toUpperCase();
+      if (valid_web_user_md_basename(filename))
         strlcpy(contest_web_user_slot[i], filename.c_str(), sizeof(contest_web_user_slot[i]));
-      }
-      slot_line = true;
-      break;
-    }
-    if (slot_line || line.charAt(0) == '#') continue;
-
-    int p1 = line.indexOf('\t');
-    int p2 = p1 < 0 ? -1 : line.indexOf('\t', p1 + 1);
-    int p3 = p2 < 0 ? -1 : line.indexOf('\t', p2 + 1);
-    int p4 = p3 < 0 ? -1 : line.indexOf('\t', p3 + 1);
-    int p5 = p4 < 0 ? -1 : line.indexOf('\t', p4 + 1);
-    int p6 = p5 < 0 ? -1 : line.indexOf('\t', p5 + 1);
-    if (p1 < 1 || p2 < 0 || p3 < 0) continue;
-    String name = line.substring(0, p1);
-    ContestWebPreset *p = find_contest_web_preset(name.c_str(), true);
-    if (!p) continue;
-    copy_web_value(p->f1, sizeof(p->f1), line.substring(p1 + 1, p2));
-    if (p4 >= 0 && p5 >= 0) {
-      copy_web_value(p->f2, sizeof(p->f2), line.substring(p2 + 1, p3));
-      copy_web_value(p->f3, sizeof(p->f3), line.substring(p3 + 1, p4));
-      copy_web_value(p->f5, sizeof(p->f5), line.substring(p4 + 1, p5));
-      if (p6 >= 0) {
-        copy_web_value(p->exch, sizeof(p->exch), line.substring(p5 + 1, p6));
-        p->dupe_separate = line.substring(p6 + 1).toInt() != 0;
-      } else {
-        copy_web_value(p->exch, sizeof(p->exch), line.substring(p5 + 1));
-        p->dupe_separate = false;
-      }
-    } else {
-      copy_web_value(p->f3, sizeof(p->f3), line.substring(p2 + 1, p3));
-      copy_web_value(p->exch, sizeof(p->exch), line.substring(p3 + 1));
     }
   }
   f.close();
@@ -1027,52 +1320,25 @@ static bool save_contest_web_presets() {
     set_contest_web_status("save failed: microSD is not mounted");
     return false;
   }
-  if (SD.exists(CONTEST_PRESET_FILE) && !SD.remove(CONTEST_PRESET_FILE)) {
-    set_contest_web_status(String("save failed: cannot remove old ") + CONTEST_PRESET_FILE);
-    return false;
-  }
-  // FILE_WRITE in the old Arduino-ESP32 core used by this project may open
-  // an existing file without O_CREAT.  Use the already-mounted VFS path
-  // explicitly so a new 8.3 file can always be created/truncated.
-  FILE *fp = fopen(CONTEST_PRESET_VFS_FILE, "w");
+  FILE *fp = fopen(CONTEST_PRESET_VFS_FILE, "a");
   if (!fp) {
-    set_contest_web_status(String("save failed: fopen(") + CONTEST_PRESET_VFS_FILE + ",w) failed, errno=" + String(errno));
+    set_contest_web_status(String("save failed: fopen(") + CONTEST_PRESET_VFS_FILE + ",a) failed, errno=" + String(errno));
     return false;
   }
   int n = fprintf(fp, "#USER_SLOT1=%s\n#USER_SLOT2=%s\n",
                   contest_web_user_slot[0], contest_web_user_slot[1]);
-  if (n < 0) {
-    fclose(fp);
-    set_contest_web_status(String("save failed while writing User slots to ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
-    return false;
-  }
-  size_t written = (size_t)n;
-  n = fprintf(fp, "# contest-name\tF1\tF2\tF3\tF5\tsent-exchange\tdupe-separate\n");
-  if (n > 0) written += (size_t)n;
-  for (int i = 0; i < MAX_CONTEST_WEB_PRESETS; ++i) {
-    const ContestWebPreset &p = contest_web_presets[i];
-    if (!p.used) continue;
+  if (n >= 0 && contest_web_scratch.used) {
     n = fprintf(fp, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
-                p.name, p.f1, p.f2, p.f3, p.f5, p.exch,
-                p.dupe_separate ? 1 : 0);
-    if (n < 0) {
-      fclose(fp);
-      set_contest_web_status(String("save failed while writing ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
-      return false;
-    }
-    written += (size_t)n;
+                contest_web_scratch.name, contest_web_scratch.f1,
+                contest_web_scratch.f2, contest_web_scratch.f3,
+                contest_web_scratch.f5, contest_web_scratch.exch,
+                contest_web_scratch.dupe_separate ? 1 : 0);
   }
-  if (fflush(fp) != 0) {
-    fclose(fp);
-    set_contest_web_status(String("save failed while flushing ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
-    return false;
-  }
-  if (fclose(fp) != 0) {
-    set_contest_web_status(String("save failed while closing ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
-    return false;
-  }
-  if (!SD.exists(CONTEST_PRESET_FILE)) {
-    set_contest_web_status(String("save failed: ") + CONTEST_PRESET_FILE + " is absent after close");
+  const bool write_failed = n < 0;
+  const bool flush_failed = fflush(fp) != 0;
+  const bool close_failed = fclose(fp) != 0;
+  if (write_failed || flush_failed || close_failed) {
+    set_contest_web_status(String("save failed while appending ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
     return false;
   }
   File verify = SD.open(CONTEST_PRESET_FILE, FILE_READ);
@@ -1080,12 +1346,26 @@ static bool save_contest_web_presets() {
     set_contest_web_status(String("save failed: cannot reopen ") + CONTEST_PRESET_FILE);
     return false;
   }
-  const size_t verified = verify.size();
+  contest_web_file_size = verify.size();
   verify.close();
   contest_web_file_loaded = true;
-  contest_web_file_size = verified;
-  set_contest_web_status(String("saved ") + CONTEST_PRESET_FILE + " (" + String(verified) + " bytes, write reported " + String(written) + ")");
+  set_contest_web_status(String("saved ") + CONTEST_PRESET_FILE + " (" + String(contest_web_file_size) + " bytes)");
   return true;
+}
+
+bool save_contest_runtime_preset(const char *contest_name) {
+  if (!contest_name || !*contest_name || !plogw) return false;
+  load_contest_web_presets();
+  ContestWebPreset *p = find_contest_web_preset(contest_name, true);
+  if (!p) return false;
+
+  copy_web_value(p->f1, sizeof(p->f1), String(plogw->cw_msg[0] + 2));
+  copy_web_value(p->f2, sizeof(p->f2), String(plogw->cw_msg[1] + 2));
+  copy_web_value(p->f3, sizeof(p->f3), String(plogw->cw_msg[2] + 2));
+  copy_web_value(p->f5, sizeof(p->f5), String(plogw->cw_msg[4] + 2));
+  copy_web_value(p->exch, sizeof(p->exch), String(plogw->sent_exch + 2));
+  p->dupe_separate = plogw->mask == CW_PH_DUPE_OK;
+  return save_contest_web_presets();
 }
 
 static void set_current_contest_messages(const ContestWebPreset &p) {
@@ -1099,6 +1379,15 @@ static void set_current_contest_messages(const ContestWebPreset &p) {
   plogw->cw_msg[4][1] = strlen(plogw->cw_msg[4] + 2);
   strlcpy(plogw->sent_exch + 2, p.exch, LEN_SENT_EXCH_WINDOW + 1);
   plogw->sent_exch[1] = strlen(plogw->sent_exch + 2);
+}
+
+bool apply_contest_runtime_preset(const char *contest_name) {
+  if (!contest_name || !*contest_name || !plogw) return false;
+  load_contest_web_presets();
+  ContestWebPreset *p = find_contest_web_preset(contest_name, false);
+  if (!p) return false;
+  set_current_contest_messages(*p);
+  return true;
 }
 
 static AsyncWebParameter *contest_request_param(AsyncWebServerRequest *request, const char *name) {
@@ -1140,8 +1429,10 @@ static void setupContestPageHandler() {
   load_contest_web_presets();
 
   web_server.on("/contests", HTTP_GET, [](AsyncWebServerRequest *request) {
-    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; char text[6144]; };
+    const bool japanese = request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja");
+    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; bool japanese=false; char text[6144]; };
     std::shared_ptr<State> state = std::make_shared<State>();
+    if (state) state->japanese = japanese;
     if (!state) {
       request->send(503, "text/plain", "Not enough memory to build contest page");
       return;
@@ -1157,6 +1448,7 @@ static void setupContestPageHandler() {
             text.replace("%LAST_STATUS%", html_attr_escape(contest_web_last_status.c_str()));
           }
           else {
+            text.replace("%LANG%", state->japanese ? "ja" : "en");
             for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
               String filename = contest_web_user_slot[i];
               if (!filename.length() && i == 0 && !contest_web_user_slot[1][0] &&
@@ -1186,7 +1478,7 @@ static void setupContestPageHandler() {
               text.replace(tag + "_F5%", html_attr_escape(f5));
               text.replace(tag + "_EXCH%", html_attr_escape(ex));
               text.replace(tag + "_DUPE_CHECKED%", (p && p->dupe_separate) ? "checked" : "");
-              text.replace(tag + "_ACTION%", current ? "Save / Re-select" : "Select &amp; Save");
+              text.replace(tag + "_ACTION%", state->japanese ? (current ? "保存して再選択" : "選択して保存") : (current ? "Save & re-select" : "Select & save"));
             }
           }
           text.toCharArray(state->text,sizeof(state->text)); state->length=strnlen(state->text,sizeof(state->text)); state->offset=0;
@@ -1195,7 +1487,7 @@ static void setupContestPageHandler() {
         while(written<maxLen && state->stage!=State::Done){
           switch(state->stage){
           case State::Header:
-            if (!state->length) prepare(contests_page_header, false);
+            if (!state->length) prepare(state->japanese ? contests_page_header : contests_page_header_en, false);
             if (copy()) state->stage = State::Entry;
             break;
           case State::Entry:
@@ -1211,8 +1503,8 @@ static void setupContestPageHandler() {
               const char *ex=p?p->exch:(current?plogw->sent_exch+2:plogw->sent_exch+2);
               bool dupe_ok=contest_definition_mask(state->index)==CW_PH_DUPE_OK;
               String form_id = String("contest_form_") + String(state->index);
-              String action_label = current ? "Save / Re-select" : "Select & Save";
-              String row=String("<tr")+(current?" class=\"current\"":"")+"><td><form id=\""+form_id+"\" method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"></form>"+String(id)+"</td><td class=\"name\"><div class=\"contest-name-field\"><span class=\"name-text\">"+html_attr_escape(name)+"</span><button form=\""+form_id+"\" type=\"submit\">"+action_label+"</button></div></td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(dupe_ok?"OK C/P":"NG C/P")+"</td>";
+              String action_label = state->japanese ? (current ? "保存して再選択" : "選択して保存") : (current ? "Save & re-select" : "Select & save");
+              String row=String("<tr")+(current?" class=\"current\"":"")+"><td><form id=\""+form_id+"\" method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"lang\" value=\""+(state->japanese?"ja":"en")+"\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"></form>"+String(id)+"</td><td class=\"name\"><div class=\"contest-name-field\"><span class=\"name-text\">"+html_attr_escape(name)+"</span><button form=\""+form_id+"\" type=\"submit\">"+action_label+"</button></div></td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(state->japanese ? (dupe_ok?"CW/Phone別":"モード共通") : (dupe_ok?"CW/Phone separate":"All modes"))+"</td>";
               row += "<td><input form=\""+form_id+"\" name=\"f1\" maxlength=\"30\" value=\""+html_attr_escape(f1)+"\"></td>";
               row += "<td><input form=\""+form_id+"\" name=\"f2\" maxlength=\"30\" value=\""+html_attr_escape(f2)+"\"></td>";
               row += "<td><input form=\""+form_id+"\" name=\"f3\" maxlength=\"30\" value=\""+html_attr_escape(f3)+"\"></td>";
@@ -1224,7 +1516,7 @@ static void setupContestPageHandler() {
             if (copy()) ++state->index;
             break;
           case State::Footer:
-            if (!state->length) prepare(contests_page_footer, true);
+            if (!state->length) prepare(state->japanese ? contests_page_footer : contests_page_footer_en, true);
             if (copy()) state->stage = State::Done;
             break;
           case State::Done: break;
@@ -1260,7 +1552,7 @@ static void setupContestPageHandler() {
     plogw->contest_id=id; set_contest_id(); set_current_contest_messages(*p);
     upd_display_info_contest_settings(so2r.radio_selected());
     set_contest_web_status(String("selected ") + (plogw->contest_name+2) + ", F2=\"" + (plogw->cw_msg[1]+2) + "\", EXCH=\"" + (plogw->sent_exch+2) + "\"");
-    request->redirect("/contests");
+    request->redirect(request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja") ? "/contests?lang=ja" : "/contests?lang=en");
   });
 
   web_server.on("/select_user_contest", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1285,7 +1577,7 @@ static void setupContestPageHandler() {
     set_user_md_fallback_dupe_mask(p->dupe_separate ? CW_PH_DUPE_OK : CW_PH_DUPE_NG);
     if(!start_user_md_contest(plogw->contest_name+2)){set_contest_web_status(String("saved preset, but failed to start loading /")+filename+".MD");request->send(400,"text/plain",contest_web_last_status);return;}
     set_contest_web_status(String("saved preset and started loading /")+filename+".MD, F2=\""+(plogw->cw_msg[1]+2)+"\", EXCH=\""+(plogw->sent_exch+2)+"\"");
-    request->redirect("/contests");
+    request->redirect(request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja") ? "/contests?lang=ja" : "/contests?lang=en");
   });
 }
 
@@ -1296,8 +1588,17 @@ void setupSettingsPageHandler() {
     String html = settings_page_html;  // テンプレートを複製
     String inputs;
 
-    for (int i = 0; i < N_EDITWIN; ++i) {
-      if (pwin_index(i)==NULL) break;
+    // Keep the stored setting indexes unchanged, but present Cluster2
+    // immediately after the primary Cluster settings on the Web page.
+    static const uint8_t display_order[] = {
+      0, 1, 2, 3, 4, 5, 6,
+      7, 8, 20, 21, 22, 23, 24, 25, 26,
+      9, 10, 11, 12,
+      13, 14, 15, 16, 17, 18, 19
+    };
+    for (size_t pos = 0; pos < sizeof(display_order); ++pos) {
+      const int i = display_order[pos];
+      if (i >= N_EDITWIN || pwin_index(i) == NULL) continue;
       char line[256];
       const char *attr="";
       switch (pwin_type_index(i)) {
@@ -1770,26 +2071,33 @@ const char index_html[] PROGMEM = R"rawliteral(
 <p>jarllog,readqso,dumpqso,csv,adif?num=QSOFILENUM(001,...) to process backup QSO files.</p>
 <p>?park=PARK# でPARK#からQRVしたログ(Remarks にPOTA_MY:PARK#)のみ出力します。</p>
 <p>?summit=SUMMIT# でSOTA SUMMIT#からQRVしたログ(Remarks にSOTA_MY:SUMMIT#)のみ出力します。</p>
-<p><a href="/potahelp">/potahelp</a> POTA 最寄り検索/ログ簡単アップロード</p>
-<p><a href="/sotahelp">/sotahelp</a> SOTA 最寄り検索/ログ簡単アップロード</p>
+<p><a href="/potahelp?lang=ja">POTA helper (jp)</a> <a href="/potahelp?lang=en">(en)</a> Nearest-park search / ADIF export</p>
+<p><a href="/sotahelp?lang=ja">SOTA helper (jp)</a> <a href="/sotahelp?lang=en">(en)</a> Nearest-summit search / ADIF export</p>
 <p><a href="/settings">/settings</a> View/Edit Logger Settings</p>
-<p><a href="/contests">/contests</a> Select Contest</p>
+<p><a href="/status">/status</a> DVPlogger Status</p>
+<p><a href="/contests?lang=ja">Contest settings (jp)</a> <a href="/contests?lang=en">(en)</a></p>
 <p><a href="/rigs">/rigs</a> View/Edit RIG Settings</p>
 <p><a href="/bandmap">/bandmap</a> Multi-band Bandmap</p>
-<p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_260718.pdf">Manual DVPlogger_manual_2560718.pdf</a></p>
+<p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_260718.pdf">Manual DVPlogger_manual_260718.pdf</a></p>
 <p><a href="/op">/op</a> Web Opeartion Window</p>
 
   <p><h1>File Upload</h1></p>
-  <p>Free Storage: %FREESPIFFS% | Used Storage: %USEDSPIFFS% | Total Storage: %TOTALSPIFFS%</p>
+  <p>SD Free: %FREESPIFFS% | SD Used: %USEDSPIFFS% | SD Total: %TOTALSPIFFS%</p>
   <form method="POST" action="/upload" enctype="multipart/form-data"><input type="file" name="data"/><input type="submit" name="upload" value="Upload" title="Upload File"></form>
 <p>パーシャルチェックのファイルはname.pck (8.3形式)でアップロードしてください。</p>
 <p>CALLHISTnameとコマンドを入力すると、name.pckを読み込みます。</p>
   <p>ファイルアップロードの開始終了は表示されませんので、ファイルリスト更新までお待ちください。</p>
-<p>After clicking upload it will take some time for the file to firstly upload and then be written to SPIFFS, there is no indicator that the upload began.  Please be patient.</p>
+<p>After clicking upload it will take some time for the file to firstly upload and then be written to the SD card, there is no indicator that the upload began.  Please be patient.</p>
   <p>Once uploaded the page will refresh and the newly uploaded file will appear in the file list.</p>
   <p>If a file does not appear, it will be because the file was too big, or had unusual characters in the file name (like spaces).</p>
   <p>You can see the progress of the upload by watching the serial output.</p>
-  <p>%FILELIST%</p>
+  <div id="filelist">Loading SD file list...</div>
+<script>
+fetch('/filelist', {cache:'no-store'})
+  .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
+  .then(function(html){ document.getElementById('filelist').innerHTML=html; })
+  .catch(function(e){ document.getElementById('filelist').textContent='SD file list error: '+e; });
+</script>
 </body>
 </html>
 )rawliteral";
@@ -1896,6 +2204,28 @@ const std::map<int, int> keycodeToHid = {
 };
 
 
+const char antenna_page_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DVPlogger Antenna Settings</title>
+<style>body{font-family:sans-serif;margin:16px}table{border-collapse:collapse}th,td{border:1px solid #aaa;padding:5px}input{font-size:15px} .wide{width:360px;max-width:80vw}</style>
+</head><body><h2>Antenna Settings</h2>
+<p>DVPlogger allocates antennas in radio-number order. Each preference string follows the DVPlogger band order: 1.8, 3.5, 7, 14, 21, 28, 50, 144, 430, 1200, 2400, 5600, 10G, 10, 18, 24 MHz. 0 means no antenna.</p>
+<form id="f">
+<table><tr><th>Enable</th><td><input id="enable" type="checkbox"></td></tr>
+<tr><th>OTRSP host</th><td><input id="host" class="wide"></td></tr><tr><th>Port</th><td><input id="port" type="number"></td></tr>
+<tr><th>1st preference</th><td><input id="pref1" class="wide" maxlength="16"></td></tr>
+<tr><th>2nd preference</th><td><input id="pref2" class="wide" maxlength="16"></td></tr>
+<tr><th>3rd preference</th><td><input id="pref3" class="wide" maxlength="16"></td></tr></table>
+<h3>Antenna names</h3><table><thead><tr><th>ID</th><th>Name</th></tr></thead><tbody id="names"></tbody></table>
+<p><button type="button" onclick="saveConfig()">Save</button> <span id="msg"></span></p></form>
+<p><a href="/op">Back to Operation</a></p>
+<script>
+async function loadConfig(){const r=await fetch('/antenna_config');const d=await r.json();enable.checked=d.enable;host.value=d.host;port.value=d.port;pref1.value=d.pref[0];pref2.value=d.pref[1];pref3.value=d.pref[2];names.innerHTML=d.names.map((n,i)=>`<tr><td>${i+1}</td><td><input id="name${i+1}" class="wide" maxlength="23" value="${n.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}"></td></tr>`).join('');}
+async function saveConfig(){const q=new URLSearchParams();q.set('enable',enable.checked?'1':'0');q.set('host',host.value);q.set('port',port.value);q.set('pref1',pref1.value);q.set('pref2',pref2.value);q.set('pref3',pref3.value);for(let i=1;i<=9;i++)q.set('name'+i,document.getElementById('name'+i).value);const r=await fetch('/antenna_config?'+q.toString(),{method:'POST'});msg.textContent=await r.text();}
+loadConfig();
+</script></body></html>
+)rawliteral";
+
 const char oppage_html[] PROGMEM =R"rawliteral(
 <!DOCTYPE html>
 <!-- saved from url=(0021)http://192.168.1.2/op -->
@@ -1989,7 +2319,15 @@ const char oppage_html[] PROGMEM =R"rawliteral(
     button:hover {
       background-color: #a0a0a0;
     }
-  </style>
+  
+  .ant-section { padding: 8px; }
+  .ant-section table { border-collapse: collapse; width: 100%; max-width: 900px; }
+  .ant-section th, .ant-section td { border: 1px solid #aaa; padding: 5px 7px; text-align: left; }
+  .ant-ready { background: #d9f2d9; }
+  .ant-waiting { background: #fff2b3; }
+  .ant-tx, .ant-disconnected { background: #f7cccc; }
+  .ant-disabled { background: #eeeeee; }
+</style>
 </head>
 
 <body>
@@ -2061,119 +2399,203 @@ const char oppage_html[] PROGMEM =R"rawliteral(
         <label>Contest:</label>
    <input type="text" id="edit_13" data-index="13" size="20"> <!-- contest_name 0 -->
     </div>
- <div class="form-container" id="cwkeyingDisplay"></div> <!-- CW keying ticker display -->
-    <p>Band map test</p>
-    <p><a href="/">go back to Home</a></p>
+<div class="form-container" id="cwkeyingDisplay"></div> <!-- CW keying ticker display -->
+<div class="ant-section">
+  <h4>Antenna</h4>
+  <table>
+    <tbody>
+      <tr><th>Controller</th><td id="antController">-</td><th>Connection</th><td id="antConnection">-</td></tr>
+      <tr><th>Host</th><td id="antHost">-</td><th>State</th><td id="antState">-</td></tr>
+      <tr><th>Reason</th><td id="antReason" colspan="3">-</td></tr>
+    </tbody>
+  </table>
+  <table style="margin-top:6px">
+    <thead><tr><th>Radio</th><th>Band</th><th>Current</th><th>Requested</th><th>Pref</th><th>Status</th></tr></thead>
+    <tbody id="antRadioRows"><tr><td colspan="6">Loading...</td></tr></tbody>
+  </table>
+  <p><a href="/antenna">Antenna settings</a></p>
+</div>
+    <p><a href="/bandmap">Open Bandmap</a> | <a href="/contests">Contest settings</a> | <a href="/">go back to Home</a></p>
 
   </form>
 
 <script>
+function normalizeOpValue(index, value) {
+  let v = String(value || '');
+  if ([0,1,4,5,10,11,12].includes(index)) v = v.toUpperCase();
+  if ([0,1].includes(index)) return v.replace(/[^A-Z0-9\/.]/g, '');
+  if ([2,3].includes(index)) return v.replace(/[^0-9]/g, '');
+  // Sent Exch (index 4) accepts the same visible ASCII macro characters
+  // as CW message fields, including '$', '#', '%', '&', '*', '+', etc.
+  if ([4,5,10,11,12,13].includes(index)) return v.replace(/[^\x21-\x7E]/g, '');
+  return v.replace(/[^\x20-\x7E]/g, '');
+}
+function normalizeOpInput(input) {
+  const index = Number(input.dataset.index);
+  const normalized = normalizeOpValue(index, input.value);
+  if (input.value !== normalized) input.value = normalized;
+  return normalized;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('input[data-index]').forEach(input => {
+    input.addEventListener('input', () => normalizeOpInput(input));
+    input.addEventListener('change', () => normalizeOpInput(input));
+  });
+});
+
+function setSelectedButton(prefix, value) {
+  const selectedId = `${prefix}_${value}`;
+  document.querySelectorAll(`[id^="${prefix}_"]`).forEach(el => {
+    el.style.backgroundColor = (el.id === selectedId) ? "green" : "gray";
+  });
+}
+
+async function sendControl(type, value, buttonPrefix) {
+  requestFastOpPolling();
+  // Reflect the user's operation immediately.  The periodic status poll later
+  // corrects the display if the command is rejected or the rig reports a
+  // different state.
+  if (buttonPrefix) setSelectedButton(buttonPrefix, value);
+  try {
+    const response = await fetch(`/control?type=${encodeURIComponent(type)}&value=${encodeURIComponent(value)}`,
+                                 { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    // Do not wait for the normal long polling cycle.  Give the main loop a
+    // short opportunity to consume the queue, then reconcile this button.
+    setTimeout(() => {
+      const index = type === 'Radio' ? 7 : (type === 'Mode' ? 8 : 9);
+      fetchStatus_button(index, buttonPrefix);
+      fetchStatus(99, 'radioDisplay');
+    }, 120);
+  } catch (error) {
+    console.error(`Control ${type} failed:`, error);
+    // Restore the authoritative state promptly after an enqueue/network error.
+    const index = type === 'Radio' ? 7 : (type === 'Mode' ? 8 : 9);
+    fetchStatus_button(index, buttonPrefix);
+  }
+}
+
 function selectRadio(name) {
-  fetch(`/control?type=Radio&value=${name}`)
+  sendControl('Radio', name, 'b_radio');
 }
 function selectMode(name) {
-  fetch(`/control?type=Mode&value=${name}`)
+  sendControl('Mode', name, 'b_mode');
 }
 function selectBand(name) {
-  fetch(`/control?type=Band&value=${name}`)
+  sendControl('Band', name, 'b_band');
 }
 
-// `fetchMultipleIndexes` 関数での処理を非同期で実行
-async function fetchMultipleIndexes() {
-  const indices = [0, 1, 2, 3, 4, 5, 10,11,12,13 ];  // 任意のindexの配列
-  const overwrite = [10,11,12]; // indices to overwrite regardless of the present value
-  for (let i = 0; i < indices.length; i++) {
-    const index = indices[i];
-    try {
-      const response = await fetch(`/radio_status?index=${index}`);
-      const data = await response.text();
-      console.log(`Response for index ${index}:`, data);
+// /opの主要状態を1回のHTTP要求で取得する。
+let forceOpInputSyncUntil = 0;
+let qsoFieldSyncing = [false, false];
+let suppressQsoBlurOnce = [false, false];
+let lastSyncedQsoValue = ['', ''];
+let opStatusFetching = false;
+let opFastPollUntil = 0;
+let opPollTimer = null;
+const OP_DEBUG = false;
 
-      // 取得したデータをinputに設定
-      const inputElement = document.getElementById(`edit_${index}`);
+function opDebug(...args) {
+  if (OP_DEBUG) console.log(...args);
+}
 
-      // inputのvalueが空の場合のみ更新
-      //if (inputElement && ((inputElement.value === '')||(overwrite.includes(${index}))))) {
-      if (inputElement && inputElement.value === '') {
-        inputElement.value = data;
+function setTextIfChanged(id, value) {
+  const el = document.getElementById(id);
+  if (el && el.textContent !== value) el.textContent = value;
+}
+
+function requestFastOpPolling(durationMs = 1500) {
+  opFastPollUntil = Math.max(opFastPollUntil, Date.now() + durationMs);
+}
+
+function selectStatusButton(prefix, value) {
+  const selectedId = `${prefix}_${value}`;
+  document.querySelectorAll(`[id^="${prefix}_"]`).forEach(el => {
+    const color = el.id === selectedId ? "green" : "gray";
+    if (el.style.backgroundColor !== color) el.style.backgroundColor = color;
+  });
+}
+
+async function fetchOpStatus() {
+  if (opStatusFetching) return;
+  opStatusFetching = true;
+  try {
+    const response = await fetch('/op_status', {cache: 'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const fields = (await response.text()).split('\t');
+    if (fields.length < 16) return;
+    const force = Date.now() < forceOpInputSyncUntil;
+    const active = document.activeElement;
+    const inputIndexes = [0,1,2,3,4,5,10,11,12,13];
+    inputIndexes.forEach((idx, pos) => {
+      const el = document.getElementById(`edit_${idx}`);
+      const syncing = (idx === 0 || idx === 1) && qsoFieldSyncing[idx];
+      if (idx === 0 || idx === 1) lastSyncedQsoValue[idx] = fields[pos];
+      if (el && !syncing && (force || active !== el) && el.value !== fields[pos]) {
+        el.value = fields[pos];
       }
-    } catch (error) {
-      console.error(`Error fetching for index ${index}:`, error);
-    }
-  }
-}
-
-// 1秒ごとに繰り返し処理を実行する
-async function repeatTask() {
-  let taskNumber = 1;
-
-  while (true) {
-    try {
-      await fetchMultipleIndexes();
-      await fetchStatus(99, 'radioDisplay');
-      await fetchStatus(98, 'cwkeyingDisplay');
-      await fetchStatus_button(7, 'b_radio');
-      await fetchStatus_button(8, 'b_mode');
-      await fetchStatus_button(9, 'b_band');
-      
-      // 処理完了後に1秒待機
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      taskNumber++;
-    } catch (error) {
-      console.error('Error in task execution:', error);
-      break;
-    }
-  }
-}
-
-// /radio_statusから状態を取得してHTMLに反映
-async function fetchStatus(index, displayId) {
-  try {
-    const response = await fetch(`/radio_status?index=${index}`);
-    const data = await response.text();
-    document.getElementById(displayId).innerText = data;
+    });
+    setTextIfChanged('radioDisplay', fields[10]);
+    setTextIfChanged('cwkeyingDisplay', fields[11]);
+    selectStatusButton('b_radio', fields[12]);
+    selectStatusButton('b_mode', fields[13]);
+    selectStatusButton('b_band', fields[14]);
   } catch (error) {
-    console.error(`Error fetching server status for index ${index}:`, error);
+    console.error('op status fetch failed:', error);
+  } finally {
+    opStatusFetching = false;
   }
 }
 
-// /radio_statusから状態を取得してbuttonに反映
-async function fetchStatus_button(index, buttonId) {
+function scheduleNextOpStatusPoll(delayMs) {
+  if (opPollTimer !== null) clearTimeout(opPollTimer);
+  opPollTimer = setTimeout(pollOpStatus, delayMs);
+}
+
+async function pollOpStatus() {
+  await fetchOpStatus();
+  const interval = document.hidden ? 5000 : (Date.now() < opFastPollUntil ? 500 : 1000);
+  scheduleNextOpStatusPoll(interval);
+}
+
+async function fetchAntennaStatus() {
   try {
-    const response = await fetch(`/radio_status?index=${index}`);
-    const data = await response.text();
-    const buttonId_sel = `${buttonId}_${data}`
-    const button = document.getElementById(buttonId_sel);
-    //const elements = document.querySelectorAll('[id^=${buttonId}]');
-    const elements = document.querySelectorAll(`[id^="${buttonId}"]`);
-
-    if (button) {
-      elements.forEach(el => {
-        if (el.id === button.id) {
-          el.style.backgroundColor = "green";
-        } else {
-          el.style.backgroundColor = "gray";
-        }
-      });
-    }
-
-
+    const response = await fetch('/antenna_status');
+    const data = await response.json();
+    document.getElementById('antController').textContent = data.controller;
+    document.getElementById('antConnection').textContent = data.connection;
+    document.getElementById('antHost').textContent = data.host;
+    document.getElementById('antState').textContent = data.state + (data.pending ? ' (Pending)' : '');
+    document.getElementById('antReason').textContent = data.reason;
+    const rows = data.radios.map(r => {
+      let pref = r.pref > 0 ? (r.pref === 1 ? '1st' : (r.pref === 2 ? '2nd' : '3rd')) : '-';
+      if (r.blockedBy >= 0 && r.pref > 1) pref += ` (R${r.blockedBy} using earlier choice)`;
+      const cls = 'ant-' + r.status.toLowerCase();
+      const current = r.current > 0 ? `${r.current} / ${r.currentName}` : (r.current < 0 ? 'Unknown' : 'None');
+      const requested = r.requested > 0 ? `${r.requested} / ${r.requestedName}` : 'None';
+      return `<tr class="${cls}"><td>R${r.radio}</td><td>${r.band}</td><td>${current}</td><td>${requested}</td><td>${pref}</td><td>${r.status}</td></tr>`;
+    }).join('');
+    document.getElementById('antRadioRows').innerHTML = rows;
   } catch (error) {
-    console.error(`Error fetching server status for index ${index}:`, error);
+    document.getElementById('antConnection').textContent = 'Status unavailable';
   }
 }
 
-
-
-// 初期化
-repeatTask();
+pollOpStatus();
+fetchAntennaStatus();
+setInterval(fetchAntennaStatus, 3000);
+document.addEventListener('visibilitychange', () => {
+  scheduleNextOpStatusPoll(document.hidden ? 5000 : 0);
+});
 
 // F1〜F5ボタンを押したときにキーコードを送信
 function sendKeyCode(keyCode) {
-  console.log(`Sending key code: ${keyCode}`);  // デバッグ用ログ
+  requestFastOpPolling();
+  opDebug(`Sending key code: ${keyCode}`);
   fetch(`/rig_key?keycode=${keyCode}`)
     .then(response => response.text())
-    .then(data => console.log("Sent key code:", keyCode, "Response:", data))
+    .then(data => opDebug("Sent key code:", keyCode, "Response:", data))
     .catch(error => console.error("Error sending keycode:", error));
 }
 
@@ -2181,25 +2603,24 @@ function sendKeyCode(keyCode) {
 function sendEnter(inputIndex) {
 
   // inputIndex = 0  Call 1 Exch 6 Radio0 name  7 Radio1 name 8 Radio2 name
-  console.log('sendEnter called',inputIndex);
+  requestFastOpPolling();
+  opDebug('sendEnter called',inputIndex);
   if (inputIndex == 0 || inputIndex == 1 ) {
     // 入力内容を送信
-    const input1 = document.getElementById('edit_0').value;
-    const input2 = document.getElementById('edit_1').value;
+    const input1 = normalizeOpInput(document.getElementById('edit_0'));
+    const input2 = normalizeOpInput(document.getElementById('edit_1'));
 
     fetch(`/rig_key?keycode=13&input0=${encodeURIComponent(input1)}&input1=${encodeURIComponent(input2)}&index=${inputIndex}`)
       .then(res => res.text())
-      .then(msg => console.log('→ rig_key response:', msg))
+      .then(msg => opDebug('→ rig_key response:', msg))
       .catch(err => console.error('fetch error:', err));
   } else {
     // set remote variable in general
-    const value = document.getElementById(`edit_${inputIndex}`).value;
+    const value = normalizeOpInput(document.getElementById(`edit_${inputIndex}`));
     fetch(`/rig_key?command=set&index=${inputIndex}&value=${encodeURIComponent(value)}`)
       .then(res => res.text())
-      .then(msg => console.log('→ rig_key response to radio setting:', msg))
+      .then(msg => opDebug('→ rig_key response to radio setting:', msg))
       .catch(err => console.error('fetch error:', err));
-    // to let remote server fill the setting value into edit window clear edit_inputIndex
-    document.getElementById(`edit_${inputIndex}`).value = '';
   }
 
   // フォーカスを次のinputに移動（ループ）
@@ -2207,7 +2628,11 @@ function sendEnter(inputIndex) {
     document.getElementById('edit_1').focus();
   } else if (inputIndex === 1) {  // recv exch
     document.getElementById('edit_0').focus();
-    clearInputs();  // 入力内容をクリア
+  }
+  if (inputIndex === 0 || inputIndex === 1) {
+    forceOpInputSyncUntil = Date.now() + 1200;
+    requestFastOpPolling();
+    scheduleNextOpStatusPoll(100);
   }
 }
 
@@ -2217,15 +2642,55 @@ function clearInputs() {
   document.getElementById('edit_2').value = '';  // recv rstをクリア
 }
 
+async function syncQsoFieldWithoutEnter(index) {
+  index = Number(index);
+  if (index !== 0 && index !== 1) return;
+
+  if (suppressQsoBlurOnce[index]) {
+    suppressQsoBlurOnce[index] = false;
+    return;
+  }
+
+  const input = document.getElementById(`edit_${index}`);
+  if (!input) return;
+
+  const value = normalizeOpInput(input);
+  if (value === lastSyncedQsoValue[index]) return;
+
+  qsoFieldSyncing[index] = true;
+  requestFastOpPolling();
+  try {
+    const response = await fetch(
+      `/rig_key?command=set&index=${index}&value=${encodeURIComponent(value)}`,
+      { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    lastSyncedQsoValue[index] = value;
+  } catch (error) {
+    console.error(`QSO field ${index} blur sync failed:`, error);
+  } finally {
+    // The response means queued, not yet applied by the main loop.  Prevent
+    // /op_status from restoring the old value during that short interval.
+    setTimeout(() => {
+      qsoFieldSyncing[index] = false;
+      fetchOpStatus();
+    }, 300);
+  }
+}
+
 // keydownイベントの監視
 document.addEventListener("DOMContentLoaded", () => {
+  const callInput = document.getElementById('edit_0');
+  const exchInput = document.getElementById('edit_1');
+  if (callInput) callInput.addEventListener('blur', () => syncQsoFieldWithoutEnter(0));
+  if (exchInput) exchInput.addEventListener('blur', () => syncQsoFieldWithoutEnter(1));
+
   document.addEventListener("keydown", event => {
     const key = event.key;
     const code = event.keyCode || event.which;
     const focused = document.activeElement;
     const idx = focused && focused.dataset ? focused.dataset.index || "" : "";
 
-    console.log('keydown idx=', idx, 'key=', key);
+    opDebug('keydown idx=', idx, 'key=', key);
 
     // Shiftキーが押されたとき
     if (key === "Shift") {
@@ -2246,20 +2711,18 @@ document.addEventListener("DOMContentLoaded", () => {
     if (key === "Enter") {
       event.preventDefault();  // フォーム送信を防ぐ
 
-      sendEnter(idx);
-
-      // フォーカス移動
-      if (idx === "1") {
-        document.getElementById('edit_0').focus();
-      } else if (idx === "0") {
-        document.getElementById('edit_1').focus();
-      }
+      // sendEnter() already commits both QSO fields and runs the normal
+      // Call/EXCH Enter operation.  Suppress the blur-only update caused by
+      // the focus move performed inside sendEnter().
+      if (idx === "0" || idx === "1") suppressQsoBlurOnce[Number(idx)] = true;
+      sendEnter(Number(idx));
+      return;  // Enter is already queued by sendEnter(); do not send it twice.
     }
 
     // fetchでキー送信（Space、Tabも含む）
     fetch(`/rig_key?keycode=${code}${idx !== "" ? "&index=" + idx : ""}`)
       .then(res => res.text())
-      .then(msg => console.log('→ rig_key response:', msg))
+      .then(msg => opDebug('→ rig_key response:', msg))
       .catch(err => console.error('fetch error:', err));
   });
 });
@@ -2280,6 +2743,7 @@ function handleShiftKey(event) {
 
 static void web_heap_point(const char *tag)
 {
+  if (!lowmem_trace) return;
   webLog.printf("[MEM] %-22s internal=%u largest=%u min=%u psram=%u\n",
                   tag,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -2293,6 +2757,7 @@ static void web_heap_point(const char *tag)
 namespace {
 constexpr int WEB_BANDMAP_BANDS = N_BAND - 1;
 constexpr int WEB_BANDMAP_MAX_ENTRIES = 200;
+constexpr int WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES = 32;
 constexpr int WEB_BANDMAP_COLUMNS = 4;
 constexpr uint32_t WEB_BANDMAP_REFRESH_MS = 1000;
 constexpr uint8_t WEB_BANDMAP_COMMAND_QUEUE_LEN = 8;
@@ -2307,7 +2772,8 @@ struct WebBandmapEntry {
 
 struct WebBandmapSnapshot {
   uint16_t count[WEB_BANDMAP_BANDS];
-  WebBandmapEntry entry[WEB_BANDMAP_BANDS][WEB_BANDMAP_MAX_ENTRIES];
+  WebBandmapEntry *entry;
+  uint16_t capacity_per_band;
   uint32_t band_generation[WEB_BANDMAP_BANDS];
   uint32_t generation;
   uint8_t sort_type;
@@ -2330,6 +2796,9 @@ struct WebBandmapCommand {
 };
 
 static WebBandmapSnapshot *web_bandmap_snapshots[2] = {nullptr, nullptr};
+static uint8_t web_bandmap_snapshot_count = 0;
+static bool web_bandmap_has_psram = false;
+static bool web_bandmap_memory_mode_logged = false;
 static volatile uint8_t web_bandmap_active_snapshot = 0;
 static volatile uint32_t web_bandmap_published_generation = 0;
 static volatile bool web_bandmap_snapshot_ready = false;
@@ -2365,37 +2834,132 @@ static bool web_bandmap_entry_less(const WebBandmapEntry &a,
   return a.freq < b.freq;
 }
 
+static WebBandmapEntry *web_bandmap_entry_at(WebBandmapSnapshot *snapshot,
+                                                int band_index,
+                                                int entry_index) {
+  return snapshot->entry +
+    static_cast<size_t>(band_index) * snapshot->capacity_per_band + entry_index;
+}
+
+static const WebBandmapEntry *web_bandmap_entry_at(
+    const WebBandmapSnapshot *snapshot, int band_index, int entry_index) {
+  return snapshot->entry +
+    static_cast<size_t>(band_index) * snapshot->capacity_per_band + entry_index;
+}
+
+static void *web_bandmap_alloc(size_t size, bool prefer_psram) {
+  if (prefer_psram) {
+    return heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  return heap_caps_calloc(1, size, MALLOC_CAP_8BIT);
+}
+
+static void web_bandmap_heap_trace(const char *tag) {
+  webLog.printf("[BANDMAPTRACE] web %-22s free=%u largest=%u min=%u snapshots=%u\n",
+                tag,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned)web_bandmap_snapshot_count);
+}
+
 static bool ensure_web_bandmap_snapshots() {
+  web_bandmap_heap_trace("ensure enter");
   if (!web_bandmap_snapshot_mutex) {
     web_bandmap_snapshot_mutex = xSemaphoreCreateMutex();
+    web_bandmap_heap_trace("after mutex create");
     if (!web_bandmap_snapshot_mutex) return false;
   }
-  if (web_bandmap_snapshots[0] && web_bandmap_snapshots[1]) return true;
-
-  for (int i = 0; i < 2; ++i) {
-    if (!web_bandmap_snapshots[i]) {
-      web_bandmap_snapshots[i] = static_cast<WebBandmapSnapshot *>(
-        heap_caps_calloc(1, sizeof(WebBandmapSnapshot),
-                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    }
+  if (web_bandmap_snapshot_count != 0) {
+    web_bandmap_heap_trace("ensure already ready");
+    return true;
   }
 
-  if (!web_bandmap_snapshots[0] || !web_bandmap_snapshots[1]) {
-    webLog.println("bandmap: cannot allocate PSRAM snapshots");
+  web_bandmap_has_psram = ESP.getPsramSize() > 0;
+  const uint8_t requested_count = web_bandmap_has_psram ? 2 : 1;
+  const uint16_t capacity = web_bandmap_has_psram
+    ? WEB_BANDMAP_MAX_ENTRIES : WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES;
+  webLog.printf("[BANDMAPTRACE] layout snapshot=%u entry=%u bands=%u capacity=%u requested=%u entries_bytes=%u\n",
+                (unsigned)sizeof(WebBandmapSnapshot),
+                (unsigned)sizeof(WebBandmapEntry),
+                (unsigned)WEB_BANDMAP_BANDS,
+                (unsigned)capacity,
+                (unsigned)requested_count,
+                (unsigned)(sizeof(WebBandmapEntry) *
+                  static_cast<size_t>(WEB_BANDMAP_BANDS) * capacity));
+
+  for (uint8_t i = 0; i < requested_count; ++i) {
+    WebBandmapSnapshot *snapshot = static_cast<WebBandmapSnapshot *>(
+      web_bandmap_alloc(sizeof(WebBandmapSnapshot), web_bandmap_has_psram));
+    web_bandmap_heap_trace("after snapshot alloc");
+    if (!snapshot) break;
+
+    const size_t entries_size = sizeof(WebBandmapEntry) *
+      static_cast<size_t>(WEB_BANDMAP_BANDS) * capacity;
+    snapshot->entry = static_cast<WebBandmapEntry *>(
+      web_bandmap_alloc(entries_size, web_bandmap_has_psram));
+    web_bandmap_heap_trace("after entries alloc");
+    if (!snapshot->entry) {
+      free(snapshot);
+      break;
+    }
+    snapshot->capacity_per_band = capacity;
+    web_bandmap_snapshots[i] = snapshot;
+    ++web_bandmap_snapshot_count;
+  }
+
+  if (web_bandmap_snapshot_count != requested_count) {
+    for (uint8_t i = 0; i < web_bandmap_snapshot_count; ++i) {
+      free(web_bandmap_snapshots[i]->entry);
+      free(web_bandmap_snapshots[i]);
+      web_bandmap_snapshots[i] = nullptr;
+    }
+    web_bandmap_snapshot_count = 0;
+    static uint32_t last_error_ms = 0;
+    const uint32_t now = millis();
+    if (now - last_error_ms >= 5000U) {
+      last_error_ms = now;
+      webLog.printf("bandmap: snapshot allocation failed psram=%u free_internal=%u largest_internal=%u\n",
+                    web_bandmap_has_psram ? 1U : 0U,
+                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    }
     return false;
   }
+
+  if (!web_bandmap_memory_mode_logged) {
+    web_bandmap_memory_mode_logged = true;
+    webLog.printf("bandmap: snapshots=%u entries_per_band=%u memory=%s\n",
+                  web_bandmap_snapshot_count, capacity,
+                  web_bandmap_has_psram ? "PSRAM" : "internal RAM");
+  }
+  web_bandmap_heap_trace("ensure success");
   return true;
 }
 
 static void rebuild_web_bandmap_snapshot() {
-  if (!ensure_web_bandmap_snapshots()) return;
+  const size_t rebuild_free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t rebuild_largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  web_bandmap_heap_trace("rebuild enter");
+  if (!ensure_web_bandmap_snapshots()) {
+    web_bandmap_heap_trace("rebuild ensure failed");
+    return;
+  }
 
-  // Build the inactive snapshot without holding the mutex.  Web handlers only
-  // read the active snapshot, so the lock is needed only for the final swap.
+  const bool single_snapshot = web_bandmap_snapshot_count == 1;
+  if (single_snapshot &&
+      xSemaphoreTake(web_bandmap_snapshot_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+    return;
+  }
+
+  // With PSRAM, build the inactive snapshot and atomically swap it.  Without
+  // PSRAM, update one compact snapshot while holding the mutex.
   const uint8_t active = web_bandmap_active_snapshot;
-  const uint8_t next = active ^ 1U;
+  const uint8_t next = single_snapshot ? 0 : (active ^ 1U);
   WebBandmapSnapshot *snapshot = web_bandmap_snapshots[next];
-  memset(snapshot, 0, sizeof(*snapshot));
+  memset(snapshot->count, 0, sizeof(snapshot->count));
+  memset(snapshot->band_generation, 0, sizeof(snapshot->band_generation));
+  snapshot->generation = 0;
   snapshot->sort_type = bandmap_disp.sort_type;
 
   uint32_t hash = 2166136261UL;
@@ -2406,7 +2970,7 @@ static void rebuild_web_bandmap_snapshot() {
     uint16_t count = 0;
 
     for (int i = 0;
-         i < bandmap[band_index].nentry && count < WEB_BANDMAP_MAX_ENTRIES;
+         i < bandmap[band_index].nentry && count < snapshot->capacity_per_band;
          ++i) {
       struct bandmap_entry *source = bandmap[band_index].entry + i;
       if (source->station[0] == '\0') continue;
@@ -2421,7 +2985,7 @@ static void rebuild_web_bandmap_snapshot() {
       }
       source->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
 
-      WebBandmapEntry &dest = snapshot->entry[band_index][count++];
+      WebBandmapEntry &dest = *web_bandmap_entry_at(snapshot, band_index, count++);
       dest.freq = source->freq;
       dest.time = source->time;
       strlcpy(dest.station, source->station, sizeof(dest.station));
@@ -2430,8 +2994,9 @@ static void rebuild_web_bandmap_snapshot() {
     }
 
     snapshot->count[band_index] = count;
-    std::sort(snapshot->entry[band_index],
-              snapshot->entry[band_index] + count,
+    WebBandmapEntry *band_entries = web_bandmap_entry_at(snapshot, band_index, 0);
+    std::sort(band_entries,
+              band_entries + count,
               [snapshot](const WebBandmapEntry &a, const WebBandmapEntry &b) {
                 return web_bandmap_entry_less(a, b, snapshot->sort_type);
               });
@@ -2441,7 +3006,7 @@ static void rebuild_web_bandmap_snapshot() {
     band_hash = web_bandmap_hash_mix(band_hash, bandid);
     band_hash = web_bandmap_hash_mix(band_hash, count);
     for (uint16_t i = 0; i < count; ++i) {
-      const WebBandmapEntry &entry = snapshot->entry[band_index][i];
+      const WebBandmapEntry &entry = *web_bandmap_entry_at(snapshot, band_index, i);
       band_hash = web_bandmap_hash_mix(band_hash, entry.freq);
       band_hash = web_bandmap_hash_mix(band_hash, static_cast<uint32_t>(entry.time));
       band_hash = web_bandmap_hash_mix(band_hash, entry.mode);
@@ -2457,14 +3022,24 @@ static void rebuild_web_bandmap_snapshot() {
 
   snapshot->generation = hash;
 
-  // Publish the completed snapshot atomically.  This critical section is very
-  // short, so /version and /data no longer contend with worked checks/sorting.
-  if (xSemaphoreTake(web_bandmap_snapshot_mutex, portMAX_DELAY) == pdTRUE) {
+  if (single_snapshot) {
+    web_bandmap_active_snapshot = 0;
+    web_bandmap_published_generation = hash;
+    web_bandmap_snapshot_ready = true;
+    xSemaphoreGive(web_bandmap_snapshot_mutex);
+  } else if (xSemaphoreTake(web_bandmap_snapshot_mutex, portMAX_DELAY) == pdTRUE) {
     web_bandmap_active_snapshot = next;
     web_bandmap_published_generation = hash;
     web_bandmap_snapshot_ready = true;
     xSemaphoreGive(web_bandmap_snapshot_mutex);
   }
+
+  const size_t rebuild_free_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t rebuild_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  web_bandmap_heap_trace("rebuild leave");
+  webLog.printf("[BANDMAPTRACE] rebuild delta free=%d largest=%d\n",
+                (int)rebuild_free_after - (int)rebuild_free_before,
+                (int)rebuild_largest_after - (int)rebuild_largest_before);
 }
 
 static bool enqueue_web_bandmap_command(const WebBandmapCommand &command) {
@@ -2522,7 +3097,7 @@ static void update_web_bandmap_entry_flags(struct bandmap_entry *entry,
   }
   if (exch_history) {
     const int multi = multi_check(exch_history, bandid);
-    if (multi >= 0 && multi_list.multi_worked[bandid - 1][multi] == 0) {
+    if (multi >= 0 && !multi_worked_get(&multi_list, bandid - 1, multi)) {
       entry->flag |= BANDMAP_ENTRY_FLAG_NEWMULTI;
     }
   }
@@ -2709,14 +3284,16 @@ static WebBandmapApiState *make_web_bandmap_api_state(uint8_t bandid) {
   if (count) {
     state->band[0].entries = static_cast<WebBandmapEntry *>(
       heap_caps_malloc(sizeof(WebBandmapEntry) * count,
-                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                       web_bandmap_has_psram
+                         ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                         : MALLOC_CAP_8BIT));
     if (!state->band[0].entries) {
       xSemaphoreGive(web_bandmap_snapshot_mutex);
       delete state;
       return nullptr;
     }
     memcpy(state->band[0].entries,
-           snapshot->entry[bandid - 1],
+           web_bandmap_entry_at(snapshot, bandid - 1, 0),
            sizeof(WebBandmapEntry) * count);
   }
   xSemaphoreGive(web_bandmap_snapshot_mutex);
@@ -2967,6 +3544,8 @@ static void setup_web_bandmap_handlers() {
 }
 
 void process_web_bandmap() {
+  if (f_low_memory_mode) return;
+
   process_web_bandmap_command_queue();
   const uint32_t now = millis();
   if ((int32_t)(now - web_bandmap_next_refresh_ms) >= 0) {
@@ -2978,7 +3557,8 @@ void process_web_bandmap() {
 void init_webserver() {
   web_heap_point("before web handlers");
 
-  
+  setupSdFileListHandler();
+
   web_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     String logmessage = "Client:" + request->client()->remoteIP().toString() + + " " + request->url();
     webLog.println(logmessage);
@@ -2990,86 +3570,90 @@ void init_webserver() {
   //  const char pota_page[] PROGMEM = R"rawliteral(
   const char *pota_page = R"rawliteral(
 <!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>POTA ADIF Downloader</title></head>
-<body>
-<h3>Enter QRV POTA Park Number</h3>
-<input type="text" id="park" %PARK_ID% placeholder="e.g. JP-1001" oninput="updateDownloadLink()">
-<button onclick="openPOTA()">Open POTA uploader</button>
-<br><br>
-<a id="dl" href="/adif" download="pota_log.adi">↓ Download ADIF</a>
-<p id="status"></p>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>POTA運用・ログ作成ヘルパー</title>
+<style>
+body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}
+</style></head>
+<body onload="updateDownloadLink()">
+<p><a href="/potahelp?lang=en">English</a> | <a href="/">ホーム</a></p>
+<h1>POTA運用・ログ作成ヘルパー</h1>
+<p>このページでは、現在運用しているPOTA公園をDVPloggerへ設定し、その公園で記録したQSOだけをADIFで取り出してPOTAへアップロードできます。</p>
+<div class="warn"><strong>重要：</strong>公園番号を入力しただけではログへ反映されません。必ず「この公園をDVPloggerへ設定」を押してください。設定後のQSOにはRemarksへ <code>POTA_MY:公園番号</code> が自動記録されます。</div>
 
-<input id="grid" value="%GRID_LOCATOR%" placeholder="Grid (e.g. PM95ru)">
-<button onclick="findNearest()">Find</button>
-<ul id="results"></ul>
-<a href="/" >go back to Home</a>
+<h2>1. 運用する公園を設定</h2>
+<div class="step">
+<label for="park"><strong>POTA公園番号</strong></label>
+<div class="row"><input type="text" id="park" %PARK_ID% placeholder="例: JP-1001" oninput="updateDownloadLink()">
+<button class="primary" onclick="setCurrentPark()">この公園をDVPloggerへ設定</button>
+<button onclick="openParkPage()">公園情報をPOTAで確認</button></div>
+<p id="setStatus" class="status"></p>
+<p class="small">設定するとDVPloggerのJCC/JCG欄へ <code>POTA/JP-xxxx</code> が入ります。以後に登録したQSOが、この公園からのアクティベーションQSOとして識別されます。</p>
+</div>
 
+<h2>公園番号が分からない場合</h2>
+<div class="step">
+<p>現在地のグリッドロケーターから、近い公園を検索できます。検索結果をクリックすると、その公園を本体へ設定し、公園情報ページも開きます。</p>
+<div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid例: PM95ru"><button onclick="findNearest()">近いPOTA公園を検索</button></div>
+<p id="searchStatus" class="status"></p><ul id="results"></ul>
+</div>
+
+<h2>2. DVPloggerで通常どおり交信を記録</h2>
+<div class="step"><p>CALLSIGN、RST、交換内容などを通常どおり入力してQSOを登録します。公園設定後に登録した各QSOへ、現在の公園番号が自動的に付加されます。</p>
+<p class="note">途中で別の公園へ移動した場合は、移動後に新しい公園番号を設定してからQSOを登録してください。公園ごとにログを分けて出力できます。</p></div>
+
+<h2>3. この公園のADIFログを作成</h2>
+<div class="step"><p>下のボタンは、Remarksに現在の公園番号が記録されたQSOだけを抽出します。</p>
+<a id="dl" class="button primary" href="/adif" download="pota_log.adi">この公園のADIFをダウンロード</a>
+<p id="status" class="status"></p>
+<p class="small">ファイル名は <code>pota_log_JP-xxxx.adi</code> です。ダウンロード前に公園番号が正しいことを確認してください。</p></div>
+
+<h2>4. POTAへアップロード</h2>
+<div class="step"><ol><li>先に上のボタンでADIFを保存します。</li><li>「POTAログ管理を開く」を押してPOTAへログインします。</li><li>POTAのログアップロード画面で、保存したADIFファイルを選択またはドラッグ＆ドロップします。</li><li>公園番号、日時、コールサインを確認して登録します。</li></ol>
+<button onclick="openPOTA()">POTAログ管理を開く</button></div>
+
+<h2>ボタンの意味</h2>
+<ul><li><strong>この公園をDVPloggerへ設定：</strong>これから記録するQSOへ公園番号を付けます。</li><li><strong>公園情報をPOTAで確認：</strong>POTA公式の公園ページを別タブで開きます。本体設定は変更しません。</li><li><strong>近いPOTA公園を検索：</strong>SDカード上の公園一覧から距離順に候補を表示します。</li><li><strong>この公園のADIFをダウンロード：</strong>選択した公園からのQSOだけをADIFへ出力します。</li><li><strong>POTAログ管理を開く：</strong>POTA公式のログ画面を開きます。自動アップロードは行いません。</li></ul>
+<p><a href="/">ホームへ戻る</a>　<a href="/sotahelp?lang=ja">SOTAヘルパーへ</a></p>
 <script>
-function findNearest() {
-  const grid = document.getElementById("grid").value.trim();
-  fetch(`/nearest?grid=${grid}`)
-    .then(r => r.json())
-    .then(showResults);
+function normPark(){return document.getElementById('park').value.trim().toUpperCase();}
+function findNearest(){
+ const grid=document.getElementById('grid').value.trim(); const st=document.getElementById('searchStatus');
+ if(!grid){st.textContent='グリッドロケーターを入力してください。';return;} st.textContent='検索中…';
+ fetch(`/nearest?grid=${encodeURIComponent(grid)}`).then(r=>{if(!r.ok)throw new Error('検索に失敗しました');return r.json();}).then(showResults).catch(e=>st.textContent=e.message);
 }
-
-function showResults(list) {
-  const ul = document.getElementById("results");
-  ul.innerHTML = "";
-  list.forEach(p => {
-    const li  = document.createElement("li");
-    const a   = document.createElement("a");
-    a.href    = "#";
-    a.textContent = `${p.code}: ${p.name} (${p.distance_km} km ${p.bearing_deg} deg.)`;
-    a.onclick = () => selectPark(p.code, p.name, document.getElementById("grid").value);
-    li.appendChild(a);
-    ul.appendChild(li);
-  });
+function showResults(list){
+ const ul=document.getElementById('results');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length}件の候補を表示しました。公園名をクリックすると本体へ設定します。`:'候補が見つかりませんでした。';
+ list.forEach(p=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${p.code}: ${p.name}（${p.distance_km} km、方位 ${p.bearing_deg}°）`;a.onclick=(ev)=>{ev.preventDefault();selectPark(p.code,p.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});
 }
-
-function selectPark(code, name, grid) {
-  // サーバーに選択を通知
-  fetch(`/select?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name)}&grid=${encodeURIComponent(grid)}`)
-    .then(() => {
-      // park入力欄を更新
-      document.getElementById("park").value = code;
-      // ダウンロードリンクを更新
-      updateDownloadLink();
-    });
-
-  // pota park ページを開く
-  window.open(`https://pota.app/#/park/${code}`, "_blank");
+function notifyPark(code,name,grid){return fetch(`/select?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('DVPloggerへの設定に失敗しました');return r.text();});}
+function setCurrentPark(){
+ const code=normPark(),st=document.getElementById('setStatus');if(!code){st.textContent='公園番号を入力してください。';return;}
+ notifyPark(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('park').value=code;updateDownloadLink();st.textContent=`${code} を現在の運用公園として設定しました。これ以後のQSOへ記録されます。`;}).catch(e=>st.textContent=e.message);
 }
-
-function updateDownloadLink() {
-  const park = document.getElementById("park").value.trim();
-  const link = document.getElementById("dl");
-
-  if (park.length === 0) {
-    link.href = "/adif";
-    link.download = "pota_log.adi";
-    document.getElementById("status").innerText = "Please enter a QRV park number.";
-  } else {
-    link.href = `/adif?park=${encodeURIComponent(park)}`;
-    link.download = `pota_log_${park}.adi`;
-    document.getElementById("status").innerText = `Ready to download log for park ${park}`;
-  }
-}
-
-function openPOTA(){
-  window.open('https://pota.app/#/user/logs','_blank');
-  alert('① 新タブで POTA にログインし、\n② 先にダウンロードした pota_l_PARK#.adi をドラッグ＆ドロップしてください。');
-}
-
-</script>
-</body>
-</html>
+function selectPark(code,name,grid){notifyPark(code,name,grid).then(()=>{document.getElementById('park').value=code;updateDownloadLink();document.getElementById('setStatus').textContent=`${code} ${name} を現在の運用公園として設定しました。`;window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}
+function openParkPage(){const code=normPark();if(!code){document.getElementById('setStatus').textContent='公園番号を入力してください。';return;}window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}
+function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';link.download='pota_log.adi';st.textContent='公園番号を入力し、本体へ設定してください。';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;link.download=`pota_log_${park}.adi`;st.textContent=`${park} のQSOだけを抽出する準備ができています。`;}}
+function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}
+</script></body></html>
 )rawliteral";  
 
   
-  web_server.on("/potahelp", HTTP_GET, [pota_page](AsyncWebServerRequest* request){
-    //    String html = FPSTR(pota_page);
-    String html(pota_page);
+  const char *pota_page_en = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>POTA Operation and Log Helper</title><style>body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}</style></head><body onload="updateDownloadLink()"><p><a href="/potahelp?lang=ja">日本語</a> | <a href="/">Home</a></p><h1>POTA Operation and Log Helper</h1><p>Set the POTA park currently being activated, export only QSOs made from that park as ADIF, and upload the file to POTA.</p><div class="warn"><strong>Important:</strong> Typing a park reference alone does not change the logger. Press “Set this park in DVPlogger”. Subsequent QSOs receive <code>POTA_MY:park-reference</code> in Remarks.</div>
+<h2>1. Set the park being activated</h2><div class="step"><label for="park"><strong>POTA park reference</strong></label><div class="row"><input type="text" id="park" %PARK_ID% placeholder="Example: JP-1001" oninput="updateDownloadLink()"><button class="primary" onclick="setCurrentPark()">Set this park in DVPlogger</button><button onclick="openParkPage()">Open park information</button></div><p id="setStatus" class="status"></p><p class="small">DVPlogger stores <code>POTA/JP-xxxx</code> in the JCC/JCG field. QSOs logged afterward are identified as activation QSOs from this park.</p></div>
+<h2>Find a nearby park</h2><div class="step"><p>Search for nearby parks using the current grid locator. Clicking a result sets the park in DVPlogger and opens its POTA page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button onclick="findNearest()">Find nearby POTA parks</button></div><p id="searchStatus" class="status"></p><ul id="results"></ul></div>
+<h2>2. Log QSOs normally</h2><div class="step"><p>Enter callsign, RST and exchange normally. Each QSO logged after setting the park is tagged with the current park reference.</p><p class="note">After moving to another park, set the new park before logging more QSOs. Logs can be exported separately for each park.</p></div>
+<h2>3. Export this park's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current park reference.</p><a id="dl" class="button primary" href="/adif" download="pota_log.adi">Download ADIF for this park</a><p id="status" class="status"></p><p class="small">The filename is <code>pota_log_JP-xxxx.adi</code>. Verify the park reference before downloading.</p></div>
+<h2>4. Upload to POTA</h2><div class="step"><ol><li>Save the ADIF file above.</li><li>Open POTA Log Manager and sign in.</li><li>Select or drag the saved ADIF file into the upload page.</li><li>Confirm the park, date/time and callsign before submitting.</li></ol><button onclick="openPOTA()">Open POTA Log Manager</button></div>
+<h2>Button reference</h2><ul><li><strong>Set this park in DVPlogger:</strong> tags subsequently logged QSOs with the park reference.</li><li><strong>Open park information:</strong> opens the official POTA park page without changing DVPlogger.</li><li><strong>Find nearby POTA parks:</strong> lists candidates from the park file on the SD card.</li><li><strong>Download ADIF for this park:</strong> exports only QSOs made from the selected park.</li><li><strong>Open POTA Log Manager:</strong> opens the official log page; upload is not automatic.</li></ul><p><a href="/sotahelp?lang=en">SOTA helper</a></p>
+<script>function normPark(){return document.getElementById('park').value.trim().toUpperCase();}function findNearest(){const grid=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus');if(!grid){st.textContent='Enter a grid locator.';return;}st.textContent='Searching...';fetch(`/nearest?grid=${encodeURIComponent(grid)}`).then(r=>{if(!r.ok)throw new Error('Search failed');return r.json();}).then(showResults).catch(e=>st.textContent=e.message);}function showResults(list){const ul=document.getElementById('results');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a park name to set it.`:'No candidates found.';list.forEach(p=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${p.code}: ${p.name} (${p.distance_km} km, bearing ${p.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectPark(p.code,p.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifyPark(code,name,grid){return fetch(`/select?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentPark(){const code=normPark(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a park reference.';return;}notifyPark(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('park').value=code;updateDownloadLink();st.textContent=`${code} is now the active park. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectPark(code,name,grid){notifyPark(code,name,grid).then(()=>{document.getElementById('park').value=code;updateDownloadLink();document.getElementById('setStatus').textContent=`${code} ${name} is now the active park.`;window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openParkPage(){const code=normPark();if(!code){document.getElementById('setStatus').textContent='Enter a park reference.';return;}window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';link.download='pota_log.adi';st.textContent='Enter a park reference and set it in DVPlogger.';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;link.download=`pota_log_${park}.adi`;st.textContent=`Ready to extract QSOs for ${park}.`;}}function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}</script></body></html>
+)rawliteral";
+
+  web_server.on("/potahelp", HTTP_GET, [pota_page,pota_page_en](AsyncWebServerRequest* request){
+    const bool japanese = request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja");
+    String html(japanese ? pota_page : pota_page_en);
     String gl = String(plogw->grid_locator_set);
     html.replace("%GRID_LOCATOR%", gl);
     // replace park
@@ -3116,75 +3700,71 @@ function openPOTA(){
 
   const char *sota_page = R"rawliteral(
 <!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>SOTA helper</title></head>
-<body>
-<h3>Enter QRV SOTA Summit ID</h3>
-<input type="text" id="summit" %SUMMIT_ID% placeholder="e.g. JA/KN-006" oninput="updateDownloadLinkSOTA()">
-<button onclick="openSOTA()">Open SOTA uploader</button>
-<br><br>
-<a id="dl" href="/adif" download="sota_log.adi">↓ Download ADIF</a>
-<p id="status"></p>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SOTA運用・ログ作成ヘルパー</title>
+<style>
+body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}
+</style></head>
+<body onload="updateDownloadLinkSOTA()">
+<p><a href="/sotahelp?lang=en">English</a> | <a href="/">ホーム</a></p>
+<h1>SOTA運用・ログ作成ヘルパー</h1>
+<p>このページでは、現在運用しているSOTA山頂をDVPloggerへ設定し、その山頂で記録したQSOだけをADIFで取り出してSOTA Databaseへアップロードできます。</p>
+<div class="warn"><strong>重要：</strong>山頂IDを入力しただけではログへ反映されません。必ず「この山頂をDVPloggerへ設定」を押してください。設定後のQSOにはRemarksへ <code>SOTA_MY:山頂ID</code> が自動記録されます。</div>
 
-  <input id="grid" value="%GRID_LOCATOR%" placeholder="Grid (e.g. PM95ru)">
-<button onclick="findSota()">Find SOTA summit</button>
-<ul id="sotaResults"></ul>
-<a href="/" >go back to Home</a>
+<h2>1. 運用する山頂を設定</h2>
+<div class="step"><label for="summit"><strong>SOTA山頂ID</strong></label>
+<div class="row"><input type="text" id="summit" %SUMMIT_ID% placeholder="例: JA/KN-006" oninput="updateDownloadLinkSOTA()">
+<button class="primary" onclick="setCurrentSummit()">この山頂をDVPloggerへ設定</button>
+<button onclick="openSummitPage()">山頂情報を確認</button></div>
+<p id="setStatus" class="status"></p><p class="small">設定するとDVPloggerのJCC/JCG欄へ <code>SOTA/JA/xx-xxx</code> が入ります。以後に登録したQSOが、この山頂からのアクティベーションQSOとして識別されます。</p></div>
 
+<h2>山頂IDが分からない場合</h2>
+<div class="step"><p>現在地のグリッドロケーターから近い山頂を検索できます。検索結果をクリックすると、その山頂を本体へ設定し、山頂情報ページも開きます。</p>
+<div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid例: PM95ru"><button onclick="findSota()">近いSOTA山頂を検索</button></div>
+<p id="searchStatus" class="status"></p><ul id="sotaResults"></ul></div>
+
+<h2>2. DVPloggerで通常どおり交信を記録</h2>
+<div class="step"><p>CALLSIGN、RST、交換内容などを通常どおり入力してQSOを登録します。山頂設定後に登録した各QSOへ、現在の山頂IDが自動的に付加されます。</p>
+<p class="note">別の山頂へ移動した場合は、新しい山頂IDを設定してからQSOを登録してください。山頂ごとにログを分けて出力できます。</p></div>
+
+<h2>3. この山頂のADIFログを作成</h2>
+<div class="step"><p>下のボタンは、Remarksに現在の山頂IDが記録されたQSOだけを抽出します。</p>
+<a id="dl" class="button primary" href="/adif" download="sota_log.adi">この山頂のADIFをダウンロード</a><p id="status" class="status"></p>
+<p class="small">ファイル名は <code>sota_log_JA_xx-xxx.adi</code> です。ブラウザーによっては山頂ID中の「/」が「_」などへ置換されます。</p></div>
+
+<h2>4. SOTA Databaseへアップロード</h2>
+<div class="step"><ol><li>先に上のボタンでADIFを保存します。</li><li>「SOTAログアップロードを開く」を押してログインします。</li><li>Activator logのアップロードを選び、保存したADIFを指定します。</li><li>山頂ID、日時、コールサインを確認して登録します。</li></ol><button onclick="openSOTA()">SOTAログアップロードを開く</button></div>
+
+<h2>ボタンの意味</h2><ul><li><strong>この山頂をDVPloggerへ設定：</strong>これから記録するQSOへ山頂IDを付けます。</li><li><strong>山頂情報を確認：</strong>SOTLASの山頂ページを別タブで開きます。本体設定は変更しません。</li><li><strong>近いSOTA山頂を検索：</strong>SDカード上の山頂一覧から距離順に候補を表示します。</li><li><strong>この山頂のADIFをダウンロード：</strong>選択した山頂からのQSOだけをADIFへ出力します。</li><li><strong>SOTAログアップロードを開く：</strong>SOTA Databaseのアップロード画面を開きます。自動アップロードは行いません。</li></ul>
+<p><a href="/">ホームへ戻る</a>　<a href="/potahelp?lang=ja">POTAヘルパーへ</a></p>
 <script>
-function findSota(){
-  const g=document.getElementById("grid").value.trim();
-  fetch(`/nearest_summit?grid=${g}`).then(r=>r.json()).then(showSota);
-}
-function showSota(list){
-  const ul=document.getElementById("sotaResults"); ul.innerHTML="";
-  list.forEach(s=>{
-    const li=document.createElement("li");
-    const a=document.createElement("a");
-    a.href="#"; a.textContent=`${s.code}: ${s.name} (${s.distance_km} km, ${s.alt}m, ${s.bearing_deg} deg.)`;
-    a.onclick=()=>selectSota(s.code,s.name,document.getElementById("grid").value);
-    li.appendChild(a); ul.appendChild(li);
-  });
-}
-function selectSota(code, name, grid) {
-  // サーバーに選択を通知
-  fetch(`/select_summit?code=${code}&name=${encodeURIComponent(name)}&grid=${grid}`)
-    .then(() => {
-      // summit入力欄を更新
-      document.getElementById("summit").value = code;
-      // ダウンロードリンクを更新
-      updateDownloadLinkSOTA();
-    });
-
-  // summitページを開く
-  window.open(`https://sotl.as/summits/${code}`, "_blank");
-}
-
-function updateDownloadLinkSOTA() {
-  const summit = document.getElementById("summit").value.trim();
-  const link = document.getElementById("dl");
-
-  if (summit.length === 0) {
-    link.href = "/adif";
-    link.download = "sota_log.adi";
-    document.getElementById("status").innerText = "Please enter a QRV summit number.";
-  } else {
-    link.href = `/adif?summit=${encodeURIComponent(summit)}`;
-    link.download = `sota_log_${summit}.adi`;
-    document.getElementById("status").innerText = `Ready to download log for summit ${summit}`;
-  }
-}
-
-function openSOTA(){
-  window.open('https://www.sotadata.org.uk/ja/upload','_blank');
-}
-
-</script>
+function normSummit(){return document.getElementById('summit').value.trim().toUpperCase();}
+function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus');if(!g){st.textContent='グリッドロケーターを入力してください。';return;}st.textContent='検索中…';fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`).then(r=>{if(!r.ok)throw new Error('検索に失敗しました');return r.json();}).then(showSota).catch(e=>st.textContent=e.message);}
+function showSota(list){const ul=document.getElementById('sotaResults');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length}件の候補を表示しました。山頂名をクリックすると本体へ設定します。`:'候補が見つかりませんでした。';list.forEach(s=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${s.code}: ${s.name}（${s.distance_km} km、標高 ${s.alt} m、方位 ${s.bearing_deg}°）`;a.onclick=(ev)=>{ev.preventDefault();selectSota(s.code,s.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}
+function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('DVPloggerへの設定に失敗しました');return r.text();});}
+function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='山頂IDを入力してください。';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} を現在の運用山頂として設定しました。これ以後のQSOへ記録されます。`;}).catch(e=>st.textContent=e.message);}
+function selectSota(code,name,grid){notifySummit(code,name,grid).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();document.getElementById('setStatus').textContent=`${code} ${name} を現在の運用山頂として設定しました。`;window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}
+function openSummitPage(){const code=normSummit();if(!code){document.getElementById('setStatus').textContent='山頂IDを入力してください。';return;}window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}
+function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';link.download='sota_log.adi';st.textContent='山頂IDを入力し、本体へ設定してください。';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;link.download=`sota_log_${summit.replaceAll('/','_')}.adi`;st.textContent=`${summit} のQSOだけを抽出する準備ができています。`;}}
+function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank');}
+</script></body></html>
 )rawliteral";  
   
-  web_server.on("/sotahelp", HTTP_GET, [sota_page](AsyncWebServerRequest* request){
-    //    String html = FPSTR(pota_page);
-    String html(sota_page);
+  const char *sota_page_en = R"rawliteral(
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SOTA Operation and Log Helper</title><style>body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}</style></head><body onload="updateDownloadLinkSOTA()"><p><a href="/sotahelp?lang=ja">日本語</a> | <a href="/">Home</a></p><h1>SOTA Operation and Log Helper</h1><p>Set the SOTA summit currently being activated, export only QSOs made from that summit as ADIF, and upload the file to SOTA Database.</p><div class="warn"><strong>Important:</strong> Typing a summit reference alone does not change the logger. Press “Set this summit in DVPlogger”. Subsequent QSOs receive <code>SOTA_MY:summit-reference</code> in Remarks.</div>
+<h2>1. Set the summit being activated</h2><div class="step"><label for="summit"><strong>SOTA summit reference</strong></label><div class="row"><input type="text" id="summit" %SUMMIT_ID% placeholder="Example: JA/KN-006" oninput="updateDownloadLinkSOTA()"><button class="primary" onclick="setCurrentSummit()">Set this summit in DVPlogger</button><button onclick="openSummitPage()">Open summit information</button></div><p id="setStatus" class="status"></p><p class="small">DVPlogger stores <code>SOTA/JA/xx-xxx</code> in the JCC/JCG field. QSOs logged afterward are identified as activation QSOs from this summit.</p></div>
+<h2>Find a nearby summit</h2><div class="step"><p>Search for nearby summits using the current grid locator. Clicking a result sets the summit in DVPlogger and opens its information page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button onclick="findSota()">Find nearby SOTA summits</button></div><p id="searchStatus" class="status"></p><ul id="sotaResults"></ul></div>
+<h2>2. Log QSOs normally</h2><div class="step"><p>Enter callsign, RST and exchange normally. Each QSO logged after setting the summit is tagged with the current summit reference.</p><p class="note">After moving to another summit, set the new reference before logging more QSOs. Logs can be exported separately for each summit.</p></div>
+<h2>3. Export this summit's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current summit reference.</p><a id="dl" class="button primary" href="/adif" download="sota_log.adi">Download ADIF for this summit</a><p id="status" class="status"></p><p class="small">The filename is <code>sota_log_JA_xx-xxx.adi</code>. A browser may replace “/” in the summit reference with “_”.</p></div>
+<h2>4. Upload to SOTA Database</h2><div class="step"><ol><li>Save the ADIF file above.</li><li>Open SOTA log upload and sign in.</li><li>Select Activator log upload and choose the saved ADIF file.</li><li>Confirm the summit, date/time and callsign before submitting.</li></ol><button onclick="openSOTA()">Open SOTA log upload</button></div>
+<h2>Button reference</h2><ul><li><strong>Set this summit in DVPlogger:</strong> tags subsequently logged QSOs with the summit reference.</li><li><strong>Open summit information:</strong> opens the SOTLAS summit page without changing DVPlogger.</li><li><strong>Find nearby SOTA summits:</strong> lists candidates from the summit file on the SD card.</li><li><strong>Download ADIF for this summit:</strong> exports only QSOs made from the selected summit.</li><li><strong>Open SOTA log upload:</strong> opens the SOTA Database upload page; upload is not automatic.</li></ul><p><a href="/potahelp?lang=en">POTA helper</a></p>
+<script>function normSummit(){return document.getElementById('summit').value.trim().toUpperCase();}function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus');if(!g){st.textContent='Enter a grid locator.';return;}st.textContent='Searching...';fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`).then(r=>{if(!r.ok)throw new Error('Search failed');return r.json();}).then(showSota).catch(e=>st.textContent=e.message);}function showSota(list){const ul=document.getElementById('sotaResults');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a summit name to set it.`:'No candidates found.';list.forEach(x=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${x.code}: ${x.name} (${x.distance_km} km, altitude ${x.alt} m, bearing ${x.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectSota(x.code,x.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a summit reference.';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} is now the active summit. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectSota(code,name,grid){notifySummit(code,name,grid).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();document.getElementById('setStatus').textContent=`${code} ${name} is now the active summit.`;window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openSummitPage(){const code=normSummit();if(!code){document.getElementById('setStatus').textContent='Enter a summit reference.';return;}window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';link.download='sota_log.adi';st.textContent='Enter a summit reference and set it in DVPlogger.';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;link.download=`sota_log_${summit.replaceAll('/','_')}.adi`;st.textContent=`Ready to extract QSOs for ${summit}.`;}}function openSOTA(){window.open('https://www.sotadata.org.uk/en/upload','_blank');}</script></body></html>
+)rawliteral";
+
+  web_server.on("/sotahelp", HTTP_GET, [sota_page,sota_page_en](AsyncWebServerRequest* request){
+    const bool japanese = request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja");
+    String html(japanese ? sota_page : sota_page_en);
     String gl = String(plogw->grid_locator_set);
     html.replace("%GRID_LOCATOR%", gl);
     gl="";
@@ -3274,6 +3854,227 @@ function openSOTA(){
 static bool shiftLeftPressed = false;  // 左Shiftキーの状態
 static bool shiftRightPressed = false;  // 右Shiftキーの状態
 
+// DVPlogger status page.  Use ?lang=en for English; Japanese is default.
+web_server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+  bool english = request->hasParam("lang") &&
+                 request->getParam("lang")->value().equalsIgnoreCase("en");
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+  const uint32_t seconds = millis() / 1000UL;
+  const uint32_t days = seconds / 86400UL;
+  const uint32_t hours = (seconds / 3600UL) % 24UL;
+  const uint32_t minutes = (seconds / 60UL) % 60UL;
+  const uint32_t secs = seconds % 60UL;
+
+  auto esc = [](const String &src) {
+    String dst;
+    dst.reserve(src.length() + 12);
+    for (size_t i = 0; i < src.length(); ++i) {
+      switch (src[i]) {
+      case '&': dst += F("&amp;"); break;
+      case '<': dst += F("&lt;"); break;
+      case '>': dst += F("&gt;"); break;
+      case '"': dst += F("&quot;"); break;
+      default: dst += src[i]; break;
+      }
+    }
+    return dst;
+  };
+
+  auto input_name = [english](int ptr) -> String {
+    if (ptr >= 10 && ptr < 10 + N_CWMSG)
+      return String(english ? "CW message F" : "CWメッセージ F") + String(ptr - 9);
+    if (ptr >= 30 && ptr < 30 + N_CWMSG)
+      return String(english ? "RTTY message F" : "RTTYメッセージ F") + String(ptr - 29);
+    switch (ptr) {
+    case 0: return english ? String("Callsign") : String("相手局コールサイン");
+    case 1: return english ? String("Received exchange") : String("受信ナンバー");
+    case 2: return english ? String("Sent RST") : String("送信RST");
+    case 3: return english ? String("Received RST") : String("受信RST");
+    case 4: return english ? String("My callsign") : String("自局コールサイン");
+    case 5: return english ? String("Sent exchange") : String("送出ナンバー");
+    case 6: return english ? String("Remarks") : String("Remarks");
+    case 7: return english ? String("Satellite") : String("衛星名");
+    case 8: return english ? String("Grid locator") : String("グリッドロケータ");
+    case 9: return english ? String("JCC/JCG") : String("JCC/JCG");
+    case 20: return english ? String("Rig name") : String("リグ名");
+    case 21: return english ? String("Cluster name") : String("Cluster名");
+    case 22: return english ? String("Email address") : String("メールアドレス");
+    case 23: return english ? String("Cluster command") : String("Clusterコマンド");
+    case 24: return english ? String("Power code") : String("電力コード");
+    case 25: return english ? String("Wi-Fi SSID") : String("Wi-Fi SSID");
+    case 26: return english ? String("Wi-Fi password") : String("Wi-Fiパスワード");
+    case 27: return english ? String("Rig specification") : String("リグ仕様");
+    case 28: return english ? String("Z-server") : String("Z-server");
+    case 29: return english ? String("Operator name") : String("オペレータ名");
+    case 40: return english ? String("Contest") : String("コンテスト");
+    case 41: return english ? String("Cluster2 name") : String("Cluster2名");
+    case 42: return english ? String("Cluster2 command") : String("Cluster2コマンド");
+    default: return String("#") + String(ptr);
+    }
+  };
+
+  auto input_value = [](struct radio *radio) -> String {
+    const int ptr = radio->ptr_curr;
+    if (ptr >= 10 && ptr < 10 + N_CWMSG) return String(plogw->cw_msg[ptr - 10] + 2);
+    if (ptr >= 30 && ptr < 30 + N_CWMSG) return String(plogw->rtty_msg[ptr - 30] + 2);
+    switch (ptr) {
+    case 0: return String(radio->callsign + 2);
+    case 1: return String(radio->recv_exch + 2);
+    case 2: return String(radio->sent_rst + 2);
+    case 3: return String(radio->recv_rst + 2);
+    case 4: return String(plogw->my_callsign + 2);
+    case 5: return String(plogw->sent_exch + 2);
+    case 6: return String(radio->remarks + 2);
+    case 7: return String(plogw->sat_name + 2);
+    case 8: return String(plogw->grid_locator + 2);
+    case 9: return String(plogw->jcc + 2);
+    case 20: return String(radio->rig_name + 2);
+    case 21: return String(plogw->cluster_name + 2);
+    case 22: return String(plogw->email_addr + 2);
+    case 23: return String(plogw->cluster_cmd + 2);
+    case 24: return String(plogw->power_code + 2);
+    case 25: return String(plogw->wifi_ssid + 2);
+    case 26: return String("********");
+    case 27: return String(radio->rig_spec_str + 2);
+    case 28: return String(plogw->zserver_name + 2);
+    case 29: return String(plogw->my_name + 2);
+    case 40: return String(plogw->contest_name + 2);
+    case 41: return String(plogw->cluster2_name + 2);
+    case 42: return String(plogw->cluster2_cmd + 2);
+    default: return String("-");
+    }
+  };
+
+  String html;
+  html.reserve(6000);
+  html += F("<!doctype html><html lang=\"");
+  html += english ? F("en") : F("ja");
+  html += F("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+  html += F("<title>DVPlogger Status</title><style>body{font-family:sans-serif;margin:20px;max-width:1050px}table{border-collapse:collapse;width:100%;margin-bottom:18px}th,td{border:1px solid #bbb;padding:7px;text-align:left}th{background:#eee}.summary th{width:32%}.radio th,.radio td{white-space:nowrap}.radio td:last-child{white-space:normal}.nav a{margin-right:14px}h2{margin-bottom:6px}</style></head><body>");
+  html += F("<div class=\"nav\"><a href=\"/\">");
+  html += english ? F("Home") : F("ホーム");
+  html += F("</a><a href=\"/settings\">");
+  html += english ? F("Settings") : F("設定");
+  html += F("</a><a href=\"/status?lang=");
+  html += english ? F("ja\">日本語") : F("en\">English");
+  html += F("</a></div><h1>DVPlogger Status</h1>");
+
+  auto row = [&](const __FlashStringHelper *ja, const __FlashStringHelper *en,
+                 const String &value) {
+    html += F("<tr><th>"); html += english ? en : ja;
+    html += F("</th><td>"); html += esc(value); html += F("</td></tr>");
+  };
+
+  // Put the information needed most often during operation at the top.
+  html += F("<h2>"); html += english ? F("Logger") : F("ロガー"); html += F("</h2><table class=\"summary\">");
+  row(F("IPアドレス"), F("IP address"), connected ? WiFi.localIP().toString() : String("-"));
+  row(F("自局コールサイン"), F("My callsign"), String(plogw->my_callsign + 2));
+  row(F("現在のコンテスト"), F("Current contest"), String(plogw->contest_name + 2));
+  row(F("コンテスト運用"), F("Contest logging"),
+      plogw->f_off_contest ? (english ? String("OFF (OFFCONTEST)") : String("OFF（OFFCONTEST）"))
+                          : (english ? String("ON (ONCONTEST)") : String("ON（ONCONTEST）")));
+  row(F("フォーカスRadio"), F("Focused radio"), String(so2r.focused_radio() + 1));
+  row(F("RX Radio"), F("RX radio"), String(so2r.rx() + 1));
+  row(F("TX Radio"), F("TX radio"), String(so2r.tx() + 1));
+  struct radio *selected = so2r.radio_selected();
+  row(F("LCD入力欄"), F("LCD input field"), input_name(selected->ptr_curr));
+  row(F("入力中の内容"), F("Current input"), input_value(selected));
+  html += F("</table>");
+
+  html += F("<h2>Radio</h2><table class=\"radio\"><tr><th>#</th><th>");
+  html += english ? F("State") : F("状態");
+  html += F("</th><th>Rig</th><th>"); html += english ? F("Frequency") : F("周波数");
+  html += F("</th><th>Mode</th><th>S</th><th>CQ/S&amp;P</th><th>");
+  html += english ? F("LCD input field") : F("LCD入力欄"); html += F("</th></tr>");
+  for (int i = 0; i < N_RADIO; ++i) {
+    struct radio *radio = &radio_list[i];
+    String state;
+    if (!radio->enabled) state = english ? String("Disabled") : String("無効");
+    else state = english ? String("Enabled") : String("有効");
+    if (so2r.focused_radio() == i) state += english ? String(" / Focus") : String(" / Focus");
+    if (so2r.rx() == i) state += String(" / RX");
+    if (so2r.tx() == i) state += String(" / TX");
+    char fbuf[24];
+    snprintf(fbuf, sizeof(fbuf), "%u.%05u MHz", radio->freq / 100000U,
+             radio->freq % 100000U);
+    const char *rig_name = (radio->rig_spec != NULL && radio->rig_spec->name != NULL)
+                           ? radio->rig_spec->name : "-";
+    html += F("<tr><td>"); html += String(i + 1); html += F("</td><td>"); html += esc(state);
+    html += F("</td><td>"); html += esc(String(rig_name)); html += F("</td><td>"); html += fbuf;
+    html += F("</td><td>"); html += esc(String(radio->opmode)); html += F("</td><td>");
+    html += radio->enabled ? String(radio->smeter / SMETER_UNIT_DBM) : String("-");
+    html += F("</td><td>");
+    html += radio->cq[radio->modetype] ? String("CQ") : String("S&P");
+    html += F("</td><td>"); html += esc(input_name(radio->ptr_curr)); html += F("</td></tr>");
+  }
+  html += F("</table>");
+
+  html += F("<h2>Wi-Fi</h2><table class=\"summary\">");
+  row(F("Wi-Fi状態"), F("Wi-Fi status"),
+      connected ? (english ? String("Connected") : String("接続中"))
+                : (english ? String("Disconnected") : String("未接続")));
+  row(F("SSID"), F("SSID"), connected ? WiFi.SSID() : String("-"));
+  row(F("受信強度"), F("Wi-Fi RSSI"), connected ? String(WiFi.RSSI()) + " dBm" : String("-"));
+  row(F("サブネットマスク"), F("Subnet mask"), connected ? WiFi.subnetMask().toString() : String("-"));
+  row(F("ゲートウェイ"), F("Gateway"), connected ? WiFi.gatewayIP().toString() : String("-"));
+  row(F("MACアドレス"), F("MAC address"), WiFi.macAddress());
+  html += F("</table>");
+
+  html += F("<h2>"); html += english ? F("System") : F("システム"); html += F("</h2><table class=\"summary\">");
+  row(F("稼働時間"), F("Uptime"),
+      String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(secs) + "s");
+  row(F("空きヒープ"), F("Free heap"), String(ESP.getFreeHeap()) + " bytes");
+  row(F("最小空きヒープ"), F("Minimum free heap"), String(ESP.getMinFreeHeap()) + " bytes");
+  row(F("PSRAM容量"), F("PSRAM size"), String(ESP.getPsramSize()) + " bytes");
+  row(F("メモリ動作モード"), F("Memory mode"),
+      String(f_low_memory_mode ? "LOW (no PSRAM)" : "NORMAL (PSRAM)"));
+  row(F("PSRAM空き"), F("Free PSRAM"), String(ESP.getFreePsram()) + " bytes");
+  html += F("</table><p>");
+  html += english ? F("Reload this page to refresh the values.")
+                  : F("表示を更新するにはページを再読み込みしてください。");
+  html += F("</p></body></html>");
+  request->send(200, "text/html", html);
+});
+
+web_server.on("/antenna_status", HTTP_GET, [](AsyncWebServerRequest *request) {
+  request->send(200, "application/json", antenna_status_json());
+});
+
+web_server.on("/antenna", HTTP_GET, [](AsyncWebServerRequest *request) {
+  request->send_P(200, "text/html", antenna_page_html);
+});
+
+web_server.on("/antenna_config", HTTP_GET, [](AsyncWebServerRequest *request) {
+  String out;
+  out.reserve(700);
+  out += F("{\"enable\":"); out += antenna_control_enable ? F("true") : F("false");
+  out += F(",\"host\":\""); out += antenna_host;
+  out += F("\",\"port\":"); out += String(antenna_port);
+  out += F(",\"pref\":[");
+  for (int i=0;i<ANTENNA_PREF_ROWS;i++){if(i)out+=',';out+='\"';out+=antenna_pref[i];out+='\"';}
+  out += F("],\"names\":[");
+  for (int i=0;i<ANTENNA_MAX_ID;i++){if(i)out+=',';out+='\"';out+=antenna_name[i];out+='\"';}
+  out += F("]}");
+  request->send(200, "application/json", out);
+});
+
+web_server.on("/antenna_config", HTTP_POST, [](AsyncWebServerRequest *request) {
+  if (request->hasParam("enable")) antenna_control_enable = request->getParam("enable")->value().toInt() ? 1 : 0;
+  if (request->hasParam("host")) strlcpy(antenna_host, request->getParam("host")->value().c_str(), sizeof(antenna_host));
+  if (request->hasParam("port")) antenna_port = request->getParam("port")->value().toInt();
+  for (int i=0;i<ANTENNA_PREF_ROWS;i++) {
+    String key = String("pref") + String(i+1);
+    if (request->hasParam(key)) strlcpy(antenna_pref[i], request->getParam(key)->value().c_str(), sizeof(antenna_pref[i]));
+  }
+  for (int i=0;i<ANTENNA_MAX_ID;i++) {
+    String key = String("name") + String(i+1);
+    if (request->hasParam(key)) strlcpy(antenna_name[i], request->getParam(key)->value().c_str(), sizeof(antenna_name[i]));
+  }
+  antenna_settings_changed();
+  save_settings("");
+  request->send(200, "text/plain", "Saved");
+});
+
 // /op ページ配信
 web_server.on("/op", HTTP_GET, [](AsyncWebServerRequest *request) {
   request->send_P(200, "text/html", oppage_html);
@@ -3284,88 +4085,15 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
   strcpy(response_string,"");
   struct radio *radio;  
   if (req->hasParam("keycode")) {
-    int keycode = req->getParam("keycode")->value().toInt();  // 送信されたキーコードを整数に変換
-    String keyName = "Unknown Key";
-
-    // HIDキーコードに基づいて処理
-    if (keycodeToHid.find(keycode) != keycodeToHid.end()) {
-      keyName = String(keycodeToHid.at(keycode));  // HIDキーコードから名前を取得
-      webLog.printf("Received HID Key: %s keycode %d\n", keyName.c_str(),keycode);
-    } else {
-      webLog.printf("Unknown keycode: %d\n", keycode);
-    }
-    keyName="";
-
-    // function keys 
-    if (keycode>=112 && keycode <=116) {
-      webLog.println("function keys");
-      so2r.cancel_msg_tx();	
-      so2r.set_msg_tx_to_focused(); // start sending in the currently focued radio
-      so2r.set_rx_in_sending_msg();	
-      function_keys(keycode-54, 0);
-    } else if (keycode==27) {
-      // esc
-      webLog.println("esc from web");
-      so2r.cancel_msg_tx();
-      switch(so2r.radio_mode) {
-      case SO2R::RADIO_MODE_SO2R:
-	so2r.sequence_mode(SO2R::SO2R_CQSandP);
-	break;
-      case SO2R::RADIO_MODE_SO1R:
-      case SO2R::RADIO_MODE_SAT:	
-	so2r.sequence_mode(SO2R::Manual);
-	break;
-      }
-      so2r.sequence_stat(SO2R::Default);
-    }
-
-
-    radio=so2r.radio_selected();
-    
-    // インデックスが送信されている場合
-    int idx = -1;
-    if (req->hasParam("index")) {
-      idx = req->getParam("index")->value().toInt();
-    }
-
-    // 入力内容（input0, input1）の受け取り
-    String input1 = "";
-    String input2 = "";
-    int flag=0;
-    if (req->hasParam("input0")) {
-      flag|=1;
-      input1 = req->getParam("input0")->value();
-      // update radio->callsign
-      strncpy(radio->callsign+2,input1.c_str(),LEN_CALL_WINDOW-1);
-    }
-    if (req->hasParam("input1")) {
-      flag|=2;
-      input2 = req->getParam("input1")->value();
-      // update radio->recv_exch
-      strncpy(radio->recv_exch+2,input2.c_str(),LEN_EXCH_WINDOW-1);
-    }
-    if (flag) {
-      switch (idx) {
-      case 0:// callsign 
-	radio->ptr_curr=0; // callsign window
-	// process_enter
-	process_enter(0);
-	break;
-      case 1: // exch
-	radio->ptr_curr=1; // callsign window
-	process_enter(0);
-	break;
-      }
-    }
-
-
-    // ログに出力
-    webLog.printf("Received input0: %s, input1: %s, index: %d\n", input1.c_str(), input2.c_str(), idx);
-    input1="";
-    input2="";
-    strcpy(response_string,"Keycode received and processed.");
-    req->send(200, "text/plain",response_string);
-    
+    WebUiCommand cmd{};
+    cmd.type=WEB_UI_KEY;
+    cmd.value=req->getParam("keycode")->value().toInt();
+    cmd.index=req->hasParam("index") ? req->getParam("index")->value().toInt() : -1;
+    if (req->hasParam("input0")) normalize_op_cstr(0,cmd.input0,sizeof(cmd.input0),req->getParam("input0")->value());
+    if (req->hasParam("input1")) normalize_op_cstr(1,cmd.input1,sizeof(cmd.input1),req->getParam("input1")->value());
+    if ((cmd.index==0 || cmd.index==1) && req->hasParam("input0") && req->hasParam("input1")) cmd.type=WEB_UI_ENTER;
+    if (!enqueue_web_ui(cmd)) { req->send(503,"text/plain","Web UI queue full"); return; }
+    req->send(202,"text/plain","Queued");
   } else if (req->hasParam("command")) {
 
     String command;
@@ -3376,7 +4104,16 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
       if (req->hasParam("index") && req->hasParam("value")) {
 	// get index and value
 	int idx = req->getParam("index")->value().toInt();
-	String value= req->getParam("value")->value();
+	String value = normalize_op_value(idx, req->getParam("value")->value());
+        if ((idx >= 0 && idx <= 5)) {
+          WebUiCommand cmd{};
+          cmd.type = WEB_UI_SET;
+          cmd.index = idx;
+          strlcpy(cmd.input0, value.c_str(), sizeof(cmd.input0));
+          if (!enqueue_web_ui(cmd)) { req->send(503,"text/plain","Web UI queue full"); return; }
+          req->send(202,"text/plain","Queued");
+          return;
+        }
 	switch (idx) {
 	case 10: // radio 0 name
 	case 11: // radio 1 name
@@ -3416,52 +4153,44 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
 });
 
 web_server.on("/control", HTTP_GET, [](AsyncWebServerRequest *request) {
-  if (request->hasParam("type") && request->hasParam("value")) {
-    String type =request->getParam("type")->value();
-    String value =request->getParam("value")->value();    
-    //      int index = request->getParam("index")->value().toInt();
-    //      String value = request->getParam("value")->value();
-    int ival;
-    ival = value.toInt();
-    const char *valuecstr;
-    valuecstr=value.c_str();    
-    struct radio *radio;
-
-    radio=so2r.radio_selected();
-    // control type Radio Mode Band
-    webLog.print("/control type=");
-    webLog.print(type);
-    webLog.print(" value=");
-    webLog.println(value);
-    int modetype;
-    if (type == "Radio") {
-      so2r.change_focused_radio(ival);
-    } else if (type == "Mode") {
-      modetype = modetype_string(valuecstr);
-      int filt;
-      filt = radio->filtbank[radio->bandid][radio->cq[modetype]][modetype];
-      if (filt==0) {
-	filt=default_filt(valuecstr);
-      }
-      set_mode(valuecstr, filt, radio);
-      send_mode_set_civ(valuecstr, filt);
-    } else if (type == "Band") {
-      if (ival>=1 && ival<N_BAND) {
-	if (((1<<(ival -1)) & radio->band_mask) == 0) {
-	  band_change(ival,radio);
-	  webLog.print("band_change to band ");
-	  webLog.println(ival);
-	}
-      }
-    }
-
-    type="";
-    value="";
+  if (!request->hasParam("type") || !request->hasParam("value")) {
+    request->send(400,"text/plain","Missing parameter"); return;
   }
-  request->send(200, "text/plain","OK");
- });
+  WebUiCommand cmd{};
+  cmd.type=WEB_UI_CONTROL;
+  strlcpy(cmd.name,request->getParam("type")->value().c_str(),sizeof(cmd.name));
+  String value=request->getParam("value")->value();
+  cmd.value=value.toInt();
+  strlcpy(cmd.input0,value.c_str(),sizeof(cmd.input0));
+  if (!enqueue_web_ui(cmd)) { request->send(503,"text/plain","Web UI queue full"); return; }
+  request->send(202,"text/plain","Queued");
+});
 
        
+// /op main status: one compact response instead of many /radio_status requests.
+web_server.on("/op_status", HTTP_GET, [](AsyncWebServerRequest *req) {
+  struct radio *radio = so2r.radio_selected();
+  char radio_text[120];
+  unsigned int frac = (radio->freq % (1000/FREQ_UNIT))/(10/FREQ_UNIT);
+  unsigned int khz = (radio->freq / (1000/FREQ_UNIT)) % 1000;
+  snprintf(radio_text, sizeof(radio_text),
+           "%-14s Radio:%d %3s Freq:%4d.%03d.%02d Hz Mode:%4s",
+           plogw->tm+9, radio->rig_idx,
+           radio->cq[radio->modetype] == LOG_CQ ? "CQ" : "S&P",
+           radio->freq / (1000000/FREQ_UNIT), khz, frac, radio->opmode);
+  char payload[512];
+  snprintf(payload, sizeof(payload),
+           "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t1",
+           radio->callsign+2, radio->recv_exch+2,
+           radio->recv_rst+2, radio->sent_rst+2,
+           plogw->sent_exch+2, plogw->my_callsign+2,
+           radio_list[0].rig_name+2, radio_list[1].rig_name+2,
+           radio_list[2].rig_name+2, plogw->contest_name+2,
+           radio_text, plogw->cwbuf_display,
+           radio->rig_idx, radio->opmode, radio->bandid);
+  req->send(200, "text/plain", payload);
+});
+
 // サーバー側でHTMLの一部（radio状態）を返すエンドポイント
 web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
   struct radio *radio;  
@@ -3521,7 +4250,7 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
       req->send(200, "text/plain", plogw->contest_name+2);
       break;
     case 98: // cw
-      strncpy(string_buf,plogw->cwbuf_display,50);
+      strlcpy(string_buf, plogw->cwbuf_display, sizeof(string_buf));
       req->send(200, "text/plain", string_buf);
       break;
     case 99: // radio
@@ -3571,23 +4300,44 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
   });
 
 
-  setup_web_bandmap_handlers();
+  if (f_low_memory_mode) {
+    webLog.println("[WEB] LOWMEM: bandmap snapshots/API disabled");
+    web_server.on("/bandmap", HTTP_GET, [](AsyncWebServerRequest *request) {
+      request->send(200, "text/html; charset=utf-8",
+        "<!doctype html><meta charset='utf-8'><title>DVPlogger low memory</title>"
+        "<h2>Bandmap disabled</h2>"
+        "<p>This unit has no PSRAM. The Web bandmap is disabled to preserve memory.</p>"
+        "<p>LCD bandmap, logging, status and settings remain available.</p>"
+        "<p><a href='/'>Home</a> | <a href='/status'>Status</a> | <a href='/settings'>Settings</a></p>");
+    });
+    web_server.on("/api/bandmap/version", HTTP_GET,
+      [](AsyncWebServerRequest *request) {
+        request->send(503, "application/json", "{\"ready\":false,\"low_memory\":true}");
+      });
+  } else {
+    setup_web_bandmap_handlers();
+  }
 
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "*");
 
   web_server.onNotFound(notFound);
 
+  // Keep Nearest/Summit available in LOWMEM mode. Measure each handler
+  // group separately so its permanent internal-RAM cost is visible.
+  web_heap_point("before nearest");
   setupNearestHandler(web_server);
+  web_heap_point("after nearest");
   setupNearestSummit(web_server);
+  web_heap_point("after summit");
   setupContestPageHandler();
-  setupSettingsPageHandler();  
+  web_heap_point("after contest handler");
+  setupSettingsPageHandler();
+  web_heap_point("after settings handler");
   web_heap_point("after web handlers");
   web_server.begin();
   web_heap_point("after web begin");
 }
 
 
-
-String listFiles(bool ishtml = false);
 

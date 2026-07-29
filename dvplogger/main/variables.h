@@ -29,6 +29,8 @@ extern int main_loop_revs;
 extern bool f_cardkey_present;
 extern union qso_union_tag qso;  // data is delimited by space in the file
 extern int f_spiram;
+extern bool f_low_memory_mode;
+extern int lowmem_trace;
 //#include "DS3231.h"
 #include "RTClib.h"
 extern class DateTime rtctime, ntptime;

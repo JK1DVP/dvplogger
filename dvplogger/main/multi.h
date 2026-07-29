@@ -53,8 +53,26 @@ struct multi_list {
   const struct multi_item *multi[N_BAND]; // multi item definition for each band
   // index is iband-1 (iband=1... N_BAND)
   int n_multi[N_BAND]; // number of multi defined for each band
-  bool multi_worked[N_BAND][N_MULTI];
+  // One bit per multiplier instead of one byte per multiplier.
+  uint8_t multi_worked_bits[N_BAND][(N_MULTI + 7) / 8];
 };
+static inline bool multi_worked_get(const struct multi_list *list, int band, int multi) {
+  if (!list || band < 0 || band >= N_BAND || multi < 0 || multi >= N_MULTI) return false;
+  return (list->multi_worked_bits[band][multi >> 3] & (uint8_t)(1U << (multi & 7))) != 0;
+}
+
+static inline void multi_worked_set(struct multi_list *list, int band, int multi, bool worked) {
+  if (!list || band < 0 || band >= N_BAND || multi < 0 || multi >= N_MULTI) return;
+  uint8_t *cell = &list->multi_worked_bits[band][multi >> 3];
+  const uint8_t mask = (uint8_t)(1U << (multi & 7));
+  if (worked) *cell |= mask;
+  else *cell &= (uint8_t)~mask;
+}
+
+static inline void multi_worked_clear_band(struct multi_list *list, int band) {
+  if (!list || band < 0 || band >= N_BAND) return;
+  memset(list->multi_worked_bits[band], 0, sizeof(list->multi_worked_bits[band]));
+}
 //extern void init_multi();
 //extern int multi_check(char *s);
 //extern int multi_check_old();
@@ -62,7 +80,7 @@ struct multi_list {
 
 //extern struct multi_item multi_arrl;
 extern struct multi_item multi_test_line ;
-extern struct multi_item multi_aatest ;
+extern const struct multi_item multi_aatest ;
 extern const struct multi_item multi_musashino_line;
 extern const struct multi_item multi_hswas ;
 extern const struct multi_item multi_kcj;

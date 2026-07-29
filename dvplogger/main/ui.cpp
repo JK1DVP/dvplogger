@@ -73,6 +73,7 @@
 #include "network.h"
 #include "main.h"
 #include "zserver.h"
+#include "antenna.h"
 #include "cty_chk.h"
 #include "iambic_keyer.h"
 #include "mux_transport.h"
@@ -81,7 +82,64 @@
 #include "so2r.h"
 #include "dac-adc.h"
 #include "morse_decoder_simple.h"
+#include "esp32_flasher.h"
 
+
+
+static bool restart_subcpu_and_enter_mux() {
+  static const char ack[] = "go_mux accepted";
+  size_t ack_pos = 0;
+  uint32_t start_ms;
+  uint32_t next_send_ms;
+
+  f_mux_transport = 0;
+
+  /* Discard bytes left from the previous MUX session before reset. */
+  while (Serial2.available()) Serial2.read();
+
+  loader_port_reset_target_func();
+  start_ms = millis();
+  next_send_ms = start_ms + 500;
+
+  /*
+   * SUBCPU setup includes Bluetooth/UART initialization.  A fixed 800 ms
+   * delay is not sufficient on every boot, so keep sending the raw command
+   * until the SUBCPU explicitly acknowledges it.
+   */
+  while ((uint32_t)(millis() - start_ms) < 8000) {
+    uint32_t now = millis();
+    if ((int32_t)(now - next_send_ms) >= 0) {
+      Serial2.print("\r\ngo_mux\r\n");
+      Serial2.flush();
+      next_send_ms = now + 250;
+    }
+
+    while (Serial2.available()) {
+      char c = (char)Serial2.read();
+      if (c == ack[ack_pos]) {
+        ack_pos++;
+        if (ack_pos == sizeof(ack) - 1) {
+          /* Drain the trailing CR/LF before enabling the binary parser. */
+          delay(20);
+          while (Serial2.available()) Serial2.read();
+          f_mux_transport = 1;
+
+          uint32_t ready_until = millis() + 300;
+          while ((int32_t)(millis() - ready_until) < 0) {
+            mux_transport.recv_pkt();
+            delay(1);
+          }
+          return true;
+        }
+      } else {
+        ack_pos = (c == ack[0]) ? 1 : 0;
+      }
+    }
+    delay(1);
+  }
+
+  return false;
+}
 
 int ui_cursor_next_entry_partial_check (struct radio *radio)
 {
@@ -274,6 +332,16 @@ void send_single_char_radio(struct radio *radio,char c)
 
 void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 
+if (key == 0x1f) {
+  plogw->ostream->printf(
+      "KEY2 rawmod=%02X ctrl=%d shift=%d alt=%d caps=%d\n",
+      *((uint8_t *)&modkey),
+      modkey_ctrl(modkey),
+      modkey_shift(modkey),
+      modkey_alt(modkey),
+      f_capslock);
+}
+  
   plogw->count_autopoweroff=0; // reset auto powerdown counter
   //  verbose=1;
   if (verbose & 1) {
@@ -303,9 +371,22 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 
   struct radio *radio;
   radio = so2r.radio_selected();
+
+  // Handle Ctrl-Shift-2 before the general Shift-key dispatcher.
+  // This also covers CapsLock-as-Ctrl through modkey_ctrl().
+  // Use the HID usage code (0x1f) rather than the translated character,
+  // because Shift+2 produces different characters on different keyboards.
+  if (modkey_shift(modkey) && modkey_ctrl(modkey) &&
+      !modkey_alt(modkey) && key == 0x1f) {
+    alternate_contest();
+    return;
+  }
+
   // the following is mixed with function in logw_handler() ... unify sometime 21/10/24 ea
   // Shift + alphanumeric key will be sent to cw keying regardless of keyer mode .. 21/11/22 ea
-  if (modkey_shift(modkey)) {
+  // Ctrl-Shift shortcuts must be handled by the Ctrl branch below.
+  // Previously the Shift branch consumed them before Ctrl-Shift-T/Y could run.
+  if (modkey_shift(modkey) && !modkey_ctrl(modkey)) {
     ///// shift+
     if (!modkey_alt(modkey) && !modkey_ctrl(modkey)) {
       // only shift + --> basically cw keying
@@ -665,11 +746,11 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
       } else {
 	//if (key == 0x13) {
 	// alt-p change verbose level of printing cluster input to serial
-	f_show_cluster++;
-	if (f_show_cluster >= 3) f_show_cluster = 0;
+	cluster_verbose_level[0]++;
+	if (cluster_verbose_level[0] >= 4) cluster_verbose_level[0] = 0;
 	if (!plogw->f_console_emu) {
-	  plogw->ostream->print("alt-p cluster verbose leve = ");
-	  plogw->ostream->println(f_show_cluster);
+	  plogw->ostream->print("Alt-P: cluster 1 verbose level = ");
+	  plogw->ostream->println(cluster_verbose_level[0]);
 	}
       }
       // }
@@ -1148,10 +1229,16 @@ void on_key_down(MODIFIERKEYS modkey, uint8_t key, uint8_t c) {
 	sync_dupechk_mask_subcpu(plogw->mask);
 	upd_display_info_contest_settings(radio);
 	break;
-      case 0x1f:  // ctrl-2  // switch contest
-	plogw->contest_id++;
-	if (plogw->contest_id >= N_CONTEST) plogw->contest_id = 0;
-	set_contest_id();
+      case 0x1f:  // Ctrl-2 / Ctrl-Shift-2: switch contest
+        if (modkey_shift(modkey)) {
+          // Alternate between the current and previous contest.
+          alternate_contest();
+        } else {
+          // Advance to the next registered contest.
+          plogw->contest_id++;
+          if (plogw->contest_id >= N_CONTEST) plogw->contest_id = 0;
+          set_contest_id();
+        }
 	break;
       case 0x20:  // ctrl-3  bandmap mask toggle for current operating band
 	if (bandmap_mask & (1 << (radio->bandid - 1))) {
@@ -2150,6 +2237,127 @@ void process_enter(int option) {
                         + (arg[2] - '0');
       clear_buf(radio->callsign);
       switch_qso_log(backup_number);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "ZMERGE") == 0) {
+      clear_buf(radio->callsign);
+      zserver_start_merge(false);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "ZMERGE") == 0) {
+      clear_buf(radio->callsign);
+      zserver_start_merge(false);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "ANTENNAON") == 0) {
+      antenna_control_enable = 1;
+      antenna_settings_changed();
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "ANTENNA CTRL\nON\n%s:%d",
+               antenna_host, antenna_port);
+      upd_display_info_flash(dp->lcdbuf);
+      if (!plogw->f_console_emu) {
+        plogw->ostream->print("antenna control ON: ");
+        plogw->ostream->print(antenna_host);
+        plogw->ostream->print(":");
+        plogw->ostream->println(antenna_port);
+      }
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "ANTENNAOFF") == 0) {
+      antenna_control_enable = 0;
+      antenna_settings_changed();
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "ANTENNA CTRL\nOFF");
+      upd_display_info_flash(dp->lcdbuf);
+      if (!plogw->f_console_emu)
+        plogw->ostream->println("antenna control OFF");
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "ANTENNA") == 0 ||
+        strcmp(radio->callsign + 2, "ANTENNASTATUS") == 0) {
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "ANT CTRL:%s\n%s\n%s:%d",
+               antenna_control_enable ? "ON" : "OFF",
+               antenna_controller_state(),
+               antenna_host, antenna_port);
+      upd_display_info_flash(dp->lcdbuf);
+      if (!plogw->f_console_emu) {
+        plogw->ostream->print("antenna control=");
+        plogw->ostream->print(antenna_control_enable ? "ON" : "OFF");
+        plogw->ostream->print(" state=");
+        plogw->ostream->print(antenna_controller_state());
+        plogw->ostream->print(" server=");
+        plogw->ostream->print(antenna_host);
+        plogw->ostream->print(":");
+        plogw->ostream->println(antenna_port);
+      }
+      clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "DUPERESET") == 0) {
+      clear_buf(radio->callsign);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Resetting SUBCPU\nDUPE database...");
+      upd_display_info_flash(dp->lcdbuf);
+
+      bool ok = reset_dupechk_subcpu();
+      if (ok) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SUBCPU DUPE RESET\nOK\nRun MAKEDUPE");
+      } else {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SUBCPU DUPE RESET\nFAILED\nUse SUBCPURESET");
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "SUBCPURESET") == 0) {
+      clear_buf(radio->callsign);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Resetting SUBCPU...\nPlease wait");
+      upd_display_info_flash(dp->lcdbuf);
+
+      bool mux_ok = restart_subcpu_and_enter_mux();
+      if (!mux_ok) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SUBCPU RESET DONE\nMUX START NO ACK\nTry again");
+        upd_display_info_flash(dp->lcdbuf);
+        break;
+      }
+
+      bool dupe_reset_ok = reset_dupechk_subcpu();
+      if (!dupe_reset_ok) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SUBCPU RESET DONE\nMUX/DUPE NO REPLY\nCheck connection");
+        upd_display_info_flash(dp->lcdbuf);
+        break;
+      }
+
+      int callhist_count = 0;
+      if (plogw->enable_callhist && callhist_at == 1) {
+        if (load_callhist_subcpu(callhistfn))
+          callhist_count = get_callhist_subcpu_count();
+      }
+
+      init_score();
+      clear_multi_worked();
+      init_dupechk_maincpu();
+      read_qso_log(READQSO_MAKEDUPE);
+
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "SUBCPU RECOVERED\nDUPE rebuilt\nCALLHIST=%d",
+               callhist_count);
+      upd_display_info_flash(dp->lcdbuf);
       break;
     }
 

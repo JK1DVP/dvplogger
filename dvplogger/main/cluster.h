@@ -27,6 +27,11 @@
 //extern WiFiClient client;
 extern char cluster_server[40];
 extern int cluster_port ;
+
+#define N_CLUSTER2_STARTUP_CMDS 5
+extern char cluster2_startup_cmd[N_CLUSTER2_STARTUP_CMDS][LEN_CLUSTER_CMD + 3];
+void initialize_cluster2_startup_commands();
+
 #define NCHR_CLUSTER_RINGBUF 1024
 extern char cluster_buf[NCHR_CLUSTER_RINGBUF];
 extern struct cluster cluster;
@@ -44,11 +49,14 @@ extern const char * cluster_cmd[3] ;
 void set_cluster() ;
 void send_cluster_cmd() ;
 void send_cluster2_cmd() ;
+bool send_cluster_terminal_cmd(uint8_t cluster_no, const char *cmd, Stream *out);
 void set_cluster2() ;
 void disconnect_cluster2() ;
 void disconnect_cluster2_temp() ;
 int connect_cluster2() ;
-extern int f_show_cluster;
+extern uint8_t cluster_verbose_level[2];
+void print_cluster_verbose_status(Stream *out);
+bool set_cluster_verbose_level(int cluster_no, int level, Stream *out);
 
 
 #endif

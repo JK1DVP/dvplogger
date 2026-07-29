@@ -27,7 +27,7 @@
 
 #include "multi.h"
 
-struct multi_item multi_aatest = {
+const struct multi_item multi_aatest = {
   {
     "VALID",""
   },

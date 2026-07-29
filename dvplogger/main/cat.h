@@ -33,6 +33,7 @@
 #define RIG_TYPE_KENWOOD 3 // QCX_MINI and TS-2000 etc 
 #define RIG_TYPE_MANUAL 4 // manual rig
 #define RIG_TYPE_ELECRAFT_KX 6
+#define RIG_TYPE_XIEGU_X6100 7 // Xiegu X6100 (ICOM CI-V derivative)
 
 #define CAT_TYPE_CIV 0
 #define CAT_TYPE_YAESU_NEW 1
@@ -65,8 +66,6 @@ int is_manual_rig(struct radio *radio) ;
 void set_frequency_rig_radio(unsigned int freq, struct radio *radio) ;
 void set_frequency_rig(unsigned int freq);
 void print_cat_cmdbuf(struct radio *radio);
-void attach_interrupt_civ();
-void detach_interrupt_civ();
 void send_head_civ(struct radio *radio);
 void send_tail_civ(struct radio *radio);
 void set_ptt_rig(struct radio *radio, int on) ;
@@ -123,7 +122,6 @@ void receive_pkt_handler_cat3(struct mux_packet *packet);
 void receive_pkt_handler_portnum(struct mux_packet *packet,int port_num);
 
 void receive_civport(struct radio *radio) ;
-void receive_civport_1() ;
 void clear_civ(struct radio *radio) ;
 int antenna_switch_commands(char *cmd);
 int signal_command(char *s);

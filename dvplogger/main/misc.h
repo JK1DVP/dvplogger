@@ -69,4 +69,6 @@ void set_location_gl_calc(char *locator) ;
 void release_memory() ;
 void print_memory();
 void i2c_scan(Stream *out = nullptr);
+void memtrace_event(const char *tag);
+void memtrace_poll();
 #endif

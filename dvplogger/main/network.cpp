@@ -36,6 +36,7 @@
 #include "AsyncTCP.h"
 #include "SD.h"
 #include "settings.h"
+#include "misc.h"
 
 #include "ESP32FtpServer.h"
 //FtpServer ftpSrv;   //set #define FTP_DEBUG in ESP32FtpServer.h to see ftp verbose on serial
@@ -171,11 +172,17 @@ void init_network() {
   sprintf(dp->lcdbuf, "init_network()\nPlease Wait");
   upd_display_info_flash(dp->lcdbuf);
   
+  memtrace_event("network before multiwifi");
   init_multiwifi() ;
+  memtrace_event("network after multiwifi");
   //  WiFi.begin(ssid, password);
+  memtrace_event("network before wifi check");
   check_wifi();
+  memtrace_event("network after wifi check");
   console->println("MDNS()");
+  memtrace_event("network before mdns");
   MDNS.begin(plogw->hostname+2); // ホスト名
+  memtrace_event("network after mdns");
 
   // older 
   //  timeClient.begin();
@@ -184,7 +191,9 @@ void init_network() {
 
   // Use ESPNptpClient
   //  NTP.setTimeZone (TZ_Etc_UTC);
+  memtrace_event("network before ntp");
   NTP.begin ();
+  memtrace_event("network after ntp");
   // start system clock sntp
   //  sntp_setoperatingmode(SNTP_OPMODE_POLL);
   //  sntp_set_time_sync_notification_cb(time_sync_notification_cb);
@@ -195,15 +204,21 @@ void init_network() {
   //initialize_sntp();
   
   
+  memtrace_event("before init_cluster_info");
   init_cluster_info();
+  memtrace_event("after init_cluster_info");
   plogw->ostream->println("inited cluster info");
   
+  memtrace_event("before init_zserver_info");
   init_zserver_info();
+  memtrace_event("after init_zserver_info");
   plogw->ostream->println("inited zserver info");
   
   //  for (int i = 0; i < MAX_SRV_CLIENTS; i++) serverClients_status[i] = 0;
   
+  memtrace_event("before init_tcpserver");
   init_tcpserver();
+  memtrace_event("after init_tcpserver");
   sprintf(dp->lcdbuf, "init_network()\nFinished");
   upd_display_info_flash(dp->lcdbuf);
   
@@ -239,6 +254,7 @@ int check_wifi() {
 
 	wifi_count = 0;
 	wifi_status = 1;
+        memtrace_event("wifi connected");
 	return 1;
       } else {
 	sprintf(dp->lcdbuf, "check_wifi()\nnot found.cnt=%d",wifi_count);
@@ -262,6 +278,7 @@ int check_wifi() {
       if (ESPWMAP.handle()== WL_CONNECTED) {
 	wifi_count = 0;
 	wifi_status = 1;
+        memtrace_event("wifi connected");
 	return 1;
       } else {
 	wifi_status = 0;

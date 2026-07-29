@@ -38,6 +38,7 @@
 #include "satellite.h"
 #include "display.h"
 #include "so2r.h"
+#include "antenna.h"
 #include <vector>
 
 // read one line from file,with line termination 'term'
@@ -86,6 +87,7 @@ struct dict_item settings_dict[N_SETTINGS_DICT];
 
 void init_settings_dict() {
   n_settings_dict = 0;
+  initialize_cluster2_startup_commands();
   /*
 REGISTER_SETTING_OFFSET(settings_dict, plogw, my_callsign, 2, DICT_VALUE_TYPE_CHARARRAY);
 REGISTER_SETTING_OFFSET(settings_dict, plogw, sent_exch, 2, DICT_VALUE_TYPE_CHARARRAY);
@@ -136,6 +138,7 @@ REGISTER_SETTING_AUTO(settings_dict, , kbdtype);
 REGISTER_SETTING_OFFSET(settings_dict, plogw, grid_locator, 2, DICT_VALUE_TYPE_CHARARRAY);
 REGISTER_SETTING_AUTO(settings_dict, , f_mux_transport);
 REGISTER_SETTING_AUTO(settings_dict, , display_type);
+REGISTER_SETTING_AUTO(settings_dict, , lowmem_trace);
 REGISTER_SETTING_AUTO(settings_dict, plogw, f_esm);
 REGISTER_SETTING_AUTO(settings_dict, plogw, show_smeter);
 REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
@@ -229,6 +232,31 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
 
   settings_dict[n_settings_dict].name = "cluster2_cmd";
   settings_dict[n_settings_dict].value = (void *)plogw->cluster2_cmd + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_startup_cmd_1";
+  settings_dict[n_settings_dict].value = (void *)cluster2_startup_cmd[0] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_startup_cmd_2";
+  settings_dict[n_settings_dict].value = (void *)cluster2_startup_cmd[1] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_startup_cmd_3";
+  settings_dict[n_settings_dict].value = (void *)cluster2_startup_cmd[2] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_startup_cmd_4";
+  settings_dict[n_settings_dict].value = (void *)cluster2_startup_cmd[3] + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_startup_cmd_5";
+  settings_dict[n_settings_dict].value = (void *)cluster2_startup_cmd[4] + 2;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
   n_settings_dict++;
 
@@ -363,6 +391,40 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
   
+  settings_dict[n_settings_dict].name = "antctrl";
+  settings_dict[n_settings_dict].value = (void *)&antenna_control_enable;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "anthost";
+  settings_dict[n_settings_dict].value = (void *)antenna_host;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "antport";
+  settings_dict[n_settings_dict].value = (void *)&antenna_port;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  for (int i = 0; i < ANTENNA_PREF_ROWS; ++i) {
+    static const char *pref_names[ANTENNA_PREF_ROWS] = {"antpref1", "antpref2", "antpref3"};
+    settings_dict[n_settings_dict].name = pref_names[i];
+    settings_dict[n_settings_dict].value = (void *)antenna_pref[i];
+    settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+    n_settings_dict++;
+  }
+
+  for (int i = 0; i < ANTENNA_MAX_ID; ++i) {
+    static const char *ant_names[ANTENNA_MAX_ID] = {
+      "antname1", "antname2", "antname3", "antname4", "antname5",
+      "antname6", "antname7", "antname8", "antname9"
+    };
+    settings_dict[n_settings_dict].name = ant_names[i];
+    settings_dict[n_settings_dict].value = (void *)antenna_name[i];
+    settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+    n_settings_dict++;
+  }
+
   settings_dict[n_settings_dict].name = "";
   settings_dict[n_settings_dict].value = NULL;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
@@ -541,6 +603,7 @@ int load_settings(char *fn) {
   set_cluster();
   set_cluster2();
   reconnect_zserver();
+  antenna_settings_changed();
   
   return 1;
 }
@@ -644,3 +707,50 @@ void set_grid_locator_information()
     }
 }
 
+int load_boot_display_type(const char *path)
+{
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    console->println("boot display setting not found; using default");
+    return 0;
+  }
+
+  char line[128];
+
+  while (readline(&file, line, 0x0d0a, sizeof(line)) != 0) {
+    char *p = line;
+
+    while (*p == ' ' || *p == '\t') {
+      ++p;
+    }
+
+    if (strncmp(p, "display_type", 12) != 0) {
+      continue;
+    }
+
+    p += 12;
+
+    if (*p != ' ' && *p != '\t' && *p != '=') {
+      continue;
+    }
+
+    while (*p == ' ' || *p == '\t' || *p == '=') {
+      ++p;
+    }
+
+    int value = atoi(p);
+    if (value < 0 || value > 2) {
+      console->printf("invalid boot display_type=%d; using default\n",
+                      value);
+      break;
+    }
+
+    display_type = value;
+    console->printf("boot display_type=%d\n", display_type);
+    file.close();
+    return 1;
+  }
+
+  file.close();
+  return 0;
+}

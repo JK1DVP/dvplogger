@@ -37,7 +37,10 @@
 void console_process() {
   // Serial command input remains available even while the active log console
   // has been redirected to the single Telnet client.
-  Stream *serial_terminal = &Serial;
+  //Stream *serial_terminal = &Serial;
+  Stream *serial_terminal = console;
+  if (serial_terminal == nullptr) return;
+  
   while (serial_terminal->available() > 0) {
     char c = serial_terminal->read();
     if (verbose & 32) {

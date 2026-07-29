@@ -45,6 +45,7 @@ bool repair_qso_log(const uint32_t *server_ids, size_t server_count,
 void init_qsofiles() ;
 void init_qso() ;
 void makedupe_qso_entry() ;
+void process_makedupe_multiplier_maincpu(const char *recv_exch, unsigned char bandmode);
 void reformat_qso_entry(union qso_union_tag *qso) ;
 void read_qso_log(int option, Stream *out = nullptr) ;
 int read_qso_log_to_file() ;
