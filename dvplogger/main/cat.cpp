@@ -4290,10 +4290,21 @@ void init_all_radio() {
 void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
 {
   char s1[300];char *p;
+  console->print("RIGSPEC=[");
+  console->print(s);
+  console->println("]");
+  // The rig specification string is a complete replacement, not a partial
+  // update.  Clear fields which may be omitted from the serialized string so
+  // deleting e.g. XVTR: from the web editor also removes the old RAM value.
+  rig_spec->civaddr = 0;
+  rig_spec->civport_baud = 0;
+  rig_spec->civport_reversed = false;
+  rig_spec->pttmethod = 0;
+  memset(rig_spec->transverter_freq, 0, sizeof(rig_spec->transverter_freq));
   char *saveptr1, *saveptr2;  
   char *p1; int idx1,idx2; long long val;// for arg parse
   int n;
-  strcpy(s1,s);
+  strlcpy(s1, s, sizeof(s1));
   p=strtok_r(s1,", ",&saveptr1);
 
   console->println("set_rig_spec_from_str_rig()");
@@ -4317,7 +4328,7 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
     } else if (strncmp(p,"P:",2)==0) {
       // civport num
       n=atoi(p+2);
-      if (n>=-2 && n<=3) {
+      if (n>=-2 && n<=4) {
 	rig_spec->civport_num = n;
       }
     } else if (strncmp(p,"ADR:",4)==0) {
@@ -4328,7 +4339,7 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
       }
     } else if (strncmp(p,"NAME:",5)==0) {
       if (*(p+5)!='\0') {
-	strncpy(rig_spec->name,p+5,20);
+	strlcpy(rig_spec->name, p + 5, sizeof(rig_spec->name));
 	console->print("name set to rig_spec->name=;");console->println(rig_spec->name);
       }
     } else if (strncmp(p,"XVTR:",5)==0) {
@@ -4371,10 +4382,19 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
       }
       
     } else if (strncmp(p,"BM:",3)==0) {
+      console->print("BM token=");
+      console->println(p);
+
+      console->print("BM before=");
+      console->println(rig_spec->band_mask, HEX);      
       // bandmask hex 
       if (sscanf(p+3,"%x",&n)==1) {
+	console->print("parsed=");
+	console->println(n, HEX);	
 	rig_spec->band_mask = n;
 	//	console->print("BM;");console->println(	rig_spec->band_mask ,HEX);
+	console->print("after=");
+	console->println(rig_spec->band_mask, HEX);
       }
     } else if (strncmp(p,"TP:",3)==0) {
       // cat_type and rig_type
@@ -4430,7 +4450,7 @@ void print_rig_spec_str(int rig_idx,char *buf) // reverse set rig_spec_string fr
   if (p->transverter_freq[0][0]!=0) {
     sprintf(buf1,"XVTR:"); strcat(buf,buf1);
     for (int i=0;i<NMAX_TRANSVERTER;i++) {
-      for (int j=0;i<4;j++) {
+      for (int j=0;j<4;j++) {
 	if (p->transverter_freq[i][j]!=0) {
 	  // end
 	  if (!(i==0 && j==0)) {
@@ -4489,6 +4509,15 @@ void save_rigs(char *fn)
   }
   strcat(fnbuf, ".txt");
   plogw->ostream->println(fnbuf);
+
+  // FILE_WRITE appends on ESP32 Arduino.  Remove the old file first so
+  // Save RIGs writes exactly the current contents of rig_spec[].
+  if (SD.exists(fnbuf) && !SD.remove(fnbuf)) {
+    if (!plogw->f_console_emu) {
+      plogw->ostream->println("Failed to remove old rigs file");
+    }
+    return;
+  }
 
   f = SD.open(fnbuf, FILE_WRITE);
 

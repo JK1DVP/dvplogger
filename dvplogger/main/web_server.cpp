@@ -857,6 +857,10 @@ const char *settings_page_html = R"rawliteral(
     input[type="text"] { width: 60%; padding: 5px; margin: 5px 0; }
     label { display: block; margin-top: 10px; font-weight: bold; }
     .setting { margin-bottom: 15px; }
+    #status { min-height: 1.4em; font-weight: bold; }
+    .saved { color: #176b2c; }
+    .dirty { color: #9a6700; }
+    .error { color: #b42318; }
   </style>
 </head>
 <body>
@@ -932,8 +936,8 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
 </ul>
 <p>Press Enter in input box to reflect changes.</p>
 <p><a href="/" >go back to Home</a></p>
-<button onclick="fetch('/save_rigs').then(() => location.reload());">Save RIGs</button>
-<button onclick="fetch('/load_rigs').then(() => location.reload());">Load RIGs</button>
+<button type="button" onclick="saveRigs();">Save RIGs</button>
+<button type="button" onclick="loadRigs();">Load RIGs</button>
   <form id="settingsForm">
 )rawliteral";
 
@@ -941,17 +945,80 @@ static const char rigs_page_footer[] PROGMEM = R"rawliteral(
   </form>
   <p id="status"></p>
 <script>
-function updateSetting(index) {
-  const input = document.getElementById('edit_' + index);
-  const value = encodeURIComponent(input.value);
-  fetch(`/rig_edit?index=${index}&value=${value}`)
-    .then(res => res.text())
-    .then(msg => {
-      document.getElementById("status").innerText = msg;
-      // 設定変更後にページリロード
-      setTimeout(() => location.reload(), 500);
-    });
+let rigsDirty = false;
+let rigUpdateInProgress = false;
+
+function setRigStatus(message, state) {
+  const status = document.getElementById("status");
+  status.textContent = message;
+  status.className = state || "";
 }
+
+async function updateSetting(index) {
+  const input = document.getElementById('edit_' + index);
+  if (!input || rigUpdateInProgress) return;
+
+  const requested = input.value;
+  rigUpdateInProgress = true;
+  input.disabled = true;
+  try {
+    const params = new URLSearchParams({
+      index: String(index),
+      value: requested
+    });
+    const res = await fetch(`/rig_edit?${params.toString()}`, { cache: 'no-store' });
+    const canonical = await res.text();
+    if (!res.ok) throw new Error(canonical || `HTTP ${res.status}`);
+
+    // rig_spec[] is the single source of truth.  Always show the string
+    // regenerated from the RAM structure, never a browser-only edit.
+    input.value = canonical;
+    rigsDirty = true;
+    setRigStatus(`RIG ${index} updated in RAM (not saved yet).`, "dirty");
+  } catch (error) {
+    setRigStatus(`Update failed: ${error.message}`, "error");
+  } finally {
+    rigUpdateInProgress = false;
+    input.disabled = false;
+    input.focus();
+    input.select();
+  }
+}
+
+async function saveRigs() {
+  if (rigUpdateInProgress) {
+    setRigStatus("RIG update is still in progress. Press Save again after it completes.", "error");
+    return;
+  }
+  try {
+    const res = await fetch('/save_rigs', { cache: 'no-store' });
+    const msg = await res.text();
+    if (!res.ok) throw new Error(msg || `HTTP ${res.status}`);
+    rigsDirty = false;
+    setRigStatus(msg, "saved");
+  } catch (error) {
+    setRigStatus(`Save failed: ${error.message}`, "error");
+  }
+}
+
+async function loadRigs() {
+  try {
+    const res = await fetch('/load_rigs', { cache: 'no-store' });
+    const msg = await res.text();
+    if (!res.ok) throw new Error(msg || `HTTP ${res.status}`);
+    rigsDirty = false;
+    setRigStatus(msg, "saved");
+    setTimeout(() => location.reload(), 200);
+  } catch (error) {
+    setRigStatus(`Load failed: ${error.message}`, "error");
+  }
+}
+
+window.addEventListener('beforeunload', event => {
+  if (!rigsDirty) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
 document.addEventListener("DOMContentLoaded", () => {
   const inputs = document.querySelectorAll("input[type=text]");
   inputs.forEach(input => {
@@ -1753,9 +1820,9 @@ void setupSettingsPageHandler() {
     request->send(200, "text/plain", "RIG Settings saved");
   });
   
-  web_server.on("/load_settings", HTTP_GET, [](AsyncWebServerRequest *request){
-    load_rigs("RIGS"); 
-    request->send(200, "text/plain", "RIG Settings loaded");
+  web_server.on("/load_rigs", HTTP_GET, [](AsyncWebServerRequest *request){
+    load_rigs("RIGS");
+    request->send(200, "text/plain", "RIG settings loaded from /RIGS.txt");
   });
   
 
@@ -1780,24 +1847,41 @@ void setupSettingsPageHandler() {
 
   // RIG設定更新ハンドラ
   web_server.on("/rig_edit", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (request->hasParam("index") && request->hasParam("value")) {
-      int index = request->getParam("index")->value().toInt();
-      String value = request->getParam("value")->value();
-      struct rig *spec;
-      //      webLog.print("rig_edit value:");webLog.println(value.c_str());
-      set_rig_spec_from_str_rig(&rig_spec[index],value.c_str());
-      
-      //      if (index >= 0 && index < N_EDITWIN) {
-      //	if (pwin_index(index)!=NULL) {
-      //	  strncpy(pwin_index(index)+2, value.c_str(), pwin_index(index)[0] - 1);
-      //	  (pwin_index(index)+2)[pwin_index(index)[0] - 1] = '\0';
-      //	}
-      request->send(200, "text/plain", "Updated setting.");
-      //	return;
-      //      }
+    if (!request->hasParam("index") || !request->hasParam("value")) {
+      request->send(400, "text/plain", "Missing index or value");
       return;
     }
-    request->send(400, "text/plain", "Invalid parameters.");
+
+    const int index = request->getParam("index")->value().toInt();
+    const String value = request->getParam("value")->value();
+    if (index < 0 || index >= N_RIG) {
+      request->send(400, "text/plain", "RIG index out of range");
+      return;
+    }
+    if (value.length() == 0 || value.length() >= 300) {
+      request->send(400, "text/plain", "RIG specification must be 1-299 characters");
+      return;
+    }
+
+    set_rig_spec_from_str_rig(&rig_spec[index], value.c_str());
+
+    // radio->rig_spec already points at rig_spec[index].  Refresh the
+    // cached display string/name and band mask for every radio using it.
+    for (int i = 0; i < N_RADIO; ++i) {
+      if (radio_list[i].rig_spec_idx != index) continue;
+      radio_list[i].rig_spec = &rig_spec[index];
+      strlcpy(radio_list[i].rig_name + 2,
+              rig_spec[index].name,
+              sizeof(radio_list[i].rig_name) - 2);
+      set_rig_spec_str_from_spec(&radio_list[i]);
+      radio_list[i].band_mask = rig_spec[index].band_mask;
+    }
+
+    char spec_buf[300];
+    spec_buf[0] = '\0';
+    print_rig_spec_str(index, spec_buf);
+    spec_buf[sizeof(spec_buf) - 1] = '\0';
+    request->send(200, "text/plain", spec_buf);
   });
 }
 
@@ -2855,6 +2939,7 @@ static void *web_bandmap_alloc(size_t size, bool prefer_psram) {
 }
 
 static void web_bandmap_heap_trace(const char *tag) {
+  if (!lowmem_trace) return;
   webLog.printf("[BANDMAPTRACE] web %-22s free=%u largest=%u min=%u snapshots=%u\n",
                 tag,
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -2879,14 +2964,16 @@ static bool ensure_web_bandmap_snapshots() {
   const uint8_t requested_count = web_bandmap_has_psram ? 2 : 1;
   const uint16_t capacity = web_bandmap_has_psram
     ? WEB_BANDMAP_MAX_ENTRIES : WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES;
-  webLog.printf("[BANDMAPTRACE] layout snapshot=%u entry=%u bands=%u capacity=%u requested=%u entries_bytes=%u\n",
-                (unsigned)sizeof(WebBandmapSnapshot),
-                (unsigned)sizeof(WebBandmapEntry),
-                (unsigned)WEB_BANDMAP_BANDS,
-                (unsigned)capacity,
-                (unsigned)requested_count,
-                (unsigned)(sizeof(WebBandmapEntry) *
-                  static_cast<size_t>(WEB_BANDMAP_BANDS) * capacity));
+  if (lowmem_trace) {
+    webLog.printf("[BANDMAPTRACE] layout snapshot=%u entry=%u bands=%u capacity=%u requested=%u entries_bytes=%u\n",
+		  (unsigned)sizeof(WebBandmapSnapshot),
+		  (unsigned)sizeof(WebBandmapEntry),
+		  (unsigned)WEB_BANDMAP_BANDS,
+		  (unsigned)capacity,
+		  (unsigned)requested_count,
+		  (unsigned)(sizeof(WebBandmapEntry) *
+			     static_cast<size_t>(WEB_BANDMAP_BANDS) * capacity));
+  }  
 
   for (uint8_t i = 0; i < requested_count; ++i) {
     WebBandmapSnapshot *snapshot = static_cast<WebBandmapSnapshot *>(
@@ -3037,9 +3124,11 @@ static void rebuild_web_bandmap_snapshot() {
   const size_t rebuild_free_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   const size_t rebuild_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   web_bandmap_heap_trace("rebuild leave");
-  webLog.printf("[BANDMAPTRACE] rebuild delta free=%d largest=%d\n",
-                (int)rebuild_free_after - (int)rebuild_free_before,
-                (int)rebuild_largest_after - (int)rebuild_largest_before);
+  if (lowmem_trace) {
+    webLog.printf("[BANDMAPTRACE] rebuild delta free=%d largest=%d\n",
+		  (int)rebuild_free_after - (int)rebuild_free_before,
+		  (int)rebuild_largest_after - (int)rebuild_largest_before);
+  }
 }
 
 static bool enqueue_web_bandmap_command(const WebBandmapCommand &command) {
