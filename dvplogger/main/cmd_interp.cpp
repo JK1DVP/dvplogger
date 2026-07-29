@@ -252,7 +252,15 @@ void play_string_cmd(char *cmd)
   if (f_mux_transport) {
     char buf[40];
     if (strlen(cmd)<34) {
-      sprintf(buf,"playp%s",cmd);
+      // Voice playback starts immediately after PTT is asserted.  Some radios
+      // need a short TX-settling interval or the first syllable is clipped.
+      // On the SubCPU, a space in a voice string is rendered as 0.1 s silence.
+      // Add one only when the message does not already provide leading silence.
+      if (cmd[0] == ' ') {
+        sprintf(buf,"playp%s",cmd);
+      } else {
+        sprintf(buf,"playp %s",cmd);
+      }
       plogw->f_playing=1;
       // ptt control
       radio=so2r.radio_tx();

@@ -350,6 +350,21 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
     buf[n] = '\0';
     console->print("received duped=");
     console->println(buf);
+  } else if (strncmp(packet->buf,"cwdbg:",6)==0) {
+    size_t n = min((size_t)(packet->idx - 6), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 6, n);
+    buf[n] = '\0';
+    unsigned int phase = 0, ch = 0, fifo_before = 0, fifo_after = 0;
+    if (sscanf(buf, "%u|%u|%u|%u",
+               &phase, &ch, &fifo_before, &fifo_after) == 4) {
+      console->printf("SUBCPU CWDBG phase=%u char=%c(0x%02X) fifo=%u->%u\n",
+                      phase,
+                      (ch >= 32 && ch <= 126) ? (char)ch : '?',
+                      ch, fifo_before, fifo_after);
+    } else {
+      console->print("invalid SUBCPU CWDBG: ");
+      console->println(buf);
+    }
   } else if (strncmp(packet->buf,"playq:",6)==0) {
     // response to 'playq' command, playq: with currently playing string
     console->print("Now playing:");

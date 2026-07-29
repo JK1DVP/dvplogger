@@ -37,6 +37,17 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// SubCPU -> MainCPU audio diagnostics.
+// Set to 1 temporarily when CW/SPIFFS diagnostics are required.
+#define AUDIOPLAYER_MUX_DIAGNOSTICS 1
+
+// CW playback diagnostic state.  The audio task only updates these fields;
+// the control task transports them to the main CPU in response to playq.
+static volatile unsigned int cwdbg_phase = 0;
+static volatile unsigned int cwdbg_fifo_before = 0;
+static volatile unsigned int cwdbg_fifo_after = 0;
+static volatile unsigned int cwdbg_char = 0;
+
 
 
 #define ESP_LOGI(tag, format, ...)  ((void)0)
@@ -615,8 +626,15 @@ void AudioPlayer::task(void *arg) {
 	if (entry.symbol & 0x8000) {
 	  ESP_LOGI(TAG, "Detected 欧文モールス: %c", entry.symbol & 0x7F);
 	  char ascii = entry.symbol & 0x7F;
+	  cwdbg_char = (unsigned char)ascii;
+	  cwdbg_fifo_before = self->fifo.count();
+	  cwdbg_fifo_after = cwdbg_fifo_before;
+	  cwdbg_phase = 1;  // about to enter play_morse_char()
 	  self->play_morse_char(ascii);
+	  cwdbg_phase = 2;  // play_morse_char() returned
 	  self->fifo.pop(entry);
+	  cwdbg_fifo_after = self->fifo.count();
+	  cwdbg_phase = 3;  // FIFO pop completed
 	  continue;
 	} else if (entry.symbol >= 0x30A0 && entry.symbol <= 0x30FF) {
 	  ESP_LOGI(TAG, "Detected 和文モールス: U+%04X", entry.symbol);
@@ -1057,6 +1075,12 @@ void play_sound(char *cmd) {
       buf[6]='\0';
     } 
     mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL,MUX_PORT_MAIN_BRD_CTRL,(unsigned char *)buf,strlen(buf));
+#if AUDIOPLAYER_MUX_DIAGNOSTICS
+    snprintf(buf, sizeof(buf), "cwdbg:%u|%u|%u|%u",
+             cwdbg_phase, cwdbg_char, cwdbg_fifo_before, cwdbg_fifo_after);
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL,MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)buf,strlen(buf));
+#endif
     break;
   case 'l': // llabelfn load labels
     player.load_labels(cmd+1);

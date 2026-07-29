@@ -1053,8 +1053,10 @@ void play_sound(char *cmd) {
     //    std::string playbuf=player.get_string_fifo();
     sprintf(buf,"playq:");
     if (!player.get_string_fifo(buf+6,100-6,AudioPlayer::FIFO_BOTH)) {
-      //      ESP_LOGI("MAIN", "FIFO empty, playback finished");
-      buf[0]='\0';
+      // Keep the "playq:" header and return an empty queue string.
+      // Clearing buf[0] sends a zero-length packet, so the main CPU never
+      // receives the completion response and continues polling forever.
+      buf[6]='\0';
     } 
     mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL,MUX_PORT_MAIN_BRD_CTRL,(unsigned char *)buf,strlen(buf));
     break;

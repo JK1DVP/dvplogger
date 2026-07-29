@@ -1636,10 +1636,17 @@ void function_keys(uint8_t key, uint8_t c) {
       append_cwbuf_string(plogw->cw_msg[key - 0x3a] + 2);  // send CW msg
       append_cwbuf('$');  // repeat command
     } else if (radio->modetype== LOG_MODETYPE_PH) {
-      // こちらもsequence_modeにしたがって制御する必要あり。
-	// voice memory playback
 	if (plogw->voice_memory_enable) {
-	  send_voice_memory(radio, key - 0x3a + 1);  // F3 voice memory send
+	  if (plogw->voice_memory_enable == 3) {
+	    // SubCPU voice generation using metan.wav.
+	    // Match the behavior of the ESM path.
+	    so2r.play_string_macro(
+				   plogw->cw_msg[key - 0x3a] + 2);
+	  } else {
+	    // Rig built-in voice memory.
+	    send_voice_memory(
+			      radio, key - 0x3a + 1);
+	  }
 	}
     } else if (radio->modetype== LOG_MODETYPE_DG) {  // RTTY
       set_rttymemory_string(radio, key - 0x3a + 1, plogw->rtty_msg[key - 0x3a] + 2);
@@ -1735,7 +1742,7 @@ void process_enter(int option) {
   switch (radio->ptr_curr) {
   case 1:  // number entry
     if (!plogw->f_off_contest) {        
-      // check multipliers
+      // check multipliers only for QSOs belonging to the active contest
       int ret;
       radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
       //   plogw->ostream->println("contest multi checking0");
@@ -1749,14 +1756,15 @@ void process_enter(int option) {
 	  break;
 	}
       }
+    }
 
-      // ESM
-      if (plogw->f_esm==1) {
-	if (radio->cq[radio->modetype] == LOG_SandP && option!=1) {
-	  // ESM && S&P -- > send exchange
-	  if (!so2r.send_exch(radio)) return; // this need to be done for the previously focused radio
-	  // 2bsiq delay so set flag and return
-	}
+    // ESM is an operating aid, not contest scoring state.  Keep the normal
+    // exchange/TU sequence active in OFFCONTEST as well.
+    if (plogw->f_esm==1) {
+      if (radio->cq[radio->modetype] == LOG_SandP && option!=1) {
+	// ESM && S&P --> send exchange
+	if (!so2r.send_exch(radio)) return; // this need to be done for the previously focused radio
+	// 2bsiq delay so set flag and return
       }
     }
     
@@ -1805,13 +1813,6 @@ void process_enter(int option) {
 	}
       }
 
-      // send TU
-      if (option == 0 && ((plogw->f_esm==0) || (plogw->f_esm==1 && (radio->cq[radio->modetype] == LOG_CQ)))) {    
-	so2r.send_tu();
-	if (verbose&4) console->println("end of tu");      
-      }
-      so2r.print_sequence_mode();
-    
       if (verbose&4) 	{
 	if (!plogw->f_console_emu) plogw->ostream->println("bandmap updated  ");
       }
@@ -1822,6 +1823,18 @@ void process_enter(int option) {
       sprintf(dp->lcdbuf, "OFF Contest=%d !!!\nNo Dupe/Multi/Score\nperformed.",plogw->f_off_contest);
       upd_display_info_flash(dp->lcdbuf);
     }
+
+    // Message sequencing is independent of contest scoring.  OFFCONTEST
+    // QSOs still complete the normal ESM/TU operating sequence, while the
+    // contest dupe/multiplier/score and bandmap-worked state above remain
+    // untouched.
+    if (option == 0 && ((plogw->f_esm==0) ||
+                       (plogw->f_esm==1 &&
+                        (radio->cq[radio->modetype] == LOG_CQ)))) {
+      so2r.send_tu();
+      if (verbose&4) console->println("end of tu");
+    }
+    so2r.print_sequence_mode();
       
     
     // prepare new log entry

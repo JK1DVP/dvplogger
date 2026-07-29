@@ -127,6 +127,13 @@ public:
   void set_queue_monitor_status(int value)
   {
     queue_monitor_status=value;
+    // Start queue polling with a finite delay.  Without this, timeout_monitor
+    // may remain zero and task() can spin continuously while playback is active.
+    if (value) {
+      set_timeout_monitor(500);
+    } else {
+      timeout_monitor=0;
+    }
   }
 
   int query_queue_monitor_status()
@@ -497,14 +504,15 @@ public:
       switch(queue_monitor_status) {
       case 0:  // nothing to do
 	break;
-      case 1: // monitor queue if sending message
+      case 1: // monitor sub CPU playback queue
 	console->print("timeout_monitor=");console->println(timeout_monitor);      
 	console->print("queue_monitor_status="); console->print(queue_monitor_status);
 	console->print(" sequence_stat="); console->println(sequence_stat());
-	if ((sequence_stat() == Sending_Msg) || (sequence_stat() == Sending_Msg_Finished)) {
-	  play_queue_cmd();
-	  set_timeout_monitor(500);
-	}
+	// queue_monitor_status itself means that voice/tone playback is active.
+	// Terminal playcw/play commands do not necessarily enter Sending_Msg, so
+	// do not gate playq polling on sequence_stat().
+	play_queue_cmd();
+	set_timeout_monitor(500);
 	break;
       }
       show_status_lcd();      
