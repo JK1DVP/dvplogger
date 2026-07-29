@@ -76,8 +76,8 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"emu", "enter terminal screen emulation; EXITEMU exits"},
   {"verbose[n]", "toggle verbose output, or set verbose bit mask n"},
   {"clusterverbose [1|2] [0-3]", "show/set Cluster 1 or 2 traffic display level"},
-  {"c1cmd command", "send one command directly to Cluster 1"},
-  {"c2cmd command", "send one command directly to Cluster 2"},
+  {"c1cmd <command>", "send one command immediately to Cluster 1 (not saved)"},
+  {"c2cmd <command>", "send one command immediately to Cluster 2 (not saved)"},
   {"loadsat", "load saved satellite information"},
   {"savesat", "save satellite information"},
   {"satellite", "load/update TLE data"},
@@ -93,6 +93,9 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"makedupe", "rebuild dupe/multiplier data from QSO.TXT"},
   {"dumpqso[n]", "dump current raw QSO log, or backup log n"},
   {"readqso", "print QSO.TXT in importable text format"},
+  {"listqsofile", "list available QSO backup files"},
+  {"switchlog <0-999>", "switch to the specified QSO backup log"},
+  {"mailqso", "reserved command; QSO mail sending is currently disabled"},
   {"dumpcur", "dump the currently selected QSO record"},
   {"dumptop", "dump the first QSO record"},
   {"dumpnext", "dump the next QSO record"},
@@ -510,6 +513,16 @@ void cmd_interp(char *cmd, Stream *output) {
           out->println("usage: clusterverbose [1|2] [0-3]");
           print_cluster_verbose_status(out);
         }
+        break;
+      }
+      if (strncmp(cmd, "c1cmd", 5) == 0 &&
+          (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t')) {
+        send_cluster_terminal_cmd(1, cmd + 5, out);
+        break;
+      }
+      if (strncmp(cmd, "c2cmd", 5) == 0 &&
+          (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t')) {
+        send_cluster_terminal_cmd(2, cmd + 5, out);
         break;
       }
       if (strncmp(cmd, "nextaos", 7) == 0) {

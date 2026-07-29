@@ -2246,12 +2246,6 @@ void process_enter(int option) {
       break;
     }
 
-    if (strcmp(radio->callsign + 2, "ZMERGE") == 0) {
-      clear_buf(radio->callsign);
-      zserver_start_merge(false);
-      break;
-    }
-
     if (strcmp(radio->callsign + 2, "ANTENNAON") == 0) {
       antenna_control_enable = 1;
       antenna_settings_changed();
