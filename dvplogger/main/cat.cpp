@@ -1016,8 +1016,10 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) {
   case CAT_TYPE_NOCAT:
       return;
   case CAT_TYPE_YAESU_FT817:
-    // use civ_buf to construct binary command data and send
-    freq = freq / (100/FREQ_UNIT);  // 10 Hz
+    // FT-817/818 frequency data is four packed-BCD bytes in 10 Hz units.
+    // radio->freq is already stored in FREQ_UNIT (10 Hz) units, so do not
+    // divide it again here.  Dividing by (100/FREQ_UNIT) made 28.600 MHz
+    // become 2.860 MHz on the rig.
     bytebuf[3]=dec2bcd(freq % 100);
     freq = freq / 100;  // 1kHz
     bytebuf[2]=dec2bcd(freq % 100);
@@ -1212,8 +1214,10 @@ void send_freq_query_civ(struct radio *radio) {
     add_civ_buf((byte)0x00); // dummy
     add_civ_buf((byte)0x00); // dummy
     add_civ_buf((byte)0x03);     // Read Frequency and Mode Status
-    send_civ_buf_radio(radio);
     radio->cat_status=0x30;
+    radio->f_civ_response_expected = 1;
+    radio->civ_response_timer = 50;
+    send_civ_buf_radio(radio);
     return;
   case CAT_TYPE_NOCAT:
     return;
@@ -1324,6 +1328,8 @@ void send_ptt_query_civ(struct radio *radio) {
     add_civ_buf((byte)0x00); // dummy
     add_civ_buf((byte)0xF7);     // Read TX status
     radio->cat_status=0x20;    // set reading TX status
+    radio->f_civ_response_expected = 1;
+    radio->civ_response_timer = 50;
     send_civ_buf_radio(radio);
     return;
   case CAT_TYPE_KENWOOD:
@@ -1497,6 +1503,8 @@ void send_smeter_query_civ(struct radio *radio) {
     add_civ_buf((byte)0x00); // dummy
     add_civ_buf((byte)0xE7);     // Read RX status
     radio->cat_status=0x10;    // set reading RX status
+    radio->f_civ_response_expected = 1;
+    radio->civ_response_timer = 50;
     send_civ_buf_radio(radio);
     return;
   case CAT_TYPE_NOCAT:  // manual radio do nothing
@@ -2445,6 +2453,12 @@ void get_cat_ft817(struct radio *radio) {
   int tmp;
   int filt;
   
+  // A complete fixed-length FT-817 response has arrived.  Release the
+  // query gate before applying the decoded status so the next periodic
+  // query can be sent.
+  radio->f_civ_response_expected = 0;
+  radio->civ_response_timer = 0;
+
   switch (radio->cat_status&0xf0) {
   case 0x10: // RX status
     radio->smeter=radio->cmdbuf[0]&0xf; // smeter
@@ -4218,7 +4232,9 @@ void init_rigspec() {
   rig_spec[18].cat_type = CAT_TYPE_YAESU_FT817;  // cat
   rig_spec[18].civaddr = 0;
   rig_spec[18].civport_num=3; 
-  rig_spec[18].civport_reversed=1; // normal
+  // FT-817/FT-818 DATA/ACC CAT is TTL level and works without UART
+  // inversion on the DVPlogger TTL serial port.
+  rig_spec[18].civport_reversed=0;
   rig_spec[18].civport_baud = 4800;      // default
   rig_spec[18].cwport = 1;  // 
   rig_spec[18].rig_type = RIG_TYPE_YAESU;

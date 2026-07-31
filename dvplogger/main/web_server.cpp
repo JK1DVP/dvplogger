@@ -3419,6 +3419,21 @@ static void web_bandmap_json_safe_copy(char *dest, size_t dest_size,
   dest[out] = '\0';
 }
 
+static void add_bandmap_api_headers(AsyncWebServerResponse *response) {
+  if (!response) return;
+  response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Access-Control-Allow-Origin", "*");
+}
+
+static void send_bandmap_api_text(AsyncWebServerRequest *request, int code,
+                                  const char *content_type,
+                                  const String &body) {
+  AsyncWebServerResponse *response =
+    request->beginResponse(code, content_type, body);
+  add_bandmap_api_headers(response);
+  request->send(response);
+}
+
 static void setup_web_bandmap_handlers() {
   web_server.on("/bandmap", HTTP_GET, [](AsyncWebServerRequest *request) {
     AsyncWebServerResponse *response = request->beginResponse_P(
@@ -3438,7 +3453,22 @@ static void setup_web_bandmap_handlers() {
       json += "\"}";
     }
     json += "]}";
-    request->send(200, "application/json", json);
+    send_bandmap_api_text(request, 200, "application/json", json);
+  });
+
+  // Even Hub applications use the same compact band list.
+  web_server.on("/api/g2/bands", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{\"bands\":[";
+    for (int bandid = 1; bandid < N_BAND; ++bandid) {
+      if (bandid > 1) json += ',';
+      json += "{\"id\":" + String(bandid) + ",\"label\":\"";
+      String label = bandid_str[bandid - 1];
+      label.trim();
+      json += label;
+      json += "\"}";
+    }
+    json += "]}";
+    send_bandmap_api_text(request, 200, "application/json", json);
   });
 
   web_server.on("/api/bandmap/version", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -3461,7 +3491,7 @@ static void setup_web_bandmap_handlers() {
       xSemaphoreGive(web_bandmap_snapshot_mutex);
     }
     snprintf(json + used, sizeof(json) - used, "}}");
-    request->send(200, "application/json", json);
+    send_bandmap_api_text(request, 200, "application/json", String(json));
   });
 
   web_server.on("/api/bandmap/data", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -3535,8 +3565,14 @@ static void setup_web_bandmap_handlers() {
     delete state;
     AsyncWebServerResponse *response =
       request->beginResponse(200, "application/json", json);
-    response->addHeader("Cache-Control", "no-store");
+    add_bandmap_api_headers(response);
     request->send(response);
+  });
+
+  // /api/g2/bandmap is a lightweight alias intended for Even Hub clients.
+  web_server.on("/api/g2/bandmap", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->redirect("/api/bandmap/data?band=" +
+                      String(parse_web_bandmap_band(request)));
   });
 
   web_server.on("/api/bandmap/select", HTTP_POST,
@@ -3568,7 +3604,47 @@ static void setup_web_bandmap_handlers() {
         request->send(503, "text/plain", "bandmap command queue full");
         return;
       }
-      request->send(202, "text/plain", "spot selection queued");
+      send_bandmap_api_text(request, 202, "text/plain",
+                            String("spot selection queued"));
+    });
+
+  // G2 uses the same no-confirmation selection queue as the web bandmap.
+  web_server.on("/api/g2/select", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      const char *required[] = {"band", "freq", "mode", "time", "call"};
+      for (const char *name : required) {
+        if (!request->hasParam(name, true)) {
+          send_bandmap_api_text(request, 400, "text/plain",
+                                String("missing parameter"));
+          return;
+        }
+      }
+
+      WebBandmapCommand command{};
+      command.type = WEB_BANDMAP_COMMAND_SELECT;
+      command.bandid = request->getParam("band", true)->value().toInt();
+      command.freq = request->getParam("freq", true)->value().toInt();
+      command.mode = request->getParam("mode", true)->value().toInt();
+      command.time = request->getParam("time", true)->value().toInt();
+      String call = request->getParam("call", true)->value();
+      call.trim();
+      call.toUpperCase();
+      strlcpy(command.station, call.c_str(), sizeof(command.station));
+
+      if (command.bandid < 1 || command.bandid >= N_BAND ||
+          !valid_web_bandmap_callsign(command.station) ||
+          command.mode >= NMODEID) {
+        send_bandmap_api_text(request, 400, "text/plain",
+                              String("invalid spot"));
+        return;
+      }
+      if (!enqueue_web_bandmap_command(command)) {
+        send_bandmap_api_text(request, 503, "text/plain",
+                              String("bandmap command queue full"));
+        return;
+      }
+      send_bandmap_api_text(request, 202, "text/plain",
+                            String("spot selection queued"));
     });
 
   auto enqueue_edit_command = [](AsyncWebServerRequest *request,
