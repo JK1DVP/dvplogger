@@ -430,31 +430,106 @@ String humanReadableSize(const size_t bytes) {
   return String(text);
 }
 
-// handles uploads
-void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-  String logmessage = "Client:" + request->client()->remoteIP().toString() + " " + request->url();
-  webLog.println(logmessage);
-
-  if (!index) {
-    logmessage = "Upload Start: " + String(filename);
-    // open the file on first call and store the file handle in the request object
+// Upload status is kept in the request-local temporary file only.  Avoid a
+// global request lock here: when a browser connection is interrupted, the POST
+// completion callback is not guaranteed to run and a global lock can remain
+// stuck, causing every retry to be rejected.
+//
+// Progress logging is deliberately sparse.  Logging every TCP-sized chunk can
+// enqueue thousands of messages during a firmware image upload and starve the
+// asynchronous web/TCP processing that is receiving the file.
+void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
+                  uint8_t *data, size_t len, bool final) {
+  if (index == 0) {
     request->_tempFile = SD.open("/" + filename, "w");
-    webLog.println(logmessage);
+
+    webLog.print("Upload Start: ");
+    webLog.print(filename);
+    webLog.print(" client=");
+    webLog.println(request->client()->remoteIP().toString());
+
+    if (!request->_tempFile) {
+      webLog.print("Upload Error: cannot open /");
+      webLog.println(filename);
+      return;
+    }
   }
 
-  if (len) {
-    // stream the incoming chunk to the opened file
-    request->_tempFile.write(data, len);
-    logmessage = "Writing file: " + String(filename) + " index=" + String(index) + " len=" + String(len);
-    webLog.println(logmessage);
+  if (len != 0) {
+    // After an unrecoverable write error the file is closed.  The HTTP stack
+    // still delivers the remaining body chunks, so discard them silently
+    // instead of producing one error message for every TCP packet.
+    if (!request->_tempFile) {
+      return;
+    }
+
+    // SD writes can occasionally return zero while another task or the card is
+    // briefly busy.  Retry the same chunk for a few milliseconds before
+    // declaring the upload failed.  No bytes are skipped: a partial write is
+    // continued from data + written until the complete chunk is stored.
+    size_t written = 0;
+    uint8_t retry_count = 0;
+    static const uint8_t max_write_retries = 8;
+    while (written < len) {
+      const size_t n = request->_tempFile.write(data + written, len - written);
+      if (n != 0) {
+        written += n;
+        retry_count = 0;
+        continue;
+      }
+
+      if (++retry_count > max_write_retries) {
+        break;
+      }
+      delay(2);
+      yield();
+    }
+
+    if (written != len) {
+      webLog.print("Upload Error: SD write stalled file=");
+      webLog.print(filename);
+      webLog.print(" index=");
+      webLog.print(index);
+      webLog.print(" requested=");
+      webLog.print(len);
+      webLog.print(" written=");
+      webLog.println(written);
+      request->_tempFile.close();
+      return;
+    }
+
+    // Periodically flush the SD cache.  This keeps the amount of dirty data
+    // bounded during multi-megabyte uploads and makes a later card stall less
+    // likely to lose a large buffered region.
+    static const size_t flush_step = 256 * 1024;
+    const size_t end_index = index + len;
+    if (index / flush_step != end_index / flush_step) {
+      request->_tempFile.flush();
+    }
+
+    // One message per 64 KiB is sufficient to show progress without flooding
+    // webLog and delaying the network receive callback.
+    static const size_t progress_step = 64 * 1024;
+    if (index == 0 || index / progress_step != end_index / progress_step) {
+      webLog.print("Upload Progress: ");
+      webLog.print(filename);
+      webLog.print(" size=");
+      webLog.println(end_index);
+    }
   }
 
   if (final) {
-    logmessage = "Upload Complete: " + String(filename) + ",size: " + String(index + len);
-    // close the file handle as the upload is now done
-    request->_tempFile.close();
-    webLog.println(logmessage);
-    request->redirect("/");
+    if (request->_tempFile) {
+      request->_tempFile.flush();
+      request->_tempFile.close();
+      webLog.print("Upload Complete: ");
+      webLog.print(filename);
+      webLog.print(" size=");
+      webLog.println(index + len);
+    } else {
+      webLog.print("Upload Error: incomplete file=");
+      webLog.println(filename);
+    }
   }
 }
 
@@ -3973,7 +4048,9 @@ function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank'
   // Send a GET request to <IP>/get?message=<message>  
   // run handleUpload function when any file is uploaded
   web_server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request) {
-    request->send(200);
+    // The upload callback only writes and closes the file.  Send one response
+    // here after the complete multipart body has been received.
+    request->redirect("/");
   }, handleUpload);
 
   

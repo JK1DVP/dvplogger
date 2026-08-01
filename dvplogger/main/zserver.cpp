@@ -39,7 +39,7 @@
 #include "esp_heap_caps.h"
 
 
-char zserver_server[40] = "192.168.1.2";
+char zserver_server[40] = "";
 int zserver_port = 23;
 char zserver_buf[NCHR_ZSERVER_RINGBUF];
 //WiFiClient zserver_client;
@@ -817,7 +817,21 @@ int opmode2zLogmode(char *opmode)
   return 7;
 }
 
+static bool zserver_is_configured() {
+  return plogw != nullptr && plogw->zserver_name[2] != '\0' &&
+         zserver_server[0] != '\0';
+}
+
 int connect_zserver() {
+  // An empty Z-server setting explicitly disables the connection.  Check this
+  // here as the final guard because connect_zserver() may be called from more
+  // than one state-machine path.
+  if (!zserver_is_configured() || zserver.stat == 11) {
+    if (zserver_client->connected()) zserver_client->stop();
+    zserver.stat = 11;
+    return 0;
+  }
+
   if (wifi_status == 1) {
     if (!zserver_client->connected()) {
       if (!plogw->f_console_emu) {
@@ -921,6 +935,17 @@ void onDisconnect_zserver(void *arg, AsyncClient *client)
 void onConnect_zserver(void *arg, AsyncClient *client)
 {
   memtrace_event("zserver connected");
+
+  // The setting can be cleared while an asynchronous connection attempt is
+  // still in progress.  Do not accept that late connection.
+  if (!zserver_is_configured() || zserver.stat == 11) {
+    if (!plogw->f_console_emu) {
+      plogw->ostream->println("zserver connected after being disabled; closing.");
+    }
+    client->stop();
+    zserver.stat = 11;
+    return;
+  }
   if (!plogw->f_console_emu) {
     plogw->ostream->print("connected to zserver ");
     plogw->ostream->print(zserver_server);
@@ -964,6 +989,15 @@ void zserver_process() {
 
   switch (zserver.stat) {
   case 0:  // not logged in
+
+    // Empty configuration means disabled.  This also protects the short period
+    // during startup before settings have been loaded.
+    if (!zserver_is_configured()) {
+      if (zserver_client->connected()) zserver_client->stop();
+      zserver.stat = 11;
+      zserver.timeout_count = 0;
+      break;
+    }
     
     if (wifi_status == 0 ) {
       zserver.stat = 10;
@@ -1179,20 +1213,28 @@ void zserver_send(char *buf)
 
 void reconnect_zserver()
 {
-  // stop zserver if any
+  // Stop the old connection before changing the destination.  AsyncTCP may
+  // still deliver a late onConnect callback; onConnect_zserver() checks the
+  // disabled state as well.
   zserver_client->stop();
-  zserver.stat = 0;
+  zserver.timeout_count = 0;
+  zserver.timeout = 0;
   Serial.println("reconnect_zserver()");
-  // set new server name from plogw->zserver_name
-  if (strlen(plogw->zserver_name+2)!=0) {
-    strcpy(zserver_server,plogw->zserver_name+2); // set new name
-    sprintf(dp->lcdbuf,"set new zserver name:\n%s",zserver_server);
+
+  // Set the new server name from plogw->zserver_name.  An empty field is an
+  // explicit disable request, so also erase the cached destination.
+  if (strlen(plogw->zserver_name + 2) != 0) {
+    strncpy(zserver_server, plogw->zserver_name + 2,
+            sizeof(zserver_server) - 1);
+    zserver_server[sizeof(zserver_server) - 1] = '\0';
+    zserver.stat = 0;
+    sprintf(dp->lcdbuf, "set new zserver name:\n%s", zserver_server);
   } else {
-    zserver.stat=11; // stop connecting to zserver
-    sprintf(dp->lcdbuf,"stop conn to zserver");
+    zserver_server[0] = '\0';
+    zserver.stat = 11; // do not connect until a server name is entered
+    sprintf(dp->lcdbuf, "ZSERVER\nDisabled");
   }
-  upd_display_info_flash(dp->lcdbuf);      
-  
+  upd_display_info_flash(dp->lcdbuf);
 }
 
 void zserver_freq_notification()
