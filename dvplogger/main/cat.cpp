@@ -2452,6 +2452,7 @@ void get_cat_ft817(struct radio *radio) {
   if (!radio->enabled) return;
   int tmp;
   int filt;
+  byte mode_code;
   
   // A complete fixed-length FT-817 response has arrived.  Release the
   // query gate before applying the decoded status so the next periodic
@@ -2489,8 +2490,17 @@ void get_cat_ft817(struct radio *radio) {
     freq=freq*100+bcd2dec(radio->cmdbuf[3]); // 100/10Hz
     freq=freq*(10/FREQ_UNIT);
     check_and_set_frequency(radio,freq);
-    // set mode
-    switch (radio->cmdbuf[4]) {
+    // The FT-817/818 may set bit 7 in the returned mode byte when the
+    // optional narrow filter is selected (for example 0x82 for CW-N).
+    // The lower nibble is the actual CAT mode code.
+    mode_code = ((byte)radio->cmdbuf[4]) & 0x0f;
+    if (verbose & VERBOSE_CAT) {
+      plogw->ostream->print("FT817 mode raw=0x");
+      plogw->ostream->print((byte)radio->cmdbuf[4], HEX);
+      plogw->ostream->print(" code=0x");
+      plogw->ostream->println(mode_code, HEX);
+    }
+    switch (mode_code) {
       case 0x00:  // LSB
         sprintf(opmode, "LSB");
         break;
