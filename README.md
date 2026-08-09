@@ -57,13 +57,13 @@ git clone -b 2.0.17 --recursive https://github.com/espressif/arduino-esp32 ./com
 
 ただし、dvploggerでは、arduino-esp32のライブラリを追加かつ変更していますので、components/arduino/libraries/の下を本リポジトリの内容で上書きをしてください。そのため、gitの管理が残っているとうまくいきませんので、
 
-rm -rf  ./components/arduino\.git
+rm -rf  ./components/arduino/.git
 
 として、
 
 cd ..
 
-git restore .\dvplogger\components\arduino
+git restore ./dvplogger/components/arduino
 
 で、本リポジトリの内容を書き戻します。
 
