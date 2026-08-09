@@ -44,18 +44,27 @@ https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/get-started/index.ht
 また、本システムはarduino-esp32 v2.0.17 をcomponent として使っています。
 https://github.com/espressif/arduino-esp32/tree/2.0.17
 などに従い、dvplogger/components/arduino/にArduino-esp32 v2.0.17をcloneしてください。
+
 参考：
+
 いったんarduino以下をクリーンにし、そのうえで、v2.0.17をクローンします。
+
 cd ソースディレクトリ/dvplogger
+
 rm -rf components/arduino 
 
 git clone -b 2.0.17 --recursive https://github.com/espressif/arduino-esp32 ./components/arduino
 
 ただし、dvploggerでは、arduino-esp32のライブラリを追加かつ変更していますので、components/arduino/libraries/の下を本リポジトリの内容で上書きをしてください。そのため、gitの管理が残っているとうまくいきませんので、
+
 rm -rf  ./components/arduino\.git
+
 として、
+
 cd ..
+
 git restore .\dvplogger\components\arduino
+
 で、本リポジトリの内容を書き戻します。
 
 その上で、
