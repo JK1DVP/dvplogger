@@ -125,8 +125,8 @@ private:
 #define ADC_CH          ADC1_CHANNEL_0          
 #define ADC_ATTEN_SET   ADC_ATTEN_DB_11
 #define FS_TARGET_HZ    (SAMPLING_FREQ*GOERTZEL_DECIM)   // 24 kHz
-#define DMA_BUF_LEN     (GOERTZEL_N*GOERTZEL_DECIM)      
-#define DMA_BUF_COUNT   8
+#define MORSE_DMA_BUF_LEN     (GOERTZEL_N*GOERTZEL_DECIM)      
+#define MORSE_DMA_BUF_COUNT   8
 #define TASK_STACK      4096
 #define TASK_PRIO       1
 #define TASK_CORE       1                       // Core1 に固定

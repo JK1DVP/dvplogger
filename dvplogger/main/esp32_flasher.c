@@ -29,6 +29,7 @@
 
 #include <string.h>
 #include "esp_err.h"
+#include "esp_system.h"
 #include "esp_log.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -55,6 +56,9 @@
 //#include <SoftwareSerial.h>
 //#include "decl.h"
 #include "sd_wrapper.h"
+
+/* Route flasher progress to the same runtime console Stream as commands. */
+#define printf(...) dvplogger_console_printf(__VA_ARGS__)
 //extern SoftwareSerial Serial3;
 //extern SoftwareSerial Serial4;
 
@@ -87,6 +91,8 @@ const uint8_t reset_trigger_mcp_pin = 15;
 #define BUF_LEN 128
 static uint8_t buf[BUF_LEN] = {0};
 
+static const char *get_error_string(const esp_loader_error_t error);
+
 void slave_monitor(void *arg)
 {
 #if (HIGHER_BAUDRATE != 115200)
@@ -102,31 +108,53 @@ void slave_monitor(void *arg)
 }
 
 void loader_boot_init_func() {
+  printf("[FLASHERSD] boot init: MCP pin %u -> HIGH/output\n", gpio0_trigger_mcp_pin);
   mcp_write_pin(gpio0_trigger_mcp_pin,1);
   mcp_pin_mode(gpio0_trigger_mcp_pin,OUTPUT);
 }
 
 void loader_reset_init_func() {
+  printf("[FLASHERSD] reset init: MCP pin %u -> HIGH/output\n", reset_trigger_mcp_pin);
   mcp_write_pin(reset_trigger_mcp_pin,1);
   mcp_pin_mode(reset_trigger_mcp_pin,OUTPUT);
 }
 
 void loader_port_reset_target_func() {
+  printf("[FLASHERSD] reset target: MCP pin %u LOW hold=%u ms\n",
+         reset_trigger_mcp_pin, (unsigned int)SERIAL_FLASHER_RESET_HOLD_TIME_MS);
   mcp_write_pin(reset_trigger_mcp_pin, 0);
   loader_port_delay_ms(SERIAL_FLASHER_RESET_HOLD_TIME_MS);
-  mcp_write_pin(reset_trigger_mcp_pin, 1);  
+  mcp_write_pin(reset_trigger_mcp_pin, 1);
+  printf("[FLASHERSD] reset target: MCP pin %u HIGH\n", reset_trigger_mcp_pin);
 }
 
 void loader_port_enter_bootloader_func() {
+  printf("[FLASHERSD] enter bootloader: MCP GPIO0 pin %u LOW\n",
+         gpio0_trigger_mcp_pin);
   mcp_write_pin(gpio0_trigger_mcp_pin,0);
   loader_port_reset_target_func();
+  printf("[FLASHERSD] boot hold=%u ms\n",
+         (unsigned int)SERIAL_FLASHER_BOOT_HOLD_TIME_MS);
   loader_port_delay_ms(SERIAL_FLASHER_BOOT_HOLD_TIME_MS);
   mcp_write_pin(gpio0_trigger_mcp_pin,1);
+  printf("[FLASHERSD] enter bootloader: MCP GPIO0 pin %u HIGH\n",
+         gpio0_trigger_mcp_pin);
 }
+
 
 
 void esp_flasher_sd(char *which)
 {
+  printf("[FLASHERSD] ENTRY before config hwver=%d stack_hwm=%u free_heap=%u\n",
+         JK1DVPLOG_HWVER,
+         (unsigned int)uxTaskGetStackHighWaterMark(NULL),
+         (unsigned int)esp_get_free_heap_size());
+  fflush(stdout);
+
+  printf("[FLASHERSD] sizeof(loader_esp32_config_t)=%u\n",
+         (unsigned int)sizeof(loader_esp32_config_t));
+  fflush(stdout);
+
   const loader_esp32_config_t config = {
     .baud_rate = 115200,
     .uart_port = UART_NUM_2,
@@ -140,40 +168,74 @@ void esp_flasher_sd(char *which)
     .loader_port_enter_bootloader_func=loader_port_enter_bootloader_func // target enter bootloader function or NULL
   };
 
+  printf("[FLASHERSD] config constructed stack_hwm=%u free_heap=%u\n",
+         (unsigned int)uxTaskGetStackHighWaterMark(NULL),
+         (unsigned int)esp_get_free_heap_size());
+  fflush(stdout);
+
+  printf("[FLASHERSD] begin which='%s' hwver=%d\n",
+         which ? which : "(null)", JK1DVPLOG_HWVER);
+  printf("[FLASHERSD] config uart=%d rx=%d tx=%d initial_baud=%d higher_baud=%d\n",
+         (int)config.uart_port, (int)config.uart_rx_pin, (int)config.uart_tx_pin,
+         (int)config.baud_rate, (int)HIGHER_BAUDRATE);
+  printf("[FLASHERSD] MCP gpio0=%u reset=%u uart2_driver_before=%d\n",
+         gpio0_trigger_mcp_pin, reset_trigger_mcp_pin,
+         uart_is_driver_installed(UART_NUM_2) ? 1 : 0);
+  fflush(stdout);
+
+  printf("[FLASHERSD] BEFORE loader_port_esp32_init stack_hwm=%u\n",
+         (unsigned int)uxTaskGetStackHighWaterMark(NULL));
+  fflush(stdout);
+
   //  setup_vfs_sd();
-  
-  if (loader_port_esp32_init(&config) != ESP_LOADER_SUCCESS) { // replace this with custom version using mcp 
+  esp_loader_error_t init_err = loader_port_esp32_init(&config);
+  printf("[FLASHERSD] loader_port_esp32_init result=%d (%s) uart2_driver_after=%d\n",
+         (int)init_err, get_error_string(init_err),
+         uart_is_driver_installed(UART_NUM_2) ? 1 : 0);
+  if (init_err != ESP_LOADER_SUCCESS) { // replace this with custom version using mcp
     ESP_LOGE(TAG, "serial initialization failed.");
     return;
   }
 
-  if (connect_to_target(HIGHER_BAUDRATE) == ESP_LOADER_SUCCESS) {
+  printf("[FLASHERSD] connect_to_target begin\n");
+  esp_loader_error_t connect_err = connect_to_target(HIGHER_BAUDRATE);
+  printf("[FLASHERSD] connect_to_target result=%d (%s)\n",
+         (int)connect_err, get_error_string(connect_err));
+  if (connect_err == ESP_LOADER_SUCCESS) {
     if (strstr(which,"boot")!=NULL) {
       ESP_LOGI(TAG, "Loading bootloader...");
-      flash_bin_file_streaming("/bootload.bin",BOOTLOADER_ADDRESS_V0);
+      int rc = flash_bin_file_streaming("/bootload.bin",BOOTLOADER_ADDRESS_V0);
+      printf("[FLASHERSD] boot result=%d\n", rc);
     }
     if (strstr(which,"part") != NULL) {
       ESP_LOGI(TAG, "Loading partition table...");
-      flash_bin_file_streaming("/partitio.bin",PARTITION_ADDRESS);
+      int rc = flash_bin_file_streaming("/partitio.bin",PARTITION_ADDRESS);
+      printf("[FLASHERSD] partition result=%d\n", rc);
     }
     if (strstr(which,"app")!=NULL) {
-      ESP_LOGI(TAG, "Loading app...");    
-      flash_bin_file_streaming("/app0.bin",APPLICATION_ADDRESS);
+      ESP_LOGI(TAG, "Loading app...");
+      int rc = flash_bin_file_streaming("/app0.bin",APPLICATION_ADDRESS);
+      printf("[FLASHERSD] app result=%d\n", rc);
     }
     if (strstr(which,"spiffs")!= NULL) {
-      ESP_LOGI(TAG, "Loading SPIFFS...");    
-      flash_bin_file_streaming("/spiffs.bin",SPIFFS_ADDRESS);
+      ESP_LOGI(TAG, "Loading SPIFFS...");
+      int rc = flash_bin_file_streaming("/spiffs.bin",SPIFFS_ADDRESS);
+      printf("[FLASHERSD] spiffs result=%d\n", rc);
     }
     ESP_LOGI(TAG, "Done!");
-    esp_loader_reset_target(); // replace this with local custom version
+    printf("[FLASHERSD] esp_loader_reset_target begin\n");
+    esp_loader_reset_target();
+    printf("[FLASHERSD] esp_loader_reset_target returned\n");
 
     // Delay for skipping the boot message of the targets
     vTaskDelay(500 / portTICK_PERIOD_MS);
-      
+  } else {
+    printf("[FLASHERSD] abort: target connection failed\n");
   }
-    
+  printf("[FLASHERSD] end uart2_driver=%d free_heap=%u\n",
+         uart_is_driver_installed(UART_NUM_2) ? 1 : 0,
+         (unsigned int)esp_get_free_heap_size());
   //  unmount_sdcard_vfs();
-    
 }
 
 void esp_flasher(void)
@@ -456,100 +518,122 @@ esp_loader_error_t load_ram_binary(const uint8_t *bin)
 #define CHUNK_SIZE 1024  // 一度に読み込むバイト数（1KB）
 
 int flash_bin_file_streaming(const char *filepath, uint32_t flash_address) {
+    printf("[FLASHERSD-STAGE 01] enter path=%s address=0x%08" PRIX32 "\n",
+           filepath, flash_address);
+    fflush(stdout);
 
-
-
-
-    // ハンドルで連続読み込み
+    printf("[FLASHERSD-STAGE 02] before sd_fopen\n");
+    fflush(stdout);
     SDFileHandle *fp = sd_fopen(filepath, "r");
-//        void *fp = sd_open_file("/data.bin", "r");
-    //    if (fp) {
-    //        sd_read(buffer, 128, fp);
-    //        sd_close_file(fp);
-    //    }
-
-    //    sd_deinit();
+    printf("[FLASHERSD-STAGE 03] after sd_fopen fp=%p\n", (void *)fp);
+    fflush(stdout);
 
     esp_loader_error_t err;
-    //    FILE *fp = fopen(filepath, "rb");
     if (!fp) {
-        printf("Failed to open %s\n", filepath);
+        printf("[FLASHERSD] file open failed path=%s\n", filepath);
+        fflush(stdout);
         return -1;
     }
 
-    // ファイルサイズ取得
-    //    fseek(fp, 0, SEEK_END);
-    //    size_t total_size = ftell(fp);
-    //    fseek(fp, 0, SEEK_SET);
+    printf("[FLASHERSD-STAGE 04] before sd_fsize\n");
+    fflush(stdout);
     size_t total_size = sd_fsize(fp);
-    sd_fseek(fp, 0);  // = SEEK_SET
-    //    printf("File size: %zu\n", total_size);
+    printf("[FLASHERSD-STAGE 05] after sd_fsize size=%zu\n", total_size);
+    fflush(stdout);
 
-    //    uint8_t *buf = malloc(total_size);
-    //    if (buf) {
-    //        sd_read(buf, total_size, fp);
-	
+    printf("[FLASHERSD-STAGE 06] before sd_fseek(0)\n");
+    fflush(stdout);
+    sd_fseek(fp, 0);
+    printf("[FLASHERSD-STAGE 07] after sd_fseek(0)\n");
+    fflush(stdout);
 
-    printf("Writing %zu bytes to flash address 0x%08X\n", total_size, flash_address);
-
-    // flash 書き込みの開始通知
-    err=esp_loader_flash_start(flash_address, total_size, CHUNK_SIZE) ;
-    if (err!= ESP_LOADER_SUCCESS) {
-        printf("Erasing flash failed with error: %s.\n", get_error_string(err));
-      
-	//        printf("Failed to start flash\n");
+    printf("[FLASHERSD-STAGE 08] before flash_start address=0x%08" PRIX32
+           " size=%zu block=%u\n", flash_address, total_size,
+           (unsigned int)CHUNK_SIZE);
+    fflush(stdout);
+    err = esp_loader_flash_start(flash_address, total_size, CHUNK_SIZE);
+    printf("[FLASHERSD-STAGE 09] after flash_start result=%d (%s)\n",
+           (int)err, get_error_string(err));
+    fflush(stdout);
+    if (err != ESP_LOADER_SUCCESS) {
+        printf("[FLASHERSD] flash_start failed error=%d (%s)\n",
+               (int)err, get_error_string(err));
+        fflush(stdout);
         if (err == ESP_LOADER_ERROR_INVALID_PARAM) {
-            printf("If using Secure Download Mode, double check that the specified\
-                    target flash size is correct.\n");
+            printf("If using Secure Download Mode, double check that the specified target flash size is correct.\n");
+            fflush(stdout);
         }
         sd_fclose(fp);
         return err;
     }
-    printf("Start programming\n");
-
 
     static uint8_t buffer[CHUNK_SIZE];
     size_t offset = 0;
+    unsigned int block_no = 0;
 
-
-    //    while (!sd_feof(fp)) {
     while (!sd_feof(fp) && offset < total_size) {
         size_t to_read = CHUNK_SIZE;
         if (offset + to_read > total_size) {
             to_read = total_size - offset;
         }
 
-	//        size_t read_bytes = fread(buffer, 1, to_read, fp);
-	//	      sd_read(buf, total_size, fp);
-	size_t read_bytes = sd_fread(buffer,to_read, fp);	
+        if (block_no == 0) {
+            printf("[FLASHERSD-STAGE 10] before first sd_fread offset=%zu len=%zu\n",
+                   offset, to_read);
+            fflush(stdout);
+        }
+        size_t read_bytes = sd_fread(buffer, to_read, fp);
+        if (block_no == 0) {
+            printf("[FLASHERSD-STAGE 11] after first sd_fread read=%zu\n",
+                   read_bytes);
+            fflush(stdout);
+        }
         if (read_bytes != to_read) {
-            printf("File read error\n");
+            printf("[FLASHERSD] file read error block=%u offset=%zu requested=%zu read=%zu\n",
+                   block_no, offset, to_read, read_bytes);
+            fflush(stdout);
             break;
         }
-	err=esp_loader_flash_write(buffer, read_bytes);
+
+        if (block_no == 0) {
+            printf("[FLASHERSD-STAGE 12] before first flash_write len=%zu\n",
+                   read_bytes);
+            fflush(stdout);
+        }
+        err = esp_loader_flash_write(buffer, read_bytes);
+        if (block_no == 0) {
+            printf("[FLASHERSD-STAGE 13] after first flash_write result=%d (%s)\n",
+                   (int)err, get_error_string(err));
+            fflush(stdout);
+        }
         if (err != ESP_LOADER_SUCCESS) {
-            printf("\nPacket could not be written! Error %s.\n", get_error_string(err));
-	    return err;
-	    //            printf("Flash write failed at offset %zu\n", offset);
-	    //            break;
+            printf("[FLASHERSD] flash_write failed block=%u offset=%zu len=%zu error=%d (%s)\n",
+                   block_no, offset, read_bytes, (int)err, get_error_string(err));
+            fflush(stdout);
+            sd_fclose(fp);
+            return err;
         }
 
         offset += read_bytes;
-	
-        int progress = (int)(((float)offset / total_size) * 100);
-        printf("\rProgress: %d %%", progress);
-	
+        block_no++;
+
+        if ((offset % (16 * 1024)) == 0 || offset == total_size) {
+            printf("[FLASHERSD-STAGE 20] progress block=%u offset=%zu/%zu (%u%%)\n",
+                   block_no, offset, total_size,
+                   total_size ? (unsigned int)((offset * 100U) / total_size) : 100U);
+            fflush(stdout);
+        }
     }
 
+    printf("[FLASHERSD-STAGE 30] before sd_fclose offset=%zu/%zu\n",
+           offset, total_size);
+    fflush(stdout);
     sd_fclose(fp);
-
-    
-    /*    if (esp_loader_flash_finish(true) != ESP_LOADER_SUCCESS) {
-        printf("Flash finish failed\n");
-    } else {
-        printf("Flashing done and rebooted.\n");
-    }
-    */
+    printf("[FLASHERSD-STAGE 31] after sd_fclose\n");
+    fflush(stdout);
+    printf("[FLASHERSD] file complete path=%s written=%zu/%zu\n",
+           filepath, offset, total_size);
+    fflush(stdout);
     return 0;
 }
 

@@ -29,13 +29,13 @@
 #include "display.h"
 #include "timekeep.h"
 #include "i2c_guard.h"
-#include <WiFiUdp.h>
-//#include <NTPClient.h>
+#include "dupechk.h"
+#include "mux_transport.h"
+#include "satellite.h"
 #include "misc.h"
 #include "Ticker.h"
-//#include <sys/time.h>
-//#include <esp_sntp.h>
-#include <ESPNtpClient.h>
+#include <sys/time.h>
+#include "network.h"
 
 
 myDateTime my_rtc;
@@ -123,8 +123,6 @@ void interrupt_my_rtc()
   my_rtc.inc_ms(100);
 }
 
-WiFiUDP ntpUDP;
-
 // You can specify the time server pool and the offset (in seconds, can be
 // changed later with setTimeOffset() ). Additionaly you can specify the
 // update interval (in milliseconds, can be changed using setUpdateInterval() ).
@@ -134,6 +132,12 @@ WiFiUDP ntpUDP;
 RTC_DS1307 rtcclock;
 DateTime myRTC;
 //RTClib myRTC;
+
+// NTP -> DS1307 propagation remains deliberately conservative: only after a
+// persistent >=2 s error.  Schedule the write for the next system-clock second
+// boundary without blocking the main loop.
+static bool rtc_ntp_adjust_pending = false;
+static uint32_t rtc_ntp_adjust_due_ms = 0;
 
 //static const uint8_t LED = 2;
 
@@ -202,20 +206,24 @@ void print_rtcclock() {
 
 
 void print_ntpstatus(Stream *out) {
-    if (!out) out = console;
+  if (!out) out = console;
 
-    timeval ntptime;
-    struct tm local_tm;
-    char datestr[100];
-    gettimeofday(&ntptime,NULL);
-    localtime_r(&ntptime.tv_sec,&local_tm);
-    sprintf(datestr, "NTP:%04d/%02d/%02d %02d:%02d:%02d.%03ld myRTC:%02d:%02d:%02d.%03d",
-	    local_tm.tm_year+1900,local_tm.tm_mon+1,local_tm.tm_mday,local_tm.tm_hour,local_tm.tm_min,local_tm.tm_sec,ntptime.tv_usec/1000,
-	    my_rtc.hour(), my_rtc.minute(), my_rtc.second(),my_rtc.msec);
-    out->print(datestr);
-    out->print(" status=");
-    out->print(NTP.syncStatus());
-    out->printf (" Free heap: %u\n", ESP.getFreeHeap ());      
+  timeval systime;
+  struct tm local_tm;
+  char datestr[100];
+  gettimeofday(&systime, NULL);
+  localtime_r(&systime.tv_sec, &local_tm);
+  snprintf(datestr, sizeof(datestr),
+           "NTP:%04d/%02d/%02d %02d:%02d:%02d.%03ld "
+           "myRTC:%02d:%02d:%02d.%03d",
+           local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday,
+           local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec,
+           systime.tv_usec / 1000,
+           my_rtc.hour(), my_rtc.minute(), my_rtc.second(), my_rtc.msec);
+  out->print(datestr);
+  out->print(" status=");
+  out->print(network_ntp_synced() ? "SYNCED" : "NOT_SYNCED");
+  out->printf(" Free heap: %u\n", ESP.getFreeHeap());
 }
 
 void set_rtcclock(char *timestr) { // yymmddhhmmss to set 
@@ -236,12 +244,85 @@ void set_rtcclock(char *timestr) { // yymmddhhmmss to set
   print_rtcclock();
 }
 
+void format_display_clock(char *buf, size_t buflen, bool include_zone_name) {
+  if (buf == nullptr || buflen == 0) return;
+
+  if (clock_display_mode == 1) {
+    // The internal clock is maintained as UTC+9. Convert to UTC for display only.
+    time_t utc_epoch = static_cast<time_t>(my_rtc.unixtime()) - 9 * 60 * 60;
+    struct tm utc_tm;
+    gmtime_r(&utc_epoch, &utc_tm);
+    if (include_zone_name) {
+      snprintf(buf, buflen, "%02d:%02d:%02dU (UTC)",
+               utc_tm.tm_hour, utc_tm.tm_min, utc_tm.tm_sec);
+    } else {
+      snprintf(buf, buflen, "%02d:%02d:%02dU",
+               utc_tm.tm_hour, utc_tm.tm_min, utc_tm.tm_sec);
+    }
+  } else {
+    if (include_zone_name) {
+      snprintf(buf, buflen, "%02d:%02d:%02d (JST)",
+               my_rtc.hour(), my_rtc.minute(), my_rtc.second());
+    } else {
+      snprintf(buf, buflen, "%02d:%02d:%02d",
+               my_rtc.hour(), my_rtc.minute(), my_rtc.second());
+    }
+  }
+}
+
+static int64_t my_rtc_local_ms() {
+  return (int64_t)my_rtc.unixtime() * 1000LL + (int64_t)my_rtc.msec;
+}
+
+static int64_t system_local_ms(const timeval &systime) {
+  // my_rtc stores JST calendar fields as a DateTime-like local epoch.
+  return ((int64_t)systime.tv_sec + 9LL * 60LL * 60LL) * 1000LL +
+         (int64_t)(systime.tv_usec / 1000);
+}
+
+static void service_pending_rtc_ntp_adjust() {
+  if (!rtc_ntp_adjust_pending) return;
+  if ((int32_t)(millis() - rtc_ntp_adjust_due_ms) < 0) return;
+
+  timeval systime;
+  gettimeofday(&systime, NULL);
+  const time_t local_epoch =
+      systime.tv_sec + (time_t)(9 * 60 * 60);
+
+  bool adjusted = false;
+  if (i2c_bus_lock("rtc_ntp_set", pdMS_TO_TICKS(20))) {
+    uint32_t t0 = micros();
+    rtcclock.adjust((uint32_t)local_epoch);
+    i2c_bus_unlock("rtc_ntp_set");
+    i2c_diag_io("rtc_ntp_set", micros() - t0);
+    adjusted = true;
+  }
+
+  if (adjusted) {
+    console->printf("RTC reset by NTP at system phase %ld ms\n",
+                    (long)(systime.tv_usec / 1000));
+    rtc_ntp_adjust_pending = false;
+    rtcadj_count = 0;
+  } else {
+    // I2C was temporarily busy.  Retry shortly without blocking anything.
+    rtc_ntp_adjust_due_ms = millis() + 50;
+  }
+}
+
 void timekeep() {
   //  DateTime rtctime_bak;
 
+  service_pending_rtc_ntp_adjust();
 
   if (my_rtc.evt_second) {
     my_rtc.evt_second=0;
+
+    // Satellite LCD also contains the clock. Refresh it from the same
+    // my_rtc second-boundary event as the normal clock display instead of
+    // from an independent millis()+1000 timer.
+    if (plogw->sat) {
+      upd_display_sat();
+    }
     
     char datestr[40];
 
@@ -255,93 +336,118 @@ void timekeep() {
                          my_rtc.hour(), my_rtc.minute(), my_rtc.second());
     }
 
-    // check my_rtc and rtctime (DS1307) to keep track with DS1307
+    // my_rtc is the DVPlogger master clock.  DS1307 is the always-available
+    // startup/holdover reference; NTP-synchronized system time is the more
+    // accurate reference whenever it is available.
     TimeSpan dt1;
-    int32_t dt;    
-    dt1=my_rtc-rtctime;
-    dt=dt1.totalseconds();
-    if (verbose & 1024) {
-      sprintf(buf,"my_rtc %04d/%02d/%02d %02d:%02d:%02d.%03d dt(ds1307)=%d",my_rtc.year(), my_rtc.month(), my_rtc.day(),my_rtc.hour(),my_rtc.minute(),my_rtc.second(),my_rtc.msec,dt);
+    int32_t dt;
+    dt1 = my_rtc - rtctime;
+    dt = dt1.totalseconds();
+    if (verbose & VERBOSE_PERF) {
+      snprintf(buf, 128,
+               "my_rtc %04d/%02d/%02d %02d:%02d:%02d.%03d "
+               "dt(ds1307)=%d",
+               my_rtc.year(), my_rtc.month(), my_rtc.day(),
+               my_rtc.hour(), my_rtc.minute(), my_rtc.second(),
+               my_rtc.msec, dt);
       console->println(buf);
     }
 
-    if (dt!=0) {
-      if (dt>=1 && dt<=10) {      
-	// my_rtc is ahead of DS1307  my_rtc need to be slowed
-	console->print("my_rtc adj -100 dt=");
-	console->println(dt);
-	my_rtc.adj=-100;
+    const bool ntp_synced = network_ntp_synced();
+
+    // DS1307 -> my_rtc slew is holdover behavior only.  Once NTP is valid,
+    // do not let the coarse one-second RTC reference compete with NTP.
+    if (!ntp_synced && dt != 0) {
+      if (dt >= 1 && dt <= 10) {
+        // my_rtc is ahead of DS1307: pause one 100 ms tick.
+        console->print("my_rtc adj -100 dt=");
+        console->println(dt);
+        my_rtc.adj = -100;
+      } else if (dt <= -1 && dt >= -10) {
+        // my_rtc is behind DS1307: advance one extra 100 ms tick.
+        console->print("my_rtc adj 100 dt=");
+        console->println(dt);
+        my_rtc.adj = 100;
       } else {
-	if (dt<=-1 && dt>=-10) {	
-	  // my_rtc is behind DS1307  my_rtc need to be advanced
-	  console->print("my_rtc adj 100 dt=");
-	  console->println(dt);	  
-	  my_rtc.adj=100;\
-	} else {
-	  // large difference
-	  console->println("my_rtc large difference with DS1307");
-	  sprintf(buf,"my_rtc %02d:%02d:%02d.%03d dt(ds1307)=%d DS1307 %02d:%02d:%02d ",my_rtc.hour(),my_rtc.minute(),my_rtc.second(),my_rtc.msec,dt,rtctime.hour(),rtctime.minute(),rtctime.second());
-	  console->println(buf);
-	}
-      }
-    }
-    
-    // ntp update
-    if (verbose & 1024) {
-      if (NTP.syncStatus() != 0) { // check only synched     
-	time_t now;
-	char strftime_buf[64];
-	struct tm timeinfo;
-
-	time(&now);
-	localtime_r(&now, &timeinfo);
-	strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-	console->printf("SystemTime(local): %s ", strftime_buf);
-
-	console->print("ESPNtp:");
-	console->print(NTP.getTimeDateStringUs ());
-	console->print(" status=");
-	console->print(NTP.syncStatus());
-	console->printf (" Free heap: %u\n", ESP.getFreeHeap ());      
+        console->println("my_rtc large difference with DS1307");
+        snprintf(buf, 128,
+                 "my_rtc %02d:%02d:%02d.%03d dt(ds1307)=%d "
+                 "DS1307 %02d:%02d:%02d",
+                 my_rtc.hour(), my_rtc.minute(), my_rtc.second(),
+                 my_rtc.msec, dt,
+                 rtctime.hour(), rtctime.minute(), rtctime.second());
+        console->println(buf);
       }
     }
 
-    timeval ntptime;
+    timeval systime;
     struct tm local_tm;
-    time_t ntptime_local;
-    if (NTP.syncStatus() == 0) { // check only synched 
-      gettimeofday(&ntptime,NULL);
-      ntptime_local=ntptime.tv_sec+32400; // JST
-      localtime_r(&ntptime.tv_sec,&local_tm);
-      if (my_rtc.unixtime() > ntptime_local) { // my rtc.unixtime really is localtime
-	dt = my_rtc.unixtime() - ntptime_local;
-      } else {
-	dt = ntptime_local - my_rtc.unixtime();
-      }
-	
-      if (dt >= 2) {
-	if (!plogw->f_console_emu) {
-	  plogw->ostream->print("dt=");
-	  plogw->ostream->println(dt);
-	}
+    time_t system_local_sec = 0;
+    if (ntp_synced) {
+      gettimeofday(&systime, NULL);
+      system_local_sec = systime.tv_sec + (time_t)(9 * 60 * 60);
+      localtime_r(&systime.tv_sec, &local_tm);
 
-	rtcadj_count++;
-	if (!plogw->f_console_emu) {
-	  plogw->ostream->print("rtcadj_count=");
-	  plogw->ostream->println(rtcadj_count);
-	}
-	if (rtcadj_count >= 10) {
-	  // set rtc from ntptime
-	  delay(1000-ntptime.tv_usec/1000); // delay until the next second
-	  rtcclock.adjust(ntptime_local+1); // set DS1307 1sec ahead
-	  my_rtc=myDateTime(local_tm.tm_year+1900,local_tm.tm_mon+1,local_tm.tm_mday,local_tm.tm_hour,local_tm.tm_min,local_tm.tm_sec);
-	  console->printf("adjusting my_rtc set %04d/%02d/%02d %02d:%02d:%02d \n",local_tm.tm_year+1900,local_tm.tm_mon+1,local_tm.tm_mday,local_tm.tm_hour,local_tm.tm_min,local_tm.tm_sec);
-	  if (!plogw->f_console_emu) plogw->ostream->println("RTC reset by NTP");
-	  rtcadj_count = 0;
-	}
-      } else {
-	rtcadj_count = 0;
+      // NTP/system -> my_rtc: slew by at most 100 ms per my_rtc second.
+      // A +/-99 ms dead band matches my_rtc's 100 ms resolution and avoids
+      // hunting on scheduler/readout phase jitter.
+      const int64_t error_ms =
+          system_local_ms(systime) - my_rtc_local_ms();
+      if (error_ms >= 100) {
+        my_rtc.adj = 100;
+      } else if (error_ms <= -100) {
+        my_rtc.adj = -100;
       }
+
+      if (verbose & VERBOSE_PERF) {
+        console->printf(
+            "NTP/system %04d/%02d/%02d %02d:%02d:%02d.%03ld "
+            "my_rtc_error=%lld ms slew=%d\n",
+            local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday,
+            local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec,
+            systime.tv_usec / 1000, (long long)error_ms, my_rtc.adj);
+      }
+
+      // NTP/system -> DS1307: retain the existing conservative policy.
+      // Compare DS1307 directly with the accurate system reference, ignore
+      // sub-2-second differences, and require 10 consecutive observations
+      // before rewriting the RTC.
+      const int64_t rtc_error_sec =
+          (int64_t)rtctime.unixtime() - (int64_t)system_local_sec;
+      const uint64_t rtc_abs_error_sec =
+          rtc_error_sec < 0 ? (uint64_t)(-rtc_error_sec)
+                            : (uint64_t)rtc_error_sec;
+
+      if (!rtc_ntp_adjust_pending && rtc_abs_error_sec >= 2) {
+        if (!plogw->f_console_emu) {
+          plogw->ostream->printf("dt(DS1307-NTP)=%lld\n",
+                                  (long long)rtc_error_sec);
+        }
+
+        rtcadj_count++;
+        if (!plogw->f_console_emu) {
+          plogw->ostream->print("rtcadj_count=");
+          plogw->ostream->println(rtcadj_count);
+        }
+
+        if (rtcadj_count >= 10) {
+          // Preserve the old "write at the next integer second" idea, but do
+          // not delay() the main loop.  timekeep() services this deadline on
+          // subsequent loop iterations.
+          uint32_t wait_ms =
+              1000U - (uint32_t)(systime.tv_usec / 1000);
+          if (wait_ms == 0) wait_ms = 1000U;
+          rtc_ntp_adjust_due_ms = millis() + wait_ms;
+          rtc_ntp_adjust_pending = true;
+          rtcadj_count = 0;
+          if (!plogw->f_console_emu)
+            plogw->ostream->println("RTC NTP reset scheduled");
+        }
+      } else if (!rtc_ntp_adjust_pending) {
+        rtcadj_count = 0;
+      }
+    } else {
+      rtcadj_count = 0;
     }
 
 
@@ -351,9 +457,16 @@ void timekeep() {
     // now refers to my_rtc
     sprintf(plogw->tm, "%02d/%02d/%02d-%02d:%02d:%02d", my_rtc.year() % 100, my_rtc.month(), my_rtc.day(),
 	    my_rtc.hour(), my_rtc.minute(), my_rtc.second());
-    if (verbose&1024) console->println(plogw->tm);
-    upd_display_tm(); // comment out for reducing main loop time consumption
-    right_display_sendBuffer();
+    if (verbose&VERBOSE_PERF) console->println(plogw->tm);
+    // Update the RAM buffer first, but postpone the slow full-buffer OLED
+    // transfer while a latency-sensitive remote DUPE request is pending.
+    if (f_mux_transport) mux_transport.recv_pkt();
+    upd_display_tm();
+    if (!dupechk_remote_query_pending()) {
+      if (f_mux_transport) mux_transport.recv_pkt();
+      right_display_sendBuffer();
+      if (f_mux_transport) mux_transport.recv_pkt();
+    }
     if (f_show_clock == 2) {
 
       sprintf(datestr, "%04d/%02d/%02d-%02d:%02d:%02d",
@@ -367,15 +480,19 @@ void timekeep() {
         plogw->ostream->print(datestr);
       }
 
-      if (NTP.syncStatus() == 0) { // check only synched 
-	tm local_tm;
+      if (network_ntp_synced()) {
+        tm display_tm;
         if (!plogw->f_console_emu) {
-	  gettimeofday(&ntptime,NULL); // obtain Epoch time
-	  localtime_r(&ntptime.tv_sec,&local_tm); // get local time from 
-	  
+          timeval display_time;
+          gettimeofday(&display_time, NULL);
+          localtime_r(&display_time.tv_sec, &display_tm);
+
           plogw->ostream->print(" ");
-          sprintf(datestr, "%04d/%02d/%02d %02d:%02d:%02d",
-		  local_tm.tm_year+1900,local_tm.tm_mon+1,local_tm.tm_mday,local_tm.tm_hour,local_tm.tm_min,local_tm.tm_sec);
+          snprintf(datestr, sizeof(datestr),
+                   "%04d/%02d/%02d %02d:%02d:%02d",
+                   display_tm.tm_year + 1900, display_tm.tm_mon + 1,
+                   display_tm.tm_mday, display_tm.tm_hour,
+                   display_tm.tm_min, display_tm.tm_sec);
           plogw->ostream->print("NTP:");
           plogw->ostream->println(datestr);
         }

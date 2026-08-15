@@ -85,6 +85,10 @@ const char *sat_names[N_SATELLITES] = {
   ""
 };
 bool f_sat_updated = 0;
+char sat_tle_url[192] = "http://www.amsat.org/tle/current/nasabare.txt";
+volatile bool sat_tle_update_requested = false;
+volatile bool sat_tle_update_in_progress = false;
+int sat_tle_last_result = 0;
 
 
 char tcp_ringbuf_buf[NCHR_TCP_RINGBUF];
@@ -99,8 +103,9 @@ struct info_display info_disp;
 
 const char *settingsfn = "/settings.txt";
 
-struct bandmap bandmap[N_BAND];
+struct bandmap bandmap[N_BAND + 1];
 int bandmap_mask = 0;  // suppress updating bandmap from telnet cluster if the corresponding bit 1<<(bandid-1) is set
+int bandmap_lifetime_minutes = 20; // remove spots older than this many minutes
 struct bandmap_disp bandmap_disp;
 
 int display_type=0; // 0 1.3" display 1 2.4" display 2 1.3" but flipped 
@@ -118,6 +123,7 @@ int wifi_count = 0;
 int wifi_status = 0;
 int count = 0;
 int rtcadj_count = 0;
+int clock_display_mode = 0; // 0: JST (internal UTC+9), 1: UTC display
 
 //int callhistf_stat = 0;  // 0 not open 1 open for reading 2 open for writing
 char qsologfn[20];    // qso log filename (append)

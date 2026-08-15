@@ -87,8 +87,8 @@ int readline(File *f, char *buf, int term, int size) ;
 void init_settings_dict();
 int assign_settings(char *line, struct dict_item *dict) ;
 int dump_settings(Stream *f, struct dict_item *dict) ;
-int load_settings(char *fn) ;
-int save_settings(char *fn) ;
+int load_settings(const char *fn) ;
+int save_settings(const char *fn) ;
 void set_grid_locator_information();
 int load_boot_display_type(const char *path);
 #endif

@@ -58,6 +58,7 @@ void interrupt_my_rtc();
 void print_rtcclock();
 void set_rtcclock(char *timestr) ; // yymmddhhmmss to set
 void print_ntpstatus(Stream *out = nullptr) ;
+void format_display_clock(char *buf, size_t buflen, bool include_zone_name = false);
 
 //extern NTPClient timeClient;
 

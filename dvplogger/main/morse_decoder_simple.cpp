@@ -259,7 +259,7 @@ bool Morse_decoder::pop_rms_block(RmsBlock &out) {
 
 void Morse_decoder::i2s_adc_task_i2sread()
 {
-  static uint16_t buf[DMA_BUF_LEN];
+  static uint16_t buf[MORSE_DMA_BUF_LEN];
   static size_t   br = 0;
   static uint64_t t0 = esp_timer_get_time();
   static uint32_t nsamp_acc = 0;
@@ -304,8 +304,8 @@ void Morse_decoder::i2s_adc_rms_task_adcinit()
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // MONO
     .communication_format = I2S_COMM_FORMAT_I2S_MSB,
     .intr_alloc_flags = 0,
-    .dma_buf_count = DMA_BUF_COUNT,
-    .dma_buf_len = DMA_BUF_LEN,
+    .dma_buf_count = MORSE_DMA_BUF_COUNT,
+    .dma_buf_len = MORSE_DMA_BUF_LEN,
     .use_apll = false                   
   };
   ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &i2s_cfg, 0, NULL));
@@ -316,7 +316,7 @@ void Morse_decoder::i2s_adc_rms_task_adcinit()
   ESP_ERROR_CHECK(i2s_adc_enable(I2S_PORT));
 
   ESP_LOGI(TAG, "I2S-ADC started (%.1f kHz), buf=%d x %d",
-	   FS_TARGET_HZ/1000.0, DMA_BUF_COUNT, DMA_BUF_LEN);
+	   FS_TARGET_HZ/1000.0, MORSE_DMA_BUF_COUNT, MORSE_DMA_BUF_LEN);
   
 }
 

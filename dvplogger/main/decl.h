@@ -43,7 +43,7 @@
 //#define JK1DVPLOG_VERSION_STRING "ver 25/8/19"
 //#define JK1DVPLOG_VERSION_STRING "ver 25/12/19"
 
-#define JK1DVPLOG_VERSION_STRING "ver 26/7/14"
+#define JK1DVPLOG_VERSION_STRING "ver 26/8/15"
 
 #if JK1DVPLOG_HWVER >= 2
 #define PSRAM_EXISTS
@@ -59,8 +59,13 @@
 #include "RTClib.h"
 
 
-#define VERBOSE_CAT 512
-#define VERBOSE_MEM 4096
+// Verbose bit assignments grouped by processing unit.
+#define VERBOSE_SEQUENCE 256   // SO2R/sequence state diagnostics
+#define VERBOSE_CAT      512   // CAT/CI-V protocol diagnostics
+#define VERBOSE_PERF    1024   // timing, loop stalls, Wi-Fi timing, I2C timing
+#define VERBOSE_PADDLE  2048   // paddle ADC/queue diagnostics
+#define VERBOSE_MEM     4096   // memory diagnostics
+#define VERBOSE_USB     8192   // USB host and USB CAT transport diagnostics
 
 #define LOG_MODETYPE_CW 1
 #define LOG_MODETYPE_PH 2
@@ -70,6 +75,7 @@
 #define INFO_DISP_QSO 3  // qso log browsing
 #define INFO_DISP_BANDMAP 2
 #define INFO_DISP_FLASH 4  // flash information such as progress of receiving sat information etc...
+#define INFO_DISP_HELP 9   // HELP page, displayed with its own timeout
 #define INFO_DISP_CONTEST_SETTINGS 6
 #define INFO_DISP_SAT 1      // satellite
 #define INFO_DISP_SAT_AOS 5  // checking satellite time to next AOS
@@ -330,6 +336,10 @@ struct radio {
   // these interractive buffer the first byte is current editing pointer, second byte size of the buffer from the third byte contents
 
   char opmode[6];
+  // True after a real rig mode has been received, selected, or recalled.
+  // Until then the current-mode field is displayed as "----" rather than
+  // showing stale/uninitialised opmode storage.
+  bool mode_initialized;
   int filt; // current filter
   int dupe; // set to 1 when dupe
   struct check_entry_list check_entry_list; // partial and dupe check 
@@ -656,6 +666,7 @@ struct bandmap_entry {
   byte mode;
   char remarks[30];
   int time;
+  uint16_t receive_order; // arrival order within the same second
   byte type ; // 1 .. qso/s&p bit 2 ... cluster bit  ... (3= qso and cluster)
   byte flag; // flag to identify printed category (0 default 1 near current frequency)
 };

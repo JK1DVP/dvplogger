@@ -47,6 +47,9 @@ char zserver_buf[NCHR_ZSERVER_RINGBUF];
 AsyncClient *zserver_client = new AsyncClient;
 
 int f_show_zserver=1;
+int zserver_auto_enable=1;
+static bool zserver_connected_state=false;
+static bool zserver_suppress_disconnect_notice=false;
 struct zserver zserver;
 // idx                       0      1      2    3     4     5    6      7     8     9     10    11      12      13      14     15
 const char *zserver_freqcodes[]={"1.9","3.5","7","10","14","18","21","24","28","50","144 ","430 ","1200","2400","5600","10G","10","18","24" };
@@ -826,8 +829,11 @@ int connect_zserver() {
   // An empty Z-server setting explicitly disables the connection.  Check this
   // here as the final guard because connect_zserver() may be called from more
   // than one state-machine path.
-  if (!zserver_is_configured() || zserver.stat == 11) {
-    if (zserver_client->connected()) zserver_client->stop();
+  if (!zserver_auto_enable || !zserver_is_configured() || zserver.stat == 11) {
+    if (zserver_client->connected()) {
+      zserver_suppress_disconnect_notice = true;
+      zserver_client->stop();
+    }
     zserver.stat = 11;
     return 0;
   }
@@ -927,8 +933,20 @@ void onDisconnect_zserver(void *arg, AsyncClient *client)
   //  zserver.stat = 0;
   //  zserver.timeout = millis() + 2000;
   if (zmerge.phase != 0) zmerge.abort_requested = true;
+  const bool was_connected = zserver_connected_state;
+  zserver_connected_state = false;
+  const bool suppress_notice = zserver_suppress_disconnect_notice;
+  zserver_suppress_disconnect_notice = false;
   if (!plogw->f_console_emu) {
     plogw->ostream->println("onDisconnect_zserver():disconnected from zserver.");
+  }
+  if (zserver_auto_enable && zserver_is_configured() && zserver.stat != 11) {
+    zserver.stat = 10;
+    zserver.timeout = millis() + 60000;
+  }
+  if (was_connected && !suppress_notice && zserver_auto_enable &&
+      WiFi.status() == WL_CONNECTED && zserver_is_configured()) {
+    network_display_error("NETWORK ERROR\nZserver lost\nRetry in 60 sec");
   }
 }
 
@@ -938,7 +956,7 @@ void onConnect_zserver(void *arg, AsyncClient *client)
 
   // The setting can be cleared while an asynchronous connection attempt is
   // still in progress.  Do not accept that late connection.
-  if (!zserver_is_configured() || zserver.stat == 11) {
+  if (!zserver_auto_enable || !zserver_is_configured() || zserver.stat == 11) {
     if (!plogw->f_console_emu) {
       plogw->ostream->println("zserver connected after being disabled; closing.");
     }
@@ -953,6 +971,7 @@ void onConnect_zserver(void *arg, AsyncClient *client)
     plogw->ostream->println(zserver_port);
   }
 
+  zserver_connected_state = true;
   sprintf(dp->lcdbuf, "ZSERVER\nConnected\n%s\nPort %d", zserver_server, zserver_port);
   upd_display_info_flash(dp->lcdbuf);
 
@@ -992,37 +1011,32 @@ void zserver_process() {
 
     // Empty configuration means disabled.  This also protects the short period
     // during startup before settings have been loaded.
-    if (!zserver_is_configured()) {
-      if (zserver_client->connected()) zserver_client->stop();
+    if (!zserver_auto_enable || !zserver_is_configured()) {
+      if (zserver_client->connected()) {
+        zserver_suppress_disconnect_notice = true;
+        zserver_client->stop();
+      }
+      zserver_connected_state = false;
       zserver.stat = 11;
       zserver.timeout_count = 0;
       break;
     }
     
-    if (wifi_status == 0 ) {
+    if (!network_external_service_ready(15000)) {
       zserver.stat = 10;
       zserver.timeout = millis() + 1000;
       break;
     } else {
       if (!zserver_client->connected()) {
-	if (zserver.timeout_count>=5) {
-	  sprintf(dp->lcdbuf, "ZSERVER\nNo Try\n%s\nPort %d", zserver_server, zserver_port);
-	  plogw->ostream->println(dp->lcdbuf);
-	  upd_display_info_flash(dp->lcdbuf);
-
-	  zserver.stat=11; // not try to connect to zserver unless instructed
-	  zserver.timeout_count=0;
-	} else {
-	  connect_zserver(); // try connecting
-	  if (!plogw->f_console_emu) {    
-	    plogw->ostream->print("Zserver connection tried. count=");
-	    plogw->ostream->println(zserver.timeout_count);
-	  }
-	  // retry after 10 seconds
-	  zserver.stat = 10;
-	  zserver.timeout_count++;
-	  zserver.timeout = millis() + 10000;
+	connect_zserver(); // try connecting
+	if (!plogw->f_console_emu) {
+	  plogw->ostream->print("Zserver connection tried. count=");
+	  plogw->ostream->println(zserver.timeout_count);
 	}
+	// AUTO mode retries indefinitely, but only once per minute.
+	zserver.stat = 10;
+	zserver.timeout_count++;
+	zserver.timeout = millis() + 60000;
       } else {
 	// already connected but status not updated !?
 	if (!plogw->f_console_emu) {    	
@@ -1078,9 +1092,10 @@ void zserver_process() {
   case 4: //
     /// zserver is connected and initialized when 
     if (!zserver_client->connected()) {
-      if (verbose & 16) plogw->ostream->println("disconnecting from zserver .");
-      zserver_client->stop();
-      zserver.stat = 0;
+      if (verbose & 16) plogw->ostream->println("zserver link is down.");
+      zserver_connected_state = false;
+      zserver.stat = zserver_auto_enable ? 10 : 11;
+      zserver.timeout = zserver_auto_enable ? millis() + 60000 : 0;
     } 
     break;
   case 5: { // merging log with zserver
@@ -1216,7 +1231,11 @@ void reconnect_zserver()
   // Stop the old connection before changing the destination.  AsyncTCP may
   // still deliver a late onConnect callback; onConnect_zserver() checks the
   // disabled state as well.
-  zserver_client->stop();
+  if (zserver_client->connected()) {
+    zserver_suppress_disconnect_notice = true;
+    zserver_connected_state = false;
+    zserver_client->stop();
+  }
   zserver.timeout_count = 0;
   zserver.timeout = 0;
   Serial.println("reconnect_zserver()");
@@ -1227,14 +1246,49 @@ void reconnect_zserver()
     strncpy(zserver_server, plogw->zserver_name + 2,
             sizeof(zserver_server) - 1);
     zserver_server[sizeof(zserver_server) - 1] = '\0';
-    zserver.stat = 0;
-    sprintf(dp->lcdbuf, "set new zserver name:\n%s", zserver_server);
+    zserver.stat = zserver_auto_enable ? 0 : 11;
+    sprintf(dp->lcdbuf, "set new zserver name:\n%s\n%s",
+            zserver_server, zserver_auto_enable ? "AUTO" : "OFF");
   } else {
     zserver_server[0] = '\0';
     zserver.stat = 11; // do not connect until a server name is entered
     sprintf(dp->lcdbuf, "ZSERVER\nDisabled");
   }
   upd_display_info_flash(dp->lcdbuf);
+}
+
+void set_zserver_auto(int enabled)
+{
+  zserver_auto_enable = enabled ? 1 : 0;
+  zserver.timeout_count = 0;
+  zserver.timeout = 0;
+  if (!zserver_auto_enable) {
+    if (zserver_client->connected()) {
+      zserver_suppress_disconnect_notice = true;
+      zserver_connected_state = false;
+      zserver_client->stop();
+    }
+    zserver.stat = 11;
+  } else {
+    zserver.stat = zserver_is_configured() ? 0 : 11;
+  }
+}
+
+int get_zserver_auto() { return zserver_auto_enable ? 1 : 0; }
+
+bool zserver_is_connected()
+{
+  return zserver_auto_enable && zserver_connected_state &&
+         zserver_client && zserver_client->connected();
+}
+
+const char *zserver_connection_state()
+{
+  if (!zserver_auto_enable) return "OFF";
+  if (!zserver_is_configured()) return "NOT CONFIGURED";
+  if (zserver_is_connected()) return "CONNECTED";
+  if (zserver.stat == 10) return "RETRY WAIT";
+  return "CONNECTING";
 }
 
 void zserver_freq_notification()

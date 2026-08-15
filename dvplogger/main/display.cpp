@@ -27,6 +27,7 @@
 #include "decl.h"
 #include "variables.h"
 #include "edit_buf.h"
+#include "timekeep.h"
 #include <U8g2lib.h>
 #ifdef U8X8_HAVE_HW_SPI
 #include <SPI.h>
@@ -58,6 +59,8 @@ class U8G2 *u8g2_r;
 #include "dupechk.h"
 #include "cw_keying.h"
 #include "so2r.h"
+#include "mux_transport.h"
+#include "satellite.h"
 #include "freertos/queue.h"
 //#include <u8g2_font_t0_8_mf.h>
 
@@ -80,6 +83,27 @@ struct DisplayRequest {
 static QueueHandle_t s_display_queue = nullptr;
 static TaskHandle_t s_display_owner = nullptr;
 static volatile uint32_t s_display_dropped = 0;
+
+static inline void service_mux_transport()
+{
+  if (f_mux_transport) {
+    mux_transport.recv_pkt();
+  }
+}
+
+enum DupeAwareDisplayState : uint8_t {
+  DUPE_DISPLAY_IDLE = 0,
+  DUPE_DISPLAY_WAIT_ACK,
+  DUPE_DISPLAY_DRAW_PENDING,
+  DUPE_DISPLAY_FLUSH_PENDING
+};
+
+static DupeAwareDisplayState s_dupe_display_state = DUPE_DISPLAY_IDLE;
+static uint32_t s_dupe_display_wait_started_us = 0;
+static bool s_bandmap_update_pending = false;
+static const uint32_t DUPE_DISPLAY_ACK_BUDGET_US = 8000U;
+
+static void upd_display_render(bool flush_to_oled);
 
 void init_display_dispatch()
 {
@@ -113,19 +137,109 @@ void process_display_requests()
   int budget = 8;
   while (budget-- > 0 && xQueueReceive(s_display_queue, &req, 0) == pdTRUE) {
     switch (req.type) {
-      case DISPLAY_REQ_UPDATE: upd_display(); break;
+      case DISPLAY_REQ_UPDATE: request_display_update_on_demand(); break;
       case DISPLAY_REQ_INFO_FLASH: upd_display_info_flash(req.text); break;
       case DISPLAY_REQ_CONTEST_SETTINGS:
         if (req.radio_idx >= 0 && req.radio_idx < 3)
           upd_display_info_contest_settings(&radio_list[req.radio_idx]);
         break;
-      case DISPLAY_REQ_BANDMAP: upd_display_bandmap(); break;
+      case DISPLAY_REQ_BANDMAP: request_bandmap_update_on_demand(); break;
       case DISPLAY_REQ_CWBUF: display_cw_buf_lcd(req.text); break;
     }
   }
   if (s_display_dropped) {
     console->printf("display queue: %lu request(s) dropped\n", (unsigned long)s_display_dropped);
     s_display_dropped = 0;
+  }
+}
+
+void request_display_update_on_demand()
+{
+  request_dupe_aware_display_update();
+}
+
+void request_bandmap_update_on_demand()
+{
+  if (!display_is_main_loop()) {
+    if (s_display_queue != nullptr) {
+      DisplayRequest req{};
+      req.type = DISPLAY_REQ_BANDMAP;
+      if (xQueueSend(s_display_queue, &req, 0) != pdTRUE) ++s_display_dropped;
+    }
+    return;
+  }
+  // This on-demand request supersedes the legacy interval flag.  Clear it
+  // here so the same event cannot schedule a second redraw later.
+  bandmap_disp.f_update = 0;
+  s_bandmap_update_pending = true;
+}
+
+void request_dupe_aware_display_update()
+{
+  if (!display_is_main_loop()) {
+    if (s_display_queue != nullptr) {
+      DisplayRequest req{};
+      req.type = DISPLAY_REQ_UPDATE;
+      if (xQueueSend(s_display_queue, &req, 0) != pdTRUE) ++s_display_dropped;
+    }
+    return;
+  }
+
+  s_dupe_display_wait_started_us = micros();
+  s_dupe_display_state = dupechk_remote_query_pending()
+                           ? DUPE_DISPLAY_WAIT_ACK
+                           : DUPE_DISPLAY_DRAW_PENDING;
+}
+
+void process_dupe_aware_display_update()
+{
+  if (!display_is_main_loop()) return;
+
+  switch (s_dupe_display_state) {
+    case DUPE_DISPLAY_IDLE:
+      break;
+
+    case DUPE_DISPLAY_WAIT_ACK:
+      // Keep the MUX moving while waiting, but never block the main loop.
+      service_mux_transport();
+      if (dupechk_remote_ack_received() ||
+          !dupechk_remote_query_pending() ||
+          (uint32_t)(micros() - s_dupe_display_wait_started_us) >=
+            DUPE_DISPLAY_ACK_BUDGET_US) {
+        s_dupe_display_state = DUPE_DISPLAY_DRAW_PENDING;
+      }
+      break;
+
+    case DUPE_DISPLAY_DRAW_PENDING:
+      // Draw into the RAM framebuffer only.  A later loop performs I2C.
+      service_mux_transport();
+      upd_display_render(false);
+      service_mux_transport();
+      s_dupe_display_state = DUPE_DISPLAY_FLUSH_PENDING;
+      break;
+
+    case DUPE_DISPLAY_FLUSH_PENDING:
+      // OLED transfer is still synchronous, so service MUX immediately before
+      // and after it.  Consecutive key strokes coalesce by resetting the state.
+      service_mux_transport();
+      right_display_sendBuffer();
+      service_mux_transport();
+      s_dupe_display_state = DUPE_DISPLAY_IDLE;
+      break;
+  }
+
+  // Bandmap redraws use the left OLED and may also take about 50 ms.  Run
+  // them only after the right-side update is complete, coalescing repeated
+  // band changes into a single redraw.
+  if (s_dupe_display_state == DUPE_DISPLAY_IDLE &&
+      s_bandmap_update_pending &&
+      !plogw->sat &&
+      !dupechk_remote_query_pending() &&
+      !(info_disp.show_info == INFO_DISP_FLASH && info_disp.timer > 0)) {
+    s_bandmap_update_pending = false;
+    service_mux_transport();
+    upd_display_bandmap();
+    service_mux_transport();
   }
 }
 
@@ -140,32 +254,70 @@ static void i2c_guarded_send_buffer(U8G2 *display, const char *owner)
   i2c_diag_io(owner, elapsed_us);
 }
 
+// Clear exactly one text-row cell.  The input screen is composed from complete
+// rows (including rows that contain two logical fields), so clearing the whole
+// row and redrawing its complete contents is safer than widening an individual
+// field rectangle.  Clamp at the physical display edge to avoid touching a
+// neighbouring row or wrapping an unsigned coordinate.
+static void clear_display_text_row(U8G2 *display, int row, int row_height)
+{
+  if (display == nullptr || row < 0 || row_height <= 0) return;
+
+  const int display_height = display->getDisplayHeight();
+  const int y = row * row_height;
+  if (y < 0 || y >= display_height) return;
+
+  // Some lowercase glyphs (g, j, p, q, y) extend below the nominal
+  // font row.  Clear two extra scan lines as a deliberate, inexpensive
+  // over-clear.  Full rows are redrawn afterwards, and the final row is
+  // clamped at the physical display edge.
+  int clear_height = row_height + 2;
+  if (y + clear_height > display_height)
+    clear_height = display_height - y;
+
+  display->setDrawColor(0);
+  display->drawBox(0, y, display->getDisplayWidth(), clear_height);
+  display->setDrawColor(1);
+}
+
 
 #define WCOL_STR "                 "
 void display_cw_buf_lcd(char *buf) {
-  if (defer_display(DISPLAY_REQ_CWBUF, buf)) return;
+  if (!display_is_main_loop()) {
+    if (verbose & VERBOSE_SEQUENCE) {
+      console->printf("[CWREQ ] tx=%d msg=%d focus=%d seq=%d text=\"%.20s\"\n",
+                      so2r.tx(), so2r.msg_tx_radio(), so2r.focused_radio(),
+                      so2r.sequence_stat(), buf ? buf : "");
+    }
+    if (defer_display(DISPLAY_REQ_CWBUF, buf)) return;
+  }
+  if (verbose & VERBOSE_SEQUENCE) {
+    console->printf("[CWDRAW] tx=%d msg=%d focus=%d seq=%d text=\"%.20s\"\n",
+                    so2r.tx(), so2r.msg_tx_radio(), so2r.focused_radio(),
+                    so2r.sequence_stat(), buf ? buf : "");
+  }
   int LCD_CW_POSY ;
   LCD_CW_POSY=dp->hcol[0]*4;
   //#define LCD_CW_POSY (24 + 13 + 13)
   strncpy(dp->lcdbuf, buf, 20);
   //  sprintf(lcdbuf, "%-20s", buf);
   //  plogw->ostream->println(lcdbuf);
-  u8g2_r->setDrawColor(0);
-  //  u8g2_r->drawBox(0, LCD_CW_POSY, dp->wcol, dp->hcol[0]);
-  u8g2_r->drawBox(0,LCD_CW_POSY , dp->wcol, dp->hcol[0]+1);
-  u8g2_r->setDrawColor(1);
+  clear_display_text_row(u8g2_r, 4, dp->hcol[0]);
   //  u8g2_r->drawStr(0, LCD_CW_POSY, dp->lcdbuf);
   u8g2_r->drawUTF8(0, LCD_CW_POSY , dp->lcdbuf);  
   // under line according to the radio
-  switch (so2r.msg_tx_radio()) {
+  switch (so2r.tx()) {
   case 0: // radio 0
     break;
   case 1: // radio 1
-    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*10/10, 128);
+    //    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*10/10, 128);
+    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]-2, 128);    
     break;
   case 2: // radio 2
-    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*9/10, 128);    
-    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*10/10, 128);
+    //    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*9/10, 128);    
+    //    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]*10/10, 128);
+    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]-4, 128);    
+    u8g2_r->drawHLine(0, LCD_CW_POSY+dp->hcol[0]-2, 128);
     break;
   }
   i2c_guarded_send_buffer(u8g2_r, "oled_r");  // transfer internal memory to the display
@@ -192,15 +344,13 @@ void select_right_display() {
 }
 
 // print string to the specified column in the display
-void display_printStr(char *s, byte ycol) {
+void display_printStr(const char *s, byte ycol) {
   if (!display_is_main_loop()) return;
 
   if (ycol >= 10) {
     // select left
     select_left_display();
-    u8g2_l->setDrawColor(0);
-    u8g2_l->drawBox(0, (ycol - 10) * dp->hcol[1]+1, dp->wcol, dp->hcol[1]);
-    u8g2_l->setDrawColor(1);
+    clear_display_text_row(u8g2_l, ycol - 10, dp->hcol[1]);
     //    u8g2_l->drawStr(0, (ycol - 10) * dp->hcol[1], s);
     u8g2_l->drawUTF8(0, (ycol - 10) * dp->hcol[1], s);    
     if (plogw->f_console_emu) {
@@ -214,9 +364,7 @@ void display_printStr(char *s, byte ycol) {
     }
   } else {
     select_right_display();
-    u8g2_r->setDrawColor(0);
-    u8g2_r->drawBox(0, ycol * dp->hcol[0]+1, dp->wcol, dp->hcol[0]);
-    u8g2_r->setDrawColor(1);
+    clear_display_text_row(u8g2_r, ycol, dp->hcol[0]);
     //    u8g2_r->drawStr(0, ycol * dp->hcol[0], s);
     u8g2_r->drawUTF8(0, ycol * dp->hcol[0], s);    
     if (plogw->f_console_emu) {
@@ -251,7 +399,18 @@ void upd_display_info_flash(const char *s) {
     memcpy(line, p, len);
     line[len] = '\0';
 
+    char *right_text = strchr(line, '\x1f');
+    if (right_text != NULL) {
+      *right_text++ = '\0';
+    }
+
     display_printStr(line, 10 + count);
+    if (right_text != NULL && *right_text != '\0') {
+      const int width = u8g2_l->getUTF8Width(right_text);
+      int x = 128 - width;
+      if (x < 0) x = 0;
+      u8g2_l->drawUTF8(x, count * dp->hcol[1], right_text);
+    }
     count++;
 
     if (eol == NULL) break;
@@ -273,32 +432,41 @@ void upd_display_tm() {
   int x, y, line_flag;
   line_flag = 0;
   radio = so2r.radio_selected();
+  char clock_text[24];
+  format_display_clock(clock_text, sizeof(clock_text), false);
+  const bool utc_clock = (clock_display_mode == 1);
   if (plogw->show_smeter) {
     if (radio->smeter_stat >= 1) {
       // show peak  with underline
       if (radio->smeter_peak != SMETER_MINIMUM_DBM) {
-        sprintf(buf, "%1d %-8s S%4d", so2r.focused_radio(), plogw->tm + 9, radio->smeter_peak/SMETER_UNIT_DBM);
+        if (utc_clock) sprintf(buf, "%1d %sS%4d", so2r.focused_radio(), clock_text, radio->smeter_peak/SMETER_UNIT_DBM);
+        else sprintf(buf, "%1d %-8s S%4d", so2r.focused_radio(), clock_text, radio->smeter_peak/SMETER_UNIT_DBM);
         y = dp->hcol[0] * 2 - 2;  // 2nd line
         x = 8 * 11;
         line_flag = 1;
       } else {
-        sprintf(buf, "%1d %-8s S----", so2r.focused_radio(), plogw->tm + 9);
+        if (utc_clock) sprintf(buf, "%1d %sS----", so2r.focused_radio(), clock_text);
+        else sprintf(buf, "%1d %-8s S----", so2r.focused_radio(), clock_text);
       }
     } else {
       if (radio->smeter != SMETER_MINIMUM_DBM) {
-        sprintf(buf, "%1d %-8s S%4d", so2r.focused_radio(), plogw->tm + 9, radio->smeter/SMETER_UNIT_DBM);
+        if (utc_clock) sprintf(buf, "%1d %sS%4d", so2r.focused_radio(), clock_text, radio->smeter/SMETER_UNIT_DBM);
+        else sprintf(buf, "%1d %-8s S%4d", so2r.focused_radio(), clock_text, radio->smeter/SMETER_UNIT_DBM);
       } else {
-        sprintf(buf, "%1d %-8s S----", so2r.focused_radio(), plogw->tm + 9);
+        if (utc_clock) sprintf(buf, "%1d %sS----", so2r.focused_radio(), clock_text);
+        else sprintf(buf, "%1d %-8s S----", so2r.focused_radio(), clock_text);
       }
     }
   } else {
     if (plogw->show_qso_interval) {
-      sprintf(buf, "%1d %-8s  %4d", so2r.focused_radio(), plogw->tm + 9, plogw->qso_interval_timer/1000);
+      if (utc_clock) sprintf(buf, "%1d %s %4d", so2r.focused_radio(), clock_text, plogw->qso_interval_timer/1000);
+      else sprintf(buf, "%1d %-8s  %4d", so2r.focused_radio(), clock_text, plogw->qso_interval_timer/1000);
     } else {
       if (radio->qsodata_loaded) {
 	sprintf(buf, "%1c %-8s  %4d", 'E', radio->tm_loaded + 9, radio->seqnr_loaded);
       } else {
-	sprintf(buf, "%1d %-8s  %4d", so2r.focused_radio(), plogw->tm + 9, plogw->seqnr);
+	if (utc_clock) sprintf(buf, "%1d %s %4d", so2r.focused_radio(), clock_text, plogw->seqnr);
+        else sprintf(buf, "%1d %-8s  %4d", so2r.focused_radio(), clock_text, plogw->seqnr);
       }
     }
   }
@@ -593,6 +761,12 @@ void upd_display_freq(unsigned int freq, char *opmode, int col) {
 
 void upd_display() {
   if (defer_display(DISPLAY_REQ_UPDATE)) return;
+  // A synchronous display request supersedes any delayed key-entry update.
+  s_dupe_display_state = DUPE_DISPLAY_IDLE;
+  upd_display_render(true);
+}
+
+static void upd_display_render(bool flush_to_oled) {
   struct radio *radio;
   radio = so2r.radio_selected();
   if (verbose &4) {
@@ -613,9 +787,18 @@ void upd_display() {
   }
 
   if (radio->qsodata_loaded) {
+    // A loaded QSO already has a recorded mode, independent of the current
+    // rig's live CAT/manual-mode initialisation state.
     upd_display_freq(radio->freq_loaded, radio->opmode_loaded, 0);
   } else {
-    upd_display_freq(radio->freq, radio->opmode, 0);
+    char mode_display[sizeof(radio->opmode)];
+    if (radio->mode_initialized && radio->opmode[0] != '\0') {
+      strncpy(mode_display, radio->opmode, sizeof(mode_display) - 1);
+      mode_display[sizeof(mode_display) - 1] = '\0';
+    } else {
+      strcpy(mode_display, "----");
+    }
+    upd_display_freq(radio->freq, mode_display, 0);
   }
   // second line: time
   upd_display_tm();
@@ -754,7 +937,9 @@ void upd_display() {
 
   upd_display_stat();
 
-  i2c_guarded_send_buffer(u8g2_r, "oled_r");  // transfer internal memory to the display
+  if (flush_to_oled) {
+    i2c_guarded_send_buffer(u8g2_r, "oled_r");  // transfer internal memory to the display
+  }
   // i2c_guarded_send_buffer(u8g2_l, "oled_l");          // transfer internal memory to the display
 }
 
@@ -846,11 +1031,14 @@ void init_display() {
   u8g2_r->clearBuffer();  // clear the internal memory
   //  u8g2_r->setFont(u8g2_font_8x13_mf);
   u8g2_r->setFont(u8g2_font_unifont_t_japanese1);
+  // Configure the reference height and top-position mode before measuring the
+  // row pitch.  Measuring first can undercount descenders by one scan line for
+  // characters such as g, j, p, q and y.
+  u8g2_r->setFontRefHeightExtendedText();
+  u8g2_r->setFontPosTop();
   dp->hcol[0] = u8g2_r->getFontAscent() - u8g2_r->getFontDescent();
   plogw->ostream->print("u8g2_r hcol =");
   plogw->ostream->println(dp->hcol[0]);
-  u8g2_r->setFontRefHeightExtendedText();
-  u8g2_r->setFontPosTop();
 
   u8g2_l->begin();
 
@@ -1638,6 +1826,22 @@ void upd_display_info() {
       console->print("upd_display_info():display;");
       console->print(info_disp.show_info);      
     }
+
+    // A temporary left-display message has expired.  Return immediately to
+    // the bandmap for the currently focused radio instead of leaving the
+    // previous message (or an empty screen) visible until the next periodic
+    // bandmap refresh.  This path is driven only by the information-display
+    // timeout; SO2R's temporary TX/focus changes do not call it.
+    if (plogw->sat) {
+      // Satellite operation owns the left display.  When a temporary
+      // information screen expires, return immediately to live satellite
+      // tracking instead of briefly restoring the normal bandmap.
+      upd_display_sat();
+      return;
+    }
+    info_disp.show_info = INFO_DISP_BANDMAP;
+    upd_display_bandmap();
+    return;
   }
     
   select_left_display();
@@ -1668,6 +1872,7 @@ void upd_display_info() {
       //upd_display_info_contest_settings();
       break;
     case INFO_DISP_FLASH:
+    case INFO_DISP_HELP:
       // keep displaying previous
       return;
     case INFO_DISP_SIGNAL:
@@ -1721,6 +1926,11 @@ static void bandmap_display_heap_trace(const char *tag) {
 }
 
 void upd_display_bandmap() {
+  // The left OLED is the live satellite tracking display while SAT is ON.
+  // Many normal UI paths request a bandmap redraw asynchronously; ignore
+  // those redraws here so they cannot overwrite the satellite screen.
+  if (plogw->sat) return;
+
   static uint32_t trace_sequence = 0;
   const uint32_t this_trace = ++trace_sequence;
   const size_t trace_free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);

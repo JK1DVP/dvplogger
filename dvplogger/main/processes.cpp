@@ -42,16 +42,18 @@
 #include "mcp_interface.h"
 #include "log.h"
 #include "antenna.h"
+#include "dupechk.h"
+#include "mux_transport.h"
 
 enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att,Power};
 void send_query_civ(enum QueryCIVType type,struct radio *radio) {
   switch(type) {
   case Freq:		send_freq_query_civ(radio);break;//0
   case Mode:		send_mode_query_civ(radio);break;//1
-  case Smeter:	    send_smeter_query_civ(radio);//2
+  case Smeter:	    send_smeter_query_civ(radio);break;//2
   case Ptt:		send_ptt_query_civ(radio);break;//3
   case Att:		send_att_query_civ(radio);break;//3    
-  case Id:	      send_identification_query_civ(radio);  // 5
+  case Id:	      send_identification_query_civ(radio);break;  // 5
   case Preamp:		send_preamp_query_civ(radio);break;   //7 
   case Gps:		send_gps_query_civ(radio); break; 
   case Power:   send_power_query_civ(radio); break;
@@ -115,8 +117,9 @@ void interval_process() {
   next_interval = 100;
   antenna_process();
   interval_diag_mark(&interval_diag, "antenna");
+  if (f_mux_transport) mux_transport.recv_pkt();
   if (timeout_interval < millis()) {
-    if (verbose & 256) {
+    if (verbose & VERBOSE_SEQUENCE) {
       if (so2r.repeat_timer()!=0) {
 	plogw->ostream->print("repeat timer=");
 	//      plogw->ostream->print(plogw->repeat_func_timer);
@@ -126,12 +129,18 @@ void interval_process() {
       }
     }
 
-    if (bandmap_disp.f_update) {
-      upd_display_bandmap();
-      interval_diag_mark(&interval_diag, "bandmap_display");
+    if (bandmap_disp.f_update && !dupechk_remote_query_pending()) {
+      // Consume the legacy flag before translating it into the single
+      // on-demand request path.
       bandmap_disp.f_update = 0;
+      request_bandmap_update_on_demand();
+      interval_diag_mark(&interval_diag, "bandmap_request");
     }
-    upd_display_info();// update info_display (when timer==0)
+    if (!dupechk_remote_query_pending()) {
+      if (f_mux_transport) mux_transport.recv_pkt();
+      upd_display_info();// update info_display (when timer==0)
+      if (f_mux_transport) mux_transport.recv_pkt();
+    }
     interval_diag_mark(&interval_diag, "display_info");
     
     for (int i = 0; i < N_RADIO; i++) {
@@ -214,6 +223,7 @@ void interval_process() {
       }
     }		
     interval_diag_mark(&interval_diag, "radio_queries");
+    if (f_mux_transport) mux_transport.recv_pkt();
 
 
     if (interval_process_stat == 4) {
@@ -229,7 +239,9 @@ void interval_process() {
 
   // satellite process 500ms
   if (timeout_interval_sat < millis()) {
+    if (f_mux_transport) mux_transport.recv_pkt();
     sat_process();
+    if (f_mux_transport) mux_transport.recv_pkt();
     interval_diag_mark(&interval_diag, "sat_process");
     timeout_interval_sat = millis() + 500;
   }
@@ -286,7 +298,7 @@ void interval_process() {
     // print_time_measure results and clear counter
     //    usb_task_memory_watermark=uxTaskGetStackHighWaterMark(gxHandle_USBloop);
     //    plogw->ostream->print("usb task mem=");plogw->ostream->print(usb_task_memory_watermark);
-    if (verbose & 1024) {
+    if (verbose & VERBOSE_PERF) {
       plogw->ostream->print(" profile:");
       for (int i = 0; i < PROF_BANK_COUNT; ++i) {
         const char *name = time_measure_get_name(i);
@@ -345,9 +357,10 @@ void interval_process() {
 
     // remove old bandmap entry for all bands
     int i;
-    for (i = 0; i < N_BAND; i++) {
-      delete_old_entry(i, 20);
+    for (i = 1; i < N_BAND; i++) {
+      delete_old_entry(i, bandmap_lifetime_minutes);
     }
+    // Keep the special all-band/new-entry list at its existing short lifetime.
     delete_old_entry(N_BAND, 5);
     
     bandmap_disp.f_update = 1;

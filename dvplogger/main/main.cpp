@@ -76,6 +76,7 @@
 #include "AudioPlayer.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -88,6 +89,10 @@
 #include "callhist_remote.h"
 #include "callhist_mem.h"
 #include "esp_heap_caps.h"
+
+// Keep the latest SUBCPU profiler report available on MAIN even when routine
+// console output is disabled.  Printing is controlled by VERBOSE_PERF.
+static char latest_subcpu_profile[256] = {0};
 #include "morse_decoder_simple.h"
 #include "esp_intr_alloc.h"
 #include "cardkey.h"
@@ -111,6 +116,17 @@ void usb_loop_setup()
 }
 
 Stream *console; 
+
+extern "C" int dvplogger_console_printf(const char *fmt, ...)
+{
+  char b[512];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(b, sizeof(b), fmt, ap);
+  va_end(ap);
+  if (console) console->print(b);
+  return n;
+}
 
 
 static bool memstat_watch_enabled = false;
@@ -200,15 +216,42 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
   char buf[256];
   if (verbose &4) console->println("receive_pkt_handler_main_brd()");  
   if (strncmp(packet->buf,"chdone:",7)==0 ||
-      strncmp(packet->buf,"chack:",6)==0) {
+      strncmp(packet->buf,"chack:",6)==0 ||
+      strncmp(packet->buf,"chpong",6)==0) {
     size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
     memcpy(buf, packet->buf, n); buf[n] = '\0';
     process_callhist_control_response_main(buf);
+  } else if (strncmp(packet->buf,"dupeack:",8)==0) {
+    size_t n = min((size_t)(packet->idx - 8), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 8, n);
+    buf[n] = '\0';
+    unsigned int query_id = strtoul(buf, NULL, 10);
+    dupechk_note_main_ack(query_id);
+    if (verbose & 16384) Serial.printf("DUPE MAIN ACK raw=[%.*s]\n", packet->idx, packet->buf);
   } else if (strncmp(packet->buf,"dupepr:",7)==0) {
+    dupechk_note_main_rx();
+    size_t raw_n = min((size_t)packet->idx, sizeof(buf) - 1);
+    memcpy(buf, packet->buf, raw_n);
+    buf[raw_n] = '\0';
+    if (verbose & 16384) Serial.printf("DUPE MAIN RX raw=[%s]\n", buf);
     size_t n = min((size_t)(packet->idx - 7), sizeof(buf) - 1);
     memcpy(buf, packet->buf + 7, n);
     buf[n] = '\0';
     process_dupechk_partial_response_maincpu(buf);
+  } else if (strncmp(packet->buf, "subprof:", 8) == 0) {
+    size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
+    memcpy(buf, packet->buf, n);
+    buf[n] = '\0';
+
+    // Always receive and retain SUBCPU health information on MAIN.  Only the
+    // repetitive once-per-second console display is controlled by verbose.
+    size_t cached_n = min(n, sizeof(latest_subcpu_profile) - 1);
+    memcpy(latest_subcpu_profile, buf, cached_n);
+    latest_subcpu_profile[cached_n] = '\0';
+
+    if ((verbose & VERBOSE_PERF) && console) {
+      console->println(latest_subcpu_profile);
+    }
   } else if (strncmp(packet->buf, "memstat:", 8) == 0) {
     memstat_request_pending = false;
     Stream *out = memstat_reply_stream();
@@ -291,6 +334,7 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
     }
     return;
   } else if (strncmp(packet->buf,"duper:",6)==0) {
+    dupechk_note_main_rx();
     unsigned int query_id;
     int is_dupe, has_exch;
     char exch[LEN_EXCH + 1] = "";
@@ -298,9 +342,14 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
     size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
     memcpy(buf, packet->buf, n);
     buf[n] = '\0';
+    if (verbose & 16384) Serial.printf("DUPE MAIN RX raw=[%s]\n", buf);
 
-    if (sscanf(buf + 6, "%u %d %d %10s",
-               &query_id, &is_dupe, &has_exch, exch) == 4) {
+    unsigned long sub_search_us = 0;
+    unsigned int qso_scanned = 0, hist_scanned = 0, cache_hit = 0;
+    int parsed = sscanf(buf + 6, "%u %d %d %10s %lu %u %u %u",
+                        &query_id, &is_dupe, &has_exch, exch, &sub_search_us,
+                        &qso_scanned, &hist_scanned, &cache_hit);
+    if (parsed >= 4) {
       if (dupechk->dupechk_status == 1 &&
           query_id == dupechk->dupechk_query_id) {
         dupechk->dupechk_dupe = is_dupe ? 1 : 0;
@@ -311,6 +360,10 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
         } else {
           dupechk->dupechk_exch[0] = '\0';
         }
+        if (parsed >= 8)
+          dupechk_log_timing("exact", query_id, (uint32_t)sub_search_us,
+                             qso_scanned, hist_scanned, cache_hit != 0);
+        dupechk_note_exact_response_success(query_id);
         dupechk->dupechk_status = 0;
       } else if (verbose & 4) {
         console->println("ignored stale duper response");
@@ -329,6 +382,7 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
       *sep = '\0';
       int bandmode = atoi(buf);
       if (bandmode >= 0 && bandmode <= 255) {
+        note_makedupe_accepted_maincpu();
         process_makedupe_multiplier_maincpu(sep + 1,
                                             (unsigned char)bandmode);
       }
@@ -416,10 +470,20 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
 
 void check_spiram()
 {
-  if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM)>0) f_spiram=1; else f_spiram=0;
-  f_low_memory_mode = (f_spiram == 0);
-  Serial.printf("memory mode: %s\r\n", f_low_memory_mode ? "LOW (no PSRAM)" : "NORMAL (PSRAM)");
+  const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  const size_t psram_largest =
+      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 
+  f_spiram = (psram_total > 0) ? 1 : 0;
+  f_low_memory_mode = (f_spiram == 0);
+
+  Serial.printf(
+      "memory mode: %s; PSRAM total=%u free=%u largest=%u\r\n",
+      f_low_memory_mode ? "LOW (no PSRAM)" : "NORMAL (PSRAM)",
+      static_cast<unsigned>(psram_total),
+      static_cast<unsigned>(psram_free),
+      static_cast<unsigned>(psram_largest));
 }
 
 void setup()
@@ -448,8 +512,8 @@ void setup()
 
   init_callhist_list();
   
-  // subcpu start
-
+  // Start/reset the SUBCPU.  Blank/corrupt firmware is tolerated: a bounded
+  // probe after MUX setup decides whether remote services are usable.
   loader_boot_init_func();
   loader_reset_init_func();
   loader_port_reset_target_func();
@@ -563,20 +627,34 @@ void setup()
 
   // multiplexed data transport between boards through a serial port
   f_mux_transport=0;
+  subcpu_online=false;
   mux_transport=Mux_transport();
   mux_transport.mux_stream=&Serial2;
   mux_transport.debug_stream=console;
-  mux_transport.debug=1;
-  mux_transport.debug=0;  
+  mux_transport.debug=0;
   mux_transport.set_port_handler(MUX_PORT_CAT2_MAIN,receive_pkt_handler_cat2);
   mux_transport.set_port_handler(MUX_PORT_CAT3_MAIN,receive_pkt_handler_cat3);
   mux_transport.set_port_handler(MUX_PORT_MAIN_BRD_CTRL,receive_pkt_handler_main_brd);
   mux_transport.set_port_handler(MUX_PORT_BT_SERIAL_MAIN,receive_pkt_handler_btserial);
   mux_transport.set_port_handler(MUX_PORT_USB_KEYBOARD1_MAIN,receive_pkt_handler_keyboard1_main);
 
-  // go mux
+  // Enter MUX and perform one bounded liveness probe.  With an empty SUBCPU
+  // this costs only the timeout below; MAIN then boots without remote waits.
   Serial2.print("\r\ngo_mux\r\n");
   f_mux_transport=1;
+  delay(100);
+  subcpu_online = callhist_subcpu_alive(350);
+  if (subcpu_online) {
+    console->println("SUBCPU probe: online; normal remote services enabled");
+  } else {
+    console->println("SUBCPU probe: no response; remote callhist/dupe/MUX requests disabled");
+    f_mux_transport=0;
+    mux_transport.mux_stream=NULL;
+    deinit_mux_serial();
+    callhist_at=0;
+    plogw->enable_callhist=0;
+    init_dupechk(1,0);
+  }
 
   /*
    * callhist_at is restored by load_settings().  Load the configured
@@ -587,7 +665,7 @@ void setup()
     console->printf("invalid callhist_at=%d; using MAIN CPU\n", callhist_at);
     callhist_at = 0;
   }
-  if (f_low_memory_mode) {
+  if (f_low_memory_mode && subcpu_online) {
     if (callhist_at != 1) {
       callhist_at = 1;
       console->println("LOWMEM: Call History forced to SUBCPU");
@@ -602,11 +680,14 @@ void setup()
   console->printf("database placement: callhist=%s dupechk=%s\n",
                   callhist_at == 1 ? "SUBCPU" : "MAIN",
                   (dupechk != NULL && dupechk->dupechk_at == 1) ? "SUBCPU" : "MAIN");
+
   if (plogw->enable_callhist) {
     int n = 0;
     if (callhist_at == 1) {
       delay(100);  // allow the SUB CPU MUX command handler to become ready
-      if (load_callhist_subcpu(callhistfn)) {
+      if (!callhist_subcpu_alive(350)) {
+        console->println("startup callhist: SUBCPU unavailable; transfer skipped");
+      } else if (load_callhist_subcpu(callhistfn)) {
         n = get_callhist_subcpu_count();
       }
     } else {
@@ -615,6 +696,7 @@ void setup()
     console->printf("startup callhist: file=%s at=%s entries=%d\n",
                     callhistfn, callhist_at ? "SUBCPU" : "MAIN", n);
   }
+
 }
 
 
@@ -637,11 +719,21 @@ void check_Serial2()
 struct paddle_queue paddle_queue_recv;
 
 int prev_n_adc_i2s_read=0;
+
+// Service pending MAIN<->SUBCPU packets at latency-sensitive boundaries.
+// recv_pkt() is non-blocking when no data is available.
+static inline void service_mux_transport()
+{
+  if (f_mux_transport) {
+    mux_transport.recv_pkt();
+  }
+}
+
 void loop() {
   time_measure_start_name(PROF_LOOP_TOTAL, "loop");
 
   time_measure_start_name(PROF_MUX_RECV, "mux_recv");
-  if (f_mux_transport) mux_transport.recv_pkt();
+  service_mux_transport();
   time_measure_stop(PROF_MUX_RECV);
 
   time_measure_start_name(PROF_MEMSTAT, "memstat");
@@ -650,6 +742,8 @@ void loop() {
   time_measure_stop(PROF_MEMSTAT);
 
   process_display_requests();
+  process_dupe_aware_display_update();
+  service_mux_transport();
 
   time_measure_start_name(PROF_WEB_TERMINAL, "web_term");
   process_web_ui_queue();
@@ -658,8 +752,11 @@ void loop() {
 
 
   time_measure_start_name(PROF_WEB_BANDMAP, "web_band");
-  process_web_bandmap();
+  // Snapshot construction can take about 10 ms.  Do not let it delay a
+  // latency-sensitive remote DUPE reply; the next loop will retry it.
+  if (!dupechk_remote_query_pending()) process_web_bandmap();
   time_measure_stop(PROF_WEB_BANDMAP);
+  service_mux_transport();
 
   
   time_measure_start_name(PROF_TCP_SERVER, "tcp");
@@ -679,7 +776,7 @@ void loop() {
   time_measure_stop(PROF_CARDKEY);
 
   time_measure_start_name(PROF_PADDLE_DIAG, "paddle");
-  if ((verbose & 2048) && xQueuePaddle != NULL) {
+  if ((verbose & VERBOSE_PADDLE) && xQueuePaddle != NULL) {
     static uint32_t next_paddle_report_ms = 0;
     uint32_t now_ms = millis();
     if ((int32_t)(now_ms - next_paddle_report_ms) >= 0) {
@@ -693,16 +790,19 @@ void loop() {
   time_measure_stop(PROF_PADDLE_DIAG);
 
   time_measure_start_name(PROF_KEY_MAIN, "key_main");
-  Prs.process_keyrpt_queue();
+  Prs.process_keyrpt_queue("main");
   time_measure_stop(PROF_KEY_MAIN);
+  process_dupe_aware_display_update();
 
   time_measure_start_name(PROF_KEY_EXTERNAL, "key_ext");
-  Prs1.process_keyrpt_queue();
+  Prs1.process_keyrpt_queue("external");
   time_measure_stop(PROF_KEY_EXTERNAL);
+  process_dupe_aware_display_update();
 
   time_measure_start_name(PROF_QSO_FILE, "qso_file");
   process_qso_file_operation();
   time_measure_stop(PROF_QSO_FILE);
+  service_mux_transport();
 
   time_measure_start_name(PROF_USER_MD, "user_md");
   process_user_md_contest();
@@ -716,9 +816,11 @@ void loop() {
   Control_TX_process();
   time_measure_stop(PROF_CONTROL_TX);
 
+  service_mux_transport();
   time_measure_start_name(PROF_TIMEKEEP, "timekeep");
   timekeep();
   time_measure_stop(PROF_TIMEKEEP);
+  service_mux_transport();
 
   time_measure_start_name(PROF_SO2R_1, "so2r_1");
   so2r.task();
@@ -733,11 +835,13 @@ void loop() {
     wifi_timeout = millis() + 2000;
     check_wifi();
   }
+  service_network_background();
   time_measure_stop(PROF_WIFI);
 
   time_measure_start_name(PROF_INTERVAL, "interval");
   interval_process();
   time_measure_stop(PROF_INTERVAL);
+  service_mux_transport();
 
   time_measure_start_name(PROF_SIGNAL, "signal");
   signal_process();
@@ -758,10 +862,12 @@ void loop() {
   time_measure_start_name(PROF_CLUSTER, "cluster");
   cluster_process();
   time_measure_stop(PROF_CLUSTER);
+  service_mux_transport();
 
   time_measure_start_name(PROF_ZSERVER, "zserver");
   zserver_process();
   time_measure_stop(PROF_ZSERVER);
+  service_mux_transport();
 
   time_measure_start_name(PROF_CW_DISPLAY, "cw_display");
   display_cwbuf();

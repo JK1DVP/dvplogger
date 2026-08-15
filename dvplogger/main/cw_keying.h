@@ -49,7 +49,7 @@ void set_tone_keying(struct radio *radio);
 void keying(int on);
 void interrupt_cw_send() ;
 void init_cw_keying();
-int send_the_dits_and_dahs(char *cw_to_send) ;
+int send_the_dits_and_dahs(const char *cw_to_send) ;
 void send_bits(byte code, int fig, int *figures) ;
 void send_baudot(byte ascii, int *figures);
 void send_char(byte cw_char, byte omit_letterspace) ;
@@ -63,14 +63,18 @@ void set_rttymemory_string_buf(char *s) ;
 char *power_code(int bandid);
 // char *expand_macro_string(char *p,char *s) ; // expand macro string s to p older
 char *expand_macro_string(char *p,size_t p_size, const char *s) ; // expand macro string s to p
-void append_cwbuf_string(char *s) ;
+void append_cwbuf_string(const char *s) ;
 int cw_wptr_cw_send_buf_previous() ;
 void delete_cwbuf();
 void cancel_keying(struct radio *radio); // here radio indicates currently transmitting radio
 void clear_cwbuf() ;
 void display_cw_buf_lcd(char *buf) ;
 void display_cwbuf() ;
+#define CW_SPEED_MIN_WPM 10
+#define CW_SPEED_MAX_WPM 60
+
 extern int cw_spd;  // wpm
+void clamp_cw_speed();
 extern int cw_dah_ratio_bunshi ;
 extern int cw_ratio_bunbo ;
 extern int cw_duty_ratio ;

@@ -31,6 +31,7 @@
 #include "cat.h"
 #include "cw_keying.h"
 #include "usb_host.h"
+#include "usb_cat_transport.h"
 #include "display.h"
 #include "log.h"
 #include "edit_buf.h"
@@ -256,7 +257,8 @@ void set_ptt_rig(struct radio *radio, int on) {
     }
     send_civ_buf_radio(radio);
     break;
-  case CAT_TYPE_KENWOOD:  // kenwood cat ( QCX special command and not of Kenwood general)
+  case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:  // kenwood cat ( QCX special command and not of Kenwood general)
     if (on) {
       send_cat_cmd(radio, "TQ1;");
     } else {
@@ -470,7 +472,52 @@ static bool cat_cmd_send_raw(struct radio *radio, const char *cmd)
   bool sent = false;
   switch (radio->rig_spec->civport_num) {
   case -2: // MANUAL
-  case -1: // USB
+    break;
+  case -1: { // USB
+    const size_t len = strlen(cmd);
+    if (len == 0 || len > sizeof(((struct catmsg_t *)nullptr)->buf)) {
+      console->printf("!USB CAT TX invalid length rig=%d len=%u\n",
+                      radio->rig_idx, (unsigned int)len);
+      break;
+    }
+
+    const bool is_qmx =
+      radio->rig_spec->cat_type == CAT_TYPE_QMX;
+
+    if (is_qmx && !usb_cat_ready_for_rig_type(CAT_TYPE_QMX)) {
+      static uint32_t last_qmx_not_ready_log = 0;
+      const uint32_t now = millis();
+      if (now - last_qmx_not_ready_log >= 1000) {
+        last_qmx_not_ready_log = now;
+        if (verbose & VERBOSE_USB) console->printf(
+          "QMX CAT TX suppressed: USB QMX not ready len=%u cmd=%s\n",
+          (unsigned int)len, cmd);
+      }
+      break;
+    }
+
+    /*
+     * Transport policy is selected by the rig protocol.  QMX polling
+     * commands are snapshots, so an old queued poll may be dropped.  The
+     * same common queue API is also used by the future Yaesu/CP2105 path.
+     */
+    bool dropped_oldest = false;
+    const usb_cat_profile_t &profile = usb_cat_profile(
+      is_qmx ? USB_CAT_BACKEND_ACM_QMX : USB_CAT_BACKEND_ACM_GENERIC);
+    sent = usb_cat_enqueue(reinterpret_cast<const uint8_t *>(cmd), len,
+                           profile.drop_oldest_poll, &dropped_oldest);
+
+    if (is_qmx && (verbose & VERBOSE_USB)) {
+      console->printf(
+        "QMX CAT TX enqueue rig=%d sent=%d drop=%d "
+        "waiting=%u free=%u len=%u cmd=%s\n",
+        radio->rig_idx, sent ? 1 : 0, dropped_oldest ? 1 : 0,
+        (unsigned int)usb_cat_tx_waiting(),
+        (unsigned int)usb_cat_tx_free(),
+        (unsigned int)len, cmd);
+    }
+    break;
+  }
   case 0:  // port0 console (should not set)
     break;
   case 1:  // port1 BT
@@ -580,7 +627,7 @@ static void yaesu_query_response_received(struct radio *radio)
   radio->yaesu_query_next_send_at = millis() + YAESU_QUERY_INTERVAL_MS;
 }
 
-void send_cat_cmd(struct radio *radio, char *cmd)
+void send_cat_cmd(struct radio *radio, const char *cmd)
 {
   int slot = is_yaesu_ascii_radio(radio) ? yaesu_query_slot(cmd) : -1;
   if (slot >= 0) {
@@ -824,6 +871,7 @@ void set_power(struct radio *radio, int power)  // power value is in W
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
     sprintf(buf, "PC%03d;", power);
     send_cat_cmd(radio, buf);
@@ -909,6 +957,7 @@ void send_rit_setting(struct radio *radio, int rit, int xit) {
       send_cat_cmd(radio, buf);
       return;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
     // kenwood TS480
     return;
   case CAT_TYPE_CIV:  // icom ci-v
@@ -992,24 +1041,21 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) {
   byte bytebuf[4];
   switch (type) {
   case CAT_TYPE_YAESU_NEW: // FTDX3000  etc 
-    if (freq < 0) return;
     sprintf(buf, "FA%09lld;", ((long long)freq*FREQ_UNIT));
     send_cat_cmd(radio, buf);
     return;
   case CAT_TYPE_YAESU_OLD:
-    if (freq < 0) return;
     sprintf(buf, "FA%08lld;", ((long long)freq*FREQ_UNIT));
     send_cat_cmd(radio, buf);
     return;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
       // kenwood TS480 uses 11 digit
-      if (freq < 0) return;
       sprintf(buf, "FA%011lld;", ((long long)freq*FREQ_UNIT));
       send_cat_cmd(radio, buf);
       return;
   case CAT_TYPE_ELECRAFT_KX:
       // Elecraft KX-line FA command also uses an 11-digit frequency in Hz.
-      if (freq < 0) return;
       sprintf(buf, "FA%011lld;", ((long long)freq*FREQ_UNIT));
       send_cat_cmd(radio, buf);
       return;
@@ -1063,9 +1109,8 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) {
 
 
 
-void send_mode_set_civ(const char *opmode, int filnr) {
-  struct radio *radio;
-  radio = so2r.radio_selected();
+void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio) {
+  if (!radio || !radio->enabled || !radio->rig_spec) return;
 
   int mode;
   mode = rig_modenum(opmode);
@@ -1150,6 +1195,7 @@ void send_mode_set_civ(const char *opmode, int filnr) {
     send_civ_buf_radio(radio);
     break;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
       // Kenwood and Elecraft KX-line use the one-digit MD command form.
       switch (mode) {
@@ -1194,6 +1240,11 @@ void send_mode_set_civ(const char *opmode, int filnr) {
   }
 }
 
+void send_mode_set_civ(const char *opmode, int filnr) {
+  send_mode_set_civ_radio(opmode, filnr, so2r.radio_selected());
+}
+
+
 void send_freq_query_civ(struct radio *radio) {
   if (!radio->enabled) return;
   int type;
@@ -1202,6 +1253,7 @@ void send_freq_query_civ(struct radio *radio) {
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:      
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
     // IF returns frequency, mode and TX/RX status for Kenwood/Elecraft.
     send_cat_cmd(radio, "IF;");
@@ -1247,6 +1299,7 @@ void send_mode_query_civ(struct radio *radio) {
     send_cat_cmd(radio, "IF;");
     return;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_YAESU_FT817:
   case CAT_TYPE_NOCAT:    
     return;
@@ -1333,6 +1386,7 @@ void send_ptt_query_civ(struct radio *radio) {
     send_civ_buf_radio(radio);
     return;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
     // Do nothing; TX/RX status is obtained from the periodic IF response.
   case CAT_TYPE_NOCAT:
@@ -1363,6 +1417,7 @@ void send_gps_query_civ(struct radio *radio) {
   case CAT_TYPE_YAESU_FT817:    
       return;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
       return;
   case CAT_TYPE_NOCAT:  // manual radio do nothing
@@ -1389,6 +1444,7 @@ void send_preamp_query_civ(struct radio *radio) {
       return;
   case CAT_TYPE_YAESU_FT817:
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
       return;
     case CAT_TYPE_NOCAT:  // manual radio do nothing
@@ -1413,6 +1469,7 @@ void send_identification_query_civ(struct radio *radio) {
       send_cat_cmd(radio, "ID;");  //0670 FT991A
       return;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
   case CAT_TYPE_YAESU_FT817:
       return;
@@ -1437,6 +1494,7 @@ void send_power_query_civ(struct radio *radio) {
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
       send_cat_cmd(radio, "PC;");
       return;
   case CAT_TYPE_ELECRAFT_KX:
@@ -1467,6 +1525,7 @@ void send_att_query_civ(struct radio *radio) {
       send_cat_cmd(radio, "RA0;");
       return;
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
   case CAT_TYPE_ELECRAFT_KX:
   case CAT_TYPE_YAESU_FT817:
       return;
@@ -1488,6 +1547,9 @@ void send_smeter_query_civ(struct radio *radio) {
   type = radio->rig_spec->cat_type;
   
   switch (type) {
+  case CAT_TYPE_QMX:
+    send_cat_cmd(radio, "SM;");
+    return;
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:
   case CAT_TYPE_KENWOOD:
@@ -1693,6 +1755,7 @@ void set_frequency(int freq, struct radio *radio) {
 
 void set_mode_nonfil(const char *opmode, struct radio *radio) {
   strcpy(radio->opmode, opmode);
+  radio->mode_initialized = (opmode != nullptr && opmode[0] != '\0');
 
   radio->modetype = modetype_string(radio->opmode);
   if (radio->f_tone_keying && radio->modetype == LOG_MODETYPE_PH ) {
@@ -1991,10 +2054,19 @@ void get_cat_kenwood(struct radio *radio) {
     // QCX case 5 digit hex number
     // kenwood TS-480 case, could be HEX 4 digit number
     tmp = 0;
-    for (int i = 0; i < 5; i++) {
-      tmp *= 10;
-      tmp += radio->cmdbuf[i + 2] - '0';
+    bool have_digit = false;
+    for (int i = 2; radio->cmdbuf[i] != '\0' && radio->cmdbuf[i] != ';'; i++) {
+      if (radio->cmdbuf[i] < '0' || radio->cmdbuf[i] > '9') {
+        if (verbose & VERBOSE_CAT) {
+          plogw->ostream->print("!SM kenwood invalid response: ");
+          plogw->ostream->println(radio->cmdbuf);
+        }
+        return;
+      }
+      have_digit = true;
+      tmp = tmp * 10 + (radio->cmdbuf[i] - '0');
     }
+    if (!have_digit) return;
 
     radio->smeter = tmp;
     conv_smeter(radio);
@@ -2246,6 +2318,14 @@ void get_cat(struct radio *radio) {
 
 
 void conv_smeter(struct radio *radio) {
+  // QMX SM responses are already in S-meter units (for example SM007; = 7).
+  // Store them in the common internal 0.1-unit representation used by the
+  // display, including zero so that SM000; actively clears the old reading.
+  if (radio->rig_spec->rig_type == RIG_TYPE_QMX) {
+    radio->smeter *= SMETER_UNIT_DBM;
+    return;
+  }
+
   if (plogw->show_smeter == 2) {
     if (radio->smeter == 0) {
       radio->smeter = SMETER_MINIMUM_DBM;
@@ -2407,7 +2487,10 @@ void conv_smeter(struct radio *radio) {
 
 void smeter_postprocess(struct radio *radio)
 {
-  if (radio->smeter != 0 && radio->smeter != SMETER_MINIMUM_DBM) {
+  const bool qmx_zero_is_valid =
+      radio->rig_spec->rig_type == RIG_TYPE_QMX && radio->smeter == 0;
+  if ((radio->smeter != 0 || qmx_zero_is_valid) &&
+      radio->smeter != SMETER_MINIMUM_DBM) {
     // if smeter value is valid
     if (verbose & VERBOSE_CAT) {
       plogw->ostream->print("SMETER:");
@@ -3925,6 +4008,25 @@ void select_rig(struct radio *radio) {
 
   // set serial port characteristics
   config_rig_serialport(radio);
+
+  /*
+   * Do not carry CAT requests from the previously selected USB rig into a
+   * newly selected QMX session.  This also gives the diagnostics a known
+   * empty-queue starting point.
+   */
+  if (radio->rig_spec->civport_num == -1 &&
+      radio->rig_spec->cat_type == CAT_TYPE_QMX &&
+      xQueueCATUSBTx != NULL) {
+    struct catmsg_t stale = {};
+    unsigned int cleared = 0;
+    while (xQueueReceive(xQueueCATUSBTx, &stale, 0) == pdTRUE) {
+      ++cleared;
+    }
+    if (verbose & VERBOSE_USB) console->printf("QMX CAT TX queue reset cleared=%u waiting=%u free=%u\n",
+                    cleared,
+                    (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx),
+                    (unsigned int)uxQueueSpacesAvailable(xQueueCATUSBTx));
+  }
   
   radio->f_civ_response_expected = 0;
   radio->civ_response_timer = 0;
@@ -4115,13 +4217,13 @@ void init_rigspec() {
   rig_spec[8].band_mask = ~(0b1111111|BAND_MASK_WARC) ;//0x780;
 
   strcpy(rig_spec[9].name , "QMX");
-  rig_spec[9].cat_type = CAT_TYPE_KENWOOD;  // kenwood cat port USB
+  rig_spec[9].cat_type = CAT_TYPE_QMX;  // QMX CAT over USB
   rig_spec[9].civaddr = 0;
   rig_spec[9].civport_num=-1; // USB
   rig_spec[9].civport_reversed=0; // normal
   rig_spec[9].civport_baud = 0;      
   rig_spec[9].cwport = 1;
-  rig_spec[9].rig_type = 3;
+  rig_spec[9].rig_type = RIG_TYPE_QMX;
   rig_spec[9].pttmethod = 2;
   rig_spec[9].transverter_freq[0][0] = 0;
 
@@ -4435,6 +4537,7 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
     }
     p=strtok_r(NULL,", ",&saveptr1);
   }
+
 }
 
 // set rig_spec characteristics from string
@@ -4523,7 +4626,7 @@ void set_rig_spec_str_from_spec(struct radio *radio) // reverse set rig_spec_str
 }
 
 
-void save_rigs(char *fn)
+void save_rigs(const char *fn)
 {
   char fnbuf[30];char spec_buf[300];
   plogw->ostream->print("save rig settings to:");
@@ -4568,7 +4671,7 @@ void save_rigs(char *fn)
 }
 
 
-void load_rigs(char *fn)
+void load_rigs(const char *fn)
 {
   char fnbuf[30],spec_buf[300];
   plogw->ostream->print("load rigs from:");
@@ -4677,6 +4780,8 @@ void init_radio(struct radio *radio, const char *rig_name) {
 
   radio->modetype = LOG_MODETYPE_UNDEF;       // not defined
   radio->modetype_prev = LOG_MODETYPE_UNDEF;  // not defined
+  radio->opmode[0] = '\0';
+  radio->mode_initialized = false;
 
   for (int i = 0; i < 4; i++) {
     radio->cq[i] = LOG_CQ;  // operation mode cq 1 or s&p 0
@@ -4823,6 +4928,7 @@ static void process_cat_frame(struct radio *radio)
     break;
 
   case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
     get_cat_kenwood(radio);
     print_cat(radio);
     break;
@@ -4858,6 +4964,7 @@ static void process_protocol_frame(struct radio *radio)
     case CAT_TYPE_YAESU_NEW:
     case CAT_TYPE_YAESU_OLD:
     case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX:
     case CAT_TYPE_ELECRAFT_KX:
         process_cat_frame(radio);
         break;
@@ -5035,7 +5142,8 @@ static int receive_cat_frame(struct radio *radio, char c) {
     }
     return 0;
 
-  case CAT_TYPE_KENWOOD: // Kenwood
+  case CAT_TYPE_KENWOOD:
+  case CAT_TYPE_QMX: // Kenwood
     if (c == ';') {
       radio->cmdbuf[radio->cmd_ptr] = '\0';
       return 1;
@@ -5296,15 +5404,32 @@ void save_freq_mode_filt(struct radio *radio) {
   radio->filtbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype] = radio->filt;
 }
 
-void recall_freq_mode_filt(struct radio *radio) {
+static void recall_freq_mode_filt_impl(struct radio *radio, int target_modetype, bool force_modetype) {
   int freq;
-  // restore cq and modetype first
-  if (radio->modetype_bank[radio->bandid]!=LOG_MODETYPE_UNDEF) {
-    // not defined then keep present modetype
-    radio->modetype=radio->modetype_bank[radio->bandid];
+
+  // Normal recalls follow the band's remembered mode type.  Explicit CW/PH
+  // bank changes (Alt-Z) must not be overwritten by a stale modetype_bank.
+  if (force_modetype) {
+    if (target_modetype != LOG_MODETYPE_CW &&
+        target_modetype != LOG_MODETYPE_PH &&
+        target_modetype != LOG_MODETYPE_DG) {
+      return;
+    }
+    radio->modetype = target_modetype;
+    radio->modetype_bank[radio->bandid] = target_modetype;
+  } else if (radio->modetype_bank[radio->bandid] != LOG_MODETYPE_UNDEF) {
+    radio->modetype = radio->modetype_bank[radio->bandid];
+  } else if (radio->rig_spec &&
+             radio->rig_spec->cat_type == CAT_TYPE_NOCAT) {
+    // A manual rig has no CAT response that can resolve an undefined mode.
+    // Start an unused band in the CW bank so the displayed default mode and
+    // the ESM/CW-keying decision use the same, valid mode type.
+    radio->modetype = LOG_MODETYPE_CW;
+    radio->modetype_bank[radio->bandid] = LOG_MODETYPE_CW;
   }
-  radio->cq[radio->modetype]=radio->cq_bank[radio->bandid][radio->modetype];
-  
+
+  radio->cq[radio->modetype] = radio->cq_bank[radio->bandid][radio->modetype];
+
   // then recover freq
   freq = radio->freqbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];
 
@@ -5341,6 +5466,31 @@ void recall_freq_mode_filt(struct radio *radio) {
   //    int modenum, filt;
   modenum = radio->modebank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];
   filt = radio->filtbank[radio->bandid][radio->cq[radio->modetype]][radio->modetype];
+
+  // A manual rig has no CAT response that can update the local mode/filter
+  // state after a bank recall.  Keep DVPlogger's internal state in sync with
+  // the recalled bank before updating the display and bandmap.
+  if (radio->rig_spec && radio->rig_spec->cat_type == CAT_TYPE_NOCAT) {
+    const char *recalled_opmode = opmode_string(modenum);
+    if (recalled_opmode && recalled_opmode[0] != '\0') {
+      strncpy(radio->opmode, recalled_opmode, sizeof(radio->opmode) - 1);
+      radio->opmode[sizeof(radio->opmode) - 1] = '\0';
+    }
+    radio->filt = filt;
+
+    // Keep the operating class used by ESM/CW keying consistent with the
+    // mode text shown on the display.  Without CAT, no later response exists
+    // to perform this conversion for us.
+    int recalled_modetype = modetype_string(radio->opmode);
+    if (recalled_modetype != LOG_MODETYPE_UNDEF) {
+      radio->modetype = recalled_modetype;
+      radio->modetype_bank[radio->bandid] = recalled_modetype;
+    }
+    radio->mode_initialized =
+        (radio->opmode[0] != '\0' &&
+         radio->modetype != LOG_MODETYPE_UNDEF);
+  }
+
   if (!plogw->f_console_emu) {
     plogw->ostream->print(" modenum ");
     plogw->ostream->print(modenum);
@@ -5352,6 +5502,14 @@ void recall_freq_mode_filt(struct radio *radio) {
   send_mode_set_civ(opmode_string(modenum), filt);
   // also send bandscope width here? 25/5/5
   set_scope_mode(radio,modenum);
+}
+
+void recall_freq_mode_filt(struct radio *radio) {
+  recall_freq_mode_filt_impl(radio, LOG_MODETYPE_UNDEF, false);
+}
+
+void recall_freq_mode_filt_for_modetype(struct radio *radio, int target_modetype) {
+  recall_freq_mode_filt_impl(radio, target_modetype, true);
 }
 
 int bandid2freq(int bandid, struct radio *radio) {
@@ -5453,14 +5611,13 @@ char *default_opmode(int bandid, int modetype) {
     case LOG_MODETYPE_PH:
       if (bandid <= 3) {
         return "LSB";
-      } else {
-        if (bandid <= 7) {
-          return "USB";
-        } else {
-          return "FM";
-        }
       }
-      break;
+      // HF high bands, 50 MHz and 144 MHz default to USB.
+      // 430 MHz and above retain the existing FM defaults.
+      if (bandid <= 8) {
+        return "USB";
+      }
+      return "FM";
     case LOG_MODETYPE_DG:
       return "RTTY";
       break;

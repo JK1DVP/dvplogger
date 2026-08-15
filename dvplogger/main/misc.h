@@ -56,7 +56,7 @@ enum TimeProfileBank {
   PROF_MAKEDUPE,
   PROF_BANK_COUNT
 };
-void copy_token(char *dest,char *src,int idx,char *sep) ;
+void copy_token(char *dest,char *src,int idx,const char *sep) ;
 void time_measure_clear(int bank);
 void time_measure_start(int bank);
 void time_measure_start_name(int bank, const char *name);

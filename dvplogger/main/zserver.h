@@ -51,6 +51,11 @@ bool zserver_start_merge(bool dry_run=false);
 bool zserver_start_repair();
 bool zserver_merge_active();
 extern int f_show_zserver;
+extern int zserver_auto_enable;
+void set_zserver_auto(int enabled);
+int get_zserver_auto();
+bool zserver_is_connected();
+const char *zserver_connection_state();
 extern const char *zserver_freqcodes[]; /*={"1.9M","3.5M","7M","10M","14M","18M","21M","24M","28M","50M","144M","430M","1200M","2400M","5600M","10G" };*/
 extern int zserver_bandid_freqcodes_map[];/*={0,0,1,2,4,6,8,9,10,11,12,13,14,15};*/
 

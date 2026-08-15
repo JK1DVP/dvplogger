@@ -203,6 +203,12 @@ void control_pkt_handler(struct mux_packet *packet)
   int ret;
   char buf[256];
   // check content
+  if (strncmp(packet->buf,"chping",6)==0) {
+    const char *pong = "chpong";
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)pong, strlen(pong));
+    return;
+  }
   if (strncmp(packet->buf,"memstat",7)==0) {
     size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t min8 = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
@@ -386,10 +392,88 @@ void setup() {
 }
 
 int timeout_play=0;
+
+// SUBCPU loop/MUX latency profiler. Results are returned to MAIN over the
+// control MUX port, never printed directly into the MUX UART.
+struct subcpu_profile_t {
+  uint32_t loops;
+  uint32_t max_loop_us;
+  uint32_t max_keyboard_us;
+  uint32_t max_serial3_us;
+  uint32_t max_mux_us;
+  uint32_t max_mux_gap_us;
+  uint32_t serial3_bytes;
+  uint32_t slow_keyboard;
+  uint32_t slow_serial3;
+  uint32_t slow_loop;
+};
+
+static subcpu_profile_t subprof = {};
+static uint32_t subprof_last_report_ms = 0;
+static uint32_t subprof_last_mux_us = 0;
+
+static inline void subprof_update_max(uint32_t &dst, uint32_t value)
+{
+  if (value > dst) dst = value;
+}
+
+// Keep MAIN<->SUBCPU request latency low even while keyboard/CAT work is busy.
+static inline void service_mux_transport()
+{
+  const uint32_t now = micros();
+  if (subprof_last_mux_us != 0) {
+    subprof_update_max(subprof.max_mux_gap_us, now - subprof_last_mux_us);
+  }
+  subprof_last_mux_us = now;
+
+  const uint32_t started = micros();
+  if (f_mux_transport) {
+    mux_transport.recv_pkt();
+  }
+  subprof_update_max(subprof.max_mux_us, micros() - started);
+}
+
+static void report_subcpu_profile()
+{
+  const uint32_t now_ms = millis();
+  if ((uint32_t)(now_ms - subprof_last_report_ms) < 1000) return;
+  subprof_last_report_ms = now_ms;
+
+  if (f_mux_transport) {
+    char msg[220];
+    snprintf(msg, sizeof(msg),
+             "subprof:loops=%u loop=%u keyboard=%u serial3=%u mux=%u "
+             "muxgap=%u bytes3=%u slowk=%u slows3=%u slowloop=%u",
+             (unsigned int)subprof.loops,
+             (unsigned int)subprof.max_loop_us,
+             (unsigned int)subprof.max_keyboard_us,
+             (unsigned int)subprof.max_serial3_us,
+             (unsigned int)subprof.max_mux_us,
+             (unsigned int)subprof.max_mux_gap_us,
+             (unsigned int)subprof.serial3_bytes,
+             (unsigned int)subprof.slow_keyboard,
+             (unsigned int)subprof.slow_serial3,
+             (unsigned int)subprof.slow_loop);
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)msg, strlen(msg));
+  }
+
+  subprof = {};
+  subprof_last_mux_us = micros();
+}
+
 void loop() {
   char c;
+  const uint32_t loop_started = micros();
+  subprof.loops++;
 
+  service_mux_transport();
+  const uint32_t keyboard_started = micros();
   loop_keyboard();
+  const uint32_t keyboard_us = micros() - keyboard_started;
+  subprof_update_max(subprof.max_keyboard_us, keyboard_us);
+  if (keyboard_us >= 5000) subprof.slow_keyboard++;
+  service_mux_transport();
   /*    while (Serial1.available()) {
       c=Serial1.read();
       Serial.println(c,HEX);
@@ -410,8 +494,11 @@ void loop() {
   }
   */
   // cat3
+  const uint32_t serial3_started = micros();
+  uint32_t serial3_bytes_this_loop = 0;
   while (Serial3.available() ) {
     c=Serial3.read();
+    serial3_bytes_this_loop++;
     buf3[count3++]=c;
     // Serial.print("c:");
     //Serial.println(count);
@@ -434,10 +521,15 @@ void loop() {
       count3=0;
     }
   }
+  const uint32_t serial3_us = micros() - serial3_started;
+  subprof.serial3_bytes += serial3_bytes_this_loop;
+  subprof_update_max(subprof.max_serial3_us, serial3_us);
+  if (serial3_us >= 5000) subprof.slow_serial3++;
+  service_mux_transport();
   
 
   if (f_mux_transport) {
-    mux_transport.recv_pkt();
+    service_mux_transport();
   } else {
     while (Serial.available()) {
       c=Serial.read();
@@ -465,6 +557,11 @@ void loop() {
       }
     }
   }
+  const uint32_t loop_us = micros() - loop_started;
+  subprof_update_max(subprof.max_loop_us, loop_us);
+  if (loop_us >= 10000) subprof.slow_loop++;
+  report_subcpu_profile();
+
   delay(1);
   //  Serial.print("*");
 }

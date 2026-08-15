@@ -16,6 +16,11 @@ e-mail   :  support@circuitsathome.com
  */
 #include "cdcacm.h"
 
+extern int verbose;
+#ifndef VERBOSE_USB
+#define VERBOSE_USB 256
+#endif
+
 const uint8_t ACM::epDataInIndex = 1;
 const uint8_t ACM::epDataOutIndex = 2;
 const uint8_t ACM::epInterruptInIndex = 3;
@@ -30,6 +35,8 @@ bAddress(0),
 bControlIface(0),
 bDataIface(0),
 bNumEP(1),
+idVendor(0),
+idProduct(0),
 qNextPollTime(0),
 bPollEnable(false),
 ready(false) {
@@ -60,7 +67,7 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
 
         AddressPool &addrPool = pUsb->GetAddressPool();
 
-        USBTRACE("ACM Init\r\n");
+        if (verbose & VERBOSE_USB) USBTRACE("ACM Init\r\n");
 
         if(bAddress)
                 return USB_ERROR_CLASS_INSTANCE_ALREADY_IN_USE;
@@ -84,24 +91,29 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
 
         p->lowspeed = lowspeed;
 
-        // Get device descriptor
-        rcode = pUsb->getDevDescr(0, 0, constBufSize, (uint8_t*)buf);
+        /*
+         * During default-address enumeration only the first 8 bytes are
+         * guaranteed to be readable with the provisional EP0 packet size.
+         * Some composite devices, including QMX, NAK an immediate 18-byte
+         * request here.  Read 8 bytes first, learn bMaxPacketSize0, assign an
+         * address, then fetch the complete descriptor at the new address.
+         */
+        rcode = pUsb->getDevDescr(0, 0, 8, (uint8_t*)buf);
 
         // Restore p->epinfo
         p->epinfo = oldep_ptr;
 
-        if(rcode) 
+        if(rcode)
                 goto FailGetDevDescr;
-		
+
+        // Extract Max Packet Size from the first 8 descriptor bytes
+        epInfo[0].maxPktSize = udd->bMaxPacketSize0;
 
         // Allocate new address according to device class
         bAddress = addrPool.AllocAddress(parent, false, port);
 
         if(!bAddress)
                 return USB_ERROR_OUT_OF_ADDRESS_SPACE_IN_POOL;
-
-        // Extract Max Packet Size from the device descriptor
-        epInfo[0].maxPktSize = udd->bMaxPacketSize0;
 
         // Assign new address to the device
         rcode = pUsb->setAddr(0, 0, bAddress);
@@ -125,7 +137,16 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
 
         p->lowspeed = lowspeed;
 
+        // Read the complete descriptor now that EP0 size/address are known.
+        rcode = pUsb->getDevDescr(bAddress, 0, constBufSize, (uint8_t*)buf);
+        if(rcode)
+                goto FailGetDevDescr;
+
         num_of_conf = udd->bNumConfigurations;
+        idVendor = udd->idVendor;
+        idProduct = udd->idProduct;
+        USBTRACE2("ACM VID:", idVendor);
+        USBTRACE2("ACM PID:", idProduct);
 
         // Assign epInfo to epinfo pointer
         rcode = pUsb->setEpInfoEntry(bAddress, 1, epInfo);
@@ -133,7 +154,7 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         if(rcode)
                 goto FailSetDevTblEntry;
 
-        USBTRACE2("cdcacm init NC:", num_of_conf);
+        if (verbose & VERBOSE_USB) USBTRACE2("cdcacm init NC:", num_of_conf);
 
         for(uint8_t i = 0; i < num_of_conf; i++) {
                 ConfigDescParser< USB_CLASS_COM_AND_CDC_CTRL,
@@ -146,12 +167,31 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
                 ConfigDescParser<USB_CLASS_CDC_DATA, 0, 0,
                         CP_MASK_COMPARE_CLASS> CdcDataParser(this);
 
-                rcode = pUsb->getConfDescr(bAddress, 0, i, &CdcControlParser);
+                /*
+                 * QMX may temporarily NAK configuration-descriptor reads just
+                 * after the address has been assigned.  Retry only NAK; other
+                 * errors still abort immediately.  Both parsers need the same
+                 * protection because each getConfDescr() performs a separate
+                 * control transfer of the complete composite configuration.
+                 */
+                for(uint8_t retry = 0; retry < 10; retry++) {
+                        rcode = pUsb->getConfDescr(bAddress, 0, i, &CdcControlParser);
+                        if(rcode != hrNAK)
+                                break;
+                        USBTRACE2("ACM control getConf NAK retry:", retry + 1);
+                        delay(50);
+                }
 
                 if(rcode)
                         goto FailGetConfDescr;
 
-                rcode = pUsb->getConfDescr(bAddress, 0, i, &CdcDataParser);
+                for(uint8_t retry = 0; retry < 10; retry++) {
+                        rcode = pUsb->getConfDescr(bAddress, 0, i, &CdcDataParser);
+                        if(rcode != hrNAK)
+                                break;
+                        USBTRACE2("ACM data getConf NAK retry:", retry + 1);
+                        delay(50);
+                }
 
                 if(rcode)
                         goto FailGetConfDescr;
@@ -168,7 +208,7 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         // Assign epInfo to epinfo pointer
         rcode = pUsb->setEpInfoEntry(bAddress, bNumEP, epInfo);
 
-        USBTRACE2("cdcacm init Conf:", bConfNum);
+        if (verbose & VERBOSE_USB) USBTRACE2("cdcacm init Conf:", bConfNum);
 
         // Set Configuration Value
         rcode = pUsb->setConf(bAddress, 0, bConfNum);
@@ -188,7 +228,7 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         if(rcode)
                 goto FailOnInit;
 
-        USBTRACE("cdcacm init ACM configured\r\n");
+        if (verbose & VERBOSE_USB) USBTRACE("cdcacm init ACM configured\r\n");
 
         ready = true;
 
@@ -244,8 +284,8 @@ void ACM::EndpointXtract(uint8_t conf, uint8_t iface __attribute__((unused)), ui
         bConfNum = conf;
 
 	//        uint8_t index;
-	USBTRACE2("EndPointExtract() bmAttributes:",pep->bmAttributes);
-	USBTRACE2("EndPointExtract() bmEndpointAddress:",pep->bEndpointAddress);
+	if (verbose & VERBOSE_USB) USBTRACE2("EndPointExtract() bmAttributes:",pep->bmAttributes);
+	if (verbose & VERBOSE_USB) USBTRACE2("EndPointExtract() bmEndpointAddress:",pep->bEndpointAddress);
         if((pep->bmAttributes & bmUSB_TRANSFER_TYPE) == USB_TRANSFER_TYPE_INTERRUPT && (pep->bEndpointAddress & 0x80) == 0x80) {
 	  if ((pep->bEndpointAddress&0xf)<=3) {
 	    index = epInterruptInIndex;
@@ -264,7 +304,7 @@ void ACM::EndpointXtract(uint8_t conf, uint8_t iface __attribute__((unused)), ui
 	  USBTRACE("EndPointExtract return");
                 return;
 	}
-	USBTRACE2("EndPointExtract() index:",index);
+	if (verbose & VERBOSE_USB) USBTRACE2("EndPointExtract() index:",index);
 
 	
         // Fill in the endpoint info structure
@@ -274,7 +314,7 @@ void ACM::EndpointXtract(uint8_t conf, uint8_t iface __attribute__((unused)), ui
         epInfo[index].bmRcvToggle = 0;
 
         bNumEP++;
-        USBTRACE2("EndPointExtractbNumEP:",bNumEP);
+        if (verbose & VERBOSE_USB) USBTRACE2("EndPointExtractbNumEP:",bNumEP);
         PrintEndpointDescriptor(pep);
 }
 
@@ -285,10 +325,22 @@ uint8_t ACM::Release() {
         bControlIface = 0;
         bDataIface = 0;
         bNumEP = 1;
+        idVendor = 0;
+        idProduct = 0;
 
         bAddress = 0;
         qNextPollTime = 0;
         bPollEnable = false;
+
+        // Do not retain endpoint assignments from a previously attached
+        // multi-port ACM device.  Otherwise a later one-port device can be
+        // polled through a stale second-port endpoint.
+        for(uint8_t i = 1; i < ACM_MAX_ENDPOINTS; i++) {
+                epInfo[i].epAddr = 0;
+                epInfo[i].maxPktSize = 0;
+                epInfo[i].bmSndToggle = 0;
+                epInfo[i].bmRcvToggle = 0;
+        }
         return 0;
 }
 

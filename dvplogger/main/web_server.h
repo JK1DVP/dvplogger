@@ -22,6 +22,8 @@
 #ifndef FILE_WEB_SERVER_H
 #define FILE_WEB_SERVER_H
 void init_webserver();
+void suspend_webserver_for_flash();
+void resume_webserver_after_flash();
 void process_web_terminal_log_queue();
 void process_web_bandmap();
 void process_web_ui_queue();

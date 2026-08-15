@@ -27,6 +27,7 @@
 #include "decl.h"
 #include "variables.h"
 #include "usb_host.h"
+#include "usb_cat_transport.h"
 
 #include <cdcftdi.h>  // serial adapter
 #include <cp2105.h>
@@ -467,11 +468,36 @@ class ACMAsyncOper : public CDCAsyncOper {
     uint8_t OnInit(ACM *pacm);
 };
 
+static constexpr uint16_t QMX_USB_VID = 0x0483;
+static constexpr uint16_t QMX_USB_PID = 0xA34C;
+
 uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
   uint8_t rcode;
-  // bit1 RTS=1 bit0 DTR = 1
-  rcode = pacm->SetControlLineState(2);
-  
+  const bool is_qmx = pacm->IsDevice(QMX_USB_VID, QMX_USB_PID);
+  const usb_cat_profile_t &profile = usb_cat_profile(
+    is_qmx ? USB_CAT_BACKEND_ACM_QMX : USB_CAT_BACKEND_ACM_GENERIC);
+
+  /*
+   * QMX exposes a standard CDC data interface, but its CAT port does not
+   * require UART line coding.  Some reconnects fail on SET_LINE_CODING,
+   * and DTR/RTS may be assigned to PTT/CW keying.  Skip both requests for
+   * QMX and start with a clean CAT queue so stale ICOM CI-V frames cannot
+   * be sent to it after enumeration.
+   */
+  if (is_qmx) {
+    const UBaseType_t cleared = usb_cat_reset_tx_queue();
+    usb_cat_set_backend(profile.backend);
+    console->println("USB ACM connected: QMX CAT");
+    if (verbose & VERBOSE_USB) {
+      console->printf(
+        "USB ACM detail: VID=%04X PID=%04X CDC control skipped queue cleared=%u\n",
+        pacm->GetVid(), pacm->GetPid(), (unsigned int)cleared);
+    }
+    return 0;
+  }
+
+  // Preserve the existing ACM initialization for ICOM and other rigs.
+  rcode = pacm->SetControlLineState(2); // RTS only
   if (rcode) {
     ErrorMessage<uint8_t>(PSTR("SetControlLineState"), rcode);
     return rcode;
@@ -484,11 +510,15 @@ uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
   lc.bDataBits = 8;
 
   rcode = pacm->SetLineCoding(&lc);
-
-  if (rcode)
+  if (rcode) {
     ErrorMessage<uint8_t>(PSTR("SetLineCoding"), rcode);
+    return rcode;
+  }
 
-  return rcode;
+  usb_cat_set_backend(profile.backend);
+  console->printf("USB ACM connected: VID=%04X PID=%04X\n",
+                  pacm->GetVid(), pacm->GetPid());
+  return 0;
 }
 
 ACMAsyncOper AsyncOper;
@@ -496,6 +526,25 @@ ACM Acm(&Usb, &AsyncOper);
 CP2105 Cp2105(&Usb);
 static uint8_t cp2105_cat_port = 0;
 
+bool usb_qmx_cat_ready() {
+  return usb_cat_ready_for_rig_type(CAT_TYPE_QMX);
+}
+
+bool usb_cat_ready_for_rig_type(uint8_t cat_type) {
+  switch (cat_type) {
+  case CAT_TYPE_QMX:
+    return Acm.isReady() && Acm.IsDevice(QMX_USB_VID, QMX_USB_PID);
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD:
+  case CAT_TYPE_YAESU_FT817:
+    // Yaesu USB CAT will use the selected CP2105 port.  The profile is
+    // already common; only descriptor-based port selection remains.
+    return Cp2105.isReady() && Cp2105.portReady(cp2105_cat_port);
+  default:
+    return Acm.isReady() ||
+           (Cp2105.isReady() && Cp2105.portReady(cp2105_cat_port));
+  }
+}
 
 static bool cp2105_debug = false;
 
@@ -557,10 +606,10 @@ void CP2105status(Stream *out) {
 
 void CP2105process() {
   if (!Cp2105.isReady() || !Cp2105.portReady(cp2105_cat_port)) return;
+  usb_cat_set_backend(USB_CAT_BACKEND_CP2105);
 
   struct catmsg_t catmsg;
-  while (uxQueueMessagesWaiting(xQueueCATUSBTx)) {
-    if (xQueueReceive(xQueueCATUSBTx, &catmsg, 0) == pdTRUE) {
+  while (usb_cat_dequeue(&catmsg)) {
 
       if (cp2105_debug) {
 	dump_cp2105_data("TX",
@@ -587,7 +636,6 @@ void CP2105process() {
         break;
       }
       */
-    }
   }
 
   uint8_t buf[64];
@@ -610,9 +658,7 @@ void CP2105process() {
 		       rcvd);
     }
 
-    catmsg.size = min((uint16_t)sizeof(catmsg.buf), rcvd);
-    memcpy(catmsg.buf, buf, catmsg.size);
-    xQueueSend(xQueueCATUSBRx, &catmsg, 0);
+    usb_cat_deliver_rx(buf, rcvd);
   }
  
   /*  if (rcode && rcode != hrNAK) {
@@ -669,7 +715,42 @@ bool CP2105sendRaw(uint8_t port, const char *text)
 }
 
 void ACMprocess() {
+  /*
+   * One-second heartbeat for the USB CAT path.  Print while QMX is attached
+   * or while the TX queue contains data, so a stalled consumer is visible
+   * without flooding normal non-CAT operation.
+   */
+  static uint32_t last_cat_heartbeat = 0;
+  const bool qmx_attached = Acm.IsDevice(QMX_USB_VID, QMX_USB_PID);
+  const UBaseType_t tx_waiting = usb_cat_tx_waiting();
+  const uint32_t now = millis();
+  if (!Acm.isReady() && !Cp2105.isReady()) {
+    usb_cat_set_backend(USB_CAT_BACKEND_NONE);
+  }
+  if ((verbose & VERBOSE_USB) &&
+      (qmx_attached || tx_waiting != 0) &&
+      now - last_cat_heartbeat >= 1000) {
+    last_cat_heartbeat = now;
+    console->printf(
+      "USB CAT heartbeat state=0x%02X vbus=0x%02X "
+      "ACMready=%d QMX=%d CP2105ready=%d waiting=%u free=%u\n",
+      Usb.getUsbTaskState(), Usb.getVbusState(),
+      Acm.isReady() ? 1 : 0, qmx_attached ? 1 : 0,
+      Cp2105.isReady() ? 1 : 0,
+      (unsigned int)tx_waiting,
+      (unsigned int)usb_cat_tx_free());
+  }
+
   if (Cp2105.isReady()) {
+    if ((verbose & VERBOSE_USB) && (qmx_attached || tx_waiting != 0)) {
+      static uint32_t last_cp2105_redirect_report = 0;
+      if (now - last_cp2105_redirect_report >= 1000) {
+        last_cp2105_redirect_report = now;
+        console->printf(
+          "USB CAT consumer redirected to CP2105 addr=0x%02X waiting=%u\n",
+          Cp2105.GetAddress(), (unsigned int)tx_waiting);
+      }
+    }
     CP2105process();
     return;
   }
@@ -677,21 +758,60 @@ void ACMprocess() {
   uint8_t rcode;
   int ret;
   struct catmsg_t catmsg;
+
+  if ((verbose & VERBOSE_USB) && !Acm.isReady() && tx_waiting != 0) {
+    static uint32_t last_not_ready_report = 0;
+    if (now - last_not_ready_report >= 1000) {
+      last_not_ready_report = now;
+      console->printf(
+        "USB CAT TX blocked: ACM not ready state=0x%02X waiting=%u free=%u\n",
+        Usb.getUsbTaskState(), (unsigned int)tx_waiting,
+        (unsigned int)usb_cat_tx_free());
+    }
+  }
   
+  static bool qmx_ready_prev = false;
+  const bool qmx_ready_now = Acm.isReady() && qmx_attached;
+  if (qmx_ready_now && !qmx_ready_prev) {
+    if (verbose & VERBOSE_USB) console->printf(
+      "QMX CDC endpoints: BulkOUT=%02X BulkIN=%02X BulkIN2=%02X second=%d\n",
+      Acm.GetDataOutEp(), Acm.GetDataInEp(), Acm.GetSecondDataInEp(),
+      Acm.HasSecondDataIn() ? 1 : 0);
+
+    // Queries generated before USB enumeration are deliberately suppressed.
+    // Seed the newly ready connection with a clean first status request.
+    usb_cat_set_backend(USB_CAT_BACKEND_ACM_QMX);
+    usb_cat_reset_tx_queue();
+    const usb_cat_profile_t &profile = usb_cat_profile(USB_CAT_BACKEND_ACM_QMX);
+    const bool queued = profile.startup_query &&
+      usb_cat_enqueue(reinterpret_cast<const uint8_t *>(profile.startup_query),
+                      strlen(profile.startup_query), false);
+    if (verbose & VERBOSE_USB) console->printf(
+      "QMX CAT startup enqueue ret=%d waiting=%u free=%u cmd=%s\n",
+      queued ? 1 : 0,
+      (unsigned int)usb_cat_tx_waiting(),
+      (unsigned int)usb_cat_tx_free(),
+      profile.startup_query ? profile.startup_query : "-");
+  }
+  qmx_ready_prev = qmx_ready_now;
+
   if (Acm.isReady()) {
     // check queue and forward to USB
-    while (uxQueueMessagesWaiting(xQueueCATUSBTx)){
-      ret = xQueueReceive(xQueueCATUSBTx, &catmsg, 0);
-      if (ret==pdTRUE) {
-	if (verbose &1)
-	  console->printf("xQueueReceive() : CATUSBTx ret = %d size =%d\n", ret,catmsg.size);
-
-	rcode = Acm.SndData(catmsg.size, (uint8_t *)&catmsg.buf);
+    while (usb_cat_dequeue(&catmsg)) {
+      ret = pdTRUE;
+	const bool is_qmx = Acm.IsDevice(QMX_USB_VID, QMX_USB_PID);
+        usb_cat_set_backend(is_qmx ? USB_CAT_BACKEND_ACM_QMX
+                                   : USB_CAT_BACKEND_ACM_GENERIC);
+        usb_cat_dump("TX", catmsg.buf, catmsg.size);
+	rcode = Acm.SndData(catmsg.size, (uint8_t *)catmsg.buf);
+	if (verbose & VERBOSE_USB) {
+	  console->printf("%sUSB CAT TX complete rcode=0x%02X len=%d\n",
+	                  is_qmx ? "QMX " : "", rcode, catmsg.size);
+	}
 	if (rcode) {
 	  ErrorMessage<uint8_t>(PSTR("SndData CATUSBTx"), rcode);
 	  plogw->ostream->println("SndData CATUSBTx error");
 	}
-      }
     }
 	
 	
@@ -732,30 +852,31 @@ void ACMprocess() {
 
     struct catmsg_t catmsg;
     if (rcvd) {  //more than zero bytes received
-      if (verbose &1) {
-	plogw->ostream->print("ACMrcvd:"); // IC-705, 905 CI-V is from here
-	for (uint16_t i = 0; i < rcvd; i++) {
-	  plogw->ostream->printf("%02x ",(char)buf[i]);  //printing on the screen
-	}
-	plogw->ostream->print("\r\n");
-      }
-      // send catmsg
-      catmsg.size=rcvd;
-      memcpy(catmsg.buf,buf,rcvd);
-      ret = xQueueSend(xQueueCATUSBRx, &catmsg, 0);
-      if (verbose &1) plogw->ostream->printf("CATUSBRx queuesend ret=%d size=%d\r\n",ret,catmsg.size);
+      const bool is_qmx = Acm.IsDevice(QMX_USB_VID, QMX_USB_PID);
+      usb_cat_set_backend(is_qmx ? USB_CAT_BACKEND_ACM_QMX
+                                 : USB_CAT_BACKEND_ACM_GENERIC);
+      usb_cat_dump("RX", buf, rcvd);
+      ret = usb_cat_deliver_rx(buf, rcvd) ? pdTRUE : pdFALSE;
+      if (verbose & VERBOSE_USB) plogw->ostream->printf(
+        "CATUSBRx queuesend ret=%d size=%u\r\n", ret,
+        (unsigned int)rcvd);
     }
 
-    rcvd=64;
-    rcode = Acm.RcvData1(&rcvd, buf);
-    if (rcode && rcode != hrNAK)   ErrorMessage<uint8_t>(PSTR("Ret1"), rcode);
+    // QMX has only one CDC data interface.  Polling RcvData1() when no
+    // second Bulk-IN endpoint exists can enter a long MAX3421E NAK loop and
+    // starve IDLE0, triggering the task watchdog.
+    if (Acm.HasSecondDataIn()) {
+      rcvd=64;
+      rcode = Acm.RcvData1(&rcvd, buf);
+      if (rcode && rcode != hrNAK) ErrorMessage<uint8_t>(PSTR("Ret1"), rcode);
 
-    if (rcvd) {  //more than zero bytes received
-      plogw->ostream->print("ACMrcvd1:");
-      for (uint16_t i = 0; i < rcvd; i++) {
-        plogw->ostream->print((char)buf[i]);  //printing on the screen
+      if (rcvd) {
+        plogw->ostream->print("ACMrcvd1:");
+        for (uint16_t i = 0; i < rcvd; i++) {
+          plogw->ostream->print((char)buf[i]);
+        }
+        plogw->ostream->print("\r\n");
       }
-      plogw->ostream->print("\r\n");      
     }
   }
 }
@@ -776,10 +897,25 @@ FTDI Ftdi(&Usb, &FtdiAsync);
 
 void receive_pkt_handler_keyboard1_main(struct mux_packet *packet)
 {
-  //  Serial.print("kbd1:idx=");
-  //  Serial.println(packet->idx);
-  if (packet->idx>=2) {
-    Prs1.Parse_extKbd(packet->buf[0],packet->buf[1]);
+  // New extension firmware appends an 8-bit event sequence number.  Continue
+  // accepting the legacy two-byte packet during mixed-version updates.
+  static bool seq_valid = false;
+  static uint8_t expected_seq = 0;
+
+  if (packet->idx >= 3) {
+    const uint8_t received_seq = (uint8_t)packet->buf[2];
+    if (seq_valid && received_seq != expected_seq) {
+      Serial.printf("KBD EXT sequence gap expected=%u received=%u; resync\n",
+                    (unsigned int)expected_seq,
+                    (unsigned int)received_seq);
+      Prs1.resync_extKbd("sequence gap");
+    }
+    expected_seq = (uint8_t)(received_seq + 1);
+    seq_valid = true;
+  }
+
+  if (packet->idx >= 2) {
+    Prs1.Parse_extKbd((uint8_t)packet->buf[0], packet->buf[1] != 0);
   }
 }
 
@@ -792,6 +928,27 @@ void KbdRptParser::init_extKbd()
 }
 
   
+void KbdRptParser::resync_extKbd(const char *reason)
+{
+  const uint8_t old_mod = prevState.bInfo[0];
+
+  // Release modifier-driven functions (notably Right-Shift PTT/keying) before
+  // clearing the parser state.  Normal keys do not have persistent actions.
+  if (old_mod != 0) {
+    OnControlKeysChanged(old_mod, 0);
+  }
+
+  for (uint8_t i = 1; i < 8; i++) {
+    prevState.bInfo[i] = 1;
+  }
+  prevState.bInfo[0] = 0;
+  buf_ext[0] = 0;
+  f_capslock = 0;
+
+  Serial.printf("KBD EXT resync reason=%s old_mod=0x%02X\n",
+                reason ? reason : "unknown", (unsigned int)old_mod);
+}
+
 void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on) 
 {
   /*
@@ -998,41 +1155,160 @@ void KbdRptParser::init_keyrpt_queue() {
     xQueueKeyRpt = xQueueCreate(QUEUE_KEYRPT_LEN, sizeof(struct keymsg_t));
 }
 
-void KbdRptParser::send_keyrpt_queue(){
-  BaseType_t ret;
-  ret = xQueueSend(xQueueKeyRpt, &msg, 0);
-  //  Serial.printf("xQueueSend(%d) : ret = %d\n", data, ret);
+bool KbdRptParser::send_keyrpt_queue(){
+  const BaseType_t ret = xQueueSend(xQueueKeyRpt, &msg, 0);
+  if (ret != pdTRUE) {
+    key_queue_drop_count++;
+    const uint32_t now_ms = millis();
+    if (key_queue_drop_last_report_ms == 0 ||
+        (uint32_t)(now_ms - key_queue_drop_last_report_ms) >= 1000U) {
+      key_queue_drop_last_report_ms = now_ms;
+      Serial.printf("KBD queue full drops=%lu type=%u arg1=0x%02X arg2=0x%02X depth=%u\n",
+                    (unsigned long)key_queue_drop_count,
+                    (unsigned int)msg.type, (unsigned int)msg.arg1,
+                    (unsigned int)msg.arg2,
+                    (unsigned int)uxQueueMessagesWaiting(xQueueKeyRpt));
+    }
+    return false;
+  }
+  return true;
 }
 
-void KbdRptParser::process_keyrpt_queue() {
-  BaseType_t ret;  
-  //  Serial.println("\n受信");
-  //  data2 = -1;
-  //  MODIFIERKEYS modkey;
-      
+void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
+  struct key_profile_stats_t {
+    uint32_t window_start_ms;
+    uint32_t calls;
+    uint32_t messages;
+    uint32_t max_total_us;
+    uint32_t max_waiting_us;
+    uint32_t max_receive_us;
+    uint32_t max_control_us;
+    uint32_t max_locking_us;
+    uint32_t max_keydown_us;
+    uint32_t max_keyup_us;
+    uint32_t slow_total;
+    uint32_t slow_handler;
+    UBaseType_t max_depth;
+  };
+
+  // process_keyrpt_queue() is called for the main and external keyboard.
+  // Keep independent statistics without adding state to KbdRptParser.
+  static key_profile_stats_t stats[2] = {};
+  const int profile_index =
+      (profile_name != NULL && profile_name[0] == 'e') ? 1 : 0;
+  key_profile_stats_t &st = stats[profile_index];
+  const char *name = (profile_name != NULL) ? profile_name : "unknown";
+  const bool perf_verbose = (verbose & VERBOSE_PERF) != 0;
+  const uint32_t slow_threshold_us = 5000;
+  const uint32_t total_start_us = micros();
+
+  st.calls++;
+
+  uint32_t t0 = micros();
+  UBaseType_t waiting = uxQueueMessagesWaiting(xQueueKeyRpt);
+  uint32_t dt = (uint32_t)(micros() - t0);
+  if (dt > st.max_waiting_us) st.max_waiting_us = dt;
+  if (waiting > st.max_depth) st.max_depth = waiting;
+
   struct keymsg_t msg;
-  //  Serial.println("\nキューの数確認");
-  //  Serial.printf("uxQueueMessagesWaiting = %d\n", uxQueueMessagesWaiting(xQueue));
-  while (uxQueueMessagesWaiting(xQueueKeyRpt)){
+  BaseType_t ret;
+
+  while (waiting > 0) {
+    t0 = micros();
     ret = xQueueReceive(xQueueKeyRpt, &msg, 0);
-    if (ret==pdTRUE) {
-      //  Serial.printf("%d = xQueueReceive() : ret = %d\n", data2, ret);
+    dt = (uint32_t)(micros() - t0);
+    if (dt > st.max_receive_us) st.max_receive_us = dt;
+
+    if (ret == pdTRUE) {
+      st.messages++;
+      const uint32_t handler_start_us = micros();
+      const char *handler_name = "unknown";
+
       switch (msg.type) {
-      case KEYMSG_TYPE_ONCONTROLKEYSCHANGED:  // OnControlKeysChanged
-	OnControlKeysChanged(msg.arg1,msg.arg2);
-	break;
-      case KEYMSG_TYPE_HANDLELOCKINGKEYS: // HandleLockingKeys()
-	HandleLockingKeys(msg.hid,msg.arg2);
-	break;
-      case KEYMSG_TYPE_ONKEYDOWN: //OnKeyDown()
-	OnKeyDown(msg.arg1,msg.arg2);            
-	break;
-      case KEYMSG_TYPE_ONKEYUP: // OnKeyUp()
-	OnKeyUp(msg.arg1,msg.arg2);                  
-	//      *((uint8_t *)&modkey) = msg.mod;
-	break;
+      case KEYMSG_TYPE_ONCONTROLKEYSCHANGED:
+        handler_name = "control";
+        OnControlKeysChanged(msg.arg1, msg.arg2);
+        dt = (uint32_t)(micros() - handler_start_us);
+        if (dt > st.max_control_us) st.max_control_us = dt;
+        break;
+
+      case KEYMSG_TYPE_HANDLELOCKINGKEYS:
+        handler_name = "locking";
+        HandleLockingKeys(msg.hid, msg.arg2);
+        dt = (uint32_t)(micros() - handler_start_us);
+        if (dt > st.max_locking_us) st.max_locking_us = dt;
+        break;
+
+      case KEYMSG_TYPE_ONKEYDOWN:
+        handler_name = "keydown";
+        OnKeyDown(msg.arg1, msg.arg2);
+        dt = (uint32_t)(micros() - handler_start_us);
+        if (dt > st.max_keydown_us) st.max_keydown_us = dt;
+        break;
+
+      case KEYMSG_TYPE_ONKEYUP:
+        handler_name = "keyup";
+        OnKeyUp(msg.arg1, msg.arg2);
+        dt = (uint32_t)(micros() - handler_start_us);
+        if (dt > st.max_keyup_us) st.max_keyup_us = dt;
+        break;
+
+      default:
+        dt = (uint32_t)(micros() - handler_start_us);
+        break;
+      }
+
+      if (dt >= slow_threshold_us) {
+        st.slow_handler++;
+        if (perf_verbose) {
+          Serial.printf(
+              "KEY PROFILE SLOW keyboard=%s stage=%s dt=%luus type=%u "
+              "arg1=0x%02X arg2=0x%02X depth=%u core=%d\n",
+              name, handler_name, (unsigned long)dt,
+              (unsigned int)msg.type, (unsigned int)msg.arg1,
+              (unsigned int)msg.arg2, (unsigned int)waiting,
+              xPortGetCoreID());
+        }
       }
     }
+
+    t0 = micros();
+    waiting = uxQueueMessagesWaiting(xQueueKeyRpt);
+    dt = (uint32_t)(micros() - t0);
+    if (dt > st.max_waiting_us) st.max_waiting_us = dt;
+    if (waiting > st.max_depth) st.max_depth = waiting;
+  }
+
+  const uint32_t total_us = (uint32_t)(micros() - total_start_us);
+  if (total_us > st.max_total_us) st.max_total_us = total_us;
+  if (total_us >= slow_threshold_us) {
+    st.slow_total++;
+    if (perf_verbose) {
+      Serial.printf(
+          "KEY PROFILE SLOW keyboard=%s stage=total dt=%luus messages=%lu "
+          "max_depth=%u core=%d\n",
+          name, (unsigned long)total_us, (unsigned long)st.messages,
+          (unsigned int)st.max_depth, xPortGetCoreID());
+    }
+  }
+
+  const uint32_t now_ms = millis();
+  if (st.window_start_ms == 0) st.window_start_ms = now_ms;
+  if (perf_verbose && (uint32_t)(now_ms - st.window_start_ms) >= 1000U) {
+    Serial.printf(
+        "KEY PROFILE summary keyboard=%s calls=%lu messages=%lu depth=%u "
+        "total=%lu waiting=%lu receive=%lu control=%lu locking=%lu "
+        "keydown=%lu keyup=%lu slow_total=%lu slow_handler=%lu\n",
+        name, (unsigned long)st.calls, (unsigned long)st.messages,
+        (unsigned int)st.max_depth, (unsigned long)st.max_total_us,
+        (unsigned long)st.max_waiting_us, (unsigned long)st.max_receive_us,
+        (unsigned long)st.max_control_us, (unsigned long)st.max_locking_us,
+        (unsigned long)st.max_keydown_us, (unsigned long)st.max_keyup_us,
+        (unsigned long)st.slow_total, (unsigned long)st.slow_handler);
+
+    key_profile_stats_t cleared = {};
+    cleared.window_start_ms = now_ms;
+    st = cleared;
   }
 }
 
@@ -1304,7 +1580,8 @@ void loop_usb()
     uint8_t state = Usb.getUsbTaskState();
     uint8_t vbus = Usb.getVbusState();
 
-    if (state != previous_state || vbus != previous_vbus) {
+    if ((verbose & VERBOSE_USB) &&
+        (state != previous_state || vbus != previous_vbus)) {
         Serial.printf(
             "USB: state 0x%02x -> 0x%02x, "
             "vbus 0x%02x -> 0x%02x, ACM=%d\n",
@@ -1315,9 +1592,10 @@ void loop_usb()
             Acm.isReady()
         );
 
-        previous_state = state;
-        previous_vbus = vbus;
     }
+
+    previous_state = state;
+    previous_vbus = vbus;
 
     /*
     if (millis() - last_report >= 1000) {
@@ -1429,49 +1707,41 @@ void usb_send_cat_buf(char *cmd) {
 
 
 void usb_receive_cat_data(struct radio *radio) {
-  return;
-    while (Usb.getUsbTaskState() == USB_STATE_RUNNING) {
-      uint8_t rcode;
-      uint8_t buf[64];
-      for (uint8_t i = 0; i < 64; i++)
-        buf[i] = 0;
+  if (radio == NULL || radio->rig_spec == NULL) return;
+  if (radio->rig_spec->civport_num != -1) return;
+  if (xQueueCATUSBRx == NULL) return;
 
-      uint16_t rcvd = 64;
-      //      rcode = Ftdi.RcvData(&rcvd, buf);
-      rcode = Acm.RcvData(&rcvd, buf);      
+  struct catmsg_t catmsg;
+  int copied = 0;
+  int dropped = 0;
 
-      if (rcode && rcode != hrNAK) {
-	//        ErrorMessage<uint8_t>(PSTR("Ret"), rcode);
-        return;
+  // USB bulk packets can split a CAT response at any byte boundary.  Copy
+  // every received chunk into the existing per-radio CAT ring buffer; the
+  // normal CAT parser will join the chunks and recognize the ';' terminator.
+  while (xQueueReceive(xQueueCATUSBRx, &catmsg, 0) == pdTRUE) {
+    int size = catmsg.size;
+    if (size < 0) size = 0;
+    if (size > (int)sizeof(catmsg.buf)) size = sizeof(catmsg.buf);
+
+    for (int i = 0; i < size; i++) {
+      const int next = (radio->w_ptr + 1) % 256;
+      if (next == radio->r_ptr) {
+        // Keep the already buffered partial command intact.  Drop the rest of
+        // this USB chunk and wait for the parser to make room.
+        dropped += size - i;
+        break;
       }
-      if (verbose & 1) {
-	//plogw->ostream->print("Ftdi: rcode=");
-	plogw->ostream->print("Acm: rcode=");	
-        plogw->ostream->println(rcode);
-      }
-
-      // The device reserves the first two bytes of data
-      //   to contain the current values of the modem and line status registers.
-
-      if (rcvd > 2) {
-        if (verbose & 1) {
-          plogw->ostream->print("received from USB serial : ");
-        }
-        for (uint8_t i = 2; i < rcvd; i++) {
-          if (verbose & 1) {
-            plogw->ostream->print(buf[i], HEX);
-            plogw->ostream->print(" ");
-          }
-          radio->bt_buf[radio->w_ptr] = buf[i];
-          radio->w_ptr++;
-          radio->w_ptr %= 256;
-        }
-        if (verbose & 1) {
-          plogw->ostream->println("");
-        }
-        //            plogw->ostream->println((char*)(buf+2));
-      }
+      radio->bt_buf[radio->w_ptr] = catmsg.buf[i];
+      radio->w_ptr = next;
+      copied++;
     }
+  }
+
+  if ((verbose & VERBOSE_USB) && (copied > 0 || dropped > 0)) {
+    console->printf(
+        "USB CAT RX bridge rig=%d copied=%d dropped=%d r=%d w=%d\n",
+        radio->rig_idx, copied, dropped, radio->r_ptr, radio->w_ptr);
+  }
 }
 // key input from usb running in separate task 24/10/29 
 

@@ -51,8 +51,16 @@
 Mux_transport mux_transport;
 int f_mux_transport=0;
 int f_mux_transport_cmd=0; // 1: transition to f_mux_transport=1 2: transition to f_mux_transport=0
+bool subcpu_online=false;
 
 void Mux_transport::sync_transport_modes_master() {
+#ifndef DVPLOGGER_EXT
+  if (!subcpu_online) {
+    f_mux_transport = 0;
+    f_mux_transport_cmd = 0;
+    return;
+  }
+#endif
   // send transport mode change commands to extension board
   switch(f_mux_transport_cmd) {
     //  case 0: // raw transport
@@ -247,6 +255,14 @@ void Mux_transport::recv_pkt() {
 
 int Mux_transport::send_pkt(int frm, int to, unsigned char *data,int ndata)
   {
+#ifndef DVPLOGGER_EXT
+    /* The startup probe runs with f_mux_transport=1.  Once that bounded
+       probe fails, suppress all later MAIN->SUBCPU packets for this boot. */
+    if (!subcpu_online && !f_mux_transport) {
+      (void)frm; (void)to; (void)data; (void)ndata;
+      return 0;
+    }
+#endif
     // construct a full packet into wbuf[]
     unsigned char *p;uint8_t cksum1;
     if (ndata>256) return 0;

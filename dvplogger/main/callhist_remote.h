@@ -24,6 +24,7 @@
 #include "decl.h"
 extern int callhist_at; // 0: main CPU, 1: sub CPU
 bool load_callhist_subcpu(const char *fn);
+bool callhist_subcpu_alive(uint32_t timeout_ms = 350);
 void clear_callhist_subcpu_main();
 void process_callhist_control_response_main(const char *buf);
 void process_callhist_reset_subcpu(const char *s);

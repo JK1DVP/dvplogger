@@ -66,7 +66,7 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso);
 void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) ;
 void string_trim_right(char *s, char c);
 void print_qso_logfile() ;
-char *parse_strings(const char *remarks,char *parse_str);
+char *parse_strings(const char *remarks,const char *parse_str);
 void print_qso_log() ;
 // operation options in read_qso_log  or'ed
 #define READQSO_MAKEDUPE 1

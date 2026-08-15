@@ -33,6 +33,8 @@
 #include "cat.h"
 #include "settings.h"
 #include "display.h"
+#include "so2r.h"
+#include "log.h"
 #include <HTTPClient.h>
 #include "Plan13.h"
 #include "timekeep.h"
@@ -48,49 +50,110 @@ File tlefile;
 // index of sat_info[] sorted by  satellite aos
 int satidx_sort[N_SATELLITES];
 
-void load_satinfo() {
-  char fnbuf[30];
-  strcpy(fnbuf, "/satinfo.txt");
-  // f = SPIFFS.open(fnbuf, FILE_READ);
+static const char *satdbfilename = "/satdb.txt";
+extern const struct sat_info2 sat_info2[N_SATELLITES];
 
-  plogw->ostream->println("opening satinfo");      
-  f = SD.open(fnbuf, FILE_READ);
-  if (!f) {
-    sprintf(dp->lcdbuf, "Creating default satinfo\n");
-    upd_display_info_flash(dp->lcdbuf);
-    plogw->ostream->println("Creating default satinfo");
-    save_satinfo();
-    plogw->ostream->println("opening satinfo again");    
-    f = SD.open(fnbuf, FILE_READ);    
+static int first_empty_sat_slot() {
+  for (int i = 0; i < N_SATELLITES; ++i) {
+    if (sat_info[i].name[0] == '\0') return i;
   }
-  char *satname, *s1;
-  int i, n;
-  while (readline(&f, buf, 0x0d0a, 128) != 0) {
-    // read name and offset_freq
-    satname = strtok(buf, " ");
-    if (satname == NULL) break;
-    i = find_satname(satname);
-    plogw->ostream->print("sat ");
-    plogw->ostream->println(satname);
-    if (i == -1) {
-      // not found
-      plogw->ostream->print("satellite ");
-      plogw->ostream->print(satname);
-      plogw->ostream->println(" not found");
-      continue;
-    }
-    s1 = strtok(NULL, " ");
-    n = atoi(s1);
-    sat_info[i].offset_freq = n;
-    plogw->ostream->print("sat ");
-    plogw->ostream->print(satname);
-    plogw->ostream->print(" ofs=");
-    plogw->ostream->println(n);
-  }
-
-  f.close();
+  return -1;
 }
 
+static void set_sat_definition(int i, const char *name,
+                               int up0, int up1, const char *upmode,
+                               int dn0, int dn1, const char *dnmode,
+                               int beacon, int offset) {
+  if (i < 0 || i >= N_SATELLITES) return;
+  strlcpy(sat_info[i].name, name ? name : "", sizeof(sat_info[i].name));
+  sat_info[i].up_f0 = up0;
+  sat_info[i].up_f1 = up1;
+  sat_info[i].dn_f0 = dn0;
+  sat_info[i].dn_f1 = dn1;
+  strlcpy(sat_info[i].up_mode, upmode ? upmode : "", sizeof(sat_info[i].up_mode));
+  strlcpy(sat_info[i].dn_mode, dnmode ? dnmode : "", sizeof(sat_info[i].dn_mode));
+  sat_info[i].bc_f0 = beacon;
+  sat_info[i].offset_freq = offset;
+}
+
+static void load_default_satellite_database() {
+  // Preserve the historical satellite-name list, including satellites that
+  // have TLE/AOS data but no configured transponder.
+  for (int i = 0; i < N_SATELLITES; ++i) {
+    if (sat_names[i] == nullptr || sat_names[i][0] == '\0') break;
+    set_sat_definition(i, sat_names[i], 0, 0, "", 0, 0, "", 0, 0);
+  }
+
+  // Overlay the built-in transponder defaults.
+  for (int j = 0; j < N_SATELLITES; ++j) {
+    if (sat_info2[j].name[0] == '\0') break;
+    int i = find_satname((char *)sat_info2[j].name);
+    if (i < 0) {
+      i = first_empty_sat_slot();
+      if (i < 0) break;
+    }
+    set_sat_definition(i, sat_info2[j].name,
+                       (int)(sat_info2[j].up_f0 * 1000000.0),
+                       (int)(sat_info2[j].up_f1 * 1000000.0),
+                       sat_info2[j].up_mode,
+                       (int)(sat_info2[j].dn_f0 * 1000000.0),
+                       (int)(sat_info2[j].dn_f1 * 1000000.0),
+                       sat_info2[j].dn_mode,
+                       (int)(sat_info2[j].bc_f0 * 1000000.0),
+                       (int)(sat_info2[j].offset_freq * 1000.0));
+  }
+
+  // Migrate any old offset-only /satinfo.txt values.
+  File legacy = SD.open("/satinfo.txt", FILE_READ);
+  if (legacy) {
+    while (readline(&legacy, buf, 0x0d0a, 128) != 0) {
+      char *name = strtok(buf, " ");
+      char *ofs = strtok(NULL, " ");
+      if (!name || !ofs) continue;
+      int i = find_satname(name);
+      if (i >= 0) sat_info[i].offset_freq = atoi(ofs);
+    }
+    legacy.close();
+  }
+}
+
+void load_satinfo() {
+  File db = SD.open(satdbfilename, FILE_READ);
+  if (!db) {
+    plogw->ostream->println("Creating default satellite database /satdb.txt");
+    load_default_satellite_database();
+    save_satinfo();
+    return;
+  }
+
+  // Format:
+  // name<TAB>up0_hz<TAB>up1_hz<TAB>up_mode<TAB>dn0_hz<TAB>dn1_hz
+  // <TAB>dn_mode<TAB>beacon_hz<TAB>offset_hz
+  while (readline(&db, buf, 0x0d0a, 192) != 0) {
+    char *saveptr = nullptr;
+    char *name = strtok_r(buf, "\t", &saveptr);
+    char *up0s = strtok_r(nullptr, "\t", &saveptr);
+    char *up1s = strtok_r(nullptr, "\t", &saveptr);
+    char *upmode = strtok_r(nullptr, "\t", &saveptr);
+    char *dn0s = strtok_r(nullptr, "\t", &saveptr);
+    char *dn1s = strtok_r(nullptr, "\t", &saveptr);
+    char *dnmode = strtok_r(nullptr, "\t", &saveptr);
+    char *bcs = strtok_r(nullptr, "\t", &saveptr);
+    char *ofss = strtok_r(nullptr, "\t", &saveptr);
+    if (!name || !up0s || !up1s || !upmode || !dn0s || !dn1s ||
+        !dnmode || !bcs || !ofss) continue;
+
+    int i = find_satname(name);
+    if (i < 0) i = first_empty_sat_slot();
+    if (i < 0) break;
+
+    set_sat_definition(i, name,
+                       atoi(up0s), atoi(up1s), upmode,
+                       atoi(dn0s), atoi(dn1s), dnmode,
+                       atoi(bcs), atoi(ofss));
+  }
+  db.close();
+}
 
 
 
@@ -215,6 +278,130 @@ void set_sat_info_calc() {
 #define TX 1
 #define RX 0
 
+
+static bool sat_rig_name_starts_with(const struct radio *radio, const char *prefix) {
+  if (!radio || !radio->rig_spec || !prefix) return false;
+  return strncmp(radio->rig_spec->name, prefix, strlen(prefix)) == 0;
+}
+
+static bool sat_freq_in_range(unsigned int f, int f0, int f1) {
+  if (f == 0 || f0 <= 0 || f1 <= 0) return false;
+  const unsigned int lo = (unsigned int)(f0 < f1 ? f0 : f1);
+  const unsigned int hi = (unsigned int)(f0 < f1 ? f1 : f0);
+  const unsigned int margin = 25000U;
+  return (f + margin >= lo) && (f <= hi + margin);
+}
+
+static void sat_auto_reason(char *reason, size_t reason_len, const char *text) {
+  if (!reason || reason_len == 0) return;
+  strlcpy(reason, text ? text : "", reason_len);
+}
+
+int auto_select_sat_vfo_mode(char *reason, size_t reason_len) {
+  sat_auto_reason(reason, reason_len, "No change");
+
+  const int i = plogw->sat_idx_selected;
+  if (i < 0 || i >= N_SATELLITES || sat_info[i].name[0] == '\0') {
+    sat_auto_reason(reason, reason_len, "No satellite selected");
+    return -1;
+  }
+
+  struct radio *r0 = &radio_list[0];
+  struct radio *r1 = &radio_list[1];
+  const bool e0 = r0->enabled;
+  const bool e1 = r1->enabled;
+  const bool ic705_0 = e0 && sat_rig_name_starts_with(r0, "IC-705");
+  const bool ic705_1 = e1 && sat_rig_name_starts_with(r1, "IC-705");
+  const bool ic9700_0 = e0 && sat_rig_name_starts_with(r0, "IC-9700");
+
+  if (e0 && !e1 &&
+      (ic9700_0 || (r0->rig_spec && r0->rig_spec->rig_type == RIG_TYPE_ICOM_IC9700))) {
+    plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_TX;
+    so2r.change_focused_radio(0);
+    sat_auto_reason(reason, reason_len, "Single IC-9700: MAIN/VFO A=TX, SUB=RX");
+    return plogw->sat_vfo_mode;
+  }
+
+  if (e0 && !e1 &&
+      (ic705_0 || (r0->rig_spec && r0->rig_spec->rig_type == RIG_TYPE_ICOM_IC705))) {
+    plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_RX;
+    so2r.change_focused_radio(0);
+    sat_auto_reason(reason, reason_len, "Single IC-705: selected/VFO A=RX, other VFO=TX");
+    return plogw->sat_vfo_mode;
+  }
+
+  if (e0 && e1) {
+    const bool r0_up = sat_freq_in_range(r0->freq, sat_info[i].up_f0, sat_info[i].up_f1);
+    const bool r0_dn = sat_freq_in_range(r0->freq, sat_info[i].dn_f0, sat_info[i].dn_f1);
+    const bool r1_up = sat_freq_in_range(r1->freq, sat_info[i].up_f0, sat_info[i].up_f1);
+    const bool r1_dn = sat_freq_in_range(r1->freq, sat_info[i].dn_f0, sat_info[i].dn_f1);
+
+    if (r0_up && r1_dn && !(r0_dn && r1_up)) {
+      plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_0;
+      so2r.change_focused_radio(0);
+      sat_auto_reason(reason, reason_len, "2TRX: Radio0 frequency=uplink, Radio1=downlink");
+      return plogw->sat_vfo_mode;
+    }
+    if (r1_up && r0_dn && !(r1_dn && r0_up)) {
+      plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_1;
+      so2r.change_focused_radio(1);
+      sat_auto_reason(reason, reason_len, "2TRX: Radio1 frequency=uplink, Radio0=downlink");
+      return plogw->sat_vfo_mode;
+    }
+
+    const int up_band = freq2bandid(sat_info[i].up_f0);
+    const int dn_band = freq2bandid(sat_info[i].dn_f0);
+    const bool band0_up = up_band > 0 && r0->bandid == up_band;
+    const bool band1_up = up_band > 0 && r1->bandid == up_band;
+    const bool band0_dn = dn_band > 0 && r0->bandid == dn_band;
+    const bool band1_dn = dn_band > 0 && r1->bandid == dn_band;
+    const bool dual705 = ic705_0 && ic705_1;
+
+    if (band0_up && band1_dn) {
+      plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_0;
+      so2r.change_focused_radio(0);
+      sat_auto_reason(reason, reason_len,
+                      dual705 ? "Two IC-705s: Radio0 uplink / Radio1 downlink by band"
+                              : "2TRX: Radio0 uplink / Radio1 downlink by band");
+      return plogw->sat_vfo_mode;
+    }
+    if (band1_up && band0_dn) {
+      plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_1;
+      so2r.change_focused_radio(1);
+      sat_auto_reason(reason, reason_len,
+                      dual705 ? "Two IC-705s: Radio1 uplink / Radio0 downlink by band"
+                              : "2TRX: Radio1 uplink / Radio0 downlink by band");
+      return plogw->sat_vfo_mode;
+    }
+
+    if (dual705) {
+      sat_auto_reason(reason, reason_len,
+                      "Two IC-705s detected; TX/RX direction ambiguous, mode unchanged");
+      return -1;
+    }
+
+    sat_auto_reason(reason, reason_len,
+                    "Two rigs active; frequencies/bands do not identify TX/RX, mode unchanged");
+    return -1;
+  }
+
+  if (e0 && !e1) {
+    plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_RX;
+    so2r.change_focused_radio(0);
+    sat_auto_reason(reason, reason_len, "Single generic rig: VFO A=RX fallback");
+    return plogw->sat_vfo_mode;
+  }
+
+  if (!e0 && e1) {
+    sat_auto_reason(reason, reason_len,
+                    "Only Radio1 active; current single-TRX modes require Radio0");
+    return -1;
+  }
+
+  sat_auto_reason(reason, reason_len, "No active rig");
+  return -1;
+}
+
 void set_vfo_frequency_rig(int freq, int vfo, struct radio *radio)
 // vfo 0 for main 1 for sub (unselected) vfo selection
 {
@@ -331,9 +518,17 @@ void set_vfo_frequency_rig(int freq, int vfo, struct radio *radio)
       break;
 
 
-    case 4:  // manual  ( ignore )
-      if (verbose & 8) plogw->ostream->print(" manual rig not set freq.");
+    case 4: { // manual rig: no CAT, but keep DVPlogger's internal frequency/LCD in sync
+      // Satellite frequencies are in Hz; radio->freq uses FREQ_UNIT-Hz units.
+      // Unlike CAT rigs, a manual rig has no later rig response that would
+      // refresh the normal radio display, so redraw it only when the displayed
+      // frequency actually changes.
+      const unsigned int old_freq = radio->freq;
+      set_frequency_rig_radio((unsigned int)(freq / FREQ_UNIT), radio);
+      if (radio->freq != old_freq) upd_display();
+      if (verbose & 8) plogw->ostream->print(" manual rig internal freq/LCD updated.");
       break;
+    }
   }
   if (verbose & 8) plogw->ostream->println("");
 }
@@ -480,8 +675,10 @@ void set_sat_freq_calc() {
         }
       }
       ofs = fsat0 - (sat_info[i].dn_f0 + sat_info[i].offset_freq);
+      // Satellite-side uplink frequency (before ground-to-satellite Doppler).
+      plogw->satup_f = sat_info[i].up_f1 - ofs;
       // usually uplink frequency is inverse so offset from upper edge of downlink band
-      plogw->up_f = (sat_info[i].up_f1 - ofs) / doppler_factor;
+      plogw->up_f = plogw->satup_f / doppler_factor;
       break;
 
     case SAT_TX_FIX:  // TX fixed (RX frequency controlled)
@@ -490,6 +687,7 @@ void set_sat_freq_calc() {
 
 
       fsat0 = plogw->up_f * doppler_factor;
+      plogw->satup_f = fsat0;
       if (fsat0 > sat_info[i].up_f1 || fsat0 < sat_info[i].up_f0) {
         if (verbose & 8) {
           plogw->ostream->print("uplink frequency ");
@@ -525,7 +723,8 @@ void set_sat_freq_calc() {
         plogw->f_inband_txp = 1;
       }
       ofs = fsat0 - (sat_info[i].dn_f0 + sat_info[i].offset_freq);
-      plogw->up_f = (sat_info[i].up_f1 - ofs) / doppler_factor;
+      plogw->satup_f = sat_info[i].up_f1 - ofs;
+      plogw->up_f = plogw->satup_f / doppler_factor;
       plogw->dn_f = plogw->satdn_f * doppler_factor;
 
       break;
@@ -608,8 +807,9 @@ void freq2str(char *s, int freq) {
 
 void upd_display_sat() {
   //  Serial.print ("upd_display_sat timer=");
-  //  Serial.println(info_disp.timer);  
+  //  Serial.println(info_disp.timer);
   if (info_disp.timer > 0) return;
+  const uint32_t satlcd_t0_us = micros();
   select_left_display();  
   char sbuf[20], sbuf1[20];
   sprintf(dp->lcdbuf, "%-6s %-6s az%03d%c", plogw->sat_name_set, plogw->grid_locator_set, plogw->rotator_az, plogw->f_rotator_track ? 'T' : ' ');
@@ -647,6 +847,16 @@ void upd_display_sat() {
 
   //u8g2_l.sendBuffer();  // transfer internal memory to the display
   left_display_sendBuffer();
+
+  // Measure the complete satellite LCD redraw, including the OLED buffer
+  // transfer.  This is intentionally printed once per actual LCD update so
+  // that it can be compared directly with INTERVAL SLOW diagnostics.
+  const uint32_t satlcd_dt_us = micros() - satlcd_t0_us;
+  if (verbose & VERBOSE_PERF) {
+    plogw->ostream->print("[SATLCD] upd_display_sat ");
+    plogw->ostream->print((unsigned long)satlcd_dt_us);
+    plogw->ostream->println(" us");
+  }
 }
 
 void print_sat_info_by_index(int i) {
@@ -816,21 +1026,24 @@ void release_sat() {
 }
 
 int find_satname(char *satname) {
-  //  plogw->ostream->print("find_satname()");
-  int i;
-  for (i = 0; i < N_SATELLITES; i++) {
-
-    if (sat_names[i][0] == '\0') break;
-    if (strcmp(satname, sat_names[i]) == 0) {
-      plogw->ostream->print("found ");
-      plogw->ostream->print(i); plogw->ostream->print(":"); plogw->ostream->print(satname); plogw->ostream->print(":"); plogw->ostream->print(sat_names[i]); plogw->ostream->println(":");
-      return i;
-    }
+  if (!satname) return -1;
+  for (int i = 0; i < N_SATELLITES; ++i) {
+    if (sat_info[i].name[0] == '\0') continue;
+    if (strcmp(satname, sat_info[i].name) == 0) return i;
   }
   return -1;
 }
 
 void readtlefile() {
+  bool have_sat_definition = false;
+  for (int i = 0; i < N_SATELLITES; ++i) {
+    if (sat_info[i].name[0] != '\0') {
+      have_sat_definition = true;
+      break;
+    }
+  }
+  if (!have_sat_definition) load_satinfo();
+
   if (buff == NULL) {
     allocate_sat();    
     //    return;
@@ -1018,6 +1231,7 @@ void readtlefile() {
 // get tle information from network and store to tle file in SD memory.
 
 void getTLE() {
+  sat_tle_last_result = -1;
   // this fails by wifisecureclient related
   // --> make menuconfig -> component config ESP-TLS check Enabel PSK verification will compile
   int counttimeout;
@@ -1048,7 +1262,7 @@ void getTLE() {
 
     if (!plogw->f_console_emu) plogw->ostream->print("[HTTP] GET begin...\n");
     // configure traged server and url
-    http.begin("http://www.amsat.org/tle/current/nasabare.txt");
+    http.begin(sat_tle_url);
 
     if (!plogw->f_console_emu) plogw->ostream->print("[HTTP] GET...\n");
     // start connection and send HTTP header
@@ -1063,6 +1277,7 @@ void getTLE() {
 
       // file found at server
       if (httpCode == HTTP_CODE_OK) {
+        sat_tle_last_result = httpCode;
         allocate_sat();
         // get tcp stream
         WiFiClient *stream = http.getStreamPtr();
@@ -1240,20 +1455,45 @@ void plan13_test() {
 }
 
 void save_satinfo() {
-  char fnbuf[30];
-  strcpy(fnbuf, "/satinfo.txt");
-  //f = SPIFFS.open(fnbuf, FILE_WRITE);
-  f = SD.open(fnbuf, FILE_WRITE);
-  for (int i = 0; i < N_SATELLITES; i++) {
-    if (sat_info[i].name[0] == '\0') continue;
-    f.print(sat_info[i].name);
-    f.print(" ");
-    f.println(sat_info[i].offset_freq);
-    plogw->ostream->print(sat_info[i].name);
-    plogw->ostream->print(" ");
-    plogw->ostream->println(sat_info[i].offset_freq);
+  const char *tmpfn = "/satdb.tmp";
+  const char *bakfn = "/satdb.bak";
+
+  SD.remove(tmpfn);
+  File db = SD.open(tmpfn, FILE_WRITE);
+  if (!db) {
+    plogw->ostream->println("ERROR: cannot create /satdb.tmp");
+    return;
   }
-  f.close();
+
+  for (int i = 0; i < N_SATELLITES; ++i) {
+    if (sat_info[i].name[0] == '\0') continue;
+    db.print(sat_info[i].name); db.print('\t');
+    db.print(sat_info[i].up_f0); db.print('\t');
+    db.print(sat_info[i].up_f1); db.print('\t');
+    db.print(sat_info[i].up_mode); db.print('\t');
+    db.print(sat_info[i].dn_f0); db.print('\t');
+    db.print(sat_info[i].dn_f1); db.print('\t');
+    db.print(sat_info[i].dn_mode); db.print('\t');
+    db.print(sat_info[i].bc_f0); db.print('\t');
+    db.println(sat_info[i].offset_freq);
+  }
+  db.flush();
+  db.close();
+
+  SD.remove(bakfn);
+  if (SD.exists(satdbfilename)) {
+    if (!SD.rename(satdbfilename, bakfn)) {
+      plogw->ostream->println("ERROR: cannot backup /satdb.txt");
+      SD.remove(tmpfn);
+      return;
+    }
+  }
+  if (!SD.rename(tmpfn, satdbfilename)) {
+    plogw->ostream->println("ERROR: cannot install /satdb.txt");
+    if (SD.exists(bakfn)) SD.rename(bakfn, satdbfilename);
+    return;
+  }
+  SD.remove(bakfn);
 }
 
 void print_datetime(DateTime time) {
@@ -1492,14 +1732,29 @@ void sat_calc_position(int satidx, DateTime time) {
   p13.satvec();
   p13.rangevec();
 }
+
+void request_sat_tle_update() {
+  if (!sat_tle_update_in_progress) { f_sat_updated = false; sat_tle_update_requested = true; }
+}
+
+void service_sat_tle_update() {
+  if (!sat_tle_update_requested || sat_tle_update_in_progress) return;
+  sat_tle_update_requested = false;
+  sat_tle_update_in_progress = true;
+  getTLE();
+  if (sat_tle_last_result == HTTP_CODE_OK) readtlefile();
+  sat_tle_update_in_progress = false;
+}
+
 void sat_process() {
+  service_sat_tle_update();
   if (plogw->sat) {
     struct radio *radio;
 
     radio = radio_selected;
 
-    sat_find_nextaos_sequence();
-
+    // next-AOS search is serviced independently from main.cpp whenever a
+    // job is active. Do not duplicate one search step here every 500 ms.
     set_sat_info_calc();
     set_location_gl_calc(plogw->grid_locator_set);
 
@@ -1522,6 +1777,7 @@ void sat_process() {
       p13.printdata();
       plogw->ostream->println("");
     }
-    upd_display_sat();
+    // LCD redraw is intentionally serviced separately at 1 Hz from
+    // processes.cpp.  Orbit/Doppler/rig tracking stays at 500 ms.
   }
 }

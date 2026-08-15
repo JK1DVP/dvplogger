@@ -227,7 +227,6 @@ void switch_bands(struct radio *radio) {
     }
     count++;
   }
-  upd_display();
 }
 
 void band_change(int bandid, struct radio *radio) {
@@ -241,15 +240,16 @@ void band_change(int bandid, struct radio *radio) {
   //  send_mode_set_civ(mode_str[bandmap_disp.on_cursor_modeid], radio->filtbank[radio->cq[radio->modetype]][radio->modetype]); // cw phone switch filter selection!
   //set_frequency(bandid2freq(radio->bandid));
   //set_frequency_rig(bandid2freq(radio->bandid));
-  upd_display();
+  request_display_update_on_demand();
 
   // notify changed band to zserver
   sprintf(buf,"#ZLOG# BAND %d",zserver_bandid_freqcodes_map[radio->bandid]);
   zserver_send(buf);
   
 
-  //upd_display_bandmap();
-  bandmap_disp.f_update = 1;
+  // One coalescing request is sufficient; do not also leave the legacy
+  // interval flag set, which would redraw the same bandmap twice.
+  request_bandmap_update_on_demand();
 }
 
 void init_logwindow() {

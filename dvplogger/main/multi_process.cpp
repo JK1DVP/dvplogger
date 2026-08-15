@@ -202,6 +202,7 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
 	len-=2;
       }
     }
+    __attribute__((fallthrough)); // validate the remaining exchange as KENGAI
   case MULTI_TYPE_KENGAI:
     // ken number contests
     if (check_kennai(s,len)) {

@@ -70,7 +70,7 @@ bool i2c_bus_lock(const char *owner, TickType_t timeout_ticks)
 
   s_owner = owner;
   uint32_t waited_us = micros() - started_us;
-  if ((verbose & 1024) && waited_us >= 2000U && diag_allowed()) {
+  if ((verbose & VERBOSE_PERF) && waited_us >= 2000U && diag_allowed()) {
     console->printf("I2C lock slow owner=%s wait=%lu us core=%d\n",
                     owner ? owner : "?", (unsigned long)waited_us,
                     xPortGetCoreID());
@@ -88,7 +88,7 @@ void i2c_bus_unlock(const char *owner)
 
 void i2c_diag_io(const char *owner, uint32_t elapsed_us)
 {
-  if ((verbose & 1024) && elapsed_us >= 5000U && diag_allowed()) {
+  if ((verbose & VERBOSE_PERF) && elapsed_us >= 5000U && diag_allowed()) {
     console->printf("I2C io slow owner=%s io=%lu us core=%d\n",
                     owner ? owner : "?", (unsigned long)elapsed_us,
                     xPortGetCoreID());

@@ -25,6 +25,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+int dvplogger_console_printf(const char *fmt, ...);
 void esp_flasher_sd(char *which);
 void esp_flasher(void);
 void loader_boot_init_func() ;

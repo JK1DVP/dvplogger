@@ -204,6 +204,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "bandmap_lifetime_minutes";
+  settings_dict[n_settings_dict].value = (void *)&bandmap_lifetime_minutes;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "multi_type";
   settings_dict[n_settings_dict].value = (void *)&plogw->multi_type;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
@@ -220,6 +225,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "cluster1_auto_enable";
+  settings_dict[n_settings_dict].value = (void *)&cluster1_auto_enable;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "cluster_cmd";
   settings_dict[n_settings_dict].value = (void *)plogw->cluster_cmd + 2;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
@@ -228,6 +238,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].name = "cluster2_name";
   settings_dict[n_settings_dict].value = (void *)plogw->cluster2_name + 2;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "cluster2_auto_enable";
+  settings_dict[n_settings_dict].value = (void *)&cluster2_auto_enable;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
   settings_dict[n_settings_dict].name = "cluster2_cmd";
@@ -331,6 +346,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "zserver_auto_enable";
+  settings_dict[n_settings_dict].value = (void *)&zserver_auto_enable;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "my_name";
   settings_dict[n_settings_dict].value = (void *)&plogw->my_name + 2;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
@@ -368,6 +388,21 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
 
   settings_dict[n_settings_dict].name = "display_type";
   settings_dict[n_settings_dict].value = (void *)&display_type;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "clock_display_mode";
+  settings_dict[n_settings_dict].value = (void *)&clock_display_mode;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "so2r_pair_a";
+  settings_dict[n_settings_dict].value = (void *)so2r.so2r_pair_a_setting_ptr();
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "so2r_pair_b";
+  settings_dict[n_settings_dict].value = (void *)so2r.so2r_pair_b_setting_ptr();
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
@@ -425,6 +460,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
     n_settings_dict++;
   }
 
+  settings_dict[n_settings_dict].name = "sat_tle_url";
+  settings_dict[n_settings_dict].value = (void *)sat_tle_url;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "";
   settings_dict[n_settings_dict].value = NULL;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
@@ -464,6 +504,7 @@ int assign_settings(char *line, struct dict_item *dict) {
       switch ((*dict).value_type) {
       case DICT_VALUE_TYPE_INT:
 	*(int *)((*dict).value) = atoi(value);
+        if ((*dict).value == (void *)&cw_spd) clamp_cw_speed();
 	break;
       case DICT_VALUE_TYPE_CHARARRAY:
 	// clear variable string with '\0'
@@ -501,7 +542,7 @@ int dump_settings(Stream *f, struct dict_item *dict) {
 }
 
 
-int load_settings(char *fn) {
+int load_settings(const char *fn) {
   int display_type_bak=display_type;
   char fnbuf[30];
   plogw->ostream->print("load settings from:");
@@ -531,10 +572,13 @@ int load_settings(char *fn) {
   f.close();
 
   // post process
+  if (bandmap_lifetime_minutes < 1) bandmap_lifetime_minutes = 1;
+  if (bandmap_lifetime_minutes > 1440) bandmap_lifetime_minutes = 1440;
 
   radio_list[0].enabled = plogw->radios_enabled & 1;
   radio_list[1].enabled = (plogw->radios_enabled >> 1) & 1;
   radio_list[2].enabled = (plogw->radios_enabled >> 2) & 1;
+  so2r.validate_so2r_pairs();
   set_rig_from_name(&radio_list[0]);
   set_rig_from_name(&radio_list[1]);
   set_rig_from_name(&radio_list[2]);
@@ -600,16 +644,22 @@ int load_settings(char *fn) {
 
   //  multiwifi_addap(plogw->wifi_ssid+2,plogw->wifi_passwd+2);  // do not try to remember wifi settings here but wifiset.txt
   set_contest_id();
+  cluster1_auto_enable = cluster1_auto_enable ? 1 : 0;
+  cluster2_auto_enable = cluster2_auto_enable ? 1 : 0;
+  zserver_auto_enable = zserver_auto_enable ? 1 : 0;
   set_cluster();
   set_cluster2();
+  set_cluster_auto(1, cluster1_auto_enable);
+  set_cluster_auto(2, cluster2_auto_enable);
   reconnect_zserver();
+  set_zserver_auto(zserver_auto_enable);
   antenna_settings_changed();
   
   return 1;
 }
 
 
-int save_settings(char *fn) {
+int save_settings(const char *fn) {
   char fnbuf[30];
   plogw->ostream->print("save settings to:");
   if (*fn == '\0') {

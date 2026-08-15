@@ -58,5 +58,12 @@ extern uint8_t cluster_verbose_level[2];
 void print_cluster_verbose_status(Stream *out);
 bool set_cluster_verbose_level(int cluster_no, int level, Stream *out);
 
+extern int cluster1_auto_enable;
+extern int cluster2_auto_enable;
+void set_cluster_auto(uint8_t cluster_no, int enabled);
+int get_cluster_auto(uint8_t cluster_no);
+bool cluster_is_connected(uint8_t cluster_no);
+const char *cluster_connection_state(uint8_t cluster_no);
+
 
 #endif

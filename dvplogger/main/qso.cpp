@@ -336,7 +336,7 @@ void process_makedupe_multiplier_maincpu(const char *recv_exch, unsigned char ba
 
   int bandid = bandmode / 4;
   if (bandid < 1 || bandid >= N_BAND) return;
-  if (*multi_list.multi == NULL) return;
+  if (multi_list.multi[bandid - 1] == NULL) return;
 
   int len = strlen(recv_exch);
   if ((plogw->multi_type == 1) || (plogw->multi_type == 3) ||
@@ -391,23 +391,27 @@ void makedupe_qso_entry() {
   char *p;
   char tmpbuf[200];
   strcpy (tmpbuf,qso.entry.remarks);
+  const bool current_is_nomulti =
+      strcasecmp(plogw->contest_name + 2, "NOMULTI") == 0;
   if ((p=parse_strings(tmpbuf,"C:"))!=NULL) {
     if (strcmp(p,"-")==0) {
-      // off the contest
+      // OFFCONTEST QSOs are never included in MAKEDUPE.
       if (verbose&4) {
 	console->println("off the contest");
       }
       return ;
-    } else {
-      if (strcasecmp(p,plogw->contest_name+2)!=0) {
-	if (verbose&4) {
-	  char buf[100];
-	  strcpy(buf,p);
-	  console->print(buf);console->print(" not match current contest:");
-	  console->println(plogw->contest_name+2);
-	}
-	return;
+    } else if (!current_is_nomulti &&
+               strcasecmp(p,plogw->contest_name+2)!=0) {
+      // In a named contest, use only QSOs carrying the same contest tag.
+      // NOMULTI is the all-contest view: accept every normal QSO regardless
+      // of its C: tag, while C:- remains excluded above.
+      if (verbose&4) {
+	char buf[100];
+	strcpy(buf,p);
+	console->print(buf);console->print(" not match current contest:");
+	console->println(plogw->contest_name+2);
       }
+      return;
     }
   }
   
@@ -581,7 +585,23 @@ void read_qso_log(int option, Stream *out) {
     // operations
 
     if (option & READQSO_PRINT) print_qso_entry(&qso, out);
-    if (option & READQSO_MAKEDUPE) makedupe_qso_entry();
+    if (option & READQSO_MAKEDUPE) {
+      makedupe_qso_entry();
+      ++count;
+      if ((count % 50) == 0) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "MAKEDUPE\nProcessing...\nQSO %d", count);
+        if (dupechk->dupechk_at == 1 && f_mux_transport)
+          mux_transport.recv_pkt();
+        upd_display_info_flash(dp->lcdbuf);
+        if (dupechk->dupechk_at == 1 && f_mux_transport)
+          mux_transport.recv_pkt();
+      }
+      // Drain accepted-QSO notifications while the log is being scanned.
+      // Waiting until the end can overflow the MAIN UART/MUX receive buffers.
+      if (dupechk->dupechk_at == 1 && f_mux_transport)
+        mux_transport.recv_pkt();
+    }
     esp_task_wdt_reset();  // WDTをリセット
 
     //    Serial.print("c");
@@ -592,7 +612,12 @@ end:
   if ((option & READQSO_MAKEDUPE) && dupechk->dupechk_at == 1)
     finish_makedupe_subcpu();
 
-  sprintf(dp->lcdbuf, "Reading QSO\nFinished\nPos=%d\n",pos);
+  if (option & READQSO_MAKEDUPE)
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "MAKEDUPE\nFinished\nQSO %d", count);
+  else
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "Reading QSO\nFinished\nPos=%d", pos);
 
   upd_display_info_flash(dp->lcdbuf);
   if (!plogw->f_console_emu) out->println("end of read_qso_log");
@@ -695,8 +720,7 @@ void set_qsodata_from_qso_entry() {
   strcpy(radio->sent_rst + 2, qso.entry.sentrst);
   radio->sent_rst[1] = strlen(radio->sent_rst + 2);
   // strcpy(plogw->sent_exch + 2,qso.entry.sentexch); // do not load sent_exch
-  strcpy(radio->callsign + 2, qso.entry.hiscall);
-  radio->callsign[1] = strlen(radio->callsign + 2);
+  set_callsign_and_request_dupe(radio, qso.entry.hiscall, true);
   strcpy(radio->recv_rst + 2, qso.entry.rcvrst);
   radio->recv_rst[1] = strlen(radio->recv_rst + 2);
 
@@ -1497,7 +1521,7 @@ int strcpy_to_chr(char *dest, char *src,char c) {
     return len;
 }
 
-char *parse_strings(const char *remarks,char *parse_str) {
+char *parse_strings(const char *remarks,const char *parse_str) {
   char *p;
   char tmpbuf1[100];
   if ((p=strstr(remarks,parse_str))!=NULL) { // my park information in POTA activation

@@ -170,6 +170,8 @@ protected:
         uint8_t bControlIface; // Control interface value
         uint8_t bDataIface; // Data interface value
         uint8_t bNumEP; // total number of EP in the configuration
+        uint16_t idVendor;
+        uint16_t idProduct;
         uint32_t qNextPollTime; // next poll time
         volatile bool bPollEnable; // poll enable flag
         volatile bool ready; //device ready indicator
@@ -219,6 +221,19 @@ public:
         virtual bool isReady() {
                 return ready;
         };
+
+        uint16_t GetVid() const { return idVendor; }
+        uint16_t GetPid() const { return idProduct; }
+        bool IsDevice(uint16_t vid, uint16_t pid) const {
+                return idVendor == vid && idProduct == pid;
+        }
+        bool HasSecondDataIn() const {
+                return epInfo[epDataIn1Index].epAddr != 0 &&
+                       epInfo[epDataIn1Index].maxPktSize != 0;
+        }
+        uint8_t GetDataInEp() const { return epInfo[epDataInIndex].epAddr; }
+        uint8_t GetDataOutEp() const { return epInfo[epDataOutIndex].epAddr; }
+        uint8_t GetSecondDataInEp() const { return epInfo[epDataIn1Index].epAddr; }
 
         virtual tty_features enhanced_status(void) {
                 return _enhanced_status;

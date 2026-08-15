@@ -30,10 +30,16 @@ public:
   _ch9350(uint8_t rst) : ch9350if(rst) {}
   void key_event(uint8_t hid_code, bool on) {
     if (f_mux_transport) {
-      unsigned char tmp_buf[2];
-      tmp_buf[0]=hid_code;
-      tmp_buf[1]=on;
-      mux_transport.send_pkt(MUX_PORT_USB_KEYBOARD1_EXT,MUX_PORT_USB_KEYBOARD1_MAIN,tmp_buf,2);
+      // Include a monotonically increasing sequence number so that the main
+      // board can detect a lost key transition.  Losing only an Alt/Ctrl/Shift
+      // release otherwise leaves that modifier latched until reset.
+      static uint8_t key_event_seq = 0;
+      unsigned char tmp_buf[3];
+      tmp_buf[0] = hid_code;
+      tmp_buf[1] = on;
+      tmp_buf[2] = key_event_seq++;
+      mux_transport.send_pkt(MUX_PORT_USB_KEYBOARD1_EXT,
+                             MUX_PORT_USB_KEYBOARD1_MAIN, tmp_buf, 3);
     } else {
       Serial.print(" : ");
       dump_byte(hid_code);

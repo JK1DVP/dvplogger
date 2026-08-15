@@ -42,9 +42,9 @@ void adc_timer_config(void) ;
 #define NUNITS_TRANSFER 4
 #define NSAMP_I2S_TRANSFER (NSAMP_EVAL_UNIT*NUNITS_TRANSFER) // i2s DMA transfer number of samples  = 440
 #define ADC_RINGBUF_NBANK (2)  // bank of DMA transferred data ringbuf adc_ringbuf[][]
-#define DMA_BUF_COUNT 8 // I2S DMA parameter
-#define DMA_BUF_LEN (NSAMP_I2S_TRANSFER/DMA_BUF_COUNT)  // another I2S DMA paramter to transfer NSAMP_I2S_TRANSFER = 55
-#define NUM_MEM_SECT (2*DMA_BUF_COUNT*DMA_BUF_LEN) // number of data counts for the i2S DMA transfer block = 4*8*55=1760
+#define DAC_ADC_DMA_BUF_COUNT 8 // I2S DMA parameter
+#define DAC_ADC_DMA_BUF_LEN (NSAMP_I2S_TRANSFER/DAC_ADC_DMA_BUF_COUNT)  // another I2S DMA paramter to transfer NSAMP_I2S_TRANSFER = 55
+#define NUM_MEM_SECT (2*DAC_ADC_DMA_BUF_COUNT*DAC_ADC_DMA_BUF_LEN) // number of data counts for the i2S DMA transfer block = 4*8*55=1760
 extern volatile int n_adc_i2s_read; // how many read completed
 extern uint16_t adc_ringbuf[ADC_RINGBUF_NBANK][NUM_MEM_SECT]; // i2s read will store to this buffer in the background
 extern volatile uint8_t adc_ridx_bank,adc_widx_bank;

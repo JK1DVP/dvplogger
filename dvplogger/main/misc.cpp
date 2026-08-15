@@ -30,7 +30,7 @@
 #include "misc.h"
 
 // copy idx'th token in src to dest with separator character in sep
-void copy_token(char *dest,char *src,int idx,char *sep) {
+void copy_token(char *dest,char *src,int idx,const char *sep) {
   char *p,*pd;
   int n;
   pd=dest;
@@ -95,6 +95,23 @@ void time_measure_stop(int bank)
   if (time_measure_bank[bank]< time_measure_bank_tmp[bank]) {
     // update time_measure_bank
     time_measure_bank[bank]=time_measure_bank_tmp[bank];
+  }
+
+  // Report an individual processing section that can cause a visible UI stall.
+  // Use the hardware serial port so a slow network/telnet stream cannot itself
+  // create or hide the delay being diagnosed. Rate-limit each profile bank.
+  if ((verbose & VERBOSE_PERF) && time_measure_bank_tmp[bank] >= 10000) {
+    static uint32_t next_report_ms[N_TIME_MEASURE_BANK] = {0};
+    const uint32_t now_ms = millis();
+    if ((int32_t)(now_ms - next_report_ms[bank]) >= 0) {
+      next_report_ms[bank] = now_ms + 1000;
+      Serial.printf("PROFILE SLOW section=%s dt=%d us max=%d us wifi=%d core=%d\n",
+                    time_measure_bank_name[bank][0] ? time_measure_bank_name[bank] : "?",
+                    time_measure_bank_tmp[bank],
+                    time_measure_bank[bank],
+                    wifi_enable,
+                    xPortGetCoreID());
+    }
   }
 }
 

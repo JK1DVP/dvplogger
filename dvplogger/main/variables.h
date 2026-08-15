@@ -66,6 +66,10 @@ extern struct sat_info sat_info[N_SATELLITES];
 extern int n_satellites;
 extern const char *sat_names[N_SATELLITES];
 extern bool f_sat_updated ;
+extern char sat_tle_url[192];
+extern volatile bool sat_tle_update_requested;
+extern volatile bool sat_tle_update_in_progress;
+extern int sat_tle_last_result;
 
 
 extern char tcp_ringbuf_buf[NCHR_TCP_RINGBUF];
@@ -76,8 +80,9 @@ extern struct rig rig_spec[N_RIG];  // specification of the rig_id th rig
 extern struct info_display info_disp;
 
 extern const char *settingsfn ;
-extern struct bandmap bandmap[N_BAND];
+extern struct bandmap bandmap[N_BAND + 1];
 extern int bandmap_mask ;  // suppress updating bandmap from telnet cluster if the corresponding bit 1<<(bandid-1) is set
+extern int bandmap_lifetime_minutes;
 extern struct bandmap_disp bandmap_disp;
 
 extern struct dupechk *dupechk;
@@ -91,6 +96,7 @@ extern int count ;
 extern uint8_t *dispbuf_r, *dispbuf_l;
 extern int enable_usb_keying;
 extern int rtcadj_count;
+extern int clock_display_mode; // 0: JST (internal UTC+9), 1: UTC display
 extern int callhistf_stat ;  // 0 not open 1 open for reading 2 open for writing
 extern char qsologfn[20];    // qso log filename (append)
 extern char callhistfn[20];  // call history file to read

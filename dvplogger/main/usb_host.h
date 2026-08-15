@@ -89,10 +89,12 @@ class KbdRptParser : public KeyboardReportParser {
 
 
   void init_keyrpt_queue() ;
-  void send_keyrpt_queue() ;
+  bool send_keyrpt_queue() ;
+  uint32_t key_queue_drop_count = 0;
+  uint32_t key_queue_drop_last_report_ms = 0;
   
   public:
-  void process_keyrpt_queue() ;  
+  void process_keyrpt_queue(const char *profile_name = NULL) ;  
   KbdRptParser() {
     kbdLockingKeys.bLeds = 0;
     init_keyrpt_queue();
@@ -107,6 +109,7 @@ class KbdRptParser : public KeyboardReportParser {
   void OnKeyPressed(uint8_t key);
   void Parse_extKbd(uint8_t hid_code,bool on)   ;
   void init_extKbd();
+  void resync_extKbd(const char *reason);
   uint8_t OemToAscii(uint8_t mod, uint8_t key); // added to use  
   uint8_t OemToAscii2(uint8_t mod, uint8_t key); // added to use
   
@@ -124,6 +127,8 @@ extern KbdRptParser Prs,Prs1;
 
 void USB_desc(); // print usb descriptors
 void ACMprocess() ;
+bool usb_qmx_cat_ready();
+bool usb_cat_ready_for_rig_type(uint8_t cat_type);
 void CP2105process();
 void CP2105status(Stream *out = nullptr);
 bool CP2105selectPort(uint8_t port);

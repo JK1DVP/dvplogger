@@ -24,6 +24,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Arduino.h"
+#include "driver/uart.h"
 #include "decl.h"
 #include "variables.h"
 #include "callhist.h"
@@ -57,6 +58,8 @@
 #include "morse_decoder_simple.h"
 #include "mux_transport.h"
 #include "usb_host.h"
+#include "web_server.h"
+#include "AudioPlayer.h"
 int cmd_interp_state = 0;
 
 static Stream *command_output = nullptr;
@@ -450,18 +453,42 @@ void cmd_interp(char *cmd, Stream *output) {
 	  break;
       }
       if (strncmp(cmd,"flashersd",9)==0) {
-	out->println("flashersd boot part app spiffs (put what you want to flash).");
-	// stop mux serial port
-	deinit_mux_serial();
-	// stop using SD card
-	close_qsolog();
-	out->println("esp_flashersd() ... ");		
-	//      	esp_flasher();
-	esp_flasher_sd(cmd+9);
-	out->println("esp_flashersd() end... ");		
-	// restore mux serial port
-	init_mux_serial();
-      	break;
+        out->println("flashersd boot part app spiffs (put what you want to flash).");
+        out->println("[FLASHERSD] entering exclusive maintenance mode");
+
+        // flashersd owns SD for the entire operation. Main-loop jobs are
+        // naturally blocked by this synchronous call; stop the two known
+        // independent users as well: AsyncWebServer callbacks and AudioPlayer.
+        suspend_webserver_for_flash();
+        player.stop();
+        uint32_t audio_deadline = millis() + 1000;
+        while (player.isPlaying() && (int32_t)(millis() - audio_deadline) < 0)
+          delay(10);
+        if (player.isPlaying())
+          out->println("[FLASHERSD] warning: AudioPlayer did not stop within 1 s");
+
+        // Close MAIN's normal SD writer before the flasher starts streaming.
+        close_qsolog();
+
+        // UART2 is temporarily owned by esp-serial-flasher, not MUX.
+        const bool subcpu_was_online = subcpu_online;
+        deinit_mux_serial();
+        out->printf("[FLASHERSD] exclusive ready: uart2_driver=%d\n",
+                    uart_is_driver_installed(UART_NUM_2) ? 1 : 0);
+
+        esp_flasher_sd(cmd+9);
+
+        out->println("[FLASHERSD] flasher returned; restoring services");
+        if (subcpu_was_online) {
+          init_mux_serial();
+        } else {
+          f_mux_transport = 0;
+          mux_transport.mux_stream = NULL;
+          out->println("[FLASHERSD] SUBCPU was offline at boot; reboot to enable normal MUX services");
+        }
+        resume_webserver_after_flash();
+        out->println("[FLASHERSD] exclusive maintenance mode ended");
+        break;
       }
 
       if (strcmp(cmd,"memstat watch")==0) {

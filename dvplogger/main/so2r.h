@@ -95,6 +95,18 @@ private:
 
   int focused_radio_,focused_radio_prev_; // radio index corresponding to input entry window
 
+  // The receive/focus radio selected by the operator before a message starts.
+  // set_rx_in_sending_msg() temporarily moves focus to the other receiver, so
+  // focused_radio_prev_ is not a reliable return target: set_rx() updates it
+  // again while the TX sequence is running.
+  int tx_return_focus_radio_;
+  bool tx_return_focus_valid_;
+
+  // One persistent symmetric SO2R pair.  Only these two radios alternate:
+  // when either member transmits, the other member is selected for receive.
+  int so2r_pair_a_;
+  int so2r_pair_b_;
+
   int timeout_monitor; // timeout for monitoring string queue
   int queue_monitor_status;
 
@@ -108,6 +120,7 @@ public:
   SO2R() : tx_(0), rx_(0),stereo_(0),sequence_mode_(Manual),sequence_stat_(Default), qso_stat_{SendCQ,SendCQ,SendCQ}, sequence_stat_changed_(0),
 	   msg_tx_radio_(0),f_chgstat_tx_(0),f_chgstat_rx_(0),
 	   repeat_timer_(0),repeat_timer_set_(3000),msg_key_(0),repeat_cq_radio_(-1),focused_radio_(0),focused_radio_prev_(0),
+           tx_return_focus_radio_(0),tx_return_focus_valid_(false),so2r_pair_a_(0),so2r_pair_b_(1),
 	   timeout_monitor(0),queue_monitor_status(0),debug(0),
 	   radio_mode(0)
 
@@ -149,7 +162,6 @@ public:
     char *s1, *s;
     expand_macro_string(exp_buf,sizeof(exp_buf),exp_src);
     s1=expand_macro_string(exp_buf1,sizeof(exp_buf),exp_buf);  // expand macro twice
-    char buf[100];
     s=s1;
     int flag=0;
     while (*s) {
@@ -175,6 +187,7 @@ public:
     if (verbose&4)     console->print("so2r send_exch()");
     cancel_msg_tx();
     set_msg_tx_to_focused();
+    set_tx_to_msg_tx();
     set_rx_in_sending_msg(); // this will change focused radio so need to keep dealing with msg_tx_radio
     //    if (&radio_list[0]==radio) msg_tx_radio(0);
     //    else if (&radio_list[1]==radio) msg_tx_radio(1);
@@ -215,6 +228,7 @@ public:
 	if ((radio->modetype==LOG_MODETYPE_CW) || ((radio->f_tone_keying)) ) {
 	  cancel_msg_tx();
 	  set_msg_tx_to_focused();
+	  set_tx_to_msg_tx();
 	  set_rx_in_sending_msg(); // this will change focused radio so need to keep dealing with msg_tx_radio
 	  
 	  // send call and exchange , then move to my exch entry
@@ -226,6 +240,7 @@ public:
 	  if (plogw->voice_memory_enable==3) {
 	    cancel_msg_tx();
 	    set_msg_tx_to_focused();
+	    set_tx_to_msg_tx();
 	    set_rx_in_sending_msg();
 	    strcpy(radio->callsign_previously_sent, radio->callsign + 2);
 	    play_string_macro(plogw->cw_msg[4]+2);
@@ -234,6 +249,7 @@ public:
 	} else if (radio->modetype== LOG_MODETYPE_DG) {  // RTTY
 	  cancel_msg_tx();
 	  set_msg_tx_to_focused();
+	  set_tx_to_msg_tx();
 	  set_rx_in_sending_msg(); // this will change focused radio so need to keep dealing with msg_tx_radio
 	  // send call and exchange , then move to my exch entry
 	  strcpy(radio->callsign_previously_sent, radio->callsign + 2);
@@ -341,6 +357,7 @@ public:
       case LOG_MODETYPE_CW:
 	cancel_msg_tx();
 	set_msg_tx_to_focused();
+	set_tx_to_msg_tx();
 	set_rx_in_sending_msg();
 	
 	// in CW
@@ -359,6 +376,7 @@ public:
 	if (plogw->voice_memory_enable>=2) {
 	  cancel_msg_tx();
 	  set_msg_tx_to_focused();
+	  set_tx_to_msg_tx();
 	  set_rx_in_sending_msg();
 	  if (plogw->voice_memory_enable==3) {
 	    // play with voice generation
@@ -380,6 +398,7 @@ public:
       case LOG_MODETYPE_DG:
 	cancel_msg_tx();
 	set_msg_tx_to_focused();
+	set_tx_to_msg_tx();
 	set_rx_in_sending_msg();
 	
 	set_rttymemory_string(radio, 3, plogw->rtty_msg[2] + 2);  // set rtty memory on rig
@@ -399,6 +418,7 @@ public:
 
     struct radio *radio; // new
     radio= radio_msg_tx();
+    set_tx_to_msg_tx();
     radio->cq[radio->modetype]=LOG_CQ;
     
     repeat_cq_radio_= msg_tx_radio(); // memorize
@@ -538,8 +558,49 @@ public:
 
 
 
+  void remember_focus_before_message_tx() {
+    tx_return_focus_radio_ = focused_radio();
+    tx_return_focus_valid_ = true;
+    if (verbose & VERBOSE_SEQUENCE) {
+      console->printf("SO2R TX context save focus=%d tx=%d rx=%d\n",
+                      tx_return_focus_radio_, tx_, rx_);
+    }
+  }
+
+  void clear_message_tx_context() {
+    tx_return_focus_valid_ = false;
+  }
+
+  void request_restore_focus_after_message(int fallback_radio) {
+    int target = fallback_radio;
+    if (tx_return_focus_valid_ &&
+        tx_return_focus_radio_ >= 0 && tx_return_focus_radio_ <= 2) {
+      target = tx_return_focus_radio_;
+    }
+    if (verbose & VERBOSE_SEQUENCE) {
+      console->printf("SO2R TX context restore focus=%d saved_valid=%d msg_tx=%d current_focus=%d\n",
+                      target, tx_return_focus_valid_ ? 1 : 0,
+                      msg_tx_radio(), focused_radio());
+    }
+    tx_return_focus_valid_ = false;
+    request_set_rx(target);
+  }
+
   void set_msg_tx_to_focused() {
+    // Capture the operator-selected radio before set_rx_in_sending_msg()
+    // temporarily changes focused_radio_.
+    remember_focus_before_message_tx();
     msg_tx_radio(focused_radio());
+  }
+
+  // Start a Web-originated message on an explicitly selected radio without
+  // changing the operator focus first.  This preserves the true return focus
+  // and prevents a queued Web Radio command or SO2R RX switching from changing
+  // the physical TX radio while the message is being sent.
+  void set_msg_tx_to_radio(int radio) {
+    if (radio < 0 || radio >= N_RADIO) return;
+    remember_focus_before_message_tx();
+    msg_tx_radio(radio);
   }
 
   void set_tx_to_msg_tx() {
@@ -581,8 +642,72 @@ public:
     }
   }
 
+  int so2r_pair_a() const { return so2r_pair_a_; }
+  int so2r_pair_b() const { return so2r_pair_b_; }
+
+  int *so2r_pair_a_setting_ptr() { return &so2r_pair_a_; }
+  int *so2r_pair_b_setting_ptr() { return &so2r_pair_b_; }
+
+  bool so2r_pair_contains(int radio) const {
+    return radio == so2r_pair_a_ || radio == so2r_pair_b_;
+  }
+
+  int so2r_pair_radio(int tx_radio) const {
+    if (tx_radio == so2r_pair_a_) return so2r_pair_b_;
+    if (tx_radio == so2r_pair_b_) return so2r_pair_a_;
+    return -1;
+  }
+
+  int next_enabled_partner(int tx_radio, int direction) const {
+    if (tx_radio < 0 || tx_radio > 2) return -1;
+    const int step = direction < 0 ? -1 : 1;
+    for (int n = 1; n <= 3; ++n) {
+      int candidate = (tx_radio + step * n) % 3;
+      if (candidate < 0) candidate += 3;
+      if (candidate != tx_radio && radio_list[candidate].enabled) return candidate;
+    }
+    return -1;
+  }
+
+  bool set_so2r_pair(int radio_a, int radio_b) {
+    if (radio_a < 0 || radio_a > 2 || radio_b < 0 || radio_b > 2 ||
+        radio_a == radio_b || !radio_list[radio_a].enabled ||
+        !radio_list[radio_b].enabled) {
+      return false;
+    }
+    so2r_pair_a_ = radio_a;
+    so2r_pair_b_ = radio_b;
+    return true;
+  }
+
+  bool select_so2r_pair_for_radio(int radio, int direction) {
+    const int partner = next_enabled_partner(radio, direction);
+    return partner >= 0 && set_so2r_pair(radio, partner);
+  }
+
+  void validate_so2r_pairs() {
+    if (so2r_pair_a_ >= 0 && so2r_pair_a_ <= 2 &&
+        so2r_pair_b_ >= 0 && so2r_pair_b_ <= 2 &&
+        so2r_pair_a_ != so2r_pair_b_ &&
+        radio_list[so2r_pair_a_].enabled && radio_list[so2r_pair_b_].enabled) {
+      return;
+    }
+
+    int first = -1;
+    int second = -1;
+    for (int i = 0; i < 3; ++i) {
+      if (!radio_list[i].enabled) continue;
+      if (first < 0) first = i;
+      else { second = i; break; }
+    }
+    if (first >= 0 && second >= 0) {
+      so2r_pair_a_ = first;
+      so2r_pair_b_ = second;
+    }
+  }
+
   void set_rx_in_sending_msg() { // choose rx and set
-    // in SO2R switch rx 
+    // In SO2R, alternate only inside the one persistent symmetric pair.
     if (radio_mode==RADIO_MODE_SO2R) {
       switch(sequence_mode()) {
       case SO2R::Manual:
@@ -591,18 +716,14 @@ public:
       case SO2R::SO2R_Repeat_Func:
       case SO2R::SO2R_CQSandP:
       case SO2R::SO2R_ALTCQ:
-      case SO2R::SO2R_2BSIQ:
-	switch (msg_tx_radio()) {
-	case 0: set_rx(1); break;
-	case 1: set_rx(0); break;
-	case 2: set_rx(0); break;
-	}
-	// focused 0 RX1 -> listen to RX2 while CQ
-	//         1 RX2              RX1
-	// switch rx now
-	//	SO2R_process();
-	//	so2r.task();
+      case SO2R::SO2R_2BSIQ: {
+        validate_so2r_pairs();
+        const int partner = so2r_pair_radio(msg_tx_radio());
+        if (partner >= 0 && partner <= 2 && partner != msg_tx_radio()) {
+          set_rx(partner);
+        }
 	break;
+      }
       }
     }
   }
@@ -614,6 +735,7 @@ public:
     switch (radio_mode) {
     case RADIO_MODE_SAT:
     case RADIO_MODE_SO1R:
+      clear_message_tx_context();
       //      if (sequence_mode_ == SEQUENCE_MODE_REPEAT_FUNC) {
       if (sequence_mode() == Repeat_Func) {
 	if (verbose&4) 	console->println("repeat func timer start");
@@ -627,9 +749,11 @@ public:
 	//      case SEQUENCE_MODE_SO2R_REPEAT_FUNC:
       case Manual:
 	if (verbose&4) 	console->println("Manual");
+        request_restore_focus_after_message(msg_tx_radio());
 	sequence_stat(Default);
 	break;
       case Repeat_Func:
+        request_restore_focus_after_message(msg_tx_radio());
 	repeat_timer_start();
 	if (msg_tx_radio() == focused_radio()) {
 	  if (radio_selected()->callsign[2] != '\0' || radio_selected()->recv_exch[2] !='\0' ) { // any input exists in the window of message sent -> suspend 
@@ -644,7 +768,7 @@ public:
 	break;
       case SO2R_Repeat_Func:
 	if (verbose&4) 	console->println("SO2R_Repeat_Func");
-	request_set_rx(msg_tx_radio());
+        request_restore_focus_after_message(msg_tx_radio());
 	repeat_timer_start();	
 	if (msg_tx_radio() == focused_radio()) {
 	  if (radio_selected()->callsign[2] != '\0' || radio_selected()->recv_exch[2] !='\0' ) {
@@ -657,10 +781,13 @@ public:
 	break;
       case SO2R_CQSandP:
 	if (verbose&4) 	console->println("so2r cqsandp");
-	request_set_rx(msg_tx_radio());
+        request_restore_focus_after_message(msg_tx_radio());
 	sequence_stat(Default);
 	break;
       case SO2R_ALTCQ:
+        // ALTCQ intentionally selects the next radio; do not restore the
+        // operator focus saved for the completed transmission.
+        clear_message_tx_context();
 	if (verbose&4) 	console->println("altcq");
 	// switch to next radio cq 
 	switch (msg_tx_radio()) {
@@ -671,6 +798,8 @@ public:
 	send_cq();
 	break;
       case SO2R_2BSIQ:
+        // 2BSIQ also owns the next RX/TX selection explicitly.
+        clear_message_tx_context();
 	//	sequence_stat(Default);
 	if (verbose&4) 	console->println("2bsiq");
 	// switch radio
@@ -719,7 +848,7 @@ public:
     struct radio *radio;
     radio = radio_msg_tx();
 
-    if (verbose & 256) {
+    if (verbose & VERBOSE_SEQUENCE) {
       if (verbose&4)     console->println("onTx_stat_update()");
       print_sequence_stat();
       // debug repeat function
@@ -777,6 +906,7 @@ public:
     switch (radio_mode) {
     case RADIO_MODE_SAT:
     case RADIO_MODE_SO1R:
+      clear_message_tx_context();
       //      if (sequence_mode_ == SEQUENCE_MODE_REPEAT_FUNC) {
       if (sequence_mode() == Repeat_Func) {
 	sequence_stat(Sending_Msg);
@@ -794,6 +924,7 @@ public:
 	if (verbose&4) 	console->println("repeat func send message(in so2r mode)???");
 	sequence_stat(Sending_Msg);
 	set_msg_tx_to_focused();
+	set_tx_to_msg_tx();
 	set_rx_in_sending_msg();
 	function_keys(msg_key(), 0);
 	break;
@@ -1086,6 +1217,10 @@ public:
   }
 
   void set_tx(int tx) {
+    if (verbose & VERBOSE_SEQUENCE) {
+      console->printf("[TXSET ] old=%d new=%d msg=%d focus=%d seq=%d\n",
+                      tx_, tx, msg_tx_radio(), focused_radio(), sequence_stat());
+    }
     // need to stop cw keying before changing so2r_tx 25/5/6
     keying(0);
     

@@ -70,6 +70,11 @@ int f_transmission = 0;     // 0 nothing   1 force transmission on active trx 2 
 
 #define CW_MS_ELEMENT 1200
 int cw_spd = 24;  // wpm
+
+void clamp_cw_speed() {
+  if (cw_spd < CW_SPEED_MIN_WPM) cw_spd = CW_SPEED_MIN_WPM;
+  if (cw_spd > CW_SPEED_MAX_WPM) cw_spd = CW_SPEED_MAX_WPM;
+}
 int cw_dah_ratio_bunshi = 30;
 int cw_duty_ratio = 10; //  cw pulse width  10  pulse:gap = 1:1  15 pulse:gap = 15:5  5 pulse:gap = 5:15   // 未実装 24/7/21
 int cw_ratio_bunbo = 10;
@@ -184,9 +189,10 @@ void keying(int on)
       // make sure all other hardware ports are off
       break;
   case SO2R::RADIO_MODE_SO2R:  // SO2R
-      //      radio = &radio_list[plogw->so2r_tx];
-      //      radio = so2r.radio_tx();
-      radio=so2r.radio_msg_tx();
+      // Use the effective TX radio for the physical CW output.
+      // This keeps the keyed port consistent with PTT/CAT routing and
+      // the CW-message underline display, both of which use so2r.tx().
+      radio = so2r.radio_tx();
       if (plogw->f_so2rmini) {
         // make sure all hardware ports are off
         digitalWrite(LED, 0);
@@ -442,9 +448,9 @@ void init_cw_keying() {
   cw_sender.attach_ms(1, interrupt_cw_send);
 }
 
-int send_the_dits_and_dahs(char *cw_to_send) {
+int send_the_dits_and_dahs(const char *cw_to_send) {
   //  int p, p1;
-  char *cp;
+  const char *cp;
   cp = cw_to_send;
   char c;
   int ms_elem, ms;
@@ -1273,7 +1279,12 @@ char *expand_macro_string(char *p,size_t p_size, const char *s) { // expand macr
 
 
 
-void append_cwbuf_string(char *s) {
+void append_cwbuf_string(const char *s) {
+  if (verbose & VERBOSE_SEQUENCE) {
+    console->printf("[CWSTART] tx=%d msg=%d focus=%d seq=%d text=\"%.32s\"\n",
+                    so2r.tx(), so2r.msg_tx_radio(), so2r.focused_radio(),
+                    so2r.sequence_stat(), s ? s : "");
+  }
   //  struct radio *radio;
   //  radio = radio_selected;
   //  radio = &radio_list[plogw->so2r_tx];

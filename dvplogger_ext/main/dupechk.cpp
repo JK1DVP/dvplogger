@@ -49,6 +49,29 @@ static uint16_t makedupe_bulk_worked[2][N_BAND];
 // request can be active at a time.
 static struct check_entry_list *dupechk_partial_entry_list = NULL;
 
+#ifndef VERBOSE_DUPE
+#define VERBOSE_DUPE 16384
+#endif
+
+#define DUPE_EXACT_CACHE_SIZE 8
+struct dupe_exact_cache_entry {
+  bool valid;
+  char call[LEN_CALLSIGN + 1];
+  uint8_t bandmode;
+  uint8_t mask;
+  bool want_exch;
+  bool dupe;
+  bool has_exch;
+  char exch[LEN_EXCH + 1];
+};
+static struct dupe_exact_cache_entry dupe_exact_cache[DUPE_EXACT_CACHE_SIZE];
+static uint8_t dupe_exact_cache_next = 0;
+
+static void invalidate_dupe_exact_cache() {
+  memset(dupe_exact_cache, 0, sizeof(dupe_exact_cache));
+  dupe_exact_cache_next = 0;
+}
+
 // bandmode calculation 
 unsigned char bandmode_param(int bandid,int modetype) {
   return bandid * 4 + modetype;
@@ -141,6 +164,10 @@ void process_dupechk_partial_query_subcpu(char *s) {
   int count = 0;
   int ndupe = 0;
   int call_len;
+  uint32_t qso_start_us, qso_us, hist_start_us, hist_us = 0;
+  unsigned int qso_scanned = 0, hist_scanned = 0;
+  char matched_qso[10][LEN_CALLSIGN + 1];
+  int nmatched_qso = 0;
 
   if (sscanf(s, "%u|%12[^|]|%u|%u|%u",
              &query_id, call, &bandmode, &mask, &max_entries) != 5) {
@@ -150,12 +177,26 @@ void process_dupechk_partial_query_subcpu(char *s) {
     return;
   }
 
+  {
+    char ack[32];
+    snprintf(ack, sizeof(ack), "dupeack:%u A", query_id);
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)ack, strlen(ack));
+  }
+
   if (max_entries > 10) max_entries = 10;
   call_len = strlen(call);
   used = snprintf(response, sizeof(response), "dupepr:%u|0|0", query_id);
 
+  qso_start_us = micros();
   for (int i = 0; i < dupechk->ncallsign && count < (int)max_entries; i++) {
+    qso_scanned++;
     if (strstr(dupechk->callsign[i], call) == NULL) continue;
+    if (nmatched_qso < 10) {
+      strncpy(matched_qso[nmatched_qso], dupechk->callsign[i], LEN_CALLSIGN);
+      matched_qso[nmatched_qso][LEN_CALLSIGN] = '\0';
+      nmatched_qso++;
+    }
 
     int flags = CHECK_ENTRY_FLAG_DUPECHECK_LIST;
     if (call_len == (int)strlen(dupechk->callsign[i])) {
@@ -177,15 +218,21 @@ void process_dupechk_partial_query_subcpu(char *s) {
     response[used] = '\0';
     count++;
   }
+  qso_us = (uint32_t)(micros() - qso_start_us);
 
 #ifdef DVPLOGGER_EXT
   // Fill remaining slots from the microSD Call History stored on the subcpu.
+  // Any QSO callsign matching this partial string was already collected above;
+  // compare against that small set instead of rescanning the whole QSO database
+  // for every Call History candidate.
+  hist_start_us = micros();
   for (int ci = 0; ci < get_callhist_subcpu_count() && count < (int)max_entries; ci++) {
+    hist_scanned++;
     const char *hc = NULL, *he = NULL;
     if (!get_callhist_subcpu_entry(ci, &hc, &he) || strstr(hc, call) == NULL) continue;
     bool already = false;
-    for (int j = 0; j < dupechk->ncallsign; j++) {
-      if (strcmp(dupechk->callsign[j], hc) == 0) { already = true; break; }
+    for (int j = 0; j < nmatched_qso; j++) {
+      if (strcmp(matched_qso[j], hc) == 0) { already = true; break; }
     }
     if (already) continue;
     int flags = CHECK_ENTRY_FLAG_CALLHIST_LIST;
@@ -196,16 +243,20 @@ void process_dupechk_partial_query_subcpu(char *s) {
     memcpy(response + used, item, item_len);
     used += item_len; response[used] = '\0'; count++;
   }
+  hist_us = (uint32_t)(micros() - hist_start_us);
 #endif
 
-  // Fill in count and dupe_count without changing the variable-length tail.
+  // Fill in count and dupe_count, and put timing metadata before the
+  // variable-length result entries so MAIN can parse it without ambiguity.
   char final_response[240];
   const char *tail = strchr(response + 7, '|');
   if (tail != NULL) tail = strchr(tail + 1, '|');
   if (tail != NULL) tail = strchr(tail + 1, '|');
   if (tail == NULL) tail = "";
-  snprintf(final_response, sizeof(final_response), "dupepr:%u|%d|%d%s",
-           query_id, count, ndupe, tail);
+  snprintf(final_response, sizeof(final_response),
+           "dupepr:%u|%d|%d|T=%lu,%u,%lu,%u%s",
+           query_id, count, ndupe, (unsigned long)(qso_us + hist_us),
+           qso_scanned, (unsigned long)hist_us, hist_scanned, tail);
   mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
                          (unsigned char *)final_response, strlen(final_response));
 }
@@ -298,25 +349,77 @@ void process_dupechk_query_subcpu(char *s) {
     return;
   }
 
-  // Search backwards so that the newest exchange is returned.
-  for (int i = dupechk->ncallsign - 1; i >= 0; i--) {
-    if (strcmp(dupechk->callsign[i], callsign) != 0) continue;
-    if (want_exch && !has_exch && dupechk->exch[i][0] != '\0') {
-      strncpy(exch, dupechk->exch[i], LEN_EXCH);
-      exch[LEN_EXCH] = '\0';
-      has_exch = 1;
-    }
-    if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) dupe = 1;
-    if (dupe && (!want_exch || has_exch)) break;
+  {
+    char ack[32];
+    snprintf(ack, sizeof(ack), "dupeack:%u E", query_id);
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)ack, strlen(ack));
   }
 
+  uint32_t search_start_us = micros();
+  uint32_t search_us;
+  unsigned int qso_scanned = 0;
+  unsigned int hist_scanned = 0;
+  bool cache_hit = false;
+
 #ifdef DVPLOGGER_EXT
-  if (want_exch && !has_exch && search_callhist_subcpu_local(callsign, exch, sizeof(exch))) {
-    has_exch = 1;
+  for (int ci = 0; ci < DUPE_EXACT_CACHE_SIZE; ci++) {
+    struct dupe_exact_cache_entry *ce = &dupe_exact_cache[ci];
+    if (!ce->valid || ce->bandmode != bandmode || ce->mask != mask ||
+        ce->want_exch != (want_exch != 0) || strcmp(ce->call, callsign) != 0)
+      continue;
+    dupe = ce->dupe;
+    has_exch = ce->has_exch;
+    if (has_exch) {
+      strncpy(exch, ce->exch, LEN_EXCH);
+      exch[LEN_EXCH] = '\0';
+    }
+    cache_hit = true;
+    break;
   }
 #endif
-  snprintf(response, sizeof(response), "duper:%u %d %d %s",
-           query_id, dupe, has_exch, has_exch ? exch : "-");
+
+  if (!cache_hit) {
+    // Search backwards so that the newest exchange is returned. Cluster and
+    // bandmap checks use this exact-match path and avoid the partial/history scan.
+    for (int i = dupechk->ncallsign - 1; i >= 0; i--) {
+      qso_scanned++;
+      if (strcmp(dupechk->callsign[i], callsign) != 0) continue;
+      if (want_exch && !has_exch && dupechk->exch[i][0] != '\0') {
+        strncpy(exch, dupechk->exch[i], LEN_EXCH);
+        exch[LEN_EXCH] = '\0';
+        has_exch = 1;
+      }
+      if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) dupe = 1;
+      if (dupe && (!want_exch || has_exch)) break;
+    }
+
+#ifdef DVPLOGGER_EXT
+    if (want_exch && !has_exch) {
+      hist_scanned = get_callhist_subcpu_count();
+      if (search_callhist_subcpu_local(callsign, exch, sizeof(exch))) has_exch = 1;
+    }
+    struct dupe_exact_cache_entry *ce = &dupe_exact_cache[dupe_exact_cache_next];
+    memset(ce, 0, sizeof(*ce));
+    ce->valid = true;
+    strncpy(ce->call, callsign, LEN_CALLSIGN);
+    ce->call[LEN_CALLSIGN] = '\0';
+    ce->bandmode = bandmode;
+    ce->mask = mask;
+    ce->want_exch = want_exch != 0;
+    ce->dupe = dupe != 0;
+    ce->has_exch = has_exch != 0;
+    if (has_exch) {
+      strncpy(ce->exch, exch, LEN_EXCH);
+      ce->exch[LEN_EXCH] = '\0';
+    }
+    dupe_exact_cache_next = (dupe_exact_cache_next + 1) % DUPE_EXACT_CACHE_SIZE;
+#endif
+  }
+  search_us = (uint32_t)(micros() - search_start_us);
+  snprintf(response, sizeof(response), "duper:%u %d %d %s %lu %u %u %u",
+           query_id, dupe, has_exch, has_exch ? exch : "-",
+           (unsigned long)search_us, qso_scanned, hist_scanned, cache_hit ? 1U : 0U);
   mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
                          (unsigned char *)response, strlen(response));
 }
@@ -539,11 +642,20 @@ void entry_dupechk_call_exch_bandmode(char *callsign,char *recv_exch,unsigned ch
     strcpy(dupechk->exch[i], recv_exch );
     dupechk->bandmode[i] = bandmode;
     dupechk->ncallsign++;
+    invalidate_dupe_exact_cache();
   }
 }
 
 #ifdef DVPLOGGER_EXT
 void begin_makedupe_bulk_subcpu(unsigned char mask) {
+  /* Rebuild the SUBCPU DUPE database from the QSO log from the beginning. */
+  if (dupechk != NULL) {
+    dupechk->ncallsign = 0;
+    dupechk->dupechk_status = 0;
+    dupechk->dupechk_timeout = 0;
+  }
+  invalidate_dupe_exact_cache();
+
   dupechk_current_mask = mask;
   makedupe_bulk_mask = dupechk_current_mask;
   memset(makedupe_bulk_worked, 0, sizeof(makedupe_bulk_worked));
@@ -578,6 +690,15 @@ void entry_makedupe_bulk_subcpu(char *s) {
   if (dupechk->ncallsign >= dupechk->nmaxqso) return;
   entry_dupechk_call_exch_bandmode(callsign, recv_exch,
                                    (unsigned char)bandmode);
+
+  // MAIN owns the contest multiplier definitions. Notify MAIN for every
+  // QSO accepted by the SUBCPU dupe filter so that MAIN counts accepted
+  // QSOs and multipliers from exactly the same filtered QSO set.
+  char accepted[48];
+  snprintf(accepted, sizeof(accepted), "dupebulka:%u|%.*s",
+           (unsigned int)bandmode, LEN_EXCH, recv_exch);
+  mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                         (unsigned char *)accepted, strlen(accepted));
 
   int bandid = bandmode / 4;
   int modetype = bandmode % 4;
@@ -669,6 +790,7 @@ void init_dupechk_maincpu()
 
 void init_dupechk_subcpu()
 {
+  invalidate_dupe_exact_cache();
   init_dupechk(NMAXQSO_SUBCPU,2);
 }
 

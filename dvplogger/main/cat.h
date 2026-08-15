@@ -34,6 +34,7 @@
 #define RIG_TYPE_MANUAL 4 // manual rig
 #define RIG_TYPE_ELECRAFT_KX 6
 #define RIG_TYPE_XIEGU_X6100 7 // Xiegu X6100 (ICOM CI-V derivative)
+#define RIG_TYPE_QMX 8 // QRP Labs QMX
 
 #define CAT_TYPE_CIV 0
 #define CAT_TYPE_YAESU_NEW 1
@@ -42,6 +43,8 @@
 #define CAT_TYPE_YAESU_OLD 4  // FT3000
 #define CAT_TYPE_ELECRAFT_KX 5  // elecraft
 #define CAT_TYPE_YAESU_FT817 6  // FT817
+#define CAT_TYPE_QMX 7  // QRP Labs QMX (Kenwood-derived CAT)
+
 
 
 struct catmsg_t {  // data structure to exchange cat/ci-v data by freertos queue
@@ -75,7 +78,7 @@ void add_civ_buf(byte c) ;
 void clear_civ_buf() ;
 void send_civ_buf_radio(struct radio *radio) ;
 void send_civ_buf(Stream *civport);
-void send_cat_cmd(struct radio *radio, char *cmd);
+void send_cat_cmd(struct radio *radio, const char *cmd);
 void receive_cat_data(struct radio *radio) ;
 int freq_width_mode(char *opmode);
 void set_power(struct radio *radio, int power) ;
@@ -84,6 +87,7 @@ void set_scope() ;
 void send_rit_setting(struct radio *radio, int rit, int xit) ;
 void send_rit_freq_civ(struct radio *radio, int freq) ;
 void send_freq_set_civ(struct radio *radio, unsigned int freq) ;
+void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio);
 void send_mode_set_civ(const char *opmode, int filnr) ;
 void send_gps_query_civ(struct radio *radio) ;
 void send_freq_query_civ(struct radio *radio) ;
@@ -140,13 +144,13 @@ void print_serial_instance(Stream *out = nullptr);
 void print_rig_spec_str(int rig_idx,char *buf); // reverse set rig_spec_string from rig_spec
 
 int check_rig_conflict(int rig_idx,struct rig *rig_spec);
-void load_rigs(char *fn);
-void save_rigs(char *fn);
+void load_rigs(const char *fn);
+void save_rigs(const char *fn);
 void init_radio(struct radio *radio, const char *rig_name);
 void set_rig_spec_from_str(struct radio *radio, char *s);
 void set_rig_spec_str_from_spec(struct radio *radio); // reverse set rig_spec_string from rig_spec
 void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s);
-void save_rigs(char *fn);
+void save_rigs(const char *fn);
 void set_rig_from_name(struct radio *radio) ;
 void switch_transverter() ;
 void signal_process();
@@ -162,6 +166,7 @@ int antenna_alternate_command(char *s);
 
 void save_freq_mode_filt(struct radio *radio) ;
 void recall_freq_mode_filt(struct radio *radio) ;
+void recall_freq_mode_filt_for_modetype(struct radio *radio, int target_modetype) ;
 int bandid2freq(int bandid, struct radio *radio) ;
 char *default_opmode(int bandid, int modetype) ;
 int default_filt(const char *opmode) ;

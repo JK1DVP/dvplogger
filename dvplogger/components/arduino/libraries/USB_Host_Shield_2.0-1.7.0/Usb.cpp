@@ -186,6 +186,21 @@ uint8_t USB::ctrlReq(uint8_t addr, uint8_t ep, uint8_t bmReqType, uint8_t bReque
 
                                 left -= read;
 
+                                /*
+                                 * Some full-speed composite devices (QMX in
+                                 * particular) need one or more SOF intervals
+                                 * before they can supply the next packet of a
+                                 * long control-IN transfer.  Without this pause
+                                 * the first 64-byte descriptor packet succeeds
+                                 * but the following IN token repeatedly returns
+                                 * NAK.  This path is used by streaming descriptor
+                                 * parsers; a 2 ms pause is harmless during USB
+                                 * enumeration and avoids restarting the entire
+                                 * GET_DESCRIPTOR request.
+                                 */
+                                if(p && left && read == nbytes)
+                                        delay(2);
+
                                 if(read < nbytes)
                                         break;
                         }
@@ -879,25 +894,44 @@ uint8_t USB::getConfDescr(uint8_t addr, uint8_t ep, uint16_t nbytes, uint8_t con
 /* Requests Configuration Descriptor. Sends two Get Conf Descr requests. The first one gets the total length of all descriptors, then the second one requests this
  total length. The length of the first request can be shorter ( 4 bytes ), however, there are devices which won't work unless this length is set to 9 */
 uint8_t USB::getConfDescr(uint8_t addr, uint8_t ep, uint8_t conf, USBReadParser *p) {
-        const uint8_t bufSize = 64;
-        uint8_t buf[bufSize];
-        USB_CONFIGURATION_DESCRIPTOR *ucd = reinterpret_cast<USB_CONFIGURATION_DESCRIPTOR *>(buf);
+        uint8_t header[sizeof(USB_CONFIGURATION_DESCRIPTOR)];
+        USB_CONFIGURATION_DESCRIPTOR *ucd = reinterpret_cast<USB_CONFIGURATION_DESCRIPTOR *>(header);
 
-        uint8_t ret = getConfDescr(addr, ep, 9, conf, buf);
-
+        uint8_t ret = getConfDescr(addr, ep, sizeof(header), conf, header);
         if(ret)
                 return ret;
 
-        uint16_t total = ucd->wTotalLength;
-
-        //USBTRACE2("\r\ntotal conf.size:", total);
+        const uint16_t total = ucd->wTotalLength;
+        if(total < sizeof(USB_CONFIGURATION_DESCRIPTOR))
+                return USB_ERROR_INVALID_ARGUMENT;
 
         /*
-	   At least 045e:0289 complains if nbytes is greater than total when calling ctrlReq().
-           Make sure that we don't request chunks greater than total length, now that XBOXOLD
-	   retrieves and parses configuration descriptors.
-	 */
-        return ( ctrlReq(addr, ep, bmREQ_GET_DESCR, USB_REQUEST_GET_DESCRIPTOR, conf, USB_DESCRIPTOR_CONFIGURATION, 0x0000, total, (total<bufSize)?total:bufSize, buf, p));
+         * Keep the complete descriptor transfer inside one InTransfer() call.
+         *
+         * The former streaming path asked ctrlReq() to fetch only 64 bytes at
+         * a time.  ctrlReq() then re-entered InTransfer() for every packet.
+         * Some composite devices, notably QMX (0483:a34c), NAK the second IN
+         * token when the data stage is split this way even though the USB data
+         * toggle is restored.  A single continuous control-IN data stage is
+         * also closer to the USB Host Shield library's normal transfer model.
+         *
+         * Configuration descriptors are small during enumeration (QMX is 268
+         * bytes), so temporarily buffering the complete descriptor is a safe
+         * and simple solution.  Parse it only after the status stage succeeds.
+         */
+        uint8_t *buf = (uint8_t*)malloc(total);
+        if(!buf)
+                return USB_ERROR_OUT_OF_ADDRESS_SPACE_IN_POOL;
+
+        ret = ctrlReq(addr, ep, bmREQ_GET_DESCR, USB_REQUEST_GET_DESCRIPTOR,
+                      conf, USB_DESCRIPTOR_CONFIGURATION, 0x0000,
+                      total, total, buf, NULL);
+
+        if(!ret && p)
+                p->Parse(total, buf, 0);
+
+        free(buf);
+        return ret;
 }
 
 //get string descriptor

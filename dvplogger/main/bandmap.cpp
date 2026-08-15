@@ -42,6 +42,23 @@
 
 
 // now bandmap[N_BAND] is bandmap entry list for all valid band sorted by time of arrival 25/8/16
+
+
+static uint32_t bandmap_last_receive_second = 0;
+static uint16_t bandmap_receive_order = 0;
+
+void stamp_bandmap_entry(struct bandmap_entry *p) {
+  if (p == NULL) return;
+  const uint32_t now = (uint32_t)my_rtc.unixtime();
+  if (now != bandmap_last_receive_second) {
+    bandmap_last_receive_second = now;
+    bandmap_receive_order = 0;
+  } else if (bandmap_receive_order < UINT16_MAX) {
+    ++bandmap_receive_order;
+  }
+  p->time = (int)now;
+  p->receive_order = bandmap_receive_order;
+}
 // will always sort by time and the last item will be deleted 
 
 void print_bandmap_mask()
@@ -75,7 +92,10 @@ int compare_bandmap_entry(const void *a, const void *b) {
 	// small time difference then check new multi
 	if (b1->flag&BANDMAP_ENTRY_FLAG_NEWMULTI) {
 	  if (a1->flag&BANDMAP_ENTRY_FLAG_NEWMULTI) {
-	    return (b1->time - a1->time); // both newmulti
+            if (b1->time != a1->time) return (b1->time > a1->time) ? 1 : -1;
+            if (b1->receive_order != a1->receive_order)
+              return (b1->receive_order > a1->receive_order) ? 1 : -1;
+            return 0; // both newmulti
 	  } else {
 	    return -1;
 	  }
@@ -83,11 +103,17 @@ int compare_bandmap_entry(const void *a, const void *b) {
 	  if (a1->flag&BANDMAP_ENTRY_FLAG_NEWMULTI) {
 	    return 1;
 	  } else {
-	    return (b1->time - a1->time); // both not new multi
+            if (b1->time != a1->time) return (b1->time > a1->time) ? 1 : -1;
+            if (b1->receive_order != a1->receive_order)
+              return (b1->receive_order > a1->receive_order) ? 1 : -1;
+            return 0; // both not new multi
 	  }
 	}
       } else {
-	return (b1->time - a1->time);
+        if (b1->time != a1->time) return (b1->time > a1->time) ? 1 : -1;
+        if (b1->receive_order != a1->receive_order)
+          return (b1->receive_order > a1->receive_order) ? 1 : -1;
+        return 0;
       }
       break;
     case 1:  // freq
@@ -290,105 +316,57 @@ void set_current_rig_priority() {
 // return -1 not found any radio else chosen target radio
 int find_appropriate_radio(int bandid)
 {
-    if (bandid < 1 || bandid >= N_BAND) {
-        return -1;
+  if (bandid < 1 || bandid >= N_BAND) return -1;
+
+  const int band_bit = 1 << (bandid - 1);
+  const int focused = so2r.focused_radio();
+
+  /*
+   * Absolute first priority: a radio whose CONFIRMED current operating band
+   * already matches the selected spot.  Do not use freq_target here; a stale
+   * or still-pending CAT target must not steal the spot from a radio that is
+   * actually operating on this band.
+   */
+  if (focused >= 0 && focused < 3) {
+    struct radio *radio = &radio_list[focused];
+    if (radio->enabled && (radio->band_mask & band_bit) == 0 &&
+        radio->bandid == bandid) {
+      return focused;
     }
+  }
 
-    const int band_bit = 1 << (bandid - 1);
-    const int focused = so2r.focused_radio();
+  for (int i = 0; i < 3; ++i) {
+    struct radio *radio = &radio_list[i];
+    if (!radio->enabled) continue;
+    if ((radio->band_mask & band_bit) != 0) continue;
+    if (radio->bandid == bandid) return i;
+  }
 
-    int normal_on_band = -1;
-    int normal_priority = -1;
-    int normal_fallback = -1;
+  /* No radio is currently on-band: honour the per-band priority next. */
+  for (int i = 0; i < 3; ++i) {
+    struct radio *radio = &radio_list[i];
+    if (!radio->enabled) continue;
+    if ((radio->band_mask & band_bit) != 0) continue;
+    if ((radio->band_mask_priority & band_bit) != 0) return i;
+  }
 
-    int manual_on_band = -1;
-    int manual_priority = -1;
-    int manual_fallback = -1;
+  /* Then keep the focused radio when it can cover the requested band. */
+  if (focused >= 0 && focused < 3) {
+    struct radio *radio = &radio_list[focused];
+    if (radio->enabled && (radio->band_mask & band_bit) == 0) return focused;
+  }
 
-    for (int i = 0; i < 3; i++) {
-        struct radio *radio = &radio_list[i];
+  /* Finally prefer a CAT-controlled radio; MANUAL is the last fallback. */
+  int manual_fallback = -1;
+  for (int i = 0; i < 3; ++i) {
+    struct radio *radio = &radio_list[i];
+    if (!radio->enabled) continue;
+    if ((radio->band_mask & band_bit) != 0) continue;
+    if (!is_manual_rig(radio)) return i;
+    if (manual_fallback < 0) manual_fallback = i;
+  }
 
-        if (!radio->enabled) {
-            continue;
-        }
-
-        /* This radio cannot operate on the requested band. */
-        if ((radio->band_mask & band_bit) != 0) {
-            continue;
-        }
-
-        const bool manual = is_manual_rig(radio);
-        const bool on_band = (radio->bandid == bandid);
-        const bool priority =
-            ((radio->band_mask_priority & band_bit) != 0);
-
-        if (!manual) {
-            /*
-             * A CAT-controlled radio already operating on the requested
-             * band is the best choice.
-             */
-            if (on_band) {
-                if (i == focused) {
-                    return i;
-                }
-                if (normal_on_band < 0) {
-                    normal_on_band = i;
-                }
-                continue;
-            }
-
-            if (priority && normal_priority < 0) {
-                normal_priority = i;
-            }
-
-            if (i == focused) {
-                /*
-                 * Remember the focused normal radio, but do not return yet:
-                 * another normal radio may already be on the requested band.
-                 */
-                normal_fallback = i;
-            } else if (normal_fallback < 0) {
-                normal_fallback = i;
-            }
-        } else {
-            /*
-             * Manual radios are fallback candidates only.
-             */
-            if (on_band && manual_on_band < 0) {
-                manual_on_band = i;
-            }
-
-            if (priority && manual_priority < 0) {
-                manual_priority = i;
-            }
-
-            if (manual_fallback < 0) {
-                manual_fallback = i;
-            }
-        }
-    }
-
-    if (normal_on_band >= 0) {
-        return normal_on_band;
-    }
-
-    if (normal_priority >= 0) {
-        return normal_priority;
-    }
-
-    if (normal_fallback >= 0) {
-        return normal_fallback;
-    }
-
-    if (manual_on_band >= 0) {
-        return manual_on_band;
-    }
-
-    if (manual_priority >= 0) {
-        return manual_priority;
-    }
-
-    return manual_fallback;
+  return manual_fallback;
 }
 
 int find_appropriate_radio_bak(int bandid) {
@@ -489,72 +467,85 @@ int select_appropriate_radio(int bandid) {
 
 int set_station_entry(struct radio *radio, char *station, unsigned int freq, const char *opmode)
 {
+  if (!radio || !radio->enabled) return 0;
+
   if (!plogw->f_console_emu) {
-  plogw->ostream->print("set_station_entry():");
-  plogw->ostream->print(station);
-  plogw->ostream->print(" ");
-  plogw->ostream->print(freq);
-  plogw->ostream->print(" rig_idx ");
-  plogw->ostream->print(radio->rig_idx);
-  plogw->ostream->print(" opmode ");  
-  plogw->ostream->println(opmode);
-  
-  }
-  int modenum;
-  if (!plogw->f_console_emu) {    
-  plogw->ostream->print("set_station_entry opmode:");
-  plogw->ostream->print(opmode);
+    plogw->ostream->print("set_station_entry():");
+    plogw->ostream->print(station);
+    plogw->ostream->print(" ");
+    plogw->ostream->print(freq);
+    plogw->ostream->print(" rig_idx ");
+    plogw->ostream->print(radio->rig_idx);
+    plogw->ostream->print(" opmode ");
+    plogw->ostream->println(opmode);
   }
 
-  modenum = rig_modenum(opmode);
-  if (!plogw->f_console_emu) {    
-    plogw->ostream->print("modenum ");
-    plogw->ostream->println(modenum);
-  }
+  const int modenum = rig_modenum(opmode);
   if (modenum < 0) {
-  if (!plogw->f_console_emu) {      
-    plogw->ostream->println("invalid opmode");
-  }
+    if (!plogw->f_console_emu) {
+      plogw->ostream->println("invalid opmode");
+    }
     return 0;
   }
-  const char *opmode_str ;
-  opmode_str = opmode_string(modenum);
-  if (!plogw->f_console_emu) {    
-  plogw->ostream->print("modenum:");
-  plogw->ostream->print(modenum);
-  plogw->ostream->print(" opmode_str:");
-  plogw->ostream->println(opmode_str);
+
+  const char *opmode_str = opmode_string(modenum);
+  const int target_modetype = modetype_string(opmode_str);
+  const int target_bandid = freq2bandid(freq);
+  if (target_bandid < 1 || target_bandid > N_BAND ||
+      target_modetype < LOG_MODETYPE_CW || target_modetype > LOG_MODETYPE_DG) {
+    return 0;
   }
 
-  strncpy(radio->callsign + 2, station, 10);
+  /*
+   * Preserve the frequency/mode/filter of the target radio before QSY.
+   * In particular, when it is running CQ, this keeps its CQ frequency so
+   * Alt-Q can return to it after the S&P QSO.
+   */
+  save_freq_mode_filt(radio);
 
+  /* Alt-Space always starts/continues S&P on the selected target radio. */
+  radio->cq[target_modetype] = LOG_SandP;
+  radio->cq_bank[target_bandid][target_modetype] = LOG_SandP;
+  radio->modetype_bank[target_bandid] = target_modetype;
 
-  //set_frequency(freq,radio);  // this should be civ process not here ? 23/4/23
-  // set_mode_nonfil(opmode_str, radio); // here also
-
-  // radio->modetype need to be changed here
-
-  int modetype = modetype_string(opmode_str);
-  // and force S&P for the modetype
-  radio->cq[modetype] = LOG_SandP;
-  // and temporal bandid
-  int bandid = freq2bandid(freq);
-
-  // then check filt for the target modetype and band
-  int filt;
-  filt = radio->filtbank[bandid][radio->cq[modetype]][modetype];
-  if (!plogw->f_console_emu) {    
-    plogw->ostream->println("filt="); plogw->ostream->println(filt);
+  int filt = radio->filtbank[target_bandid][LOG_SandP][target_modetype];
+  if (filt == 0) {
+    filt = default_filt(opmode_str);
   }
-  // then set these target values to the radio
-  set_frequency_rig(freq);
-  send_mode_set_civ(opmode_str, filt);
+
+  /*
+   * The new spot replaces the remembered S&P frequency.  Store it now,
+   * rather than waiting for the CAT response, so a rapid CQ/S&P switch cannot
+   * recall the previous S&P frequency.
+   */
+  radio->freqbank[target_bandid][LOG_SandP][target_modetype] = freq;
+  radio->modebank[target_bandid][LOG_SandP][target_modetype] = modenum;
+  radio->filtbank[target_bandid][LOG_SandP][target_modetype] = filt;
+
+  set_callsign_and_request_dupe(radio, station, true);
+
+  /*
+   * Reflect the selected spot in the chosen radio immediately.  The CAT
+   * acknowledgement may arrive later; until then, display and band matching
+   * must not continue to use the old frequency/mode from this radio.
+   */
+  radio->freq_prev = radio->freq;
+  radio->freq = freq;
+  radio->freq_target = freq;
+  radio->bandid_prev = radio->bandid;
+  radio->bandid = target_bandid;
+  radio->bandid_bandmap = target_bandid;
+  set_mode(opmode_str, filt, radio);
+  radio->filt = filt;
+  bandmap_disp.f_update = 1;
+
+  /* Do not fall back to the focused radio: program the chosen radio itself. */
+  set_frequency_rig_radio(freq, radio);
+  send_mode_set_civ_radio(opmode_str, filt, radio);
 
   upd_display();
-
   return 1;
 }
-
 
 void mark_bandmap_call_worked(const char *station, int bandid, int qso_bandmode) {
   if (!station || !*station || bandid < 1 || bandid > N_BAND) return;
@@ -574,49 +565,56 @@ void mark_bandmap_call_worked(const char *station, int bandid, int qso_bandmode)
 }
 
 void pick_entry_bandmap() {
-  struct radio *radio;
-  radio = so2r.radio_selected();
-  console->print("pick_entry_bandmap() radio_selected ");
-  console->println(radio->rig_idx);
-  
-  if (*bandmap_disp.on_cursor_station == '\0') return;
+  /*
+   * Cluster input can update the bandmap while Alt-Space is being handled.
+   * Take one coherent snapshot and use it for the entire operation.
+   */
+  char station[LEN_CALLSIGN + 1];
+  strlcpy(station, bandmap_disp.on_cursor_station, sizeof(station));
+  const unsigned int freq = bandmap_disp.on_cursor_freq;
+  const int modeid = bandmap_disp.on_cursor_modeid;
 
-  int tmp;
-  tmp = freq2bandid(bandmap_disp.on_cursor_freq);
-  if (tmp < 1 || tmp > N_BAND) return;
+  if (station[0] == '\0' || modeid < 0 || modeid >= NMODEID) return;
 
-  const int spot_mode = modetype[bandmap_disp.on_cursor_modeid];
-  const int spot_bandmode = bandmode_param(tmp, spot_mode);
-  if (dupe_check_nocallhist(bandmap_disp.on_cursor_station, spot_bandmode,
-                            plogw->mask)) {
-    mark_bandmap_call_worked(bandmap_disp.on_cursor_station, tmp,
-                             spot_bandmode);
+  const int target_bandid = freq2bandid(freq);
+  if (target_bandid < 1 || target_bandid > N_BAND) return;
+
+  const int spot_mode = modetype[modeid];
+  const int spot_bandmode = bandmode_param(target_bandid, spot_mode);
+  if (dupe_check_nocallhist(station, spot_bandmode, plogw->mask)) {
+    mark_bandmap_call_worked(station, target_bandid, spot_bandmode);
     if (!plogw->f_console_emu) {
       plogw->ostream->print("bandmap pick rejected: DUPE ");
-      plogw->ostream->println(bandmap_disp.on_cursor_station);
+      plogw->ostream->println(station);
     }
     upd_display_bandmap();
     return;
   }
 
-  // check if selected_radio do not have bandmask bit set
-  if (!select_appropriate_radio(tmp)) {  // これをpick したbandid で運用されているradio が選ばれるはずがそうなっていない。26/7/8
-    if (!plogw->f_console_emu) {      
+  const int target_radio_idx = find_appropriate_radio(target_bandid);
+  if (target_radio_idx < 0) {
+    if (!plogw->f_console_emu) {
       plogw->ostream->print("no appropriate rig for bandid");
-      plogw->ostream->println(tmp);
+      plogw->ostream->println(target_bandid);
     }
     return;
   }
-  radio = so2r.radio_selected(); 
-  if (!plogw->f_console_emu) {    
-    console->println("pick_entry_bandmap()");
-    console->println(bandmap_disp.on_cursor_station);
-    console->println(bandmap_disp.on_cursor_freq);
-    console->println(bandmap_disp.on_cursor_modeid);
-    console->println(mode_str[bandmap_disp.on_cursor_modeid]);
-  }
-  set_station_entry(radio, bandmap_disp.on_cursor_station, bandmap_disp.on_cursor_freq, mode_str[bandmap_disp.on_cursor_modeid]);
 
+  struct radio *target_radio = &radio_list[target_radio_idx];
+  if (!plogw->f_console_emu) {
+    console->print("pick_entry_bandmap target radio=");
+    console->println(target_radio_idx);
+    console->println(station);
+    console->println(freq);
+    console->println(mode_str[modeid]);
+  }
+
+  if (!set_station_entry(target_radio, station, freq, mode_str[modeid])) {
+    return;
+  }
+
+  /* Entry focus follows the radio that was actually QSYed for S&P. */
+  so2r.change_focused_radio(target_radio_idx);
 }
 
 // bandmap でオンフレのcallsign を、取り込み。
@@ -625,7 +623,7 @@ void pick_onfreq_station() {
   radio = so2r.radio_selected();
   if (bandmap_disp.f_onfreq) {  // onfreq station exists
     // pick up onfreq station
-    strncpy(radio->callsign + 2, bandmap_disp.on_freq_station, 10);
+    set_callsign_and_request_dupe(radio, bandmap_disp.on_freq_station, true);
   }
 }
 
@@ -635,18 +633,23 @@ void init_bandmap_entry(struct bandmap_entry *p) {
   p->mode = 0;
   p->remarks[0] = '\0';
   p->time = 0;
+  p->receive_order = 0;
   p->type = 0;
   p->freq = 0;
   p->flag = 0;
 }
 
 void init_bandmap() {
-  for (int i = 0; i <= N_BAND; i++) { // include bandmap[N_BAND] new entries for all band
+  // bandmap[N_BAND] is the extra slot used for entries covering all bands.
+  for (int i = 0; i <= N_BAND; i++) {
     bandmap[i].bandid = i + 1;
     bandmap[i].nstations = 0;
     bandmap[i].nentry = 0;
     bandmap[i].entry = NULL;
-    
+  }
+
+  // Display state exists only for the real bands: indices 0 .. N_BAND-1.
+  for (int i = 0; i < N_BAND; i++) {
     bandmap_disp.cursor[i] = 0;
     bandmap_disp.top_column[i] = 0;
   }
@@ -666,8 +669,10 @@ int search_bandmap(int bandid, char *stn, int md) {
   for (i = 0; i < bandmap[idx].nentry; i++) {
     //   if (bandmap[idx].entry[i].station[0] == '\0') break;
     if (bandmap[idx].entry[i].station[0] == '\0') continue;  // need to continue to search all entries? 22/7/24
-    if (strcmp(bandmap[idx].entry[i].station, stn) == 0) {
-      // matched station
+    if (strcmp(bandmap[idx].entry[i].station, stn) == 0 &&
+        (md < 0 || bandmap[idx].entry[i].mode == md)) {
+      // Same callsign and mode on this band.  A later spot refreshes this
+      // record, including its frequency, instead of creating a second entry.
       found = 1;
       break;
     }
@@ -881,7 +886,7 @@ void set_info_bandmap(int bandid, char *stn, int modeid, unsigned int ifreq, cha
   strcpy(entry->station, stn);       // station
   entry->freq = ifreq;               // frequency
   //  entry->time = rtctime.unixtime();  // current time for removing the entry in clean_bandmap();
-  entry->time = my_rtc.unixtime();  // current time for removing the entry in clean_bandmap();
+  stamp_bandmap_entry(entry);  // reception time and within-second order
   entry->mode = modeid;
   entry->remarks[0] = '\0';
   // temporally commented out
@@ -1033,7 +1038,8 @@ void upd_display_bandmap_show_entry(struct bandmap_entry *p, int count, int band
     if (count - bandmap_disp.top_column[bandid-1]== bandmap_disp.cursor[bandid-1]) {
       c = '<';
       // copy info on cursor
-      strncpy(bandmap_disp.on_cursor_station, p->station, 10);
+      strlcpy(bandmap_disp.on_cursor_station, p->station,
+              sizeof(bandmap_disp.on_cursor_station));
       bandmap_disp.on_cursor_freq = p->freq;
       bandmap_disp.on_cursor_modeid = p->mode;
     } else c = ' ';

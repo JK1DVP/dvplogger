@@ -122,6 +122,7 @@ int append_callhist_partial_subcpu(const char *call, struct check_entry_list *li
   }
   return added;
 }
+bool callhist_subcpu_alive(uint32_t){ return true; }
 int get_callhist_subcpu_count(){return rch_count;} size_t get_callhist_subcpu_bytes(){return rch_bytes;}
 bool get_callhist_subcpu_entry(int i,const char **c,const char **e){if(i<0||i>=rch_count)return false;*c=rch[i].call;*e=rch[i].exch;return true;}
 #else
@@ -130,11 +131,16 @@ static volatile bool ch_done = false;
 static int ch_count = 0;
 static size_t ch_bytes = 0;
 static volatile bool ch_ack_received = false;
+static volatile bool ch_ping_received = false;
 static int ch_ack_seq = 0;
 static int ch_ack_count = 0;
 static int ch_ack_ok = 0;
 
 void process_callhist_control_response_main(const char *b) {
+  if (!strcmp(b, "chpong")) {
+    ch_ping_received = true;
+    return;
+  }
   if (!strncmp(b, "chdone:", 7)) {
     unsigned n = 0, sz = 0;
     if (sscanf(b + 7, "%u|%u", &n, &sz) == 2) {
@@ -180,6 +186,21 @@ static bool send_callhist_entry_with_ack(int seq, const char *packet) {
   }
 
   return false;
+}
+
+
+bool callhist_subcpu_alive(uint32_t timeout_ms) {
+  if (!f_mux_transport) return false;
+  ch_ping_received = false;
+  const char *ping = "chping";
+  mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
+                         (unsigned char *)ping, strlen(ping));
+  uint32_t deadline = millis() + timeout_ms;
+  while (!ch_ping_received && (int32_t)(millis() - deadline) < 0) {
+    mux_transport.recv_pkt();
+    delay(1);
+  }
+  return ch_ping_received;
 }
 
 bool load_callhist_subcpu(const char *fn) {

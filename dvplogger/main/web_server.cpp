@@ -29,6 +29,8 @@
 #include "web_server.h"
 #include "decl.h"
 #include "cluster.h"
+#include "zserver.h"
+#include "network.h"
 #include "SD.h"
 #include "variables.h"
 #include "qso.h"
@@ -48,7 +50,12 @@
 #include "bandmap.h"
 #include "dupechk.h"
 #include "antenna.h"
+#include "satellite.h"
+#include "ui.h"
+#include "Plan13.h"
 #include "multi_process.h"
+#include "iambic_keyer.h"
+#include "cw_keying.h"
 #include <algorithm>
 #include <memory>
 
@@ -56,9 +63,13 @@
 #include <stdio.h>
 #include <errno.h>
 
+// ui.cpp currently does not expose this display helper in ui.h.
+// Declare it here so the Web WPM command can reuse the LCD speed display.
+void show_cw_spd();
+
 namespace {
 constexpr size_t WEB_LOG_LINE_SIZE = 192;
-constexpr uint8_t WEB_LOG_QUEUE_LEN = 8;
+constexpr uint8_t WEB_LOG_QUEUE_LEN = 4;
 
 struct WebLogLine {
   char text[WEB_LOG_LINE_SIZE];
@@ -161,20 +172,31 @@ static void normalize_op_cstr(int index, char *dst, size_t dst_size, const Strin
   strlcpy(dst, value.c_str(), dst_size);
 }
 
-enum WebUiCommandType : uint8_t { WEB_UI_KEY=1, WEB_UI_CONTROL, WEB_UI_ENTER, WEB_UI_SET };
+enum WebUiCommandType : uint8_t {
+  WEB_UI_KEY=1,
+  WEB_UI_CONTROL,
+  WEB_UI_ENTER,
+  WEB_UI_SET,
+  WEB_UI_CW_SEND,
+  WEB_UI_WPM_SET,
+  WEB_UI_RADIO_MODE,
+  WEB_UI_TONE_CW,
+  WEB_UI_CQSP_TOGGLE
+};
 struct WebUiCommand {
   uint8_t type;
   int16_t value;
   int8_t index;
+  int8_t radio_index;  // focused radio captured when the Web command was queued
   char name[12];
   // input0 is also used for Sent Exch, which is longer than recv_exch.
-  char input0[LEN_SENT_EXCH_WINDOW + 1];
+  char input0[100];
   char input1[LEN_EXCH_WINDOW + 1];
 };
 static QueueHandle_t s_web_ui_queue = nullptr;
 
 static bool enqueue_web_ui(const WebUiCommand &cmd) {
-  if (!s_web_ui_queue) s_web_ui_queue = xQueueCreate(12, sizeof(WebUiCommand));
+  if (!s_web_ui_queue) s_web_ui_queue = xQueueCreate(8, sizeof(WebUiCommand));
   return s_web_ui_queue && xQueueSend(s_web_ui_queue, &cmd, 0) == pdTRUE;
 }
 }
@@ -217,21 +239,132 @@ void process_web_ui_queue() {
           band_change(cmd.value,radio);
       }
     } else if (cmd.type == WEB_UI_ENTER) {
-      radio=so2r.radio_selected();
-      strlcpy(radio->callsign+2,cmd.input0,LEN_CALL_WINDOW + 1);
-      strlcpy(radio->recv_exch+2,cmd.input1,LEN_EXCH_WINDOW + 1);
-      if (cmd.index == 0) {
-        // Use the normal Call-window response path so the F5 transmission,
-        // sent-callsign record, and QSO state are updated together.
-        so2r.send_call_exch();
-        upd_display();
-      } else {
-        radio->ptr_curr = 1;
-        process_enter(0);
+      // Keep the radio selected on /op when Enter was pressed.  The queue is
+      // processed later in the main loop, so relying on the then-current
+      // focus can apply the command to a different radio.
+      if (cmd.radio_index >= 0 && cmd.radio_index < N_RADIO &&
+          cmd.radio_index != so2r.focused_radio()) {
+        so2r.change_focused_radio(cmd.radio_index);
       }
+      radio = so2r.radio_selected();
+
+      // Populate the same edit buffers used by the LCD/keyboard UI, then run
+      // the common Enter interpreter.  This preserves command, frequency and
+      // mode parsing (for example, "7030" sets 7030 kHz).  When the Call
+      // field is not a recognised command, process_enter() continues through
+      // the normal ESM behavior.
+      set_callsign_and_request_dupe(radio, cmd.input0, true);
+      strlcpy(radio->recv_exch + 2, cmd.input1, LEN_EXCH_WINDOW + 1);
+      radio->ptr_curr = (cmd.index == 1) ? 1 : 0;
+      // value=1 is the /op "Log (No TX)" action: commit the QSO using
+      // the normal Enter path, but suppress ESM exchange/TU transmission.
+      process_enter(cmd.value ? 1 : 0);
+    } else if (cmd.type == WEB_UI_CW_SEND) {
+      if (cmd.radio_index < 0 || cmd.radio_index >= N_RADIO) continue;
+
+      // The browser supplies the /op-selected radio explicitly.  Do not move
+      // focused_radio here: in SO2R the RX/focus may legitimately move during
+      // transmission, while msg_tx_radio/tx must remain fixed.
+      radio = &radio_list[cmd.radio_index];
+
+      const bool send_as_cw =
+          (radio->modetype == LOG_MODETYPE_CW) || radio->f_tone_keying;
+      const bool send_as_voice = (radio->modetype == LOG_MODETYPE_PH);
+
+      if (!send_as_cw && !send_as_voice) {
+        upd_display_info_flash("CW/Voice unavailable\nfor this mode");
+        continue;
+      }
+      if (send_as_voice && plogw->voice_memory_enable < 3) {
+        upd_display_info_flash("Voice text requires\nVoiceMemory=3");
+        continue;
+      }
+
+      so2r.cancel_msg_tx();
+      so2r.set_msg_tx_to_radio(cmd.radio_index);
+      so2r.set_tx_to_msg_tx();
+      so2r.set_rx_in_sending_msg();
+
+      if (send_as_cw) {
+        // Feed the normal CW buffer so case, punctuation and $ macros are
+        // handled exactly like LCD/function-key CW messages.
+        append_cwbuf_string(cmd.input0);
+        append_cwbuf('$');
+      } else {
+        // PHONE arbitrary text uses the existing SUBCPU voice-synthesis macro
+        // path.  Its pronunciation normalization is intentionally voice-only.
+        so2r.play_string_macro(cmd.input0);
+      }
+      so2r.sequence_stat(SO2R::Sending_Msg);
+    } else if (cmd.type == WEB_UI_WPM_SET) {
+      cw_spd = cmd.value;
+      clamp_cw_speed();
+      loadWPM(cw_spd);
+      save_settings("");
+      show_cw_spd();
+    } else if (cmd.type == WEB_UI_CQSP_TOGGLE) {
+      if (cmd.radio_index < 0 || cmd.radio_index >= N_RADIO) continue;
+      radio = &radio_list[cmd.radio_index];
+
+      // Match the normal Alt-Q CQ/S&P transition: preserve the current
+      // frequency/mode/filter bank, switch the operating state, remember it
+      // for this band/mode, then recall the corresponding bank.
+      save_freq_mode_filt(radio);
+      radio->cq[radio->modetype] =
+          (radio->cq[radio->modetype] == LOG_CQ) ? LOG_SandP : LOG_CQ;
+      radio->cq_bank[radio->bandid][radio->modetype] = radio->cq[radio->modetype];
+      recall_freq_mode_filt(radio);
+
+      request_display_update_on_demand();
+      request_bandmap_update_on_demand();
+      upd_display_stat();
+      bandmap_disp.f_update = 0;
+      upd_display();
+    } else if (cmd.type == WEB_UI_TONE_CW) {
+      if (cmd.radio_index < 0 || cmd.radio_index >= N_RADIO) continue;
+      radio = &radio_list[cmd.radio_index];
+      radio->f_tone_keying = !radio->f_tone_keying;
+      set_tone_keying(radio);
+      set_tone(0, 0);
+      keying(0);
+      clear_cwbuf();
+      if (radio->f_tone_keying) {
+        radio->modetype = LOG_MODETYPE_CW;
+      } else {
+        radio->modetype = modetype_string(radio->opmode);
+      }
+      set_log_rst(radio);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "Tone CW=%d\nRadio %d",
+               radio->f_tone_keying ? 1 : 0, cmd.radio_index);
+      upd_display_info_flash(dp->lcdbuf);
+      upd_display();
+    } else if (cmd.type == WEB_UI_RADIO_MODE) {
+      if (cmd.value < SO2R::RADIO_MODE_SO1R || cmd.value > SO2R::RADIO_MODE_SO2R) continue;
+      bool transmitting = (so2r.sequence_stat() != SO2R::Default);
+      for (int i = 0; i < N_RADIO && !transmitting; ++i) transmitting = radio_list[i].ptt_stat != 0;
+      if (transmitting) { upd_display_info_flash("RADIO MODE BUSY\nTX/sequence active"); continue; }
+      so2r.cancel_msg_tx();
+      so2r.radio_mode = static_cast<SO2R::RadioMode>(cmd.value);
+      if (so2r.radio_mode == SO2R::RADIO_MODE_SO2R) {
+        so2r.validate_so2r_pairs();
+        so2r.sequence_mode(SO2R::SO2R_CQSandP);
+      } else {
+        so2r.sequence_mode(SO2R::Manual);
+      }
+      so2r.sequence_stat(SO2R::Default);
+      so2r.set_status();
+      save_settings("");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "RADIO MODE\n%s\nSaved",
+               so2r.radio_mode == SO2R::RADIO_MODE_SO1R ? "SO1R" :
+               so2r.radio_mode == SO2R::RADIO_MODE_SAT ? "SAT" : "SO2R");
+      request_display_update_on_demand();
+      request_bandmap_update_on_demand();
+      upd_display_info_flash(dp->lcdbuf);
     } else if (cmd.type == WEB_UI_SET) {
       switch (cmd.index) {
-        case 0: strlcpy(radio->callsign+2, cmd.input0, LEN_CALL_WINDOW + 1); break;
+        case 0:
+          set_callsign_and_request_dupe(radio, cmd.input0, true);
+          break;
         case 1: strlcpy(radio->recv_exch+2, cmd.input0, LEN_EXCH_WINDOW + 1); break;
         case 2: strlcpy(radio->recv_rst+2, cmd.input0, LEN_RST_WINDOW + 1); break;
         case 3: strlcpy(radio->sent_rst+2, cmd.input0, LEN_RST_WINDOW + 1); break;
@@ -430,43 +563,97 @@ String humanReadableSize(const size_t bytes) {
   return String(text);
 }
 
-// Upload status is kept in the request-local temporary file only.  Avoid a
-// global request lock here: when a browser connection is interrupted, the POST
-// completion callback is not guaranteed to run and a global lock can remain
-// stuck, causing every retry to be rejected.
+// Upload to an 8.3-compatible temporary name first.  The existing target
+// remains untouched until the complete request has been received, flushed,
+// closed, reopened, and its stored size has been verified.
 //
+// Example:
+//   app0.bin   -> app0.tmp   (incoming upload)
+//                app0.bak   (old target during commit)
+//   spiffs.bin -> spiffs.tmp / spiffs.bak
+//
+// This intentionally assumes an 8.3 target filename.  Using the same base
+// name with TMP/BAK extensions keeps all sidecar names within the same limit.
+static bool makeUploadSidecarNames(const String& filename,
+                                   String& targetPath,
+                                   String& tempPath,
+                                   String& backupPath) {
+  String name = filename;
+
+  // Browsers normally send only a basename, but discard any client-side path
+  // defensively before constructing an SD-card path.
+  int slash = name.lastIndexOf('/');
+  int backslash = name.lastIndexOf('\\');
+  int cut = slash > backslash ? slash : backslash;
+  if (cut >= 0) name = name.substring(cut + 1);
+
+  if (name.length() == 0) return false;
+
+  int dot = name.lastIndexOf('.');
+  String base = (dot > 0) ? name.substring(0, dot) : name;
+  String ext = (dot > 0) ? name.substring(dot + 1) : String("");
+
+  // The SD configuration used by DVPlogger is limited to 8.3 names.  Reject
+  // a name that cannot be represented rather than silently truncating it and
+  // possibly overwriting another file.
+  if (base.length() == 0 || base.length() > 8 || ext.length() > 3) {
+    return false;
+  }
+
+  targetPath = "/" + name;
+  tempPath = "/" + base + ".tmp";
+  backupPath = "/" + base + ".bak";
+  return true;
+}
+
 // Progress logging is deliberately sparse.  Logging every TCP-sized chunk can
 // enqueue thousands of messages during a firmware image upload and starve the
 // asynchronous web/TCP processing that is receiving the file.
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
                   uint8_t *data, size_t len, bool final) {
+  String targetPath;
+  String tempPath;
+  String backupPath;
+  if (!makeUploadSidecarNames(filename, targetPath, tempPath, backupPath)) {
+    if (index == 0) {
+      webLog.print("Upload Error: filename is not 8.3 compatible: ");
+      webLog.println(filename);
+    }
+    return;
+  }
+
   if (index == 0) {
-    request->_tempFile = SD.open("/" + filename, "w");
+    // A stale .tmp means a previous HTTP upload was interrupted.  Removing it
+    // is safe because the committed target was never touched by that request.
+    if (SD.exists(tempPath)) {
+      SD.remove(tempPath);
+    }
+    request->_tempFile = SD.open(tempPath, "w");
 
     webLog.print("Upload Start: ");
     webLog.print(filename);
+    webLog.print(" temp=");
+    webLog.print(tempPath);
     webLog.print(" client=");
     webLog.println(request->client()->remoteIP().toString());
 
     if (!request->_tempFile) {
-      webLog.print("Upload Error: cannot open /");
-      webLog.println(filename);
+      webLog.print("Upload Error: cannot open ");
+      webLog.println(tempPath);
       return;
     }
   }
 
   if (len != 0) {
     // After an unrecoverable write error the file is closed.  The HTTP stack
-    // still delivers the remaining body chunks, so discard them silently
-    // instead of producing one error message for every TCP packet.
+    // still delivers the remaining body chunks, so discard them silently.
     if (!request->_tempFile) {
       return;
     }
 
     // SD writes can occasionally return zero while another task or the card is
-    // briefly busy.  Retry the same chunk for a few milliseconds before
-    // declaring the upload failed.  No bytes are skipped: a partial write is
-    // continued from data + written until the complete chunk is stored.
+    // briefly busy.  Retry the same chunk for a few milliseconds.  No bytes
+    // are skipped: a partial write resumes from data + written.
     size_t written = 0;
     uint8_t retry_count = 0;
     static const uint8_t max_write_retries = 8;
@@ -495,42 +682,127 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
       webLog.print(" written=");
       webLog.println(written);
       request->_tempFile.close();
+      // Leave the incomplete .tmp in place for post-mortem inspection.  A
+      // later upload of the same filename removes it before starting.
       return;
     }
 
-    // Periodically flush the SD cache.  This keeps the amount of dirty data
-    // bounded during multi-megabyte uploads and makes a later card stall less
-    // likely to lose a large buffered region.
     static const size_t flush_step = 256 * 1024;
     const size_t end_index = index + len;
     if (index / flush_step != end_index / flush_step) {
       request->_tempFile.flush();
     }
 
-    // One message per 64 KiB is sufficient to show progress without flooding
-    // webLog and delaying the network receive callback.
     static const size_t progress_step = 64 * 1024;
     if (index == 0 || index / progress_step != end_index / progress_step) {
       webLog.print("Upload Progress: ");
       webLog.print(filename);
-      webLog.print(" size=");
+      webLog.print(" received=");
       webLog.println(end_index);
     }
   }
 
-  if (final) {
-    if (request->_tempFile) {
-      request->_tempFile.flush();
-      request->_tempFile.close();
-      webLog.print("Upload Complete: ");
-      webLog.print(filename);
-      webLog.print(" size=");
-      webLog.println(index + len);
-    } else {
-      webLog.print("Upload Error: incomplete file=");
-      webLog.println(filename);
-    }
+  if (!final) return;
+
+  const size_t receivedSize = index + len;
+  if (!request->_tempFile) {
+    webLog.print("Upload Error: incomplete file=");
+    webLog.println(filename);
+    return;
   }
+
+  request->_tempFile.flush();
+  request->_tempFile.close();
+
+  // Reopen the temporary file after close/flush.  This verifies the size that
+  // is actually recorded in the filesystem rather than trusting HTTP index.
+  File verify = SD.open(tempPath, "r");
+  if (!verify) {
+    webLog.print("Upload Error: cannot reopen temp file ");
+    webLog.println(tempPath);
+    return;
+  }
+  const size_t storedSize = verify.size();
+  verify.close();
+
+  webLog.print("Upload Verify: ");
+  webLog.print(filename);
+  webLog.print(" received=");
+  webLog.print(receivedSize);
+  webLog.print(" stored=");
+  webLog.println(storedSize);
+
+  if (storedSize != receivedSize) {
+    webLog.print("Upload Error: size mismatch file=");
+    webLog.print(filename);
+    webLog.print(" received=");
+    webLog.print(receivedSize);
+    webLog.print(" stored=");
+    webLog.println(storedSize);
+    // Do not replace the previous known-good target.
+    return;
+  }
+
+  // Transactional replacement using only 8.3 filenames.  Keep the old target
+  // as .bak until the verified .tmp has been promoted successfully.
+  if (SD.exists(backupPath)) {
+    SD.remove(backupPath);
+  }
+
+  bool hadOldTarget = SD.exists(targetPath);
+  if (hadOldTarget && !SD.rename(targetPath, backupPath)) {
+    webLog.print("Upload Error: cannot backup ");
+    webLog.print(targetPath);
+    webLog.print(" -> ");
+    webLog.println(backupPath);
+    return;
+  }
+
+  if (!SD.rename(tempPath, targetPath)) {
+    webLog.print("Upload Error: cannot commit ");
+    webLog.print(tempPath);
+    webLog.print(" -> ");
+    webLog.println(targetPath);
+    if (hadOldTarget) {
+      if (!SD.rename(backupPath, targetPath)) {
+        webLog.print("Upload Error: rollback failed ");
+        webLog.print(backupPath);
+        webLog.print(" -> ");
+        webLog.println(targetPath);
+      }
+    }
+    return;
+  }
+
+  // Verify the committed name as a final guard.  If it somehow differs, put
+  // the previous target back when possible.
+  File committed = SD.open(targetPath, "r");
+  const size_t committedSize = committed ? committed.size() : 0;
+  if (committed) committed.close();
+
+  if (committedSize != receivedSize) {
+    webLog.print("Upload Error: committed size mismatch file=");
+    webLog.print(filename);
+    webLog.print(" expected=");
+    webLog.print(receivedSize);
+    webLog.print(" actual=");
+    webLog.println(committedSize);
+
+    SD.remove(targetPath);
+    if (hadOldTarget) SD.rename(backupPath, targetPath);
+    return;
+  }
+
+  if (hadOldTarget && SD.exists(backupPath)) {
+    SD.remove(backupPath);
+  }
+
+  webLog.print("Upload Complete: ");
+  webLog.print(filename);
+  webLog.print(" received=");
+  webLog.print(receivedSize);
+  webLog.print(" stored=");
+  webLog.println(committedSize);
 }
 
 String processor(const String& var) {
@@ -565,8 +837,6 @@ void gridToLatLon(const char* grid, double& lat, double& lon) {
     lon = 0;
     return;
   }
-
-  char U = 'A';  // Base for letters
   lon = (grid[0] - 'A') * 20 - 180;
   lat = (grid[1] - 'A') * 10 - 90;
 
@@ -601,8 +871,6 @@ double haversine(double lat1, double lon1, double lat2, double lon2) {
   return R * c;
 }
 
-#define DEG_TO_RAD (M_PI / 180.0)
-#define RAD_TO_DEG (180.0 / M_PI)
 // 2地点間の初期方位（北=0°, 東=90°…）を度で返す
 double calculateBearing(double lat1, double lon1, double lat2, double lon2) {
   double dLon = (lon2 - lon1) * DEG_TO_RAD;
@@ -674,9 +942,6 @@ void setupNearestHandler(AsyncWebServer &server) {
       int c2 = line.indexOf(',', c1 + 1);
       int c3 = line.indexOf(',', c2 + 1);
       int c4 = line.indexOf(',', c3 + 1);
-      int c5 = line.indexOf(',', c4 + 1);
-      int c6 = line.indexOf(',', c5 + 1);
-
       String code = line.substring(0, c1);
       String name = line.substring(c1 + 1, c2);
       double lat = line.substring(c2 + 1, c3).toFloat();
@@ -778,7 +1043,6 @@ void setupNearestSummit(AsyncWebServer &server) {
       int c3=line.indexOf(',',c2+1);
       int c4=line.indexOf(',',c3+1);
       int c5=line.indexOf(',',c4+1);
-      int c6=line.indexOf(',',c5+1);
       //JA/YN-082,Oomuroyama,35.44090,138.65359,1468
       String code=line.substring(0,c1);
       String name=line.substring(c1+1,c2);
@@ -926,10 +1190,12 @@ const char *settings_page_html = R"rawliteral(
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>DVPlogger Settings</title>
   <style>
     body { font-family: sans-serif; margin: 20px; }
-    input[type="text"] { width: 60%; padding: 5px; margin: 5px 0; }
+    input[type="text"] { width: min(60%, 42em); padding: 8px; margin: 5px 0; font-size:16px; }
+    button { min-height: 42px; margin: 4px; }
     label { display: block; margin-top: 10px; font-weight: bold; }
     .setting { margin-bottom: 15px; }
     #status { min-height: 1.4em; font-weight: bold; }
@@ -946,11 +1212,37 @@ const char *settings_page_html = R"rawliteral(
   location.reload();  // ページを再読み込み
 });">Load</button>
 
+  <div class="setting">
+    <label>Clock Display</label>
+    <label style="display:inline; font-weight:normal;"><input type="radio" name="clockMode" value="0"> JST</label>
+    <label style="display:inline; font-weight:normal; margin-left:16px;"><input type="radio" name="clockMode" value="1"> UTC</label>
+  </div>
+
+  <div class="setting">
+    <label for="bandmap_lifetime">Bandmap spot lifetime (minutes)</label>
+    <input id="bandmap_lifetime" type="number" min="1" max="1440"
+           value="%BANDMAP_LIFETIME%" style="width:10em">
+    <button type="button" onclick="updateBandmapLifetime()">Apply and save</button>
+    <div>Equivalent keyboard command: <code>OLDEST10</code> for 10 minutes.</div>
+  </div>
+
   <form id="settingsForm">
     %SETTINGS_INPUTS%
   </form>
   <p id="status"></p>
 <script>
+function updateBandmapLifetime() {
+  const input = document.getElementById('bandmap_lifetime');
+  const value = encodeURIComponent(input.value);
+  fetch(`/set_bandmap_lifetime?minutes=${value}`)
+    .then(res => res.text().then(text => ({ok: res.ok, text})))
+    .then(result => {
+      const status = document.getElementById("status");
+      status.innerText = result.text;
+      status.className = result.ok ? "saved" : "error";
+    });
+}
+
 function updateSetting(index) {
   const input = document.getElementById('edit_' + index);
   const value = encodeURIComponent(input.value);
@@ -962,6 +1254,19 @@ function updateSetting(index) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  fetch('/clock_display_mode')
+    .then(res => res.text())
+    .then(mode => {
+      const item = document.querySelector(`input[name="clockMode"][value="${mode.trim()}"]`);
+      if (item) item.checked = true;
+    });
+  document.querySelectorAll('input[name="clockMode"]').forEach(item => {
+    item.addEventListener('change', function() {
+      fetch(`/set_clock_display_mode?mode=${this.value}`)
+        .then(res => res.text())
+        .then(msg => { document.getElementById('status').innerText = msg; });
+    });
+  });
   const inputs = document.querySelectorAll("input[type=text]");
   inputs.forEach(input => {
     input.addEventListener("keydown", function(event) {
@@ -984,10 +1289,12 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>DVPlogger RIG Settings</title>
   <style>
     body { font-family: sans-serif; margin: 20px; }
-    input[type="text"] { width: 60%; padding: 5px; margin: 5px 0; }
+    input[type="text"] { width: min(70%, 48em); padding: 8px; margin: 5px 0; font-size:16px; }
+    button { min-height: 42px; margin: 4px; }
     label { display: block; margin-top: 10px; font-weight: bold; }
     .setting { margin-bottom: 15px; }
   </style>
@@ -1003,13 +1310,27 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
   <li><strong>NAME:<em>rig_name</em></strong></li>
   <li><strong>XVTR:<em>transverter_frequencies</em></strong> Frequencies joined by `_` from index 0: IFlo_0 IFhi_0 RFlo_0 RFhi_0 IFlo_1 …</li>
   <li><strong>R:<em>CAT_reverse_polarity</em></strong> (0/1)</li>
-  <li><strong>BM:<em>band_mask</em></strong> in_hex</li>
+  <li><strong>BM:<em>band_mask</em></strong> in HEX (0 = enabled, 1 = disabled)<br>
+    <strong>Typical values:</strong><br>
+    0xFE00 &nbsp; Binary: 1111 1110 0000 0000 &nbsp; = 1.8/3.5/7/14/21/28/50/144/430 MHz (WARC excluded)<br>
+    0xFFC0 &nbsp; Binary: 1111 1111 1100 0000 &nbsp; = 1.8/3.5/7/14/21/28 MHz (WARC excluded)<br>
+    0xF07F &nbsp; Binary: 1111 0000 0111 1111 &nbsp; = 144/430/1200/2400/5600 MHz
+  </li>
   <li><strong>TP:<em>cat_type</em>_<em>rig_type</em></strong><br>
-    cat_type: 0 ICOM CI-V, 1 Yaesu(New), 2 Kenwood, 3 Manual(NoCAT), 4 Yaesu(Old), 5 Elecraft KX, 6 Yaesu FT-817<br>
-    rig_type: 0 IC-705, 1 IC-9700, 2 Yaesu, 3 Kenwood, 4 Manual, 5 IC-7300, 6 Elecraft KX, 7 Xiegu X6100
+    <strong>cat_type</strong> (CAT protocol/transport handler):<br>
+    0 ICOM CI-V, 1 Yaesu New CAT, 2 Kenwood CAT, 3 Manual (No CAT),
+    4 Yaesu Old CAT, 5 Elecraft KX, 6 Yaesu FT-817/818, 7 QRP Labs QMX USB CAT<br>
+    <strong>rig_type</strong> (model-specific behavior):<br>
+    0 IC-705, 1 IC-9700, 2 Yaesu, 3 Kenwood, 4 Manual,
+    5 IC-7300, 6 Elecraft KX, 7 Xiegu X6100, 8 QRP Labs QMX<br>
+    <strong>Typical combinations:</strong>
+    IC-705 = TP:0_0, IC-9700 = TP:0_1, IC-7300 = TP:0_5,
+    Yaesu New = TP:1_2, Yaesu Old = TP:4_2, FT-817/818 = TP:6_2,
+    Kenwood = TP:2_3, Elecraft KX = TP:5_6, X6100 = TP:0_7,
+    Manual = TP:3_4, QMX = TP:7_8
   </li>
 </ul>
-<p>Press Enter in input box to reflect changes.</p>
+<p>Press Enter or tap Apply beside an input box to reflect changes.</p>
 <p><a href="/" >go back to Home</a></p>
 <button type="button" onclick="saveRigs();">Save RIGs</button>
 <button type="button" onclick="loadRigs();">Load RIGs</button>
@@ -1029,7 +1350,19 @@ function setRigStatus(message, state) {
   status.className = state || "";
 }
 
-async function updateSetting(index) {
+async function updateBandmapLifetime() {
+  const input = document.getElementById('bandmap_lifetime');
+  const value = encodeURIComponent(input.value);
+  fetch(`/set_bandmap_lifetime?minutes=${value}`)
+    .then(res => res.text().then(text => ({ok: res.ok, text})))
+    .then(result => {
+      const status = document.getElementById("status");
+      status.innerText = result.text;
+      status.className = result.ok ? "saved" : "error";
+    });
+}
+
+function updateSetting(index) {
   const input = document.getElementById('edit_' + index);
   if (!input || rigUpdateInProgress) return;
 
@@ -1115,7 +1448,8 @@ const char *example_input_html = R"rawliteral(
 <div class="setting">
   <label for="edit_%d">%s</label>
   <input type="text" id="edit_%d" data-index="%d" value="%s" maxlength="%d"
-    %s>
+    enterkeyhint="done" autocomplete="off" spellcheck="false" %s>
+  <button type="button" onclick="updateSetting(%d)">Apply</button>
 </div>
 )rawliteral";
 
@@ -1741,7 +2075,7 @@ void setupSettingsPageHandler() {
     for (size_t pos = 0; pos < sizeof(display_order); ++pos) {
       const int i = display_order[pos];
       if (i >= N_EDITWIN || pwin_index(i) == NULL) continue;
-      char line[256];
+      char line[384];
       const char *attr="";
       switch (pwin_type_index(i)) {
       case Allowall:attr="";break;
@@ -1754,11 +2088,12 @@ void setupSettingsPageHandler() {
                i,
                i,
                pwin_index(i)+2,
-               pwin_index(i)[0] - 1,attr);
+               pwin_index(i)[0] - 1, attr, i);
       inputs += line;
     }
 
     html.replace("%SETTINGS_INPUTS%", inputs);
+    html.replace("%BANDMAP_LIFETIME%", String(bandmap_lifetime_minutes));
     request->send(200, "text/html", html);
   });
 
@@ -1831,7 +2166,8 @@ void setupSettingsPageHandler() {
                                        state.rig_index,
                                        spec_buf,
                                        300,
-                                       "");
+                                       "",
+                                       state.rig_index);
               if (len < 0) {
                 state.line[0] = '\0';
                 state.line_length = 0;
@@ -1878,6 +2214,28 @@ void setupSettingsPageHandler() {
     request->send(response);
   });
 
+  web_server.on("/set_bandmap_lifetime", HTTP_GET,
+                [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("minutes")) {
+      request->send(400, "text/plain", "minutes is required");
+      return;
+    }
+    const String value = request->getParam("minutes")->value();
+    char *endp = nullptr;
+    const long minutes = strtol(value.c_str(), &endp, 10);
+    if (endp == value.c_str() || *endp != '\0' ||
+        minutes < 1 || minutes > 1440) {
+      request->send(400, "text/plain",
+                    "Bandmap lifetime must be 1..1440 minutes");
+      return;
+    }
+    bandmap_lifetime_minutes = (int)minutes;
+    save_settings("");
+    request->send(200, "text/plain",
+                  String("Bandmap lifetime saved: ") +
+                  bandmap_lifetime_minutes + " minutes");
+  });
+
   web_server.on("/save_settings", HTTP_GET, [](AsyncWebServerRequest *request){
     release_memory();
     save_settings(""); 
@@ -1887,6 +2245,25 @@ void setupSettingsPageHandler() {
   web_server.on("/load_settings", HTTP_GET, [](AsyncWebServerRequest *request){
     load_settings(""); 
     request->send(200, "text/plain", "Settings loaded");
+  });
+
+  web_server.on("/clock_display_mode", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", String(clock_display_mode));
+  });
+
+  web_server.on("/set_clock_display_mode", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->hasParam("mode")) {
+      request->send(400, "text/plain", "Missing mode");
+      return;
+    }
+    int mode = request->getParam("mode")->value().toInt();
+    if (mode != 0 && mode != 1) {
+      request->send(400, "text/plain", "Invalid mode");
+      return;
+    }
+    clock_display_mode = mode;
+    save_settings("");
+    request->send(200, "text/plain", mode == 1 ? "Clock display: UTC (saved)" : "Clock display: JST (saved)");
   });
 
 
@@ -2239,6 +2616,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <p><a href="/bandmap">/bandmap</a> Multi-band Bandmap</p>
 <p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_260718.pdf">Manual DVPlogger_manual_260718.pdf</a></p>
 <p><a href="/op">/op</a> Web Opeartion Window</p>
+<p><a href="/sat">/sat</a> Satellite Operation Helper</p>
 
   <p><h1>File Upload</h1></p>
   <p>SD Free: %FREESPIFFS% | SD Used: %USEDSPIFFS% | SD Total: %TOTALSPIFFS%</p>
@@ -2385,10 +2763,167 @@ loadConfig();
 </script></body></html>
 )rawliteral";
 
+
+const char sat_page_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DVPlogger Satellite Helper</title>
+<style>body{font-family:sans-serif;margin:16px;max-width:1100px}nav a{margin-right:12px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.card{border:1px solid #aaa;border-radius:8px;padding:12px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #bbb;padding:5px;text-align:left}button,select,input{font-size:1rem;padding:6px}.mono{font-family:monospace}.status-large{font-family:monospace;font-size:1.15rem;line-height:1.55}.ok{color:#075;font-weight:bold}.warn{color:#a50;font-weight:bold}.err{color:#b00;font-weight:bold}.sat-on{display:inline-block;padding:4px 10px;border:2px solid #080;font-weight:bold}.sat-off{display:inline-block;padding:4px 10px;border:2px solid #900;font-weight:bold}
+.passrow{cursor:pointer}.passrow:hover{background:#eee}.passrow.sel{font-weight:bold;background:#eef}
+.pass-detail{margin-top:10px;padding:10px;border:1px solid #999;border-radius:8px}
+.pass-grid{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:14px;align-items:start}
+.pass-grid>div:nth-child(2){font-size:1.15rem;line-height:1.55}
+.pass-grid>div:nth-child(2) h3{font-size:1.5rem;margin-top:0;margin-bottom:.8rem}
+.pass-grid>div:nth-child(2) .mono{font-size:1em;line-height:1.55}
+#passcanvas{width:100%;max-width:360px;height:auto;background:#111;border:1px solid #666}
+@media(max-width:700px){.pass-grid{grid-template-columns:1fr}}</style>
+</head><body><nav><a href="/">ホーム</a><a href="/op">運用画面</a><a href="/sat">衛星</a></nav>
+<h1>衛星運用ヘルパー</h1>
+<p><small>衛星位置・Doppler追尾計算はDVPlogger本体で約500 ms周期で更新されます。</small></p>
+<div class="cards"><section class="card"><h2>衛星選択</h2><p>現在: <span id="satmode" class="sat-off">SAT OFF</span></p><select id="sat"></select> <button onclick="selectSat()">選択・開始</button> <button onclick="satOn()">Satellite mode ON</button> <button onclick="satOff()">OFF</button><p id="selectmsg"></p></section>
+<section class="card"><h2>現在の追尾状態</h2><div id="status" class="status-large">読み込み中...</div></section>
+</div>
+<section class="card"><h2>次回パス</h2><p><button onclick="recalcAos()">AOS再計算</button> <span id="aosstate"></span></p>
+<table><thead><tr><th>衛星</th><th>AOS</th><th>LOS</th><th>最大仰角</th></tr></thead><tbody id="aos"></tbody></table>
+<div id="passdetail" class="pass-detail" hidden>
+<div class="pass-grid"><div><canvas id="passcanvas" width="360" height="360"></canvas></div>
+<div><h3 id="passname"></h3><div id="passtimes" class="mono"></div><hr>
+<div id="passnow" class="mono"></div><div id="passfreq" class="mono"></div>
+<p><button onclick="closePass()">閉じる</button></p></div></div>
+</div></section>
+<div class="cards">
+<section class="card"><h2>運用制御</h2>
+<p>追尾: <select id="tracking"><option value="0">RX FIX</option><option value="1">TX FIX</option><option value="2">SAT FIX</option><option value="3">NO TRACK</option></select> <button onclick="setTracking()">設定</button></p>
+<p>VFO: <select id="vfomode"><option value="0">Single: TX=A</option><option value="1">Single: RX=A</option><option value="2">TX=Radio0 / RX=Radio1</option><option value="3">TX=Radio1 / RX=Radio0</option></select> <button onclick="setVfo()">設定</button> <button onclick="autoVfo()">Auto VFO</button></p><p id="autovfomsg" class="mono"></p>
+<p><button onclick="action('center')">Center</button> <button onclick="action('beacon')">Beacon</button></p>
+<p>Offset: <button onclick="offset(-100)">-100</button> <button onclick="offset(-10)">-10</button> <button onclick="offset(10)">+10</button> <button onclick="offset(100)">+100</button> Hz</p>
+<p id="opmsg"></p></section>
+<section class="card"><h2>現在位置・時刻</h2>
+<p>Grid Locator: <input id="gridloc" maxlength="8" size="10"> <button onclick="saveLocation()">設定・保存</button></p>
+<div id="locstatus" class="status-large">読み込み中...</div>
+<div id="clockstatus" class="status-large">読み込み中...</div>
+<p><small>標高は現状の衛星計算実装に合わせて50 m固定です。</small></p>
+</section></div>
+<section class="card"><h2>衛星データ管理</h2>
+<p><small>Name はTLE内の衛星名と一致させてください。周波数は MHz、Offset は Hz です。最大26エントリ。</small></p>
+<div style="overflow-x:auto"><table><thead><tr><th>Name</th><th>Up MHz</th><th>Mode</th><th>Down MHz</th><th>Mode</th><th>Beacon MHz</th><th>Offset Hz</th><th>TLE</th><th></th></tr></thead><tbody id="satdbbody"></tbody></table></div>
+<h3 id="satdbtitle">新規追加</h3>
+<input type="hidden" id="satdbindex" value="-1">
+<p>Name <input id="satdbname" size="16" maxlength="19">
+ Up <input id="satup0" size="9"> - <input id="satup1" size="9"> MHz
+ <input id="satupmode" size="5" maxlength="9" placeholder="LSB"></p>
+<p>Down <input id="satdn0" size="9"> - <input id="satdn1" size="9"> MHz
+ <input id="satdnmode" size="5" maxlength="9" placeholder="USB">
+ Beacon <input id="satbeacon" size="9"> MHz
+ Offset <input id="satoffset" size="7"> Hz</p>
+<p><button onclick="newSatDb()">新規</button> <button onclick="saveSatDb()">保存</button> <span id="satdbmsg"></span></p>
+</section>
+<section class="card"><h2>TLE管理</h2>
+<p><small>「TLE更新」はネットワークから取得してSDへ保存し、成功後にTLEを再読込します。HTTP 200は取得成功です。</small></p>
+<label>URL <input id="tleurl" style="width:80%"></label>
+<p><button onclick="saveTleUrl()">URL保存</button> <button onclick="updateTle()">TLE更新</button> <span id="tlestate"></span></p></section>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const satEl=document.getElementById('sat');
+const statusEl=document.getElementById('status');
+const selectMsgEl=document.getElementById('selectmsg');
+const satModeEl=document.getElementById('satmode');
+const trackingEl=document.getElementById('tracking');
+const vfoModeEl=document.getElementById('vfomode');
+const opMsgEl=document.getElementById('opmsg');
+const autoVfoMsgEl=document.getElementById('autovfomsg');
+const gridLocEl=document.getElementById('gridloc');
+const locStatusEl=document.getElementById('locstatus');
+const clockStatusEl=document.getElementById('clockstatus');
+const tleUrlEl=document.getElementById('tleurl');
+const tleStateEl=document.getElementById('tlestate');
+const aosStateEl=document.getElementById('aosstate');
+const aosEl=document.getElementById('aos');
+const passDetailEl=document.getElementById('passdetail');
+const passCanvasEl=document.getElementById('passcanvas');
+const passNameEl=document.getElementById('passname');
+const passTimesEl=document.getElementById('passtimes');
+const passNowEl=document.getElementById('passnow');
+const passFreqEl=document.getElementById('passfreq');
+let expandedPassIndex=-1, expandedPassData=null;
+let trackingDirty=false, vfoDirty=false;
+let lastTleTime=null;
+trackingEl.addEventListener('change',()=>trackingDirty=true);
+vfoModeEl.addEventListener('change',()=>vfoDirty=true);
+async function loadList(){const d=await (await fetch('/api/sat/list',{cache:'no-store'})).json();satEl.innerHTML=d.satellites.map(x=>`<option value="${x.index}" ${x.selected?'selected':''}>${esc(x.name)}</option>`).join('');}
+async function loadStatus(){try{const r=await fetch('/api/sat/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();satModeEl.textContent=d.enabled?'SAT ON':'SAT OFF';satModeEl.className=d.enabled?'sat-on':'sat-off';statusEl.innerHTML=`衛星: <b>${esc(d.name)}</b><br>衛星運用: ${d.enabled?'ON':'OFF'}<br>方位: ${Number(d.az).toFixed(1)}°<br>仰角: ${Number(d.el).toFixed(1)}°<br>距離速度: ${Number(d.rr).toFixed(3)} km/s<br>追尾モード: ${esc(d.tracking_name)}<br>VFOモード: ${esc(d.vfo_name)}<br>Uplink: ${d.up_hz} Hz<br>Downlink: ${d.down_hz} Hz<br>Sat Uplink: ${d.sat_up_hz} Hz<br>Sat Downlink: ${d.sat_down_hz} Hz<br>Offset: ${d.offset_hz} Hz`;if(!trackingDirty)trackingEl.value=String(d.tracking_mode);if(!vfoDirty)vfoModeEl.value=String(d.vfo_mode);if(document.activeElement!==gridLocEl)gridLocEl.value=d.grid;locStatusEl.textContent=`Lat: ${Number(d.lat).toFixed(5)}°  Lon: ${Number(d.lon).toFixed(5)}°`;clockStatusEl.textContent=`JST: ${d.jst}   UTC: ${d.utc}`;}catch(e){statusEl.textContent='状態取得失敗: '+e.message;}}
+async function loadAos(){try{const r=await fetch('/api/sat/aos',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();aosStateEl.textContent=d.calculating?`計算中 ${d.completed}/${d.total}: ${d.current_name} (${d.state_name})`:(d.passes.length?`計算完了 (${d.total} satellites / showing ${d.passes.length})`:'有効な計算結果はありません');aosEl.innerHTML=d.passes.map(x=>`<tr class="passrow ${x.index===expandedPassIndex?'sel':''}" onclick="togglePass(${x.index})" title="クリックしてパス詳細を表示"><td>${esc(x.name)}</td><td>${esc(x.aos)}</td><td>${esc(x.los)}</td><td>${Number(x.max_el).toFixed(0)}°</td></tr>`).join('');if(expandedPassIndex>=0&&!d.passes.some(x=>x.index===expandedPassIndex))closePass();}catch(e){aosStateEl.textContent='AOS状態取得失敗: '+e.message;}}
+
+function skyXY(az,el,R,cx,cy){const rr=R*Math.max(0,Math.min(1,(90-el)/90));const a=az*Math.PI/180;return [cx+rr*Math.sin(a),cy-rr*Math.cos(a)];}
+function drawSky(points,nowp){
+  const c=passCanvasEl,ctx=c.getContext('2d'),w=c.width,h=c.height,cx=w/2,cy=h/2,R=Math.min(w,h)/2-26;
+  ctx.clearRect(0,0,w,h);ctx.fillStyle='#111';ctx.fillRect(0,0,w,h);
+  ctx.strokeStyle='#aaa';ctx.lineWidth=1;
+  [0,30,60].forEach(el=>{ctx.beginPath();ctx.arc(cx,cy,R*(90-el)/90,0,Math.PI*2);ctx.stroke();});
+  ctx.beginPath();ctx.moveTo(cx-R,cy);ctx.lineTo(cx+R,cy);ctx.moveTo(cx,cy-R);ctx.lineTo(cx,cy+R);ctx.stroke();
+  ctx.fillStyle='#ddd';ctx.font='14px sans-serif';ctx.fillText('N',cx-5,16);ctx.fillText('E',w-17,cy+5);ctx.fillText('S',cx-5,h-8);ctx.fillText('W',5,cy+5);
+  if(points&&points.length){
+    ctx.strokeStyle='#f33';ctx.lineWidth=3;ctx.beginPath();
+    points.forEach((p,k)=>{const q=skyXY(Number(p.az),Number(p.el),R,cx,cy);if(k===0)ctx.moveTo(q[0],q[1]);else ctx.lineTo(q[0],q[1]);});ctx.stroke();
+    const qa=skyXY(Number(points[0].az),Number(points[0].el),R,cx,cy),ql=skyXY(Number(points[points.length-1].az),Number(points[points.length-1].el),R,cx,cy);
+    ctx.fillStyle='#6cf';ctx.beginPath();ctx.arc(qa[0],qa[1],5,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#fc6';ctx.beginPath();ctx.arc(ql[0],ql[1],5,0,Math.PI*2);ctx.fill();
+  }
+  if(nowp&&Number(nowp.el)>=0){
+    const q=skyXY(Number(nowp.az),Number(nowp.el),R,cx,cy);ctx.fillStyle='#0ff';ctx.beginPath();ctx.arc(q[0],q[1],7,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=1;ctx.stroke();
+  }
+}
+function closePass(){expandedPassIndex=-1;expandedPassData=null;passDetailEl.hidden=true;passNowEl.textContent='';document.querySelectorAll('.passrow').forEach(r=>r.classList.remove('sel'));}
+async function togglePass(idx){
+  if(expandedPassIndex===idx){closePass();return;}
+  expandedPassIndex=idx;expandedPassData=null;passDetailEl.hidden=false;passNameEl.textContent='読み込み中...';passTimesEl.textContent='';passNowEl.textContent='';passFreqEl.textContent='';
+  try{
+    const r=await fetch('/api/sat/pass?index='+idx,{cache:'no-store'});if(!r.ok)throw new Error(await r.text());
+    const d=await r.json();expandedPassData=d;passNameEl.textContent=d.name;
+    passTimesEl.innerHTML=`AOS: ${esc(d.aos)} &nbsp; AZ ${Number(d.aos_az).toFixed(0)}°<br>MEL: ${esc(d.mel)} &nbsp; AZ ${Number(d.mel_az).toFixed(0)}° &nbsp; EL ${Number(d.mel_el).toFixed(1)}°<br>LOS: ${esc(d.los)} &nbsp; AZ ${Number(d.los_az).toFixed(0)}°`;
+    passFreqEl.innerHTML=`UP: ${Number(d.up0/1e6).toFixed(5)}-${Number(d.up1/1e6).toFixed(5)} MHz ${esc(d.upmode)}<br>DN: ${Number(d.dn0/1e6).toFixed(5)}-${Number(d.dn1/1e6).toFixed(5)} MHz ${esc(d.dnmode)}${d.beacon?`<br>Beacon: ${Number(d.beacon/1e6).toFixed(5)} MHz`:''}`;
+    drawSky(d.points,null);await updateExpandedNow();
+  }catch(e){passNameEl.textContent='パス詳細取得失敗';passTimesEl.textContent=String(e);}
+}
+async function updateExpandedNow(){
+  if(expandedPassIndex<0||!expandedPassData)return;
+  try{
+    const r=await fetch('/api/sat/nowpos?index='+expandedPassIndex,{cache:'no-store'});if(!r.ok)return;
+    const d=await r.json();
+    passNowEl.innerHTML=`NOW ${esc(d.jst)}<br>AZ: ${Number(d.az).toFixed(1)}° / EL: ${Number(d.el).toFixed(1)}°${d.active?' &nbsp; <b>PASS ACTIVE</b>':''}${d.selected?`<br>Rig UP: ${d.up_hz} Hz / DN: ${d.down_hz} Hz`:''}`;
+    drawSky(expandedPassData.points,d);
+  }catch(e){}
+}
+async function selectSat(){const q=new URLSearchParams({index:satEl.value});const r=await fetch('/api/sat/select?'+q,{method:'POST'});selectMsgEl.textContent=await r.text();trackingDirty=false;vfoDirty=false;await loadStatus();await loadList();}
+async function satOn(){const r=await fetch('/api/sat/enable?enabled=1',{method:'POST'});const msg=await r.text();selectMsgEl.textContent=r.ok?msg:`SAT ON失敗 (HTTP ${r.status}): ${msg}`;trackingDirty=false;vfoDirty=false;if(r.ok){await loadList();await loadSatDb();await loadAos();}await loadStatus();}
+async function satOff(){const r=await fetch('/api/sat/enable?enabled=0',{method:'POST'});selectMsgEl.textContent=await r.text();await loadStatus();}
+async function setTracking(){const r=await fetch('/api/sat/tracking?mode='+trackingEl.value,{method:'POST'});opMsgEl.textContent=await r.text();if(r.ok)trackingDirty=false;await loadStatus();}
+async function setVfo(){const r=await fetch('/api/sat/vfo?mode='+vfoModeEl.value,{method:'POST'});opMsgEl.textContent=await r.text();if(r.ok)vfoDirty=false;await loadStatus();}
+async function autoVfo(){const r=await fetch('/api/sat/vfo/auto',{method:'POST'});autoVfoMsgEl.textContent=await r.text();if(r.ok)vfoDirty=false;await loadStatus();}
+async function action(name){const r=await fetch('/api/sat/action?name='+encodeURIComponent(name),{method:'POST'});opMsgEl.textContent=await r.text();await loadStatus();}
+async function offset(hz){const r=await fetch('/api/sat/offset?hz='+hz,{method:'POST'});opMsgEl.textContent=await r.text();await loadStatus();}
+async function saveLocation(){const q=new URLSearchParams({grid:gridLocEl.value.trim().toUpperCase()});const r=await fetch('/api/sat/location?'+q,{method:'POST'});locStatusEl.textContent=await r.text();if(r.ok)await loadStatus();}
+async function recalcAos(){await fetch('/api/sat/aos/recalculate',{method:'POST'});loadAos();}
+let satDbRows=[];
+function mhz(v){return (Number(v)/1000000).toFixed(6);}
+async function loadSatDb(){try{const d=await (await fetch('/api/sat/db',{cache:'no-store'})).json();satDbRows=d.satellites;satdbbody.innerHTML=d.satellites.map(x=>`<tr><td>${esc(x.name)}</td><td>${mhz(x.up0)}-${mhz(x.up1)}</td><td>${esc(x.upmode)}</td><td>${mhz(x.dn0)}-${mhz(x.dn1)}</td><td>${esc(x.dnmode)}</td><td>${mhz(x.beacon)}</td><td>${x.offset}</td><td>${x.tle?'OK':'--'}</td><td><button onclick="editSatDb(${x.index})">編集</button> <button onclick="deleteSatDb(${x.index})">削除</button></td></tr>`).join('');}catch(e){satdbmsg.textContent='一覧取得失敗: '+e.message;}}
+function newSatDb(){satdbindex.value='-1';satdbtitle.textContent='新規追加';satdbname.value='';satup0.value='0';satup1.value='0';satupmode.value='';satdn0.value='0';satdn1.value='0';satdnmode.value='';satbeacon.value='0';satoffset.value='0';}
+function editSatDb(idx){const x=satDbRows.find(v=>v.index===idx);if(!x)return;satdbindex.value=String(idx);satdbtitle.textContent='編集: '+x.name;satdbname.value=x.name;satup0.value=mhz(x.up0);satup1.value=mhz(x.up1);satupmode.value=x.upmode;satdn0.value=mhz(x.dn0);satdn1.value=mhz(x.dn1);satdnmode.value=x.dnmode;satbeacon.value=mhz(x.beacon);satoffset.value=String(x.offset);}
+async function saveSatDb(){const q=new URLSearchParams({index:satdbindex.value,name:satdbname.value.trim(),up0:satup0.value,up1:satup1.value,upmode:satupmode.value.trim().toUpperCase(),dn0:satdn0.value,dn1:satdn1.value,dnmode:satdnmode.value.trim().toUpperCase(),beacon:satbeacon.value,offset:satoffset.value});const r=await fetch('/api/sat/db/save?'+q,{method:'POST'});satdbmsg.textContent=await r.text();if(r.ok){newSatDb();await loadSatDb();await loadList();}}
+async function deleteSatDb(idx){const x=satDbRows.find(v=>v.index===idx);if(!x||!confirm('削除しますか: '+x.name+' ?'))return;const r=await fetch('/api/sat/db/delete?index='+idx,{method:'POST'});satdbmsg.textContent=await r.text();if(r.ok){newSatDb();await loadSatDb();await loadList();}}
+
+async function loadTle(){try{const r=await fetch('/api/sat/tle/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();if(document.activeElement!==tleUrlEl)tleUrlEl.value=d.url;if(d.in_progress){tleStateEl.className='warn';tleStateEl.textContent='TLE更新中...';}else if(d.requested){tleStateEl.className='warn';tleStateEl.textContent='TLE更新待機中...';}else if(d.last_result===200){tleStateEl.className='ok';tleStateEl.textContent=`TLE更新成功 (HTTP 200 / 読込 ${d.valid_satellites}衛星)`;}else if(d.last_result){tleStateEl.className='err';tleStateEl.textContent=d.last_result>0?`TLE更新失敗 (HTTP ${d.last_result})`:`TLE更新失敗 (${d.last_result})`;}else{tleStateEl.className='';tleStateEl.textContent=d.tle_time?`SD上のTLE読込済 (${d.valid_satellites}衛星)`:'TLE未読込';}if(lastTleTime===null){lastTleTime=d.tle_time;}else if(d.tle_time!==lastTleTime){lastTleTime=d.tle_time;await loadList();await loadSatDb();await loadAos();}}catch(e){tleStateEl.className='err';tleStateEl.textContent='TLE状態取得失敗: '+e.message;}}
+async function saveTleUrl(){const q=new URLSearchParams({url:tleUrlEl.value});const r=await fetch('/api/sat/tle/config?'+q,{method:'POST'});const msg=await r.text();tleStateEl.className=r.ok?'ok':'err';tleStateEl.textContent=r.ok?'TLE URL保存完了':`URL保存失敗 (HTTP ${r.status}): ${msg}`;}
+async function updateTle(){const r=await fetch('/api/sat/tle/update',{method:'POST'});const msg=await r.text();if(r.status===202){tleStateEl.className='warn';tleStateEl.textContent='TLE更新要求を受け付けました';}else{tleStateEl.className='err';tleStateEl.textContent=`TLE更新開始失敗 (HTTP ${r.status}): ${msg}`;}await loadTle();}
+async function refresh(){await Promise.all([loadStatus(),loadAos(),loadTle()]);await updateExpandedNow();}
+loadList();loadSatDb();refresh();setInterval(refresh,1000);
+</script></body></html>
+)rawliteral";
+
 const char oppage_html[] PROGMEM =R"rawliteral(
 <!DOCTYPE html>
 <!-- saved from url=(0021)http://192.168.1.2/op -->
 <html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   
  <style>
@@ -2497,12 +3032,23 @@ const char oppage_html[] PROGMEM =R"rawliteral(
   <div class="button-container">
  <label "="">Radio:</label>
     <button id="b_radio_0" type="button" onclick="selectRadio(0)" style="background-color: green;">0</button>
-   <input type="text" id="edit_10" data-index="10" size="6"> <!-- radio_name 0 -->
+   <input type="text" id="edit_10" data-index="10" size="6" enterkeyhint="done" autocomplete="off" autocapitalize="characters" spellcheck="false">
+   <button type="button" onclick="sendEnter(10)">Set</button> <!-- radio_name 0 -->
     <button id="b_radio_1" type="button" onclick="selectRadio(1)" style="background-color: gray;">1</button>
-   <input type="text" id="edit_11" data-index="11" size="6"> <!-- radio_name 1 -->
+   <input type="text" id="edit_11" data-index="11" size="6" enterkeyhint="done" autocomplete="off" autocapitalize="characters" spellcheck="false">
+   <button type="button" onclick="sendEnter(11)">Set</button> <!-- radio_name 1 -->
     <button id="b_radio_2" type="button" onclick="selectRadio(2)" style="background-color: gray;">2</button>
-   <input type="text" id="edit_12" data-index="12" size="6"> <!-- radio_name 2 -->
+   <input type="text" id="edit_12" data-index="12" size="6" enterkeyhint="done" autocomplete="off" autocapitalize="characters" spellcheck="false">
+   <button type="button" onclick="sendEnter(12)">Set</button> <!-- radio_name 2 -->
 
+</div>
+<div class="button-container">
+  <label>Operation:</label>
+  <button id="b_radio_mode_0" type="button" onclick="selectRadioMode(0)" style="background-color:gray">SO1R</button>
+  <button id="b_radio_mode_1" type="button" onclick="selectRadioMode(1)" style="background-color:gray">SAT</button>
+  <button id="b_radio_mode_2" type="button" onclick="selectRadioMode(2)" style="background-color:gray">SO2R</button>
+  <button id="b_cqsp" type="button" onclick="toggleCqSp()" title="Toggle CQ / S&amp;P" style="background-color:gray">CQ/S&amp;P</button>
+  <span id="radioModeMessage"></span>
 </div>
   <div class="button-container">
  <label "="">Mode:</label>
@@ -2538,27 +3084,64 @@ const char oppage_html[] PROGMEM =R"rawliteral(
 
 <div class="form-container">
    <label for="edit_0">Call:</label>
-   <input type="text" id="edit_0" data-index="0" size="11">
+   <input type="text" id="edit_0" data-index="0" size="11" enterkeyhint="go" autocomplete="off" autocapitalize="characters" spellcheck="false">
    <button type="button" onclick="sendEnter(0)"> ⏎ </button>
 </div>
 <div class="form-container">
    <label for="edit_1">Recv:</label>
-   <input type="text" id="edit_2" data-index="2" size="3"> <!-- received rst -->
-   <input type="text" id="edit_1" data-index="1" size="11"> <!-- received exch -->
+   <input type="text" id="edit_2" data-index="2" size="3" inputmode="numeric" enterkeyhint="next"> <!-- received rst -->
+   <input type="text" id="edit_1" data-index="1" size="11" enterkeyhint="go" autocomplete="off" autocapitalize="characters" spellcheck="false"> <!-- received exch -->
    <button type="button" onclick="sendEnter(1)"> ⏎ </button>
+   <button type="button" onclick="sendEnter(1, true)">Log (No TX)</button>
+</div>
+<div class="form-container" style="display:flex;flex-wrap:wrap;gap:0.35em;align-items:center;">
+   <label for="cw_message">CW / Voice:</label>
+   <input type="text" id="cw_message" size="28" maxlength="99"
+          enterkeyhint="send" autocomplete="off" autocapitalize="characters" spellcheck="false"
+          placeholder="$C $V $W">
+   <button type="button" onclick="sendCwMessage()">Send</button>
+   <label for="cw_wpm">WPM:</label>
+   <input type="number" id="cw_wpm" size="4" min="5" max="80" inputmode="numeric" enterkeyhint="done">
+   <button type="button" onclick="setCwWpm()">Set</button>
+   <button id="toneCwButton" type="button" onclick="toggleToneCw()" style="background-color:gray">Tone CW OFF</button>
+</div>
+<div class="form-container macro-help">
+   CW: keyed as entered. PHONE: synthesized voice when VoiceMemory=3.<br>
+   Tone CW ON sends CW while the rig remains in a PHONE mode.<br>
+   Macros (CW/Voice): $I MyCall / $C Call / $V RST / $W Exch / $U CQ / $T TEST / $A TU / $P Power / $J JCC / $S Serial / $Q Band serial / $N Name
 </div>
 <div class="form-container">
    <label for="edit_5">MyCall:</label>
-   <input type="text" id="edit_5" data-index="5" size="11"> <!-- sent rst -->
+   <input type="text" id="edit_5" data-index="5" size="11" enterkeyhint="done" autocomplete="off" autocapitalize="characters" spellcheck="false">
+   <button type="button" onclick="sendEnter(5)">Set</button> <!-- sent rst -->
    <label for="edit_4">Sent:</label>
-   <input type="text" id="edit_3" data-index="3" size="3"> <!-- sent rst -->
-   <input type="text" id="edit_4" data-index="4" size="11"> <!-- sent number -->
+   <input type="text" id="edit_3" data-index="3" size="3" inputmode="numeric" enterkeyhint="next"> <!-- sent rst -->
+   <input type="text" id="edit_4" data-index="4" size="11" enterkeyhint="done" autocomplete="off" autocapitalize="characters" spellcheck="false">
+   <button type="button" onclick="sendEnter(3); sendEnter(4)">Set Sent</button> <!-- sent number -->
 </div>
 <div class="form-container">
         <label>Contest:</label>
-   <input type="text" id="edit_13" data-index="13" size="20"> <!-- contest_name 0 -->
+   <input type="text" id="edit_13" data-index="13" size="20" enterkeyhint="done" autocomplete="off" spellcheck="false">
+   <button type="button" onclick="sendEnter(13)">Set</button> <!-- contest_name 0 -->
     </div>
 <div class="form-container" id="cwkeyingDisplay"></div> <!-- CW keying ticker display -->
+<div class="ant-section">
+  <h4>SO2R active pair</h4>
+  <p>The selected two radios always alternate. Keyboard in CALLSIGN: Ctrl+Enter = pair with next enabled radio, Ctrl+Shift+Enter = pair with previous enabled radio.</p>
+  <table>
+    <thead><tr><th>Active pair</th><th>Choose pair</th></tr></thead>
+    <tbody id="so2rPairRows"><tr><td colspan="2">Loading...</td></tr></tbody>
+  </table>
+</div>
+<div class="ant-section">
+  <h4>Network services</h4>
+  <p>Mode is saved independently of host/IP settings. AUTO reconnects in the background; OFF keeps the address but makes no connection attempts.</p>
+  <table>
+    <thead><tr><th>Service</th><th>Mode</th><th>Connection</th><th>Control</th></tr></thead>
+    <tbody id="networkServiceRows"><tr><td colspan="4">Loading...</td></tr></tbody>
+  </table>
+  <p>CALLSIGN commands: <code>ZSERVERON/OFF</code>, <code>CLUSTER1ON/OFF</code>, <code>CLUSTER2ON/OFF</code>.</p>
+</div>
 <div class="ant-section">
   <h4>Antenna</h4>
   <table>
@@ -2636,6 +3219,8 @@ async function sendControl(type, value, buttonPrefix) {
 }
 
 function selectRadio(name) {
+  opSelectedRadio = Number(name);
+  opRadioSelectionPendingUntil = Date.now() + 1500;
   sendControl('Radio', name, 'b_radio');
 }
 function selectMode(name) {
@@ -2643,6 +3228,45 @@ function selectMode(name) {
 }
 function selectBand(name) {
   sendControl('Band', name, 'b_band');
+}
+async function selectRadioMode(mode) {
+  requestFastOpPolling(2000);
+  selectStatusButton('b_radio_mode', mode);
+  const message = document.getElementById('radioModeMessage');
+  if (message) message.textContent = ' Queuing...';
+  try {
+    const response = await fetch(`/radio_mode?mode=${mode}`, {cache:'no-store'});
+    const text = await response.text();
+    if (!response.ok) throw new Error(text || `HTTP ${response.status}`);
+    if (message) message.textContent = ' Saved';
+    setTimeout(fetchOpStatus, 150);
+  } catch (error) {
+    if (message) message.textContent = ` ${error.message}`;
+    setTimeout(fetchOpStatus, 150);
+  }
+}
+
+function updateCqSpButtonFromRadioText(text) {
+  const button = document.getElementById('b_cqsp');
+  if (!button) return;
+  const isSp = String(text || '').includes(' S&P Freq:');
+  const isCq = String(text || '').includes(' CQ Freq:');
+  button.textContent = isSp ? 'S&P' : (isCq ? 'CQ' : 'CQ/S&P');
+  button.style.backgroundColor = (isSp || isCq) ? 'green' : 'gray';
+}
+
+async function toggleCqSp() {
+  requestFastOpPolling(2000);
+  try {
+    const response = await fetch(`/rig_key?command=cqsp&radio=${encodeURIComponent(opSelectedRadio)}`,
+                                 {cache:'no-store'});
+    const text = await response.text();
+    if (!response.ok) throw new Error(text || `HTTP ${response.status}`);
+    setTimeout(fetchOpStatus, 120);
+  } catch (error) {
+    console.error('CQ/S&P toggle failed:', error);
+    setTimeout(fetchOpStatus, 120);
+  }
 }
 
 // /opの主要状態を1回のHTTP要求で取得する。
@@ -2653,6 +3277,8 @@ let lastSyncedQsoValue = ['', ''];
 let opStatusFetching = false;
 let opFastPollUntil = 0;
 let opPollTimer = null;
+let opSelectedRadio = 0;
+let opRadioSelectionPendingUntil = 0;
 const OP_DEBUG = false;
 
 function opDebug(...args) {
@@ -2683,7 +3309,7 @@ async function fetchOpStatus() {
     const response = await fetch('/op_status', {cache: 'no-store'});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const fields = (await response.text()).split('\t');
-    if (fields.length < 16) return;
+    if (fields.length < 19) return;
     const force = Date.now() < forceOpInputSyncUntil;
     const active = document.activeElement;
     const inputIndexes = [0,1,2,3,4,5,10,11,12,13];
@@ -2696,10 +3322,20 @@ async function fetchOpStatus() {
       }
     });
     setTextIfChanged('radioDisplay', fields[10]);
+    updateCqSpButtonFromRadioText(fields[10]);
     setTextIfChanged('cwkeyingDisplay', fields[11]);
     selectStatusButton('b_radio', fields[12]);
+    if (Date.now() >= opRadioSelectionPendingUntil) {
+      opSelectedRadio = Number(fields[12]);
+    }
     selectStatusButton('b_mode', fields[13]);
     selectStatusButton('b_band', fields[14]);
+    selectStatusButton('b_radio_mode', fields[16]);
+    const wpmInput = document.getElementById('cw_wpm');
+    if (wpmInput && document.activeElement !== wpmInput && wpmInput.value !== fields[17]) {
+      wpmInput.value = fields[17];
+    }
+    updateToneCwButton(fields[18]);
   } catch (error) {
     console.error('op status fetch failed:', error);
   } finally {
@@ -2716,6 +3352,40 @@ async function pollOpStatus() {
   await fetchOpStatus();
   const interval = document.hidden ? 5000 : (Date.now() < opFastPollUntil ? 500 : 1000);
   scheduleNextOpStatusPoll(interval);
+}
+
+async function fetchNetworkServices() {
+  try {
+    const response = await fetch('/network_services_status', {cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const rows = [
+      ['Zserver','zserver',data.zserver],
+      ['Cluster 1','cluster1',data.cluster1],
+      ['Cluster 2','cluster2',data.cluster2]
+    ].map(([label,key,item]) => {
+      const connected = item.connected ? 'CONNECTED' : item.state;
+      const mode = item.auto ? 'AUTO' : 'OFF';
+      const style = item.connected ? 'background-color:green;color:white' :
+                    (item.auto ? 'background-color:#ddd' : 'background-color:#eee;color:#777');
+      return `<tr><td>${label}</td><td>${mode}</td><td>${connected}</td><td><button type="button" style="${style}" onclick="setNetworkServiceMode('${key}',${item.auto ? 0 : 1})">${item.auto ? 'Set OFF' : 'Set AUTO'}</button></td></tr>`;
+    });
+    rows.push(`<tr><td>NTP</td><td>AUTO</td><td>${data.ntp.synced ? 'SYNCHRONIZED' : (data.ntp.started ? 'SYNCING' : 'OFFLINE / RETRY WAIT')}</td><td>-</td></tr>`);
+    document.getElementById('networkServiceRows').innerHTML = rows.join('');
+  } catch (error) {
+    document.getElementById('networkServiceRows').innerHTML =
+      '<tr><td colspan="4">Status unavailable</td></tr>';
+  }
+}
+
+async function setNetworkServiceMode(service, autoMode) {
+  try {
+    const response = await fetch(`/network_service_mode?service=${encodeURIComponent(service)}&auto=${autoMode}`, {cache:'no-store'});
+    if (!response.ok) throw new Error(await response.text());
+    await fetchNetworkServices();
+  } catch (error) {
+    console.error('Network service mode update failed:', error);
+  }
 }
 
 async function fetchAntennaStatus() {
@@ -2741,8 +3411,49 @@ async function fetchAntennaStatus() {
   }
 }
 
+async function fetchSo2rPairs() {
+  try {
+    const response = await fetch('/so2r_pair_status', {cache: 'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const buttons = [];
+    // Always show every possible two-radio combination.  A pair is selectable
+    // only when both radios are enabled; the active pair remains green.
+    for (let a = 0; a < data.enabled.length; ++a) {
+      for (let b = a + 1; b < data.enabled.length; ++b) {
+        const usable = !!data.enabled[a] && !!data.enabled[b];
+        const selected = (a === data.a && b === data.b) ||
+                         (a === data.b && b === data.a);
+        let style = selected ? 'background-color:green;color:white' :
+                    (usable ? 'background-color:gray;color:white' :
+                              'background-color:#ddd;color:#888');
+        buttons.push(`<button type="button" style="${style}" ${usable ? '' : 'disabled'} onclick="setSo2rPair(${a},${b})">R${a}-R${b}</button>`);
+      }
+    }
+    document.getElementById('so2rPairRows').innerHTML =
+      `<tr><td>R${data.a} &harr; R${data.b}</td><td>${buttons.join(' ')}</td></tr>`;
+  } catch (error) {
+    document.getElementById('so2rPairRows').innerHTML =
+      '<tr><td colspan="2">Status unavailable</td></tr>';
+  }
+}
+
+async function setSo2rPair(tx, rx) {
+  try {
+    const response = await fetch(`/so2r_pair?tx=${tx}&rx=${rx}`, {cache: 'no-store'});
+    if (!response.ok) throw new Error(await response.text());
+    await fetchSo2rPairs();
+  } catch (error) {
+    console.error('SO2R pair update failed:', error);
+  }
+}
+
 pollOpStatus();
+fetchSo2rPairs();
+fetchNetworkServices();
 fetchAntennaStatus();
+setInterval(fetchSo2rPairs, 3000);
+setInterval(fetchNetworkServices, 3000);
 setInterval(fetchAntennaStatus, 3000);
 document.addEventListener('visibilitychange', () => {
   scheduleNextOpStatusPoll(document.hidden ? 5000 : 0);
@@ -2759,7 +3470,7 @@ function sendKeyCode(keyCode) {
 }
 
 // フォーカス移動と入力内容送信
-function sendEnter(inputIndex) {
+function sendEnter(inputIndex, noTx = false) {
 
   // inputIndex = 0  Call 1 Exch 6 Radio0 name  7 Radio1 name 8 Radio2 name
   requestFastOpPolling();
@@ -2769,7 +3480,7 @@ function sendEnter(inputIndex) {
     const input1 = normalizeOpInput(document.getElementById('edit_0'));
     const input2 = normalizeOpInput(document.getElementById('edit_1'));
 
-    fetch(`/rig_key?keycode=13&input0=${encodeURIComponent(input1)}&input1=${encodeURIComponent(input2)}&index=${inputIndex}`)
+    fetch(`/rig_key?keycode=13&input0=${encodeURIComponent(input1)}&input1=${encodeURIComponent(input2)}&index=${inputIndex}${noTx ? "&no_tx=1" : ""}`)
       .then(res => res.text())
       .then(msg => opDebug('→ rig_key response:', msg))
       .catch(err => console.error('fetch error:', err));
@@ -2793,6 +3504,51 @@ function sendEnter(inputIndex) {
     requestFastOpPolling();
     scheduleNextOpStatusPoll(100);
   }
+}
+
+function sendCwMessage() {
+  const input = document.getElementById('cw_message');
+  const message = String(input.value || '').replace(/[^\x20-\x7E]/g, '');
+  if (!message) return;
+  requestFastOpPolling();
+  fetch(`/rig_key?command=cw_send&radio=${encodeURIComponent(opSelectedRadio)}&value=${encodeURIComponent(message)}`)
+    .then(res => res.text().then(text => ({ok: res.ok, text})))
+    .then(result => { if (!result.ok) throw new Error(result.text); })
+    .catch(error => console.error('CW / Voice send failed:', error));
+}
+
+function setCwWpm() {
+  const input = document.getElementById('cw_wpm');
+  const value = Number(input.value);
+  if (!Number.isFinite(value)) return;
+  requestFastOpPolling(2000);
+  fetch(`/rig_key?command=wpm&value=${encodeURIComponent(value)}`)
+    .then(res => res.text().then(text => ({ok: res.ok, text})))
+    .then(result => {
+      if (!result.ok) throw new Error(result.text);
+      setTimeout(fetchOpStatus, 100);
+    })
+    .catch(error => console.error('WPM update failed:', error));
+}
+
+function updateToneCwButton(enabled) {
+  const button = document.getElementById('toneCwButton');
+  if (!button) return;
+  const on = Number(enabled) !== 0;
+  button.textContent = on ? 'Tone CW ON' : 'Tone CW OFF';
+  button.style.backgroundColor = on ? 'green' : 'gray';
+  button.style.color = on ? 'white' : '';
+}
+
+function toggleToneCw() {
+  requestFastOpPolling(2000);
+  fetch(`/rig_key?command=tone_cw&radio=${encodeURIComponent(opSelectedRadio)}`)
+    .then(res => res.text().then(text => ({ok: res.ok, text})))
+    .then(result => {
+      if (!result.ok) throw new Error(result.text);
+      setTimeout(fetchOpStatus, 100);
+    })
+    .catch(error => console.error('Tone CW update failed:', error));
 }
 
 function clearInputs() {
@@ -2842,12 +3598,21 @@ document.addEventListener("DOMContentLoaded", () => {
   const exchInput = document.getElementById('edit_1');
   if (callInput) callInput.addEventListener('blur', () => syncQsoFieldWithoutEnter(0));
   if (exchInput) exchInput.addEventListener('blur', () => syncQsoFieldWithoutEnter(1));
+  const cwMessage = document.getElementById('cw_message');
+  const cwWpm = document.getElementById('cw_wpm');
+  if (cwMessage) cwMessage.addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); sendCwMessage(); }
+  });
+  if (cwWpm) cwWpm.addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); setCwWpm(); }
+  });
 
   document.addEventListener("keydown", event => {
     const key = event.key;
     const code = event.keyCode || event.which;
     const focused = document.activeElement;
     const idx = focused && focused.dataset ? focused.dataset.index || "" : "";
+    if (focused && (focused.id === 'cw_message' || focused.id === 'cw_wpm')) return;
 
     opDebug('keydown idx=', idx, 'key=', key);
 
@@ -2916,7 +3681,7 @@ static void web_heap_point(const char *tag)
 namespace {
 constexpr int WEB_BANDMAP_BANDS = N_BAND - 1;
 constexpr int WEB_BANDMAP_MAX_ENTRIES = 200;
-constexpr int WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES = 32;
+constexpr int WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES = 20;
 constexpr int WEB_BANDMAP_COLUMNS = 4;
 constexpr uint32_t WEB_BANDMAP_REFRESH_MS = 1000;
 constexpr uint8_t WEB_BANDMAP_COMMAND_QUEUE_LEN = 8;
@@ -3000,12 +3765,6 @@ static WebBandmapEntry *web_bandmap_entry_at(WebBandmapSnapshot *snapshot,
     static_cast<size_t>(band_index) * snapshot->capacity_per_band + entry_index;
 }
 
-static const WebBandmapEntry *web_bandmap_entry_at(
-    const WebBandmapSnapshot *snapshot, int band_index, int entry_index) {
-  return snapshot->entry +
-    static_cast<size_t>(band_index) * snapshot->capacity_per_band + entry_index;
-}
-
 static void *web_bandmap_alloc(size_t size, bool prefer_psram) {
   if (prefer_psram) {
     return heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -3023,6 +3782,45 @@ static void web_bandmap_heap_trace(const char *tag) {
                 (unsigned)web_bandmap_snapshot_count);
 }
 
+static void free_web_bandmap_snapshots() {
+  for (uint8_t i = 0; i < web_bandmap_snapshot_count; ++i) {
+    if (!web_bandmap_snapshots[i]) continue;
+    free(web_bandmap_snapshots[i]->entry);
+    free(web_bandmap_snapshots[i]);
+    web_bandmap_snapshots[i] = nullptr;
+  }
+  web_bandmap_snapshot_count = 0;
+}
+
+static bool allocate_web_bandmap_snapshots(bool use_psram,
+                                            uint16_t capacity) {
+  constexpr uint8_t required_count = 2;
+  for (uint8_t i = 0; i < required_count; ++i) {
+    WebBandmapSnapshot *snapshot = static_cast<WebBandmapSnapshot *>(
+      web_bandmap_alloc(sizeof(WebBandmapSnapshot), use_psram));
+    web_bandmap_heap_trace("after snapshot alloc");
+    if (!snapshot) break;
+
+    const size_t entries_size = sizeof(WebBandmapEntry) *
+      static_cast<size_t>(WEB_BANDMAP_BANDS) * capacity;
+    snapshot->entry = static_cast<WebBandmapEntry *>(
+      web_bandmap_alloc(entries_size, use_psram));
+    web_bandmap_heap_trace("after entries alloc");
+    if (!snapshot->entry) {
+      free(snapshot);
+      break;
+    }
+
+    snapshot->capacity_per_band = capacity;
+    web_bandmap_snapshots[i] = snapshot;
+    ++web_bandmap_snapshot_count;
+  }
+
+  if (web_bandmap_snapshot_count == required_count) return true;
+  free_web_bandmap_snapshots();
+  return false;
+}
+
 static bool ensure_web_bandmap_snapshots() {
   web_bandmap_heap_trace("ensure enter");
   if (!web_bandmap_snapshot_mutex) {
@@ -3030,61 +3828,59 @@ static bool ensure_web_bandmap_snapshots() {
     web_bandmap_heap_trace("after mutex create");
     if (!web_bandmap_snapshot_mutex) return false;
   }
-  if (web_bandmap_snapshot_count != 0) {
+  if (web_bandmap_snapshot_count == 2) {
     web_bandmap_heap_trace("ensure already ready");
     return true;
   }
 
-  web_bandmap_has_psram = ESP.getPsramSize() > 0;
-  const uint8_t requested_count = web_bandmap_has_psram ? 2 : 1;
-  const uint16_t capacity = web_bandmap_has_psram
-    ? WEB_BANDMAP_MAX_ENTRIES : WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES;
+  // ESP.getPsramSize() can report zero even when ESP-IDF has already added
+  // PSRAM to the capability heap.  The heap capability is the authoritative
+  // test for allocations made with MALLOC_CAP_SPIRAM.
+  const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  web_bandmap_has_psram = psram_total > 0;
+
   if (lowmem_trace) {
-    webLog.printf("[BANDMAPTRACE] layout snapshot=%u entry=%u bands=%u capacity=%u requested=%u entries_bytes=%u\n",
-		  (unsigned)sizeof(WebBandmapSnapshot),
-		  (unsigned)sizeof(WebBandmapEntry),
-		  (unsigned)WEB_BANDMAP_BANDS,
-		  (unsigned)capacity,
-		  (unsigned)requested_count,
-		  (unsigned)(sizeof(WebBandmapEntry) *
-			     static_cast<size_t>(WEB_BANDMAP_BANDS) * capacity));
-  }  
-
-  for (uint8_t i = 0; i < requested_count; ++i) {
-    WebBandmapSnapshot *snapshot = static_cast<WebBandmapSnapshot *>(
-      web_bandmap_alloc(sizeof(WebBandmapSnapshot), web_bandmap_has_psram));
-    web_bandmap_heap_trace("after snapshot alloc");
-    if (!snapshot) break;
-
-    const size_t entries_size = sizeof(WebBandmapEntry) *
-      static_cast<size_t>(WEB_BANDMAP_BANDS) * capacity;
-    snapshot->entry = static_cast<WebBandmapEntry *>(
-      web_bandmap_alloc(entries_size, web_bandmap_has_psram));
-    web_bandmap_heap_trace("after entries alloc");
-    if (!snapshot->entry) {
-      free(snapshot);
-      break;
-    }
-    snapshot->capacity_per_band = capacity;
-    web_bandmap_snapshots[i] = snapshot;
-    ++web_bandmap_snapshot_count;
+    webLog.printf("[BANDMAPTRACE] layout snapshot=%u entry=%u bands=%u psram_total=%u psram_free=%u\n",
+                  (unsigned)sizeof(WebBandmapSnapshot),
+                  (unsigned)sizeof(WebBandmapEntry),
+                  (unsigned)WEB_BANDMAP_BANDS,
+                  (unsigned)psram_total,
+                  (unsigned)psram_free);
   }
 
-  if (web_bandmap_snapshot_count != requested_count) {
-    for (uint8_t i = 0; i < web_bandmap_snapshot_count; ++i) {
-      free(web_bandmap_snapshots[i]->entry);
-      free(web_bandmap_snapshots[i]);
-      web_bandmap_snapshots[i] = nullptr;
-    }
-    web_bandmap_snapshot_count = 0;
+  bool allocated = false;
+  uint16_t capacity = WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES;
+  const char *memory_name = "internal RAM";
+
+  if (web_bandmap_has_psram) {
+    capacity = WEB_BANDMAP_MAX_ENTRIES;
+    allocated = allocate_web_bandmap_snapshots(true, capacity);
+    if (allocated) memory_name = "PSRAM";
+  }
+
+  // The time-sliced builder requires an inactive snapshot.  If the large
+  // PSRAM pair cannot be allocated, retain functionality with two compact
+  // internal-RAM snapshots instead of falling back to one unusable snapshot.
+  if (!allocated) {
+    capacity = WEB_BANDMAP_NO_PSRAM_MAX_ENTRIES;
+    allocated = allocate_web_bandmap_snapshots(false, capacity);
+    memory_name = "internal RAM";
+    web_bandmap_has_psram = false;
+  }
+
+  if (!allocated) {
     static uint32_t last_error_ms = 0;
     const uint32_t now = millis();
     if (now - last_error_ms >= 5000U) {
       last_error_ms = now;
-      webLog.printf("bandmap: snapshot allocation failed psram=%u free_internal=%u largest_internal=%u\n",
-                    web_bandmap_has_psram ? 1U : 0U,
-                    static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
-                    static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+      webLog.printf("bandmap: two-snapshot allocation failed psram_total=%u psram_free=%u free_internal=%u largest_internal=%u\n",
+                    (unsigned)psram_total,
+                    (unsigned)psram_free,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     }
     return false;
   }
@@ -3092,117 +3888,230 @@ static bool ensure_web_bandmap_snapshots() {
   if (!web_bandmap_memory_mode_logged) {
     web_bandmap_memory_mode_logged = true;
     webLog.printf("bandmap: snapshots=%u entries_per_band=%u memory=%s\n",
-                  web_bandmap_snapshot_count, capacity,
-                  web_bandmap_has_psram ? "PSRAM" : "internal RAM");
+                  web_bandmap_snapshot_count, capacity, memory_name);
   }
   web_bandmap_heap_trace("ensure success");
   return true;
 }
 
-static void rebuild_web_bandmap_snapshot() {
-  const size_t rebuild_free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const size_t rebuild_largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  web_bandmap_heap_trace("rebuild enter");
-  if (!ensure_web_bandmap_snapshots()) {
-    web_bandmap_heap_trace("rebuild ensure failed");
-    return;
-  }
+static constexpr uint32_t WEB_BANDMAP_JOB_BUDGET_US = 3000U;
+static constexpr uint8_t WEB_BANDMAP_JOB_MAX_ENTRIES = 4;
 
-  const bool single_snapshot = web_bandmap_snapshot_count == 1;
-  if (single_snapshot &&
-      xSemaphoreTake(web_bandmap_snapshot_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-    return;
-  }
+enum WebBandmapJobState : uint8_t {
+  WEB_BANDMAP_JOB_IDLE = 0,
+  WEB_BANDMAP_JOB_PREPARE,
+  WEB_BANDMAP_JOB_SCAN,
+  WEB_BANDMAP_JOB_WAIT_DUPE,
+  WEB_BANDMAP_JOB_FINISH_BAND,
+  WEB_BANDMAP_JOB_PUBLISH
+};
 
-  // With PSRAM, build the inactive snapshot and atomically swap it.  Without
-  // PSRAM, update one compact snapshot while holding the mutex.
-  const uint8_t active = web_bandmap_active_snapshot;
-  const uint8_t next = single_snapshot ? 0 : (active ^ 1U);
-  WebBandmapSnapshot *snapshot = web_bandmap_snapshots[next];
-  memset(snapshot->count, 0, sizeof(snapshot->count));
-  memset(snapshot->band_generation, 0, sizeof(snapshot->band_generation));
-  snapshot->generation = 0;
-  snapshot->sort_type = bandmap_disp.sort_type;
-
+struct WebBandmapBuildJob {
+  WebBandmapJobState state = WEB_BANDMAP_JOB_IDLE;
+  uint8_t snapshot_index = 0;
+  uint8_t band_index = 0;
+  uint16_t source_index = 0;
+  uint16_t output_count = 0;
   uint32_t hash = 2166136261UL;
-  hash = web_bandmap_hash_mix(hash, snapshot->sort_type);
+  WebBandmapEntry pending{};
+  uint16_t pending_source_index = 0;
+};
 
-  for (int band_index = 0; band_index < WEB_BANDMAP_BANDS; ++band_index) {
-    const int bandid = band_index + 1;
-    uint16_t count = 0;
+static WebBandmapBuildJob web_bandmap_job;
 
-    for (int i = 0;
-         i < bandmap[band_index].nentry && count < snapshot->capacity_per_band;
-         ++i) {
-      struct bandmap_entry *source = bandmap[band_index].entry + i;
-      if (source->station[0] == '\0') continue;
-      if (source->mode >= NMODEID) continue;
+static bool web_bandmap_source_still_matches(int band_index, int source_index,
+                                              const WebBandmapEntry &entry) {
+  if (band_index < 0 || band_index >= WEB_BANDMAP_BANDS) return false;
+  if (source_index < 0 || source_index >= bandmap[band_index].nentry)
+    return false;
+  const struct bandmap_entry *source = bandmap[band_index].entry + source_index;
+  return source->freq == entry.freq && source->time == entry.time &&
+         source->mode == entry.mode &&
+         strcasecmp(source->station, entry.station) == 0;
+}
 
-      const int mode_type = modetype[source->mode];
-      if (dupe_check_nocallhist(source->station,
-                               bandmode_param(bandid, mode_type),
-                               plogw->mask)) {
-        source->flag |= BANDMAP_ENTRY_FLAG_WORKED;
-        continue;
-      }
-      source->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+static void web_bandmap_store_pending(bool worked) {
+  WebBandmapSnapshot *snapshot =
+      web_bandmap_snapshots[web_bandmap_job.snapshot_index];
+  if (web_bandmap_source_still_matches(web_bandmap_job.band_index,
+                                        web_bandmap_job.pending_source_index,
+                                        web_bandmap_job.pending)) {
+    struct bandmap_entry *source =
+        bandmap[web_bandmap_job.band_index].entry +
+        web_bandmap_job.pending_source_index;
+    if (worked) source->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+    else source->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+  }
+  if (worked || web_bandmap_job.output_count >= snapshot->capacity_per_band)
+    return;
 
-      WebBandmapEntry &dest = *web_bandmap_entry_at(snapshot, band_index, count++);
-      dest.freq = source->freq;
-      dest.time = source->time;
-      strlcpy(dest.station, source->station, sizeof(dest.station));
-      dest.mode = source->mode;
-      dest.flag = source->flag;
+  web_bandmap_job.pending.flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+  *web_bandmap_entry_at(snapshot, web_bandmap_job.band_index,
+                        web_bandmap_job.output_count++) =
+      web_bandmap_job.pending;
+}
+
+static void web_bandmap_finish_current_band() {
+  WebBandmapSnapshot *snapshot =
+      web_bandmap_snapshots[web_bandmap_job.snapshot_index];
+  const int bandid = web_bandmap_job.band_index + 1;
+  snapshot->count[web_bandmap_job.band_index] = web_bandmap_job.output_count;
+  WebBandmapEntry *entries =
+      web_bandmap_entry_at(snapshot, web_bandmap_job.band_index, 0);
+  std::sort(entries, entries + web_bandmap_job.output_count,
+            [snapshot](const WebBandmapEntry &a, const WebBandmapEntry &b) {
+              return web_bandmap_entry_less(a, b, snapshot->sort_type);
+            });
+
+  uint32_t band_hash = 2166136261UL;
+  band_hash = web_bandmap_hash_mix(band_hash, snapshot->sort_type);
+  band_hash = web_bandmap_hash_mix(band_hash, bandid);
+  band_hash = web_bandmap_hash_mix(band_hash, web_bandmap_job.output_count);
+  for (uint16_t i = 0; i < web_bandmap_job.output_count; ++i) {
+    const WebBandmapEntry &entry = entries[i];
+    band_hash = web_bandmap_hash_mix(band_hash, entry.freq);
+    band_hash = web_bandmap_hash_mix(band_hash,
+                                     static_cast<uint32_t>(entry.time));
+    band_hash = web_bandmap_hash_mix(band_hash, entry.mode);
+    band_hash = web_bandmap_hash_mix(band_hash, entry.flag);
+    for (const char *q = entry.station; *q; ++q)
+      band_hash = web_bandmap_hash_mix(band_hash,
+                                       static_cast<uint8_t>(*q));
+  }
+  snapshot->band_generation[web_bandmap_job.band_index] = band_hash;
+  web_bandmap_job.hash = web_bandmap_hash_mix(web_bandmap_job.hash, band_hash);
+
+  ++web_bandmap_job.band_index;
+  web_bandmap_job.source_index = 0;
+  web_bandmap_job.output_count = 0;
+  web_bandmap_job.state = web_bandmap_job.band_index < WEB_BANDMAP_BANDS
+      ? WEB_BANDMAP_JOB_SCAN : WEB_BANDMAP_JOB_PUBLISH;
+}
+
+static bool start_web_bandmap_snapshot_job() {
+  web_bandmap_heap_trace("job start");
+  if (!ensure_web_bandmap_snapshots()) return false;
+
+  // Time-sliced asynchronous DUPE checking requires an inactive snapshot.
+  // The normal PSRAM configuration has two snapshots.  Retain the old
+  // synchronous rebuild as a fallback would defeat the loop-time guarantee,
+  // so low-memory/single-snapshot configurations simply defer the refresh.
+  if (web_bandmap_snapshot_count < 2) {
+    static uint32_t last_warning_ms = 0;
+    if (millis() - last_warning_ms >= 5000U) {
+      last_warning_ms = millis();
+      webLog.println("bandmap: time-sliced rebuild requires two snapshots");
     }
-
-    snapshot->count[band_index] = count;
-    WebBandmapEntry *band_entries = web_bandmap_entry_at(snapshot, band_index, 0);
-    std::sort(band_entries,
-              band_entries + count,
-              [snapshot](const WebBandmapEntry &a, const WebBandmapEntry &b) {
-                return web_bandmap_entry_less(a, b, snapshot->sort_type);
-              });
-
-    uint32_t band_hash = 2166136261UL;
-    band_hash = web_bandmap_hash_mix(band_hash, snapshot->sort_type);
-    band_hash = web_bandmap_hash_mix(band_hash, bandid);
-    band_hash = web_bandmap_hash_mix(band_hash, count);
-    for (uint16_t i = 0; i < count; ++i) {
-      const WebBandmapEntry &entry = *web_bandmap_entry_at(snapshot, band_index, i);
-      band_hash = web_bandmap_hash_mix(band_hash, entry.freq);
-      band_hash = web_bandmap_hash_mix(band_hash, static_cast<uint32_t>(entry.time));
-      band_hash = web_bandmap_hash_mix(band_hash, entry.mode);
-      band_hash = web_bandmap_hash_mix(band_hash, entry.flag);
-      for (const char *p = entry.station; *p; ++p) {
-        band_hash = web_bandmap_hash_mix(
-          band_hash, static_cast<uint8_t>(*p));
-      }
-    }
-    snapshot->band_generation[band_index] = band_hash;
-    hash = web_bandmap_hash_mix(hash, band_hash);
+    return false;
   }
 
-  snapshot->generation = hash;
+  web_bandmap_job = WebBandmapBuildJob{};
+  web_bandmap_job.state = WEB_BANDMAP_JOB_PREPARE;
+  web_bandmap_job.snapshot_index = web_bandmap_active_snapshot ^ 1U;
+  web_bandmap_job.hash = 2166136261UL;
+  return true;
+}
 
-  if (single_snapshot) {
-    web_bandmap_active_snapshot = 0;
-    web_bandmap_published_generation = hash;
-    web_bandmap_snapshot_ready = true;
-    xSemaphoreGive(web_bandmap_snapshot_mutex);
-  } else if (xSemaphoreTake(web_bandmap_snapshot_mutex, portMAX_DELAY) == pdTRUE) {
-    web_bandmap_active_snapshot = next;
-    web_bandmap_published_generation = hash;
-    web_bandmap_snapshot_ready = true;
-    xSemaphoreGive(web_bandmap_snapshot_mutex);
-  }
+static void process_web_bandmap_snapshot_job() {
+  if (web_bandmap_job.state == WEB_BANDMAP_JOB_IDLE) return;
+  const uint32_t started_us = micros();
+  uint8_t entries_processed = 0;
 
-  const size_t rebuild_free_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const size_t rebuild_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  web_bandmap_heap_trace("rebuild leave");
-  if (lowmem_trace) {
-    webLog.printf("[BANDMAPTRACE] rebuild delta free=%d largest=%d\n",
-		  (int)rebuild_free_after - (int)rebuild_free_before,
-		  (int)rebuild_largest_after - (int)rebuild_largest_before);
+  while (web_bandmap_job.state != WEB_BANDMAP_JOB_IDLE &&
+         entries_processed < WEB_BANDMAP_JOB_MAX_ENTRIES &&
+         (uint32_t)(micros() - started_us) < WEB_BANDMAP_JOB_BUDGET_US) {
+    WebBandmapSnapshot *snapshot =
+        web_bandmap_snapshots[web_bandmap_job.snapshot_index];
+
+    switch (web_bandmap_job.state) {
+    case WEB_BANDMAP_JOB_PREPARE:
+      memset(snapshot->count, 0, sizeof(snapshot->count));
+      memset(snapshot->band_generation, 0, sizeof(snapshot->band_generation));
+      snapshot->generation = 0;
+      snapshot->sort_type = bandmap_disp.sort_type;
+      web_bandmap_job.hash = web_bandmap_hash_mix(
+          2166136261UL, snapshot->sort_type);
+      web_bandmap_job.state = WEB_BANDMAP_JOB_SCAN;
+      break;
+
+    case WEB_BANDMAP_JOB_SCAN: {
+      if (web_bandmap_job.band_index >= WEB_BANDMAP_BANDS) {
+        web_bandmap_job.state = WEB_BANDMAP_JOB_PUBLISH;
+        break;
+      }
+      if (web_bandmap_job.source_index >=
+              bandmap[web_bandmap_job.band_index].nentry ||
+          web_bandmap_job.output_count >= snapshot->capacity_per_band) {
+        web_bandmap_job.state = WEB_BANDMAP_JOB_FINISH_BAND;
+        break;
+      }
+
+      const uint16_t source_index = web_bandmap_job.source_index++;
+      struct bandmap_entry *source =
+          bandmap[web_bandmap_job.band_index].entry + source_index;
+      ++entries_processed;
+      if (source->station[0] == '\0' || source->mode >= NMODEID) break;
+
+      web_bandmap_job.pending = WebBandmapEntry{};
+      web_bandmap_job.pending.freq = source->freq;
+      web_bandmap_job.pending.time = source->time;
+      strlcpy(web_bandmap_job.pending.station, source->station,
+              sizeof(web_bandmap_job.pending.station));
+      web_bandmap_job.pending.mode = source->mode;
+      web_bandmap_job.pending.flag = source->flag;
+      web_bandmap_job.pending_source_index = source_index;
+
+      const int bandid = web_bandmap_job.band_index + 1;
+      const byte bm = bandmode_param(bandid, modetype[source->mode]);
+      if (dupechk->dupechk_at == 1) {
+        if (!dupechk_background_exact_start(source->station, bm, plogw->mask)) {
+          // The single query slot belongs to operator work.  Retry this same
+          // entry on a later loop rather than skipping its DUPE result.
+          --web_bandmap_job.source_index;
+          return;
+        }
+        web_bandmap_job.state = WEB_BANDMAP_JOB_WAIT_DUPE;
+        return;
+      }
+
+      web_bandmap_store_pending(
+          dupe_check_nocallhist(source->station, bm, plogw->mask));
+      break;
+    }
+
+    case WEB_BANDMAP_JOB_WAIT_DUPE: {
+      bool confirmed = false;
+      bool worked = false;
+      if (!dupechk_background_exact_poll(&confirmed, &worked)) return;
+      // On timeout or operator preemption, retry the same entry in the next
+      // refresh.  Keep it visible now instead of stalling the current build.
+      web_bandmap_store_pending(confirmed && worked);
+      web_bandmap_job.state = WEB_BANDMAP_JOB_SCAN;
+      break;
+    }
+
+    case WEB_BANDMAP_JOB_FINISH_BAND:
+      web_bandmap_finish_current_band();
+      break;
+
+    case WEB_BANDMAP_JOB_PUBLISH:
+      snapshot->generation = web_bandmap_job.hash;
+      if (xSemaphoreTake(web_bandmap_snapshot_mutex,
+                         pdMS_TO_TICKS(5)) != pdTRUE)
+        return;
+      web_bandmap_active_snapshot = web_bandmap_job.snapshot_index;
+      web_bandmap_published_generation = snapshot->generation;
+      web_bandmap_snapshot_ready = true;
+      xSemaphoreGive(web_bandmap_snapshot_mutex);
+      web_bandmap_job.state = WEB_BANDMAP_JOB_IDLE;
+      web_bandmap_heap_trace("job publish");
+      break;
+
+    default:
+      dupechk_background_exact_cancel();
+      web_bandmap_job.state = WEB_BANDMAP_JOB_IDLE;
+      break;
+    }
   }
 }
 
@@ -3463,20 +4372,6 @@ static WebBandmapApiState *make_web_bandmap_api_state(uint8_t bandid) {
   xSemaphoreGive(web_bandmap_snapshot_mutex);
   state->band_count = 1;
   return state;
-}
-
-static size_t web_bandmap_copy_line(WebBandmapApiState *state,
-                                    uint8_t *buffer, size_t maxLen) {
-  const size_t length = strlen(state->line);
-  const size_t remain = length - state->offset;
-  const size_t ncopy = std::min(remain, maxLen);
-  if (ncopy) memcpy(buffer, state->line + state->offset, ncopy);
-  state->offset += ncopy;
-  if (state->offset == length) {
-    state->offset = 0;
-    state->line[0] = '\0';
-  }
-  return ncopy;
 }
 
 static void web_bandmap_json_safe_copy(char *dest, size_t dest_size,
@@ -3786,12 +4681,52 @@ static void setup_web_bandmap_handlers() {
 void process_web_bandmap() {
   if (f_low_memory_mode) return;
 
+  // User commands are handled first.  Snapshot rebuilding then advances only
+  // within its per-loop time/entry budget.
   process_web_bandmap_command_queue();
+  process_web_bandmap_snapshot_job();
+
   const uint32_t now = millis();
-  if ((int32_t)(now - web_bandmap_next_refresh_ms) >= 0) {
-    web_bandmap_next_refresh_ms = now + WEB_BANDMAP_REFRESH_MS;
-    rebuild_web_bandmap_snapshot();
+  if (web_bandmap_job.state == WEB_BANDMAP_JOB_IDLE &&
+      (int32_t)(now - web_bandmap_next_refresh_ms) >= 0) {
+    if (start_web_bandmap_snapshot_job())
+      web_bandmap_next_refresh_ms = now + WEB_BANDMAP_REFRESH_MS;
+    else
+      web_bandmap_next_refresh_ms = now + 1000U;
   }
+}
+
+
+static bool web_sat_calc_point(int idx, const DateTime &jst_time,
+                               double *az, double *el, double *rr) {
+  if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].YEAR == 0) return false;
+  Plan13 calc;
+  calc.setElements(
+    sat_info[idx].YEAR, sat_info[idx].EPOCH, sat_info[idx].INCLINATION,
+    sat_info[idx].RAAN, sat_info[idx].ECCENTRICITY * ONEPPTM,
+    sat_info[idx].ARGUMENT_PEDIGREE, sat_info[idx].MEAN_ANOMALY,
+    sat_info[idx].MEAN_MOTION, sat_info[idx].TIME_MOTION_D,
+    sat_info[idx].EPOCH_ORBIT, 180);
+  calc.setLocation(mh2lon(plogw->grid_locator_set),
+                   mh2lat(plogw->grid_locator_set), 50);
+  const uint32_t jst_epoch = jst_time.unixtime();
+  const uint32_t utc_epoch = jst_epoch >= 9UL * 3600UL
+                               ? jst_epoch - 9UL * 3600UL : 0;
+  DateTime utc_time(utc_epoch);
+  calc.setTime(utc_time.year(), utc_time.month(), utc_time.day(),
+               utc_time.hour(), utc_time.minute(), utc_time.second());
+  calc.initSat();
+  calc.satvec();
+  calc.rangevec();
+  if (az) *az = calc.AZ;
+  if (el) *el = calc.EL;
+  if (rr) *rr = calc.RR;
+  return true;
+}
+
+static void web_sat_format_datetime(const DateTime &t, char *buf, size_t n) {
+  snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d",
+           t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
 }
 
 void init_webserver() {
@@ -3804,6 +4739,454 @@ void init_webserver() {
     webLog.println(logmessage);
     request->send_P(200, "text/html", index_html, processor);
     logmessage="";
+  });
+
+
+  web_server.on("/sat", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", sat_page_html);
+  });
+
+  web_server.on("/api/sat/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const int idx = plogw->sat_idx_selected;
+    const char *name = (idx >= 0 && idx < N_SATELLITES) ? sat_info[idx].name : "";
+    char payload[768];
+    const char *tracking_name = plogw->sat_freq_tracking_mode == SAT_RX_FIX ? "RX FIX" :
+                                plogw->sat_freq_tracking_mode == SAT_TX_FIX ? "TX FIX" :
+                                plogw->sat_freq_tracking_mode == SAT_SAT_FIX ? "SAT FIX" : "NO TRACK";
+    const char *vfo_name = plogw->sat_vfo_mode == SAT_VFO_SINGLE_A_TX ? "Single: TX=A" :
+                           plogw->sat_vfo_mode == SAT_VFO_SINGLE_A_RX ? "Single: RX=A" :
+                           plogw->sat_vfo_mode == SAT_VFO_MULTI_TX_0 ? "TX=Radio0 / RX=Radio1" :
+                           "TX=Radio1 / RX=Radio0";
+    const int offset_hz = (idx >= 0 && idx < N_SATELLITES) ? sat_info[idx].offset_freq : 0;
+    DateTime utc_time((uint32_t)(my_rtc.unixtime() - 9UL * 3600UL));
+    char jst[80], utc[80];
+    snprintf(jst,sizeof(jst),"%04d-%02d-%02d %02d:%02d:%02d",my_rtc.year(),my_rtc.month(),my_rtc.day(),my_rtc.hour(),my_rtc.minute(),my_rtc.second());
+    snprintf(utc,sizeof(utc),"%04d-%02d-%02d %02d:%02d:%02d",utc_time.year(),utc_time.month(),utc_time.day(),utc_time.hour(),utc_time.minute(),utc_time.second());
+    snprintf(payload, sizeof(payload),
+             "{\"index\":%d,\"name\":\"%s\",\"enabled\":%s,"
+             "\"az\":%.3f,\"el\":%.3f,\"rr\":%.5f,"
+             "\"tracking_mode\":%d,\"tracking_name\":\"%s\","
+             "\"vfo_mode\":%d,\"vfo_name\":\"%s\","
+             "\"up_hz\":%d,\"down_hz\":%d,\"sat_up_hz\":%d,\"sat_down_hz\":%d,\"offset_hz\":%d,"
+             "\"grid\":\"%s\",\"lat\":%.6f,\"lon\":%.6f,\"jst\":\"%s\",\"utc\":\"%s\"}",
+             idx, name, plogw->sat ? "true" : "false",
+             p13.AZ, p13.EL, p13.RR,
+             plogw->sat_freq_tracking_mode, tracking_name, plogw->sat_vfo_mode, vfo_name,
+             plogw->up_f, plogw->dn_f, plogw->satup_f, plogw->satdn_f, offset_hz,
+             plogw->grid_locator_set, plogw->latitude, plogw->longitude, jst, utc);
+    request->send(200, "application/json", payload);
+  });
+
+  web_server.on("/api/sat/db", HTTP_GET, [](AsyncWebServerRequest *request) {
+    AsyncResponseStream *res = request->beginResponseStream("application/json");
+    res->print("{\"satellites\":[");
+    bool first = true;
+    for (int i = 0; i < N_SATELLITES; ++i) {
+      if (sat_info[i].name[0] == '\0') continue;
+      if (!first) res->print(',');
+      first = false;
+      res->printf("{\"index\":%d,\"name\":\"%s\",\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\","
+                  "\"dn0\":%d,\"dn1\":%d,\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"tle\":%s}",
+                  i, sat_info[i].name, sat_info[i].up_f0, sat_info[i].up_f1, sat_info[i].up_mode,
+                  sat_info[i].dn_f0, sat_info[i].dn_f1, sat_info[i].dn_mode,
+                  sat_info[i].bc_f0, sat_info[i].offset_freq,
+                  sat_info[i].YEAR ? "true" : "false");
+    }
+    res->print("]}");
+    request->send(res);
+  });
+
+  web_server.on("/api/sat/db/save", HTTP_POST, [](AsyncWebServerRequest *request) {
+    const char *required[] = {"index","name","up0","up1","upmode","dn0","dn1","dnmode","beacon","offset"};
+    for (const char *p : required) {
+      if (!request->hasParam(p)) { request->send(400, "text/plain", String("Missing ") + p); return; }
+    }
+
+    int idx = request->getParam("index")->value().toInt();
+    String name = request->getParam("name")->value();
+    String upmode = request->getParam("upmode")->value();
+    String dnmode = request->getParam("dnmode")->value();
+    name.trim(); upmode.trim(); dnmode.trim();
+    name.toUpperCase(); upmode.toUpperCase(); dnmode.toUpperCase();
+
+    if (name.length() < 1 || name.length() >= sizeof(sat_info[0].name) ||
+        upmode.length() >= sizeof(sat_info[0].up_mode) ||
+        dnmode.length() >= sizeof(sat_info[0].dn_mode)) {
+      request->send(400, "text/plain", "Name or mode is too long"); return;
+    }
+    for (size_t n=0; n<name.length(); ++n) {
+      const char c=name[n];
+      if (!(isalnum((unsigned char)c) || c==' ' || c=='-' || c=='_' || c=='/' ||
+            c=='(' || c==')' || c=='.' || c=='+')) {
+        request->send(400, "text/plain", "Invalid character in name"); return;
+      }
+    }
+
+    const double up0m = request->getParam("up0")->value().toDouble();
+    const double up1m = request->getParam("up1")->value().toDouble();
+    const double dn0m = request->getParam("dn0")->value().toDouble();
+    const double dn1m = request->getParam("dn1")->value().toDouble();
+    const double bcm  = request->getParam("beacon")->value().toDouble();
+    if (up0m < 0 || up1m < 0 || dn0m < 0 || dn1m < 0 || bcm < 0 ||
+        up0m > 2147.0 || up1m > 2147.0 || dn0m > 2147.0 || dn1m > 2147.0 || bcm > 2147.0) {
+      request->send(400, "text/plain", "Frequency out of range"); return;
+    }
+
+    if (idx < 0) {
+      for (idx = 0; idx < N_SATELLITES; ++idx) if (sat_info[idx].name[0] == '\0') break;
+      if (idx >= N_SATELLITES) { request->send(409, "text/plain", "Satellite database is full"); return; }
+    } else if (idx >= N_SATELLITES || sat_info[idx].name[0] == '\0') {
+      request->send(400, "text/plain", "Invalid index"); return;
+    }
+
+    for (int i=0;i<N_SATELLITES;++i) {
+      if (i != idx && sat_info[i].name[0] && name.equalsIgnoreCase(sat_info[i].name)) {
+        request->send(409, "text/plain", "Satellite name already exists"); return;
+      }
+    }
+
+    const bool name_changed = strcmp(sat_info[idx].name, name.c_str()) != 0;
+    strlcpy(sat_info[idx].name, name.c_str(), sizeof(sat_info[idx].name));
+    sat_info[idx].up_f0 = (int)(up0m * 1000000.0 + 0.5);
+    sat_info[idx].up_f1 = (int)(up1m * 1000000.0 + 0.5);
+    sat_info[idx].dn_f0 = (int)(dn0m * 1000000.0 + 0.5);
+    sat_info[idx].dn_f1 = (int)(dn1m * 1000000.0 + 0.5);
+    sat_info[idx].bc_f0 = (int)(bcm * 1000000.0 + 0.5);
+    sat_info[idx].offset_freq = request->getParam("offset")->value().toInt();
+    strlcpy(sat_info[idx].up_mode, upmode.c_str(), sizeof(sat_info[idx].up_mode));
+    strlcpy(sat_info[idx].dn_mode, dnmode.c_str(), sizeof(sat_info[idx].dn_mode));
+
+    if (name_changed) {
+      sat_info[idx].YEAR = 0;
+      sat_info[idx].EPOCH = 0;
+      sat_info[idx].nextaos = DateTime((uint32_t)0);
+      sat_info[idx].nextlos = DateTime((uint32_t)0);
+      sat_info[idx].maxel = 0;
+    }
+    save_satinfo();
+    readtlefile();
+    start_calc_nextaos();
+    request->send(200, "text/plain", sat_info[idx].YEAR ? "Saved; TLE matched" : "Saved; no matching TLE yet");
+  });
+
+  web_server.on("/api/sat/db/delete", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("index")) { request->send(400, "text/plain", "Missing index"); return; }
+    const int idx = request->getParam("index")->value().toInt();
+    if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].name[0] == '\0') {
+      request->send(400, "text/plain", "Invalid index"); return;
+    }
+    if (plogw->sat_idx_selected == idx) {
+      plogw->sat = 0;
+      plogw->sat_idx_selected = -1;
+      plogw->sat_name_set[0] = '\0';
+    }
+    struct sat_info empty_sat = {};
+    sat_info[idx] = empty_sat;
+    save_satinfo();
+    start_calc_nextaos();
+    request->send(200, "text/plain", "Deleted");
+  });
+
+  web_server.on("/api/sat/list", HTTP_GET, [](AsyncWebServerRequest *request) {
+    bool have_valid_sat = false;
+    for (int i = 0; i < N_SATELLITES; ++i) {
+      if (sat_info[i].name[0] != '\0' && sat_info[i].YEAR != 0) {
+        have_valid_sat = true;
+        break;
+      }
+    }
+    if (!have_valid_sat) {
+      load_satinfo();
+      readtlefile();
+    }
+
+    AsyncResponseStream *res = request->beginResponseStream("application/json");
+    res->print("{\"satellites\":[");
+    bool first = true;
+    for (int i = 0; i < N_SATELLITES; ++i) {
+      if (sat_info[i].name[0] == '\0' || sat_info[i].YEAR == 0) continue;
+      if (!first) res->print(',');
+      first = false;
+      res->printf("{\"index\":%d,\"name\":\"%s\",\"selected\":%s}",
+                  i, sat_info[i].name, i == plogw->sat_idx_selected ? "true" : "false");
+    }
+    res->print("]}");
+    request->send(res);
+  });
+
+  web_server.on("/api/sat/select", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("index")) { request->send(400, "text/plain", "Missing index"); return; }
+    const int idx = request->getParam("index")->value().toInt();
+    if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].name[0] == '\0' || sat_info[idx].YEAR == 0) {
+      request->send(400, "text/plain", "Invalid satellite"); return;
+    }
+    plogw->sat_idx_selected = idx;
+    strlcpy(plogw->sat_name + 2, sat_info[idx].name, LEN_SATNAME_WINDOW + 1);
+    sat_name_entered();
+    set_sat_info_calc();
+    set_sat_freq_calc();
+    request->send(200, "text/plain", "Selected and satellite operation started");
+  });
+
+  web_server.on("/api/sat/enable", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("enabled")) { request->send(400, "text/plain", "Missing enabled"); return; }
+    if (request->getParam("enabled")->value().toInt()) {
+      bool tle_loaded_now = false;
+      if (plogw->tle_unixtime == 0) {
+        readtlefile();
+        tle_loaded_now = (plogw->tle_unixtime != 0);
+      }
+      if (plogw->sat_idx_selected < 0 || plogw->sat_idx_selected >= N_SATELLITES ||
+          sat_info[plogw->sat_idx_selected].name[0] == '\0') {
+        request->send(409, "text/plain", "Select a satellite first");
+        return;
+      }
+      strlcpy(plogw->sat_name + 2, sat_info[plogw->sat_idx_selected].name, LEN_SATNAME_WINDOW + 1);
+      sat_name_entered(); set_sat_info_calc(); set_sat_freq_calc();
+      request->send(200, "text/plain",
+                    tle_loaded_now ? "Satellite operation ON (TLE loaded from SD)"
+                                   : "Satellite operation ON");
+    } else {
+      plogw->sat = 0;
+      request->send(200, "text/plain", "Satellite operation OFF");
+    }
+  });
+
+  web_server.on("/api/sat/tracking", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("mode")) { request->send(400, "text/plain", "Missing mode"); return; }
+    const int mode = request->getParam("mode")->value().toInt();
+    if (mode < SAT_RX_FIX || mode > SAT_NO_TRACK) { request->send(400, "text/plain", "Invalid tracking mode"); return; }
+    plogw->sat_freq_tracking_mode = mode; set_sat_freq_calc();
+    request->send(200, "text/plain", "Tracking mode changed");
+  });
+
+  web_server.on("/api/sat/vfo/auto", HTTP_POST, [](AsyncWebServerRequest *request) {
+    char reason[192];
+    const int mode = auto_select_sat_vfo_mode(reason, sizeof(reason));
+    if (mode >= 0) {
+      set_sat_freq_calc();
+      request->send(200, "text/plain", String("Auto VFO: ") + reason);
+    } else {
+      request->send(409, "text/plain", String("Auto VFO: ") + reason);
+    }
+  });
+
+  web_server.on("/api/sat/vfo", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("mode")) { request->send(400, "text/plain", "Missing mode"); return; }
+    const int mode = request->getParam("mode")->value().toInt();
+    if (mode < SAT_VFO_SINGLE_A_TX || mode > SAT_VFO_MULTI_TX_1) { request->send(400, "text/plain", "Invalid VFO mode"); return; }
+    plogw->sat_vfo_mode = mode; set_sat_freq_calc();
+    request->send(200, "text/plain", "VFO mode changed");
+  });
+
+  web_server.on("/api/sat/action", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("name")) { request->send(400, "text/plain", "Missing action"); return; }
+    const String name = request->getParam("name")->value();
+    if (name == "center") { set_sat_center_frequency(); request->send(200, "text/plain", "Center frequency selected"); }
+    else if (name == "beacon") { set_sat_beacon_frequency(); request->send(200, "text/plain", "Beacon frequency selected"); }
+    else request->send(400, "text/plain", "Invalid action");
+  });
+
+  web_server.on("/api/sat/offset", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("hz")) { request->send(400, "text/plain", "Missing hz"); return; }
+    const int hz = request->getParam("hz")->value().toInt();
+    if (!(hz == -100 || hz == -10 || hz == 10 || hz == 100)) { request->send(400, "text/plain", "Invalid offset"); return; }
+    if (!plogw->sat) { request->send(409, "text/plain", "Satellite operation is OFF"); return; }
+    adjust_sat_offset(hz);
+    request->send(200, "text/plain", "Offset adjusted");
+  });
+
+  web_server.on("/api/sat/location", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("grid")) { request->send(400, "text/plain", "Missing grid"); return; }
+    String grid = request->getParam("grid")->value();
+    grid.trim(); grid.toUpperCase();
+    if (grid.length() < 4 || grid.length() > LEN_GL) { request->send(400, "text/plain", "Grid must be 4-7 characters"); return; }
+    for (size_t i=0;i<grid.length();++i) {
+      const char c=grid[i];
+      if (!isalnum((unsigned char)c)) { request->send(400, "text/plain", "Invalid grid"); return; }
+    }
+    strlcpy(plogw->grid_locator + 2, grid.c_str(), LEN_GL + 1);
+    set_grid_locator_information();
+    save_settings("");
+    if (plogw->sat) {
+      set_sat_info_calc();
+      set_sat_freq_calc();
+    }
+    request->send(200, "text/plain", "Location updated and saved");
+  });
+
+  web_server.on("/api/sat/pass", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("index")) { request->send(400, "text/plain", "Missing index"); return; }
+    const int idx = request->getParam("index")->value().toInt();
+    if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].name[0] == '\0' || sat_info[idx].YEAR == 0) {
+      request->send(400, "text/plain", "Invalid satellite"); return;
+    }
+    const DateTime aos = sat_info[idx].nextaos;
+    const DateTime los = sat_info[idx].nextlos;
+    if (compare_datetime(los, aos) <= 0) {
+      request->send(409, "text/plain", "No valid calculated pass"); return;
+    }
+
+    const uint32_t aos_epoch = aos.unixtime();
+    const uint32_t los_epoch = los.unixtime();
+    const uint32_t duration = los_epoch - aos_epoch;
+    uint32_t step = duration / 36U;
+    if (step < 15U) step = 15U;
+    if (step > 60U) step = 60U;
+
+    char aos_text[40], los_text[40], mel_text[40];
+    web_sat_format_datetime(aos, aos_text, sizeof(aos_text));
+    web_sat_format_datetime(los, los_text, sizeof(los_text));
+
+    AsyncResponseStream *res = request->beginResponseStream("application/json");
+    res->printf("{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\","
+                "\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\",\"dn0\":%d,\"dn1\":%d,"
+                "\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"points\":[",
+                idx, sat_info[idx].name, aos_text, los_text,
+                sat_info[idx].up_f0, sat_info[idx].up_f1, sat_info[idx].up_mode,
+                sat_info[idx].dn_f0, sat_info[idx].dn_f1, sat_info[idx].dn_mode,
+                sat_info[idx].bc_f0, sat_info[idx].offset_freq);
+
+    bool first = true;
+    double max_el = -90.0, mel_az = 0.0, aos_az = 0.0, los_az = 0.0;
+    DateTime mel_time = aos;
+    uint32_t last_off = 0;
+    for (uint32_t off = 0; off <= duration; off += step) {
+      const DateTime t(aos_epoch + off);
+      double az = 0, el = 0, rr = 0;
+      if (!web_sat_calc_point(idx, t, &az, &el, &rr)) continue;
+      if (off == 0) aos_az = az;
+      if (el > max_el) { max_el = el; mel_az = az; mel_time = t; }
+      if (!first) res->print(',');
+      first = false;
+      res->printf("{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)t.unixtime(), az, el);
+      last_off = off;
+      if (duration - off < step) break;
+    }
+    if (last_off != duration) {
+      double az = 0, el = 0, rr = 0;
+      if (web_sat_calc_point(idx, los, &az, &el, &rr)) {
+        if (!first) res->print(',');
+        res->printf("{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)los.unixtime(), az, el);
+        los_az = az;
+        if (el > max_el) { max_el = el; mel_az = az; mel_time = los; }
+      }
+    } else {
+      double el = 0, rr = 0;
+      web_sat_calc_point(idx, los, &los_az, &el, &rr);
+    }
+    web_sat_format_datetime(mel_time, mel_text, sizeof(mel_text));
+    res->printf("],\"aos_az\":%.3f,\"mel\":\"%s\",\"mel_az\":%.3f,\"mel_el\":%.3f,\"los_az\":%.3f}",
+                aos_az, mel_text, mel_az, max_el, los_az);
+    request->send(res);
+  });
+
+  web_server.on("/api/sat/nowpos", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("index")) { request->send(400, "text/plain", "Missing index"); return; }
+    const int idx = request->getParam("index")->value().toInt();
+    if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].name[0] == '\0' || sat_info[idx].YEAR == 0) {
+      request->send(400, "text/plain", "Invalid satellite"); return;
+    }
+    double az = 0, el = 0, rr = 0;
+    if (!web_sat_calc_point(idx, my_rtc, &az, &el, &rr)) {
+      request->send(500, "text/plain", "Position calculation failed"); return;
+    }
+    char now_text[40];
+    web_sat_format_datetime(my_rtc, now_text, sizeof(now_text));
+    const bool active = compare_datetime(my_rtc, sat_info[idx].nextaos) >= 0 &&
+                        compare_datetime(sat_info[idx].nextlos, my_rtc) >= 0;
+    const bool selected = idx == plogw->sat_idx_selected && plogw->sat;
+    char payload[320];
+    snprintf(payload, sizeof(payload),
+             "{\"index\":%d,\"jst\":\"%s\",\"az\":%.3f,\"el\":%.3f,\"rr\":%.5f,"
+             "\"active\":%s,\"selected\":%s,\"up_hz\":%d,\"down_hz\":%d}",
+             idx, now_text, az, el, rr,
+             active ? "true" : "false", selected ? "true" : "false",
+             selected ? plogw->up_f : 0, selected ? plogw->dn_f : 0);
+    request->send(200, "application/json", payload);
+  });
+
+  web_server.on("/api/sat/aos", HTTP_GET, [](AsyncWebServerRequest *request) {
+    AsyncResponseStream *res = request->beginResponseStream("application/json");
+    int total = 0;
+    int completed = 0;
+    for (int i=0;i<N_SATELLITES;i++) {
+      if (!(sat_info[i].name[0] && sat_info[i].YEAR)) continue;
+      total++;
+      if (!plogw->f_nextaos || i < plogw->nextaos_satidx) completed++;
+    }
+    const int current_idx = plogw->nextaos_satidx;
+    const char *current_name = (current_idx >= 0 && current_idx < N_SATELLITES && sat_info[current_idx].name[0]) ? sat_info[current_idx].name : "";
+    const char *state_name = plogw->f_nextaos == 1 ? "prepare" :
+                             plogw->f_nextaos == 2 ? "AOS search" :
+                             plogw->f_nextaos == 3 ? "LOS search" :
+                             plogw->f_nextaos == 4 ? "finalize" :
+                             plogw->f_nextaos == 5 ? "next satellite" : "idle";
+    res->printf("{\"calculating\":%s,\"completed\":%d,\"total\":%d,\"current_index\":%d,\"current_name\":\"%s\",\"state\":%d,\"state_name\":\"%s\",\"passes\":[",
+                plogw->f_nextaos ? "true" : "false", completed, total, current_idx,
+                current_name, plogw->f_nextaos, state_name);
+    int aos_idx[N_SATELLITES];
+    int aos_count = 0;
+    for (int i = 0; i < N_SATELLITES; ++i) {
+      if (sat_info[i].name[0] == '\0' || sat_info[i].YEAR == 0) continue;
+      if (plogw->f_nextaos && i >= plogw->nextaos_satidx) continue;
+      if (compare_datetime(sat_info[i].nextlos, my_rtc) <= 0) continue;
+      if (compare_datetime(sat_info[i].nextlos, sat_info[i].nextaos) <= 0) continue;
+      aos_idx[aos_count++] = i;
+    }
+
+    for (int a = 1; a < aos_count; ++a) {
+      const int key = aos_idx[a];
+      int b = a - 1;
+      while (b >= 0 &&
+             compare_datetime(sat_info[aos_idx[b]].nextaos,
+                              sat_info[key].nextaos) > 0) {
+        aos_idx[b + 1] = aos_idx[b];
+        --b;
+      }
+      aos_idx[b + 1] = key;
+    }
+
+    bool first = true;
+    const int max_show = 15;
+    const int shown_count = aos_count < max_show ? aos_count : max_show;
+    for (int n = 0; n < shown_count; ++n) {
+      const int i = aos_idx[n];
+      if (!first) res->print(',');
+      first = false;
+      char aos[24], los[24];
+      snprintf(aos,sizeof(aos),"%04d-%02d-%02d %02d:%02d",sat_info[i].nextaos.year(),sat_info[i].nextaos.month(),sat_info[i].nextaos.day(),sat_info[i].nextaos.hour(),sat_info[i].nextaos.minute());
+      snprintf(los,sizeof(los),"%04d-%02d-%02d %02d:%02d",sat_info[i].nextlos.year(),sat_info[i].nextlos.month(),sat_info[i].nextlos.day(),sat_info[i].nextlos.hour(),sat_info[i].nextlos.minute());
+      res->printf("{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\",\"max_el\":%.2f}",i,sat_info[i].name,aos,los,sat_info[i].maxel);
+    }
+    res->print("]}"); request->send(res);
+  });
+
+
+  web_server.on("/api/sat/tle/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    int valid_satellites = 0;
+    for (int i = 0; i < N_SATELLITES; ++i) {
+      if (sat_info[i].name[0] && sat_info[i].YEAR) valid_satellites++;
+    }
+    char payload[448];
+    snprintf(payload,sizeof(payload),"{\"url\":\"%s\",\"requested\":%s,\"in_progress\":%s,\"last_result\":%d,\"tle_time\":%lu,\"valid_satellites\":%d}",
+             sat_tle_url, sat_tle_update_requested?"true":"false", sat_tle_update_in_progress?"true":"false",
+             sat_tle_last_result, plogw->tle_unixtime, valid_satellites);
+    request->send(200,"application/json",payload);
+  });
+  web_server.on("/api/sat/tle/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("url")) { request->send(400,"text/plain","Missing URL"); return; }
+    String url=request->getParam("url")->value(); url.trim();
+    if (!(url.startsWith("http://") || url.startsWith("https://")) || url.length() >= sizeof(sat_tle_url)) { request->send(400,"text/plain","Invalid URL"); return; }
+    strlcpy(sat_tle_url,url.c_str(),sizeof(sat_tle_url)); save_settings(""); request->send(200,"text/plain","TLE URL saved");
+  });
+  web_server.on("/api/sat/tle/update", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (sat_tle_update_in_progress || sat_tle_update_requested) { request->send(409,"text/plain","Already running"); return; }
+    request_sat_tle_update(); request->send(202,"text/plain","Queued");
+  });
+
+  web_server.on("/api/sat/aos/recalculate", HTTP_POST, [](AsyncWebServerRequest *request) {
+    start_calc_nextaos(); request->send(202, "text/plain", "Started");
   });
 
   // /potahelp
@@ -4093,189 +5476,251 @@ function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank'
   });
 
 // static変数としてShiftキーの状態を保持
-static bool shiftLeftPressed = false;  // 左Shiftキーの状態
-static bool shiftRightPressed = false;  // 右Shiftキーの状態
-
 // DVPlogger status page.  Use ?lang=en for English; Japanese is default.
 web_server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-  bool english = request->hasParam("lang") &&
-                 request->getParam("lang")->value().equalsIgnoreCase("en");
-  const bool connected = (WiFi.status() == WL_CONNECTED);
-  const uint32_t seconds = millis() / 1000UL;
-  const uint32_t days = seconds / 86400UL;
-  const uint32_t hours = (seconds / 3600UL) % 24UL;
-  const uint32_t minutes = (seconds / 60UL) % 60UL;
-  const uint32_t secs = seconds % 60UL;
+  struct StatusChunkState {
+    bool english = false;
+    uint8_t stage = 0;
+    size_t offset = 0;
+    String pending;
+  };
 
-  auto esc = [](const String &src) {
-    String dst;
-    dst.reserve(src.length() + 12);
-    for (size_t i = 0; i < src.length(); ++i) {
-      switch (src[i]) {
-      case '&': dst += F("&amp;"); break;
-      case '<': dst += F("&lt;"); break;
-      case '>': dst += F("&gt;"); break;
-      case '"': dst += F("&quot;"); break;
-      default: dst += src[i]; break;
+  auto state = std::make_shared<StatusChunkState>();
+  state->english = request->hasParam("lang") &&
+                   request->getParam("lang")->value().equalsIgnoreCase("en");
+  // Keep only one status-page section in RAM at a time.  The old handler
+  // reserved 6000+ bytes and built the complete page before sending it.
+  state->pending.reserve(1536);
+
+  AsyncWebServerResponse *response = request->beginChunkedResponse(
+    "text/html; charset=utf-8",
+    [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      (void)index;
+
+      auto esc = [](const String &src) {
+        String dst;
+        dst.reserve(src.length() + 12);
+        for (size_t i = 0; i < src.length(); ++i) {
+          switch (src[i]) {
+          case '&': dst += F("&amp;"); break;
+          case '<': dst += F("&lt;"); break;
+          case '>': dst += F("&gt;"); break;
+          case '"': dst += F("&quot;"); break;
+          default: dst += src[i]; break;
+          }
+        }
+        return dst;
+      };
+
+      auto input_name = [state](int ptr) -> String {
+        const bool english = state->english;
+        if (ptr >= 10 && ptr < 10 + N_CWMSG)
+          return String(english ? "CW message F" : "CWメッセージ F") + String(ptr - 9);
+        if (ptr >= 30 && ptr < 30 + N_CWMSG)
+          return String(english ? "RTTY message F" : "RTTYメッセージ F") + String(ptr - 29);
+        switch (ptr) {
+        case 0: return english ? String("Callsign") : String("相手局コールサイン");
+        case 1: return english ? String("Received exchange") : String("受信ナンバー");
+        case 2: return english ? String("Sent RST") : String("送信RST");
+        case 3: return english ? String("Received RST") : String("受信RST");
+        case 4: return english ? String("My callsign") : String("自局コールサイン");
+        case 5: return english ? String("Sent exchange") : String("送出ナンバー");
+        case 6: return String("Remarks");
+        case 7: return english ? String("Satellite") : String("衛星名");
+        case 8: return english ? String("Grid locator") : String("グリッドロケータ");
+        case 9: return String("JCC/JCG");
+        case 20: return english ? String("Rig name") : String("リグ名");
+        case 21: return english ? String("Cluster name") : String("Cluster名");
+        case 22: return english ? String("Email address") : String("メールアドレス");
+        case 23: return english ? String("Cluster command") : String("Clusterコマンド");
+        case 24: return english ? String("Power code") : String("電力コード");
+        case 25: return String("Wi-Fi SSID");
+        case 26: return english ? String("Wi-Fi password") : String("Wi-Fiパスワード");
+        case 27: return english ? String("Rig specification") : String("リグ仕様");
+        case 28: return String("Z-server");
+        case 29: return english ? String("Operator name") : String("オペレータ名");
+        case 40: return english ? String("Contest") : String("コンテスト");
+        case 41: return english ? String("Cluster2 name") : String("Cluster2名");
+        case 42: return english ? String("Cluster2 command") : String("Cluster2コマンド");
+        default: return String("#") + String(ptr);
+        }
+      };
+
+      auto input_value = [](struct radio *radio) -> String {
+        const int ptr = radio->ptr_curr;
+        if (ptr >= 10 && ptr < 10 + N_CWMSG) return String(plogw->cw_msg[ptr - 10] + 2);
+        if (ptr >= 30 && ptr < 30 + N_CWMSG) return String(plogw->rtty_msg[ptr - 30] + 2);
+        switch (ptr) {
+        case 0: return String(radio->callsign + 2);
+        case 1: return String(radio->recv_exch + 2);
+        case 2: return String(radio->sent_rst + 2);
+        case 3: return String(radio->recv_rst + 2);
+        case 4: return String(plogw->my_callsign + 2);
+        case 5: return String(plogw->sent_exch + 2);
+        case 6: return String(radio->remarks + 2);
+        case 7: return String(plogw->sat_name + 2);
+        case 8: return String(plogw->grid_locator + 2);
+        case 9: return String(plogw->jcc + 2);
+        case 20: return String(radio->rig_name + 2);
+        case 21: return String(plogw->cluster_name + 2);
+        case 22: return String(plogw->email_addr + 2);
+        case 23: return String(plogw->cluster_cmd + 2);
+        case 24: return String(plogw->power_code + 2);
+        case 25: return String(plogw->wifi_ssid + 2);
+        case 26: return String("********");
+        case 27: return String(radio->rig_spec_str + 2);
+        case 28: return String(plogw->zserver_name + 2);
+        case 29: return String(plogw->my_name + 2);
+        case 40: return String(plogw->contest_name + 2);
+        case 41: return String(plogw->cluster2_name + 2);
+        case 42: return String(plogw->cluster2_cmd + 2);
+        default: return String("-");
+        }
+      };
+
+      auto add_row = [&](const __FlashStringHelper *ja,
+                         const __FlashStringHelper *en,
+                         const String &value) {
+        state->pending += F("<tr><th>");
+        state->pending += state->english ? en : ja;
+        state->pending += F("</th><td>");
+        state->pending += esc(value);
+        state->pending += F("</td></tr>");
+      };
+
+      while (state->offset >= state->pending.length()) {
+        state->pending = "";
+        state->offset = 0;
+        const bool english = state->english;
+
+        switch (state->stage++) {
+        case 0:
+          state->pending += F("<!doctype html><html lang=\"");
+          state->pending += english ? F("en") : F("ja");
+          state->pending += F("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+          state->pending += F("<title>DVPlogger Status</title><style>body{font-family:sans-serif;margin:20px;max-width:1050px}table{border-collapse:collapse;width:100%;margin-bottom:18px}th,td{border:1px solid #bbb;padding:7px;text-align:left}th{background:#eee}.summary th{width:32%}.radio th,.radio td{white-space:nowrap}.radio td:last-child{white-space:normal}.nav a{margin-right:14px}h2{margin-bottom:6px}</style></head><body>");
+          state->pending += F("<div class=\"nav\"><a href=\"/\">");
+          state->pending += english ? F("Home") : F("ホーム");
+          state->pending += F("</a><a href=\"/settings\">");
+          state->pending += english ? F("Settings") : F("設定");
+          state->pending += F("</a><a href=\"/status?lang=");
+          state->pending += english ? F("ja\">日本語") : F("en\">English");
+          state->pending += F("</a></div><h1>DVPlogger Status</h1><h2>");
+          state->pending += english ? F("Logger") : F("ロガー");
+          state->pending += F("</h2><table class=\"summary\">");
+          break;
+
+        case 1: {
+          const bool connected = (WiFi.status() == WL_CONNECTED);
+          add_row(F("IPアドレス"), F("IP address"), connected ? WiFi.localIP().toString() : String("-"));
+          add_row(F("自局コールサイン"), F("My callsign"), String(plogw->my_callsign + 2));
+          add_row(F("現在のコンテスト"), F("Current contest"), String(plogw->contest_name + 2));
+          add_row(F("コンテスト運用"), F("Contest logging"),
+                  plogw->f_off_contest ? (english ? String("OFF (OFFCONTEST)") : String("OFF（OFFCONTEST）"))
+                                      : (english ? String("ON (ONCONTEST)") : String("ON（ONCONTEST）")));
+          add_row(F("フォーカスRadio"), F("Focused radio"), String(so2r.focused_radio() + 1));
+          add_row(F("RX Radio"), F("RX radio"), String(so2r.rx() + 1));
+          add_row(F("TX Radio"), F("TX radio"), String(so2r.tx() + 1));
+          struct radio *selected = so2r.radio_selected();
+          add_row(F("LCD入力欄"), F("LCD input field"), input_name(selected->ptr_curr));
+          add_row(F("入力中の内容"), F("Current input"), input_value(selected));
+          state->pending += F("</table><h2>Radio</h2><table class=\"radio\"><tr><th>#</th><th>");
+          state->pending += english ? F("State") : F("状態");
+          state->pending += F("</th><th>Rig</th><th>");
+          state->pending += english ? F("Frequency") : F("周波数");
+          state->pending += F("</th><th>Mode</th><th>S</th><th>CQ/S&amp;P</th><th>");
+          state->pending += english ? F("LCD input field") : F("LCD入力欄");
+          state->pending += F("</th></tr>");
+          break;
+        }
+
+        case 2:
+          for (int i = 0; i < N_RADIO; ++i) {
+            struct radio *radio = &radio_list[i];
+            String radio_state = radio->enabled
+              ? (english ? String("Enabled") : String("有効"))
+              : (english ? String("Disabled") : String("無効"));
+            if (so2r.focused_radio() == i) radio_state += F(" / Focus");
+            if (so2r.rx() == i) radio_state += F(" / RX");
+            if (so2r.tx() == i) radio_state += F(" / TX");
+            char fbuf[24];
+            snprintf(fbuf, sizeof(fbuf), "%u.%05u MHz", radio->freq / 100000U,
+                     radio->freq % 100000U);
+            const char *rig_name = (radio->rig_spec && radio->rig_spec->name)
+                                   ? radio->rig_spec->name : "-";
+            state->pending += F("<tr><td>"); state->pending += String(i + 1);
+            state->pending += F("</td><td>"); state->pending += esc(radio_state);
+            state->pending += F("</td><td>"); state->pending += esc(String(rig_name));
+            state->pending += F("</td><td>"); state->pending += fbuf;
+            state->pending += F("</td><td>"); state->pending += esc(String(radio->opmode));
+            state->pending += F("</td><td>");
+            state->pending += radio->enabled ? String(radio->smeter / SMETER_UNIT_DBM) : String("-");
+            state->pending += F("</td><td>");
+            state->pending += radio->cq[radio->modetype] ? F("CQ") : F("S&P");
+            state->pending += F("</td><td>"); state->pending += esc(input_name(radio->ptr_curr));
+            state->pending += F("</td></tr>");
+          }
+          state->pending += F("</table><h2>Wi-Fi</h2><table class=\"summary\">");
+          break;
+
+        case 3: {
+          const bool connected = (WiFi.status() == WL_CONNECTED);
+          add_row(F("Wi-Fi状態"), F("Wi-Fi status"),
+                  connected ? (english ? String("Connected") : String("接続中"))
+                            : (english ? String("Disconnected") : String("未接続")));
+          add_row(F("SSID"), F("SSID"), connected ? WiFi.SSID() : String("-"));
+          add_row(F("受信強度"), F("Wi-Fi RSSI"), connected ? String(WiFi.RSSI()) + " dBm" : String("-"));
+          add_row(F("サブネットマスク"), F("Subnet mask"), connected ? WiFi.subnetMask().toString() : String("-"));
+          add_row(F("ゲートウェイ"), F("Gateway"), connected ? WiFi.gatewayIP().toString() : String("-"));
+          add_row(F("MACアドレス"), F("MAC address"), WiFi.macAddress());
+          state->pending += F("</table><h2>");
+          state->pending += english ? F("System") : F("システム");
+          state->pending += F("</h2><table class=\"summary\">");
+          break;
+        }
+
+        case 4: {
+          const uint32_t seconds = millis() / 1000UL;
+          const uint32_t days = seconds / 86400UL;
+          const uint32_t hours = (seconds / 3600UL) % 24UL;
+          const uint32_t minutes = (seconds / 60UL) % 60UL;
+          const uint32_t secs = seconds % 60UL;
+          add_row(F("稼働時間"), F("Uptime"),
+                  String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(secs) + "s");
+          add_row(F("空きヒープ"), F("Free heap"), String(ESP.getFreeHeap()) + " bytes");
+          add_row(F("最小空きヒープ"), F("Minimum free heap"), String(ESP.getMinFreeHeap()) + " bytes");
+          const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+          const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+          const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+          const size_t psram_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+          add_row(F("PSRAM総容量"), F("PSRAM total"), String(psram_total) + " bytes");
+          add_row(F("メモリ動作モード"), F("Memory mode"),
+                  String(psram_total == 0 ? "LOW (no PSRAM)" : "NORMAL (PSRAM)"));
+          add_row(F("PSRAM空き"), F("Free PSRAM"), String(psram_free) + " bytes");
+          add_row(F("PSRAM最大連続領域"), F("Largest PSRAM block"), String(psram_largest) + " bytes");
+          add_row(F("PSRAM最小空き"), F("Minimum free PSRAM"), String(psram_min_free) + " bytes");
+          state->pending += F("</table><p>");
+          state->pending += english ? F("Reload this page to refresh the values.")
+                                    : F("表示を更新するにはページを再読み込みしてください。");
+          state->pending += F("</p></body></html>");
+          break;
+        }
+
+        default:
+          return 0;
+        }
       }
-    }
-    return dst;
-  };
 
-  auto input_name = [english](int ptr) -> String {
-    if (ptr >= 10 && ptr < 10 + N_CWMSG)
-      return String(english ? "CW message F" : "CWメッセージ F") + String(ptr - 9);
-    if (ptr >= 30 && ptr < 30 + N_CWMSG)
-      return String(english ? "RTTY message F" : "RTTYメッセージ F") + String(ptr - 29);
-    switch (ptr) {
-    case 0: return english ? String("Callsign") : String("相手局コールサイン");
-    case 1: return english ? String("Received exchange") : String("受信ナンバー");
-    case 2: return english ? String("Sent RST") : String("送信RST");
-    case 3: return english ? String("Received RST") : String("受信RST");
-    case 4: return english ? String("My callsign") : String("自局コールサイン");
-    case 5: return english ? String("Sent exchange") : String("送出ナンバー");
-    case 6: return english ? String("Remarks") : String("Remarks");
-    case 7: return english ? String("Satellite") : String("衛星名");
-    case 8: return english ? String("Grid locator") : String("グリッドロケータ");
-    case 9: return english ? String("JCC/JCG") : String("JCC/JCG");
-    case 20: return english ? String("Rig name") : String("リグ名");
-    case 21: return english ? String("Cluster name") : String("Cluster名");
-    case 22: return english ? String("Email address") : String("メールアドレス");
-    case 23: return english ? String("Cluster command") : String("Clusterコマンド");
-    case 24: return english ? String("Power code") : String("電力コード");
-    case 25: return english ? String("Wi-Fi SSID") : String("Wi-Fi SSID");
-    case 26: return english ? String("Wi-Fi password") : String("Wi-Fiパスワード");
-    case 27: return english ? String("Rig specification") : String("リグ仕様");
-    case 28: return english ? String("Z-server") : String("Z-server");
-    case 29: return english ? String("Operator name") : String("オペレータ名");
-    case 40: return english ? String("Contest") : String("コンテスト");
-    case 41: return english ? String("Cluster2 name") : String("Cluster2名");
-    case 42: return english ? String("Cluster2 command") : String("Cluster2コマンド");
-    default: return String("#") + String(ptr);
-    }
-  };
-
-  auto input_value = [](struct radio *radio) -> String {
-    const int ptr = radio->ptr_curr;
-    if (ptr >= 10 && ptr < 10 + N_CWMSG) return String(plogw->cw_msg[ptr - 10] + 2);
-    if (ptr >= 30 && ptr < 30 + N_CWMSG) return String(plogw->rtty_msg[ptr - 30] + 2);
-    switch (ptr) {
-    case 0: return String(radio->callsign + 2);
-    case 1: return String(radio->recv_exch + 2);
-    case 2: return String(radio->sent_rst + 2);
-    case 3: return String(radio->recv_rst + 2);
-    case 4: return String(plogw->my_callsign + 2);
-    case 5: return String(plogw->sent_exch + 2);
-    case 6: return String(radio->remarks + 2);
-    case 7: return String(plogw->sat_name + 2);
-    case 8: return String(plogw->grid_locator + 2);
-    case 9: return String(plogw->jcc + 2);
-    case 20: return String(radio->rig_name + 2);
-    case 21: return String(plogw->cluster_name + 2);
-    case 22: return String(plogw->email_addr + 2);
-    case 23: return String(plogw->cluster_cmd + 2);
-    case 24: return String(plogw->power_code + 2);
-    case 25: return String(plogw->wifi_ssid + 2);
-    case 26: return String("********");
-    case 27: return String(radio->rig_spec_str + 2);
-    case 28: return String(plogw->zserver_name + 2);
-    case 29: return String(plogw->my_name + 2);
-    case 40: return String(plogw->contest_name + 2);
-    case 41: return String(plogw->cluster2_name + 2);
-    case 42: return String(plogw->cluster2_cmd + 2);
-    default: return String("-");
-    }
-  };
-
-  String html;
-  html.reserve(6000);
-  html += F("<!doctype html><html lang=\"");
-  html += english ? F("en") : F("ja");
-  html += F("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-  html += F("<title>DVPlogger Status</title><style>body{font-family:sans-serif;margin:20px;max-width:1050px}table{border-collapse:collapse;width:100%;margin-bottom:18px}th,td{border:1px solid #bbb;padding:7px;text-align:left}th{background:#eee}.summary th{width:32%}.radio th,.radio td{white-space:nowrap}.radio td:last-child{white-space:normal}.nav a{margin-right:14px}h2{margin-bottom:6px}</style></head><body>");
-  html += F("<div class=\"nav\"><a href=\"/\">");
-  html += english ? F("Home") : F("ホーム");
-  html += F("</a><a href=\"/settings\">");
-  html += english ? F("Settings") : F("設定");
-  html += F("</a><a href=\"/status?lang=");
-  html += english ? F("ja\">日本語") : F("en\">English");
-  html += F("</a></div><h1>DVPlogger Status</h1>");
-
-  auto row = [&](const __FlashStringHelper *ja, const __FlashStringHelper *en,
-                 const String &value) {
-    html += F("<tr><th>"); html += english ? en : ja;
-    html += F("</th><td>"); html += esc(value); html += F("</td></tr>");
-  };
-
-  // Put the information needed most often during operation at the top.
-  html += F("<h2>"); html += english ? F("Logger") : F("ロガー"); html += F("</h2><table class=\"summary\">");
-  row(F("IPアドレス"), F("IP address"), connected ? WiFi.localIP().toString() : String("-"));
-  row(F("自局コールサイン"), F("My callsign"), String(plogw->my_callsign + 2));
-  row(F("現在のコンテスト"), F("Current contest"), String(plogw->contest_name + 2));
-  row(F("コンテスト運用"), F("Contest logging"),
-      plogw->f_off_contest ? (english ? String("OFF (OFFCONTEST)") : String("OFF（OFFCONTEST）"))
-                          : (english ? String("ON (ONCONTEST)") : String("ON（ONCONTEST）")));
-  row(F("フォーカスRadio"), F("Focused radio"), String(so2r.focused_radio() + 1));
-  row(F("RX Radio"), F("RX radio"), String(so2r.rx() + 1));
-  row(F("TX Radio"), F("TX radio"), String(so2r.tx() + 1));
-  struct radio *selected = so2r.radio_selected();
-  row(F("LCD入力欄"), F("LCD input field"), input_name(selected->ptr_curr));
-  row(F("入力中の内容"), F("Current input"), input_value(selected));
-  html += F("</table>");
-
-  html += F("<h2>Radio</h2><table class=\"radio\"><tr><th>#</th><th>");
-  html += english ? F("State") : F("状態");
-  html += F("</th><th>Rig</th><th>"); html += english ? F("Frequency") : F("周波数");
-  html += F("</th><th>Mode</th><th>S</th><th>CQ/S&amp;P</th><th>");
-  html += english ? F("LCD input field") : F("LCD入力欄"); html += F("</th></tr>");
-  for (int i = 0; i < N_RADIO; ++i) {
-    struct radio *radio = &radio_list[i];
-    String state;
-    if (!radio->enabled) state = english ? String("Disabled") : String("無効");
-    else state = english ? String("Enabled") : String("有効");
-    if (so2r.focused_radio() == i) state += english ? String(" / Focus") : String(" / Focus");
-    if (so2r.rx() == i) state += String(" / RX");
-    if (so2r.tx() == i) state += String(" / TX");
-    char fbuf[24];
-    snprintf(fbuf, sizeof(fbuf), "%u.%05u MHz", radio->freq / 100000U,
-             radio->freq % 100000U);
-    const char *rig_name = (radio->rig_spec != NULL && radio->rig_spec->name != NULL)
-                           ? radio->rig_spec->name : "-";
-    html += F("<tr><td>"); html += String(i + 1); html += F("</td><td>"); html += esc(state);
-    html += F("</td><td>"); html += esc(String(rig_name)); html += F("</td><td>"); html += fbuf;
-    html += F("</td><td>"); html += esc(String(radio->opmode)); html += F("</td><td>");
-    html += radio->enabled ? String(radio->smeter / SMETER_UNIT_DBM) : String("-");
-    html += F("</td><td>");
-    html += radio->cq[radio->modetype] ? String("CQ") : String("S&P");
-    html += F("</td><td>"); html += esc(input_name(radio->ptr_curr)); html += F("</td></tr>");
-  }
-  html += F("</table>");
-
-  html += F("<h2>Wi-Fi</h2><table class=\"summary\">");
-  row(F("Wi-Fi状態"), F("Wi-Fi status"),
-      connected ? (english ? String("Connected") : String("接続中"))
-                : (english ? String("Disconnected") : String("未接続")));
-  row(F("SSID"), F("SSID"), connected ? WiFi.SSID() : String("-"));
-  row(F("受信強度"), F("Wi-Fi RSSI"), connected ? String(WiFi.RSSI()) + " dBm" : String("-"));
-  row(F("サブネットマスク"), F("Subnet mask"), connected ? WiFi.subnetMask().toString() : String("-"));
-  row(F("ゲートウェイ"), F("Gateway"), connected ? WiFi.gatewayIP().toString() : String("-"));
-  row(F("MACアドレス"), F("MAC address"), WiFi.macAddress());
-  html += F("</table>");
-
-  html += F("<h2>"); html += english ? F("System") : F("システム"); html += F("</h2><table class=\"summary\">");
-  row(F("稼働時間"), F("Uptime"),
-      String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(secs) + "s");
-  row(F("空きヒープ"), F("Free heap"), String(ESP.getFreeHeap()) + " bytes");
-  row(F("最小空きヒープ"), F("Minimum free heap"), String(ESP.getMinFreeHeap()) + " bytes");
-  row(F("PSRAM容量"), F("PSRAM size"), String(ESP.getPsramSize()) + " bytes");
-  row(F("メモリ動作モード"), F("Memory mode"),
-      String(f_low_memory_mode ? "LOW (no PSRAM)" : "NORMAL (PSRAM)"));
-  row(F("PSRAM空き"), F("Free PSRAM"), String(ESP.getFreePsram()) + " bytes");
-  html += F("</table><p>");
-  html += english ? F("Reload this page to refresh the values.")
-                  : F("表示を更新するにはページを再読み込みしてください。");
-  html += F("</p></body></html>");
-  request->send(200, "text/html", html);
+      const size_t remain = state->pending.length() - state->offset;
+      const size_t ncopy = std::min(remain, maxLen);
+      if (ncopy) {
+        memcpy(buffer, state->pending.c_str() + state->offset, ncopy);
+        state->offset += ncopy;
+      }
+      return ncopy;
+    });
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
 });
 
 web_server.on("/antenna_status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -4317,6 +5762,42 @@ web_server.on("/antenna_config", HTTP_POST, [](AsyncWebServerRequest *request) {
   request->send(200, "text/plain", "Saved");
 });
 
+web_server.on("/network_services_status", HTTP_GET, [](AsyncWebServerRequest *request) {
+  char payload[512];
+  snprintf(payload, sizeof(payload),
+           "{\"zserver\":{\"auto\":%s,\"connected\":%s,\"state\":\"%s\"},"
+           "\"cluster1\":{\"auto\":%s,\"connected\":%s,\"state\":\"%s\"},"
+           "\"cluster2\":{\"auto\":%s,\"connected\":%s,\"state\":\"%s\"},"
+           "\"ntp\":{\"started\":%s,\"synced\":%s}}",
+           get_zserver_auto() ? "true" : "false",
+           zserver_is_connected() ? "true" : "false", zserver_connection_state(),
+           get_cluster_auto(1) ? "true" : "false",
+           cluster_is_connected(1) ? "true" : "false", cluster_connection_state(1),
+           get_cluster_auto(2) ? "true" : "false",
+           cluster_is_connected(2) ? "true" : "false", cluster_connection_state(2),
+           network_ntp_started() ? "true" : "false",
+           network_ntp_synced() ? "true" : "false");
+  request->send(200, "application/json", payload);
+});
+
+web_server.on("/network_service_mode", HTTP_GET, [](AsyncWebServerRequest *request) {
+  if (!request->hasParam("service") || !request->hasParam("auto")) {
+    request->send(400, "text/plain", "Missing service/auto");
+    return;
+  }
+  const String service = request->getParam("service")->value();
+  const int enabled = request->getParam("auto")->value().toInt() ? 1 : 0;
+  if (service == "zserver") set_zserver_auto(enabled);
+  else if (service == "cluster1") set_cluster_auto(1, enabled);
+  else if (service == "cluster2") set_cluster_auto(2, enabled);
+  else {
+    request->send(400, "text/plain", "Unknown service");
+    return;
+  }
+  save_settings("");
+  request->send(200, "text/plain", enabled ? "AUTO" : "OFF");
+});
+
 // /op ページ配信
 web_server.on("/op", HTTP_GET, [](AsyncWebServerRequest *request) {
   request->send_P(200, "text/html", oppage_html);
@@ -4325,15 +5806,18 @@ web_server.on("/op", HTTP_GET, [](AsyncWebServerRequest *request) {
 web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
   char response_string[100];
   strcpy(response_string,"");
-  struct radio *radio;  
   if (req->hasParam("keycode")) {
     WebUiCommand cmd{};
     cmd.type=WEB_UI_KEY;
     cmd.value=req->getParam("keycode")->value().toInt();
     cmd.index=req->hasParam("index") ? req->getParam("index")->value().toInt() : -1;
+    cmd.radio_index=so2r.focused_radio();
     if (req->hasParam("input0")) normalize_op_cstr(0,cmd.input0,sizeof(cmd.input0),req->getParam("input0")->value());
     if (req->hasParam("input1")) normalize_op_cstr(1,cmd.input1,sizeof(cmd.input1),req->getParam("input1")->value());
-    if ((cmd.index==0 || cmd.index==1) && req->hasParam("input0") && req->hasParam("input1")) cmd.type=WEB_UI_ENTER;
+    if ((cmd.index==0 || cmd.index==1) && req->hasParam("input0") && req->hasParam("input1")) {
+      cmd.type=WEB_UI_ENTER;
+      cmd.value=req->hasParam("no_tx") ? req->getParam("no_tx")->value().toInt() : 0;
+    }
     if (!enqueue_web_ui(cmd)) { req->send(503,"text/plain","Web UI queue full"); return; }
     req->send(202,"text/plain","Queued");
   } else if (req->hasParam("command")) {
@@ -4342,6 +5826,66 @@ web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
     // rig name change
     command = req->getParam("command")->value();
     webLog.print("command:");webLog.println(command);
+    if (command == "cqsp") {
+      WebUiCommand cmd{};
+      cmd.type = WEB_UI_CQSP_TOGGLE;
+      cmd.radio_index = so2r.focused_radio();
+      if (req->hasParam("radio")) {
+        const int requested_radio = req->getParam("radio")->value().toInt();
+        if (requested_radio < 0 || requested_radio >= N_RADIO) {
+          req->send(400,"text/plain","Invalid radio");
+          return;
+        }
+        cmd.radio_index = requested_radio;
+      }
+      if (!enqueue_web_ui(cmd)) { req->send(503,"text/plain","Web UI queue full"); return; }
+      req->send(202,"text/plain","CQ/S&P toggle queued");
+      return;
+    }
+    if (command == "cw_send") {
+      if (!req->hasParam("value")) { req->send(400,"text/plain","Missing CW / Voice text"); return; }
+      WebUiCommand cmd{};
+      cmd.type = WEB_UI_CW_SEND;
+      cmd.radio_index = so2r.focused_radio();
+      if (req->hasParam("radio")) {
+        const int requested_radio = req->getParam("radio")->value().toInt();
+        if (requested_radio < 0 || requested_radio >= N_RADIO) {
+          req->send(400,"text/plain","Invalid radio");
+          return;
+        }
+        cmd.radio_index = requested_radio;
+      }
+      String value = req->getParam("value")->value();
+      value.replace("\r", " ");
+      value.replace("\n", " ");
+      strlcpy(cmd.input0, value.c_str(), sizeof(cmd.input0));
+      if (!enqueue_web_ui(cmd)) { req->send(503,"text/plain","Web UI queue full"); return; }
+      req->send(202,"text/plain","CW / Voice queued");
+      return;
+    }
+    if (command == "wpm") {
+      if (!req->hasParam("value")) { req->send(400,"text/plain","Missing WPM"); return; }
+      WebUiCommand cmd{};
+      cmd.type = WEB_UI_WPM_SET;
+      cmd.value = req->getParam("value")->value().toInt();
+      if (!enqueue_web_ui(cmd)) { req->send(503,"text/plain","Web UI queue full"); return; }
+      req->send(202,"text/plain","WPM queued");
+      return;
+    }
+    if (command == "tone_cw") {
+      if (!req->hasParam("radio")) { req->send(400,"text/plain","Missing radio"); return; }
+      int radio_index = req->getParam("radio")->value().toInt();
+      if (radio_index < 0 || radio_index >= N_RADIO) {
+        req->send(400,"text/plain","Invalid radio");
+        return;
+      }
+      WebUiCommand cmd{};
+      cmd.type = WEB_UI_TONE_CW;
+      cmd.radio_index = radio_index;
+      if (!enqueue_web_ui(cmd)) { req->send(503,"text/plain","Web UI queue full"); return; }
+      req->send(202,"text/plain","Tone CW queued");
+      return;
+    }
     if (command == "set") {
       if (req->hasParam("index") && req->hasParam("value")) {
 	// get index and value
@@ -4409,27 +5953,81 @@ web_server.on("/control", HTTP_GET, [](AsyncWebServerRequest *request) {
 });
 
        
+web_server.on("/radio_mode", HTTP_GET, [](AsyncWebServerRequest *req) {
+  if (!req->hasParam("mode")) { req->send(400, "text/plain", "Missing mode"); return; }
+  const int mode = req->getParam("mode")->value().toInt();
+  if (mode < SO2R::RADIO_MODE_SO1R || mode > SO2R::RADIO_MODE_SO2R) {
+    req->send(400, "text/plain", "Invalid radio mode"); return;
+  }
+  if (so2r.sequence_stat() != SO2R::Default) {
+    req->send(409, "text/plain", "TX/sequence active"); return;
+  }
+  for (int i = 0; i < N_RADIO; ++i) {
+    if (radio_list[i].ptt_stat != 0) { req->send(409, "text/plain", "PTT active"); return; }
+  }
+  WebUiCommand cmd{};
+  cmd.type = WEB_UI_RADIO_MODE;
+  cmd.value = mode;
+  if (!enqueue_web_ui(cmd)) { req->send(503, "text/plain", "Web UI queue full"); return; }
+  req->send(202, "text/plain", "Queued");
+});
+
+web_server.on("/so2r_pair_status", HTTP_GET, [](AsyncWebServerRequest *req) {
+  so2r.validate_so2r_pairs();
+  char payload[192];
+  snprintf(payload, sizeof(payload),
+           "{\"enabled\":[%d,%d,%d],\"a\":%d,\"b\":%d}",
+           radio_list[0].enabled ? 1 : 0,
+           radio_list[1].enabled ? 1 : 0,
+           radio_list[2].enabled ? 1 : 0,
+           so2r.so2r_pair_a(), so2r.so2r_pair_b());
+  req->send(200, "application/json", payload);
+});
+
+web_server.on("/so2r_pair", HTTP_GET, [](AsyncWebServerRequest *req) {
+  if (!req->hasParam("tx") || !req->hasParam("rx")) {
+    req->send(400, "text/plain", "Missing tx or rx");
+    return;
+  }
+  const int tx = req->getParam("tx")->value().toInt();
+  const int rx = req->getParam("rx")->value().toInt();
+  if (!so2r.set_so2r_pair(tx, rx)) {
+    req->send(400, "text/plain", "Invalid or disabled SO2R partner");
+    return;
+  }
+  save_settings("");
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "SO2R PAIR SET\nR%d <-> R%d\nSaved", tx, rx);
+  request_display_update_on_demand();
+  request_bandmap_update_on_demand();
+  upd_display_info_flash(dp->lcdbuf);
+  req->send(200, "text/plain", "Saved");
+});
+
 // /op main status: one compact response instead of many /radio_status requests.
 web_server.on("/op_status", HTTP_GET, [](AsyncWebServerRequest *req) {
   struct radio *radio = so2r.radio_selected();
   char radio_text[120];
+  char web_clock[32];
+  format_display_clock(web_clock, sizeof(web_clock), true);
   unsigned int frac = (radio->freq % (1000/FREQ_UNIT))/(10/FREQ_UNIT);
   unsigned int khz = (radio->freq / (1000/FREQ_UNIT)) % 1000;
   snprintf(radio_text, sizeof(radio_text),
-           "%-14s Radio:%d %3s Freq:%4d.%03d.%02d Hz Mode:%4s",
-           plogw->tm+9, radio->rig_idx,
+           "%-20s Radio:%d %3s Freq:%4d.%03d.%02d Hz Mode:%4s",
+           web_clock, radio->rig_idx,
            radio->cq[radio->modetype] == LOG_CQ ? "CQ" : "S&P",
            radio->freq / (1000000/FREQ_UNIT), khz, frac, radio->opmode);
   char payload[512];
   snprintf(payload, sizeof(payload),
-           "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t1",
+           "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t1\t%d\t%d\t%d",
            radio->callsign+2, radio->recv_exch+2,
            radio->recv_rst+2, radio->sent_rst+2,
            plogw->sent_exch+2, plogw->my_callsign+2,
            radio_list[0].rig_name+2, radio_list[1].rig_name+2,
            radio_list[2].rig_name+2, plogw->contest_name+2,
            radio_text, plogw->cwbuf_display,
-           radio->rig_idx, radio->opmode, radio->bandid);
+           radio->rig_idx, radio->opmode, radio->bandid, so2r.radio_mode,
+           cw_spd, radio->f_tone_keying ? 1 : 0);
   req->send(200, "text/plain", payload);
 });
 
@@ -4496,18 +6094,22 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
       req->send(200, "text/plain", string_buf);
       break;
     case 99: // radio
+      {
+      char web_clock[32];
+      format_display_clock(web_clock, sizeof(web_clock), true);
       tmp2= (radio->freq % (1000/FREQ_UNIT))/(10/FREQ_UNIT); // below kHz
       tmp1 = radio->freq / (1000/FREQ_UNIT); 
       tmp1 = tmp1 % 1000 ;  // kHz
       
-      sprintf(string_buf,"%-14s Radio:%d %3s Freq:%4d.%03d.%02d Hz Mode:%4s",
-	      plogw->tm+9,
+      sprintf(string_buf,"%-20s Radio:%d %3s Freq:%4d.%03d.%02d Hz Mode:%4s",
+	      web_clock,
 	      radio->rig_idx,
 	      radio->cq[radio->modetype] == LOG_CQ ? "CQ" : "S&P",
 	      radio->freq/(1000000/FREQ_UNIT),tmp1,tmp2,
 	      radio->opmode);
       req->send(200, "text/plain", string_buf);
       //      req->send(200, "text/plain", "");
+      }
       break;
     default:
        req->send(400, "text/plain", "Invalid index parameter");
@@ -4579,6 +6181,23 @@ web_server.on("/radio_status", HTTP_GET, [](AsyncWebServerRequest *req) {
   web_heap_point("after web handlers");
   web_server.begin();
   web_heap_point("after web begin");
+}
+
+static bool webserver_suspended_for_flash = false;
+
+void suspend_webserver_for_flash() {
+  if (webserver_suspended_for_flash) return;
+  webserver_suspended_for_flash = true;
+  web_server.end();
+  // Async callbacks run on another task. Give an in-flight callback a short
+  // chance to leave SD before flashersd takes exclusive ownership.
+  delay(200);
+}
+
+void resume_webserver_after_flash() {
+  if (!webserver_suspended_for_flash) return;
+  web_server.begin();
+  webserver_suspended_for_flash = false;
 }
 
 

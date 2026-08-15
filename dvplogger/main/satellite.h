@@ -36,6 +36,7 @@ void set_sat_freq_to_rig() ;
 void set_sat_freq_calc() ;
 void set_sat_center_frequency() ;
 void set_sat_beacon_frequency() ;
+int auto_select_sat_vfo_mode(char *reason, size_t reason_len) ;
 
 void set_location_gl_calc(char *locator) ;
 void freq2str(char *s, int freq) ;
@@ -50,6 +51,8 @@ void release_sat() ;
 int find_satname(char *satname) ;
 void readtlefile() ;
 void getTLE() ;
+void request_sat_tle_update();
+void service_sat_tle_update();
 void plan13_test() ;
 void save_satinfo() ;
 void print_datetime(DateTime time) ;

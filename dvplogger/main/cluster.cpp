@@ -50,8 +50,8 @@ struct cluster cluster;
 char cluster2_startup_cmd[N_CLUSTER2_STARTUP_CMDS][LEN_CLUSTER_CMD + 3];
 
 static constexpr uint8_t N_CLUSTER_CONNECTIONS = 2;
-static constexpr size_t CLUSTER_RX_EVENT_DATA = 128;
-static constexpr size_t CLUSTER_RX_QUEUE_LEN = 16;
+static constexpr size_t CLUSTER_RX_LINE_MAX = 192;
+static constexpr size_t CLUSTER_RX_QUEUE_LEN = 32;
 
 struct ClusterRuntime {
   struct cluster *state;
@@ -60,11 +60,29 @@ struct ClusterRuntime {
   int port;
   uint8_t id;
   uint8_t startup_index;
+  char rx_line[CLUSTER_RX_LINE_MAX];
+  uint16_t rx_line_len;
+  bool rx_discard_until_eol;
+  uint32_t rx_dropped_lines;
+  uint32_t rx_dropped_bytes;
+  uint32_t rx_overlong_lines;
+  uint32_t rx_last_report_ms;
+  bool disconnect_handled;
+  bool disconnect_notice_pending;
+  bool hold_requested;
+  bool connected_state;
 };
 
 static struct cluster cluster2;
 static char cluster2_buf[NCHR_CLUSTER_RINGBUF];
 static ClusterRuntime cluster_rt[N_CLUSTER_CONNECTIONS];
+
+int cluster1_auto_enable = 1;
+int cluster2_auto_enable = 1;
+
+static inline bool cluster_auto_enabled(uint8_t id) {
+  return id == 0 ? cluster1_auto_enable != 0 : cluster2_auto_enable != 0;
+}
 
 static inline void renew_timeout_cluster(ClusterRuntime *rt) {
   rt->state->timeout_alive = millis() + 300000;
@@ -83,16 +101,68 @@ static inline bool passed_timeout_cluster(ClusterRuntime *rt) {
 
 static const char* TAG = "cluster";
 
-struct ClusterRxEvent {
+struct ClusterRxLine {
   uint8_t source;
-  uint8_t len;
-  uint8_t data[CLUSTER_RX_EVENT_DATA];
+  uint16_t len;
+  char data[CLUSTER_RX_LINE_MAX];
 };
 
 static QueueHandle_t s_cluster_rx_queue = nullptr;
-// チューニング推奨：回線速度と処理レイテンシに応じて
 
-// 受信コールバック（AsyncTCP）
+static void note_cluster_rx_overload(ClusterRuntime *rt, size_t dropped_bytes,
+                                     bool overlong) {
+  if (!rt) return;
+  rt->rx_dropped_lines++;
+  rt->rx_dropped_bytes += dropped_bytes;
+  if (overlong) rt->rx_overlong_lines++;
+
+  const uint32_t now = millis();
+  if (rt->rx_last_report_ms == 0 ||
+      (uint32_t)(now - rt->rx_last_report_ms) >= 1000U) {
+    const UBaseType_t queued = s_cluster_rx_queue
+        ? uxQueueMessagesWaiting(s_cluster_rx_queue) : 0;
+    ESP_LOGW(TAG,
+             "RX overload: cluster=%u dropped_lines=%lu dropped_bytes=%lu "
+             "overlong=%lu queued=%u/%u",
+             (unsigned)(rt->id + 1),
+             (unsigned long)rt->rx_dropped_lines,
+             (unsigned long)rt->rx_dropped_bytes,
+             (unsigned long)rt->rx_overlong_lines,
+             (unsigned)queued, (unsigned)CLUSTER_RX_QUEUE_LEN);
+    rt->rx_last_report_ms = now;
+    rt->rx_dropped_lines = 0;
+    rt->rx_dropped_bytes = 0;
+    rt->rx_overlong_lines = 0;
+  }
+}
+
+static void enqueue_complete_cluster_line(ClusterRuntime *rt) {
+  if (!rt || !s_cluster_rx_queue || rt->rx_line_len == 0) return;
+
+  ClusterRxLine line{};
+  line.source = rt->id;
+  line.len = rt->rx_line_len;
+  memcpy(line.data, rt->rx_line, line.len);
+  line.data[line.len] = '\0';
+
+  if (xQueueSend(s_cluster_rx_queue, &line, 0) != pdTRUE) {
+    // Preserve line boundaries: discard one complete old line, then keep the
+    // newest complete line.  Never discard only part of a line.
+    ClusterRxLine old_line;
+    if (xQueueReceive(s_cluster_rx_queue, &old_line, 0) == pdTRUE &&
+        xQueueSend(s_cluster_rx_queue, &line, 0) == pdTRUE) {
+      ClusterRuntime *old_rt = old_line.source < N_CLUSTER_CONNECTIONS
+          ? &cluster_rt[old_line.source] : rt;
+      note_cluster_rx_overload(old_rt, old_line.len, false);
+    } else {
+      note_cluster_rx_overload(rt, line.len, false);
+    }
+  }
+}
+
+// AsyncTCP callback: assemble complete lines before queueing them.  If a line
+// is too long, discard through the next newline so bytes from adjacent lines
+// can never be joined into a false callsign.
 void handleData_cluster(void *arg, AsyncClient *client, void *data, size_t len)
 {
   ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
@@ -100,18 +170,33 @@ void handleData_cluster(void *arg, AsyncClient *client, void *data, size_t len)
 
   renew_timeout_cluster(rt);
   const uint8_t *src = static_cast<const uint8_t *>(data);
-  while (len > 0) {
-    ClusterRxEvent ev{};
-    ev.source = rt->id;
-    ev.len = (uint8_t)min(len, CLUSTER_RX_EVENT_DATA);
-    memcpy(ev.data, src, ev.len);
-    if (xQueueSend(s_cluster_rx_queue, &ev, 0) != pdTRUE) {
-      ESP_LOGW(TAG, "RX queue overflow: cluster=%u dropped=%u",
-               (unsigned)(rt->id + 1), (unsigned)len);
-      break;
+  for (size_t i = 0; i < len; ++i) {
+    const char c = static_cast<char>(src[i]);
+
+    if (rt->rx_discard_until_eol) {
+      rt->rx_dropped_bytes++;
+      if (c == '\n') {
+        rt->rx_discard_until_eol = false;
+        rt->rx_line_len = 0;
+        note_cluster_rx_overload(rt, 0, true);
+      }
+      continue;
     }
-    src += ev.len;
-    len -= ev.len;
+
+    if (c == '\r') continue;
+    if (c == '\n') {
+      enqueue_complete_cluster_line(rt);
+      rt->rx_line_len = 0;
+      continue;
+    }
+
+    if (rt->rx_line_len + 1 >= CLUSTER_RX_LINE_MAX) {
+      rt->rx_discard_until_eol = true;
+      rt->rx_dropped_bytes += rt->rx_line_len + 1;
+      rt->rx_line_len = 0;
+      continue;
+    }
+    rt->rx_line[rt->rx_line_len++] = c;
   }
 }
 
@@ -185,38 +270,21 @@ void upd_bandmap_cluster1(uint8_t source, const char *cmdbuf) {
 //extern void upd_bandmap_cluster(const char* line);
 
 static void cluster_worker_task(void* /*pv*/) {
-    std::string acc[N_CLUSTER_CONNECTIONS];
-    for (auto &a : acc) a.reserve(1024);
-    ClusterRxEvent ev;
-
+    ClusterRxLine line;
     for (;;) {
-        if (xQueueReceive(s_cluster_rx_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
-        if (ev.source >= N_CLUSTER_CONNECTIONS) continue;
-        std::string &a = acc[ev.source];
-        a.append(reinterpret_cast<const char*>(ev.data), ev.len);
-
-        size_t start = 0;
-        while (true) {
-            size_t nl = a.find('\n', start);
-            if (nl == std::string::npos) {
-                if (start > 0) a.erase(0, start);
-                if (a.size() > 2048) {
-                    ESP_LOGW(TAG, "overlong line dropped: cluster=%u", (unsigned)(ev.source + 1));
-                    a.clear();
-                }
-                break;
-            }
-            std::string line = a.substr(start, nl - start);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (!line.empty()) upd_bandmap_cluster1(ev.source, line.c_str());
-            start = nl + 1;
-        }
+        if (xQueueReceive(s_cluster_rx_queue, &line, portMAX_DELAY) != pdTRUE)
+          continue;
+        if (line.source >= N_CLUSTER_CONNECTIONS || line.len == 0 ||
+            line.len >= CLUSTER_RX_LINE_MAX)
+          continue;
+        line.data[line.len] = '\0';
+        upd_bandmap_cluster1(line.source, line.data);
     }
 }
 
 void cluster_io_init() {
     if (!s_cluster_rx_queue) {
-        s_cluster_rx_queue = xQueueCreate(CLUSTER_RX_QUEUE_LEN, sizeof(ClusterRxEvent));
+        s_cluster_rx_queue = xQueueCreate(CLUSTER_RX_QUEUE_LEN, sizeof(ClusterRxLine));
         configASSERT(s_cluster_rx_queue != nullptr);
         xTaskCreatePinnedToCore(cluster_worker_task, "cluster_worker",
                                6144, nullptr, 4, nullptr, tskNO_AFFINITY);
@@ -228,11 +296,35 @@ void onDisconnect_cluster(void *arg, AsyncClient *client)
   memtrace_event("cluster disconnected");
   ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
   if (!rt) return;
-  rt->state->stat = 0;
-  rt->state->timeout = millis() + 2000;
+
+  // AsyncTCP may report the same disconnect more than once.  Also, stop()
+  // used for an intentional hold must not be turned back into an automatic
+  // reconnect by this callback.
+  if (rt->disconnect_handled) return;
+  rt->disconnect_handled = true;
+  const bool was_connected = rt->connected_state;
+  rt->connected_state = false;
+
   rt->startup_index = 0;
+  rt->rx_line_len = 0;
+  rt->rx_discard_until_eol = false;
+
+  if (rt->hold_requested) {
+    rt->state->stat = 11;
+    rt->state->timeout = 0;
+    return;
+  }
+
+  rt->state->stat = 10;
+  rt->state->timeout = millis() + 60000;
   if (!plogw->f_console_emu) {
-    console->printf("disconnected from cluster %u\n", (unsigned)(rt->id + 1));
+    console->printf("disconnected from cluster %u; retry in 60 sec\n",
+                    (unsigned)(rt->id + 1));
+  }
+  // Only interrupt the LCD for a real CONNECTED -> DISCONNECTED transition.
+  // Failed connection attempts remain quiet and simply retry in the background.
+  if (was_connected && WiFi.status() == WL_CONNECTED && cluster_auto_enabled(rt->id)) {
+    rt->disconnect_notice_pending = true;
   }
 }
 
@@ -241,6 +333,14 @@ void onConnect_cluster(void *arg, AsyncClient *client)
   memtrace_event("cluster connected");
   ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
   if (!rt) return;
+  if (!cluster_auto_enabled(rt->id)) {
+    rt->hold_requested = true;
+    rt->connected_state = false;
+    rt->state->stat = 11;
+    client->stop();
+    return;
+  }
+  rt->connected_state = true;
   if (!plogw->f_console_emu) {
     console->printf("connected to cluster %u %s port:%d\n",
                     (unsigned)(rt->id + 1), rt->server, rt->port);
@@ -250,6 +350,11 @@ void onConnect_cluster(void *arg, AsyncClient *client)
           WiFi.localIP().toString().c_str());
   upd_display_info_flash(dp->lcdbuf);
   rt->startup_index = 0;
+  rt->rx_line_len = 0;
+  rt->rx_discard_until_eol = false;
+  rt->disconnect_handled = false;
+  rt->disconnect_notice_pending = false;
+  rt->hold_requested = false;
   rt->state->stat = 1;
   rt->state->timeout = millis() + 2000;
   renew_timeout_cluster(rt);
@@ -273,14 +378,35 @@ void sprint_cluster_info(char *buf,struct bandmap_entry *entry, int bandid, int 
 
 void print_cluster_info(struct bandmap_entry *entry, int bandid, int idx )
 {
-  // The :F cluster report is a machine/diagnostic report and is intentionally
-  // kept on the hardware serial console even while Telnet owns normal logs.
+  /* High-rate :F reports can block the console and aggravate RX overload. */
+  if ((verbose & 16) == 0) return;
   char buf[256];
   sprint_cluster_info(buf, entry, bandid, idx);
   Serial.print(buf);
 }
 
 
+
+static int find_latest_cluster_entry(int bandid, const char *stn,
+                                     int modeid) {
+  if (bandid <= 0 || bandid > N_BAND || !stn) return -1;
+  struct bandmap *bm = &bandmap[bandid - 1];
+  int keep = -1;
+  for (int i = 0; i < bm->nentry; ++i) {
+    struct bandmap_entry *e = &bm->entry[i];
+    if (!e->station[0] || strcmp(e->station, stn) != 0 || e->mode != modeid)
+      continue;
+    if (keep < 0 || e->time > bm->entry[keep].time ||
+        (e->time == bm->entry[keep].time &&
+         e->receive_order > bm->entry[keep].receive_order)) {
+      if (keep >= 0) bm->entry[keep].station[0] = '\0';
+      keep = i;
+    } else {
+      e->station[0] = '\0';
+    }
+  }
+  return keep;
+}
 
 void get_info_cluster(const char *ssrc) {
   // obtain callsign , frequency , mode, time,  and remarks
@@ -393,34 +519,43 @@ void get_info_cluster(const char *ssrc) {
   adjust_callsign(stn);
 
 
-  int idx;
-  //  int idx_allband;
-  bool f_newentry; // new entry in the bandmap 
-  f_newentry=0;
-  // find new entry point  for the station
-  idx = search_bandmap(bandid, stn, modeid);
+  int bandmode = bandmode_param(bandid, modetype);
+  char remote_exch[LEN_EXCH + 1] = "";
+  bool dupe = false;
+  /*
+   * Do not synchronously query the SUBCPU for every incoming cluster line.
+   * A busy skimmer feed can otherwise fill the RX queue while each request
+   * waits for the remote DUPE result.  When the DUPE database is on SUBCPU,
+   * accept the spot here and run the authoritative check when it is picked.
+   */
+  if (dupechk->dupechk_at != 1) {
+    bool dupe_confirmed = dupe_check_with_exch_confirmed(
+        stn, bandmode, plogw->mask, remote_exch, sizeof(remote_exch), &dupe);
+    if (!dupe_confirmed) {
+      if (verbose & 16) {
+        console->printf("cluster spot discarded: DUPE result unavailable call=%s\n",
+                        stn);
+      }
+      return;
+    }
+  }
+  char *exch_history = remote_exch[0] ? remote_exch : NULL;
 
+  int idx = find_latest_cluster_entry(bandid, stn, modeid);
+  bool f_newentry = false;
   if (verbose & 16) {
-    console->print("search_bandmap:");
+    console->print("search_bandmap latest same call/mode:");
     console->println(idx);
   }
-  if (idx != -1) {
-    // found existing entry
-    // replace the entry with current one
+  if (idx >= 0) {
+    // Same callsign on the same band and mode: refresh the existing record.
+    // A QSY therefore replaces the old frequency with the latest spot.
     entry = bandmap[bandid - 1].entry + idx;
-    if (verbose & 16) {
-      console->print("existing entry idx:");
-      console->println(idx);
-    }
   } else {
-    // new entry
-    f_newentry=1;
-    idx = new_entry_bandmap(bandid,200);  // return entry which is not used
+    f_newentry = true;
+    idx = new_entry_bandmap(bandid, 200);
+    if (idx < 0) return;
     entry = bandmap[bandid - 1].entry + idx;
-    if (verbose & 16) {
-      console->print("new entry idx:");
-      console->println(idx);
-    }
   }
 
   /*  
@@ -453,10 +588,6 @@ void get_info_cluster(const char *ssrc) {
   }
   
   */
-  int bandmode;
-  bandmode = bandmode_param(bandid,modetype);
-  char *exch_history;
-  int dupe;
   // Do not clear an existing WORKED flag when the same spot is refreshed.
   // A DUPE query can temporarily fail or race with the just-completed QSO
   // being entered on the subcpu; clearing here would make a worked station
@@ -466,9 +597,9 @@ void get_info_cluster(const char *ssrc) {
     entry_allband->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
   }
   */
-  dupe=dupe_callhist_check(stn, bandmode, plogw->mask,1,&exch_history); // 1 means search including callhist_list (and that is needed to find out not worked station multi search)
   if (dupe) {
-    // dupe
+    // Keep DUPE spots in the database.  The display layer may hide them in
+    // the normal list, but an on-frequency lookup still needs this record.
     entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
     /*
     if (entry_allband!=NULL) {
@@ -479,6 +610,8 @@ void get_info_cluster(const char *ssrc) {
       console->print("WORKED already");
       console->println(stn);
     }
+  } else {
+    entry->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
   }
   // reset new multi flag
   entry->flag &= ~BANDMAP_ENTRY_FLAG_NEWMULTI;
@@ -527,7 +660,7 @@ void get_info_cluster(const char *ssrc) {
   strcpy(entry->station, stn);       // station
   entry->freq = ifreq;               // frequency
   //  entry->time = rtctime.unixtime();  // current time for removing the entry in clean_bandmap();
-  entry->time = my_rtc.unixtime();  // current time for removing the entry in clean_bandmap();  
+  stamp_bandmap_entry(entry);  // reception time and within-second order
   entry->mode = modeid;
   entry->remarks[0] = '\0';
   strncat(entry->remarks, remarks, 16);  // copy remarks
@@ -655,6 +788,29 @@ static String expand_cluster2_startup_command(const char *src) {
 
 static void cluster_process_one(ClusterRuntime *rt) {
   struct cluster *st = rt->state;
+
+  if (!cluster_auto_enabled(rt->id)) {
+    rt->disconnect_notice_pending = false;
+    rt->hold_requested = true;
+    st->stat = 11;
+    st->timeout = 0;
+    if (rt->client && rt->client->connected()) {
+      rt->disconnect_handled = true;
+      rt->connected_state = false;
+      rt->client->stop();
+    }
+    return;
+  }
+
+  // Run display work in the normal loop, never in the AsyncTCP callback.
+  if (rt->disconnect_notice_pending) {
+    rt->disconnect_notice_pending = false;
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "NETWORK ERROR\nCluster %u lost\nRetry in 60 sec",
+             (unsigned)(rt->id + 1));
+    network_display_error(dp->lcdbuf);
+  }
+
   if (!rt->client || rt->server[0] == '\0') {
     st->stat = 11;
     return;
@@ -662,10 +818,12 @@ static void cluster_process_one(ClusterRuntime *rt) {
 
   switch (st->stat) {
     case 0:
-      if (wifi_status == 0) {
+      if (!network_external_service_ready(5000)) {
         st->stat = 10;
         st->timeout = millis() + 1000;
       } else if (!rt->client->connected()) {
+        rt->disconnect_handled = false;
+        rt->disconnect_notice_pending = false;
         if (cluster_verbose_level[rt->id] >= 3)
           console->printf("[CL%u CONNECT] %s port %d\n",
                           (unsigned)(rt->id + 1), rt->server, rt->port);
@@ -673,7 +831,7 @@ static void cluster_process_one(ClusterRuntime *rt) {
         rt->client->connect(rt->server, rt->port);
         memtrace_event(rt->id == 0 ? "after cluster1 connect" : "after cluster2 connect");
         st->stat = 10;
-        st->timeout = millis() + 10000;
+        st->timeout = millis() + 60000;
       }
       break;
     case 10:
@@ -745,12 +903,40 @@ static void cluster_process_one(ClusterRuntime *rt) {
       break;
     case 5:
       if (!rt->client->connected()) {
-        rt->client->stop();
-        st->stat = 0;
+        // The AsyncTCP/lwIP close path may still be running after
+        // connected() becomes false.  Calling stop() again here can close
+        // the same PCB twice.  Let onDisconnect_cluster() finish the close
+        // and keep this connection in the reconnect backoff state.
+        if (!rt->disconnect_handled) {
+          rt->disconnect_handled = true;
+          rt->startup_index = 0;
+          rt->rx_line_len = 0;
+          rt->rx_discard_until_eol = false;
+          st->stat = 10;
+          st->timeout = millis() + 60000;
+          if (!plogw->f_console_emu) {
+            console->printf(
+                "cluster %u found disconnected; retry in 60 sec\n",
+                (unsigned)(rt->id + 1));
+          }
+        }
       } else if (passed_timeout_cluster(rt)) {
-        console->printf("cluster %u inactive for 5 minutes; reconnecting\n", (unsigned)(rt->id + 1));
+        console->printf(
+            "cluster %u inactive for 5 minutes; reconnecting in 60 sec\n",
+            (unsigned)(rt->id + 1));
+
+        // Move to backoff before initiating the asynchronous close.  The
+        // disconnect callback is deliberately suppressed for this
+        // logger-initiated close, so the main loop and callback cannot both
+        // close or reschedule the same AsyncClient.
+        rt->disconnect_handled = true;
+        rt->disconnect_notice_pending = false;
+        rt->startup_index = 0;
+        rt->rx_line_len = 0;
+        rt->rx_discard_until_eol = false;
+        st->stat = 10;
+        st->timeout = millis() + 60000;
         rt->client->stop();
-        st->stat = 0;
       }
       break;
   }
@@ -808,9 +994,22 @@ void init_cluster_info() {
 
 static void disconnect_cluster_id(uint8_t id, bool hold) {
   ClusterRuntime *rt = &cluster_rt[id];
-  if (rt->client) rt->client->stop();
-  console->printf("disconnected from cluster %u\n", (unsigned)(id + 1));
+  if (!rt->client) return;
+
+  // Make repeated manual disconnect requests idempotent.
+  if (hold && rt->hold_requested && rt->state->stat == 11) return;
+
+  rt->hold_requested = hold;
+  rt->disconnect_notice_pending = false;
+  rt->disconnect_handled = true;
   rt->state->stat = hold ? 11 : 0;
+  rt->state->timeout = 0;
+
+  if (rt->client->connected()) rt->client->stop();
+  if (!plogw->f_console_emu) {
+    console->printf("cluster %u disconnected%s\n",
+                    (unsigned)(id + 1), hold ? " (held)" : "");
+  }
 }
 
 void disconnect_cluster() { disconnect_cluster_id(0, true); }
@@ -820,9 +1019,13 @@ void disconnect_cluster2_temp() { disconnect_cluster_id(1, false); }
 
 static int connect_cluster_id(uint8_t id) {
   ClusterRuntime *rt = &cluster_rt[id];
-  if (wifi_status != 1 || !rt->client || !rt->server[0]) return 0;
+  if (!cluster_auto_enabled(id) || wifi_status != 1 || !rt->client || !rt->server[0]) return 0;
+  rt->hold_requested = false;
+  rt->disconnect_handled = false;
+  rt->disconnect_notice_pending = false;
   if (!rt->client->connected()) {
     rt->state->stat = 0;
+    rt->state->timeout = 0;
     return 1;
   }
   disconnect_cluster_id(id, false);
@@ -895,11 +1098,71 @@ static void set_cluster_id(uint8_t id, const char *setting) {
     strlcpy(cluster_server, rt->server, sizeof(cluster_server));
     cluster_port = rt->port;
   }
-  if (rt->client && rt->client->connected()) rt->client->stop();
-  rt->state->stat = rt->server[0] ? 0 : 11;
+  if (rt->client && rt->client->connected()) {
+    rt->disconnect_handled = true;
+    rt->connected_state = false;
+    rt->client->stop();
+  }
+  rt->hold_requested = !cluster_auto_enabled(id);
+  rt->disconnect_notice_pending = false;
+  rt->state->stat = (rt->server[0] && cluster_auto_enabled(id)) ? 0 : 11;
   if (!plogw->f_console_emu)
     console->printf("cluster %u server:%s port:%d%s\n", (unsigned)(id + 1),
                     rt->server, rt->port, rt->server[0] ? "" : " (disabled)");
+}
+
+void set_cluster_auto(uint8_t cluster_no, int enabled) {
+  if (cluster_no < 1 || cluster_no > N_CLUSTER_CONNECTIONS) return;
+  const uint8_t id = cluster_no - 1;
+  if (id == 0) cluster1_auto_enable = enabled ? 1 : 0;
+  else cluster2_auto_enable = enabled ? 1 : 0;
+
+  ClusterRuntime *rt = &cluster_rt[id];
+  if (!rt->state || !rt->client) return;
+
+  rt->disconnect_notice_pending = false;
+  if (!cluster_auto_enabled(id)) {
+    rt->hold_requested = true;
+    rt->state->stat = 11;
+    rt->state->timeout = 0;
+    rt->connected_state = false;
+    if (rt->client->connected()) {
+      rt->disconnect_handled = true;
+      rt->client->stop();
+    }
+  } else {
+    rt->hold_requested = false;
+    rt->disconnect_handled = false;
+    if (!rt->client->connected()) {
+      rt->connected_state = false;
+      rt->state->stat = rt->server[0] ? 0 : 11;
+      rt->state->timeout = 0;
+    }
+  }
+}
+
+int get_cluster_auto(uint8_t cluster_no) {
+  if (cluster_no == 1) return cluster1_auto_enable ? 1 : 0;
+  if (cluster_no == 2) return cluster2_auto_enable ? 1 : 0;
+  return 0;
+}
+
+bool cluster_is_connected(uint8_t cluster_no) {
+  if (cluster_no < 1 || cluster_no > N_CLUSTER_CONNECTIONS) return false;
+  ClusterRuntime *rt = &cluster_rt[cluster_no - 1];
+  return cluster_auto_enabled(cluster_no - 1) && rt->client &&
+         rt->client->connected() && rt->connected_state;
+}
+
+const char *cluster_connection_state(uint8_t cluster_no) {
+  if (cluster_no < 1 || cluster_no > N_CLUSTER_CONNECTIONS) return "INVALID";
+  const uint8_t id = cluster_no - 1;
+  ClusterRuntime *rt = &cluster_rt[id];
+  if (!cluster_auto_enabled(id)) return "OFF";
+  if (!rt->server[0]) return "NOT CONFIGURED";
+  if (cluster_is_connected(cluster_no)) return "CONNECTED";
+  if (rt->state && rt->state->stat == 10) return "RETRY WAIT";
+  return "CONNECTING";
 }
 
 void set_cluster() { set_cluster_id(0, plogw->cluster_name + 2); }

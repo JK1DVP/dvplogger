@@ -307,10 +307,10 @@ void i2sInit() //ref to samplecode HiFreq_ADC.ino
       .communication_format = I2S_COMM_FORMAT_STAND_MSB,  // 非推奨の設定を置き換え
       //    .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB), 
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL2,
-    .dma_buf_count = DMA_BUF_COUNT, //num of Bytes, from 2 upto 128
+    .dma_buf_count = DAC_ADC_DMA_BUF_COUNT, //num of Bytes, from 2 upto 128
     //    .dma_buf_count = 8,  // DMAバッファの個数
     //    .dma_buf_len = 64,   // DMAバッファの長さ
-    .dma_buf_len = DMA_BUF_LEN, //num of sample not Bytes, from 8 upto 1024  //https://github.com/espressif/esp-idf/blob/master/components/driver/i2s.c#L922    
+    .dma_buf_len = DAC_ADC_DMA_BUF_LEN, //num of sample not Bytes, from 8 upto 1024  //https://github.com/espressif/esp-idf/blob/master/components/driver/i2s.c#L922    
       .use_apll = false,
       .tx_desc_auto_clear = false,
       .fixed_mclk = 0,

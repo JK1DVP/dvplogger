@@ -23,11 +23,15 @@
 #define FILE_DISPLAY_H
 void init_display_dispatch();
 void process_display_requests();
+void request_dupe_aware_display_update();
+void request_display_update_on_demand();
+void request_bandmap_update_on_demand();
+void process_dupe_aware_display_update();
 bool display_is_main_loop();
 void display_cw_buf_lcd(char *buf);
 void select_left_display() ;
 void select_right_display() ;
-void display_printStr(char *s, byte ycol) ;
+void display_printStr(const char *s, byte ycol) ;
 void upd_display_info_flash(const char *s) ;
 void upd_display_tm() ;
 void upd_display_stat() ;

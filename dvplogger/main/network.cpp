@@ -46,10 +46,9 @@
 
 #include <espwmap.h>
 #include <ESPmDNS.h>
-#include <ESPNtpClient.h>
 
 #include <WiFiUdp.h>
-//#include <esp_sntp.h>
+#include <esp_sntp.h>
 
 
 //#include <ESP_Mail_Client.h>
@@ -161,9 +160,14 @@ void localip_to_string(char *buf)
 }
 
 
+static volatile bool ntp_sync_event_pending = false;
+
 void time_sync_notification_cb(struct timeval *tv)
 {
-    console->println( "Notification of a time synchronization event");
+  (void)tv;
+  // Keep the lwIP/SNTP callback minimal.  LCD/log work is done later from
+  // service_network_background() in the normal application context.
+  ntp_sync_event_pending = true;
 }
 
 
@@ -189,19 +193,10 @@ void init_network() {
   //  plogw->ostream->println("timeclient started");
   // now uses system sntp
 
-  // Use ESPNptpClient
-  //  NTP.setTimeZone (TZ_Etc_UTC);
-  memtrace_event("network before ntp");
-  NTP.begin ();
-  memtrace_event("network after ntp");
-  // start system clock sntp
-  //  sntp_setoperatingmode(SNTP_OPMODE_POLL);
-  //  sntp_set_time_sync_notification_cb(time_sync_notification_cb);
-  //  sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
-  //  sntp_set_sync_interval(15000);
-  //  sntp_setservername(0, "ntp.nict.jp");
-  //  sntp_init();
-  //initialize_sntp();
+  // NTP is started by service_network_background() only after the local
+  // Wi-Fi link has remained stable for 30 seconds.  The production path uses
+  // the ESP-IDF/lwIP SNTP implementation directly.
+  memtrace_event("network ntp deferred");
   
   
   memtrace_event("before init_cluster_info");
@@ -240,59 +235,302 @@ void ftp_service_loop()
 }
 
 
-int check_wifi() {
-  //  console->println("check_wifi()");
-  if (wifi_enable) {
-    if (wifi_status == 0) {
-      sprintf(dp->lcdbuf, "check_wifi()\nrun()");
-      upd_display_info_flash(dp->lcdbuf);
-      
-      wl_status_t status = ESPWMAP.handle();
-      if (status == WL_CONNECTED) {      
-	sprintf(dp->lcdbuf, "check_wifi()\nConnected.\n%s",WiFi.localIP().toString().c_str());
-	upd_display_info_flash(dp->lcdbuf);
+namespace {
+// Local-link age and external-service staging.  Internet reachability is not
+// used to decide whether Wi-Fi itself is connected.
+uint32_t wifi_link_connected_since_ms = 0;
 
-	wifi_count = 0;
-	wifi_status = 1;
-        memtrace_event("wifi connected");
-	return 1;
-      } else {
-	sprintf(dp->lcdbuf, "check_wifi()\nnot found.cnt=%d",wifi_count);
-	upd_display_info_flash(dp->lcdbuf);
-	
-	snprintf(buf, 128, "WIFI: connect failed count=%d status=%d mode=%d",
-	         wifi_count, (int)status, (int)WiFi.getMode());
-	console->println(buf);
-	wifi_count++;
-	if (wifi_count > 10) {
-	  console->println("check wifi failed > 10... disabling wifi");
-	  wifi_enable = 0; wifi_count = 0;
-	  wifi_status = 0;
-	  cluster.stat = 0;
-	  sprintf(dp->lcdbuf, "wifi_enable=%d", wifi_enable);
-	  upd_display_info_flash(dp->lcdbuf);
-	}
-	return 0;
-      }
-    } else {
-      if (ESPWMAP.handle()== WL_CONNECTED) {
-	wifi_count = 0;
-	wifi_status = 1;
-        memtrace_event("wifi connected");
-	return 1;
-      } else {
-	wifi_status = 0;
-	return 0;
-      }
+// ESP-IDF/lwIP SNTP is run as a short one-shot attempt.  On success DVPlogger
+// stops SNTP and schedules the next refresh for 30 minutes later.  On failure
+// it stops SNTP and backs off for five minutes, avoiding background DNS/UDP
+// retry traffic when Internet access is unavailable.
+constexpr uint32_t NTP_START_DELAY_MS = 30000;
+constexpr const char *NTP_SERVER_HOST = "pool.ntp.org";
+constexpr uint32_t NTP_SYNC_TIMEOUT_MS = 20000;
+constexpr uint32_t NTP_NORMAL_INTERVAL_MS = 1800UL * 1000UL;
+constexpr uint32_t NTP_RETRY_BACKOFF_MS = 300UL * 1000UL;
+constexpr uint32_t NTP_STATUS_INTERVAL_MS = 1000;
+
+bool ntp_client_started = false;
+bool ntp_synced_state = false;
+uint32_t ntp_client_started_ms = 0;
+uint32_t ntp_next_attempt_ms = 0;
+uint32_t ntp_last_status_ms = 0;
+
+// Wi-Fi timing diagnostics use the common performance/timing verbose bit.
+constexpr uint32_t ESPWMAP_SLOW_US = 10000;
+constexpr uint32_t ESPWMAP_SUMMARY_MS = 30000;
+
+wl_status_t timed_espwmap_handle(const char *phase) {
+  static uint32_t max_us = 0;
+  static uint32_t calls = 0;
+  static uint32_t slow_calls = 0;
+  static uint32_t last_summary_ms = 0;
+
+  const wl_status_t before = WiFi.status();
+  const uint32_t started_us = micros();
+  const wl_status_t handled = ESPWMAP.handle();
+  const uint32_t elapsed_us = micros() - started_us;
+  const wl_status_t after = WiFi.status();
+
+  calls++;
+  if (elapsed_us > max_us) max_us = elapsed_us;
+  if (elapsed_us >= ESPWMAP_SLOW_US) slow_calls++;
+
+  // A slow call is always reported because it can directly explain an
+  // input/display stall.  Verbose mode additionally reports state changes
+  // and a periodic summary, while avoiding one log line per normal call.
+  const bool state_changed = before != after || handled != after;
+  if (elapsed_us >= ESPWMAP_SLOW_US ||
+      ((verbose & VERBOSE_PERF) && state_changed)) {
+    const int rssi = (after == WL_CONNECTED) ? WiFi.RSSI() : 0;
+    snprintf(buf, 128,
+             "ESPWMAP timing phase=%s dt=%luus max=%luus calls=%lu slow=%lu "
+             "before=%d handled=%d after=%d wifi_status=%d count=%d rssi=%d",
+             phase,
+             (unsigned long)elapsed_us,
+             (unsigned long)max_us,
+             (unsigned long)calls,
+             (unsigned long)slow_calls,
+             (int)before, (int)handled, (int)after,
+             wifi_status, wifi_count, rssi);
+    console->println(buf);
+  }
+
+  const uint32_t now_ms = millis();
+  if ((verbose & VERBOSE_PERF) &&
+      now_ms - last_summary_ms >= ESPWMAP_SUMMARY_MS) {
+    last_summary_ms = now_ms;
+    snprintf(buf, 128,
+             "ESPWMAP summary calls=%lu slow=%lu max=%luus status=%d "
+             "wifi_status=%d count=%d rssi=%d",
+             (unsigned long)calls,
+             (unsigned long)slow_calls,
+             (unsigned long)max_us,
+             (int)after, wifi_status, wifi_count,
+             after == WL_CONNECTED ? WiFi.RSSI() : 0);
+    console->println(buf);
+  }
+
+  return handled;
+}
+
+void stop_ntp_service() {
+  if (esp_sntp_enabled()) esp_sntp_stop();
+  ntp_client_started = false;
+  ntp_client_started_ms = 0;
+  ntp_last_status_ms = 0;
+  ntp_sync_event_pending = false;
+}
+
+void start_ntp_service() {
+  stop_ntp_service();
+
+  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+  esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+  esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+  esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+  esp_sntp_setservername(0, NTP_SERVER_HOST);
+
+  ntp_client_started = true;
+  ntp_client_started_ms = millis();
+  ntp_last_status_ms = 0;
+  ntp_next_attempt_ms = 0;
+
+  console->printf("NTP: starting ESP-IDF SNTP server=%s timeout=%lu ms\n",
+                  NTP_SERVER_HOST, (unsigned long)NTP_SYNC_TIMEOUT_MS);
+  esp_sntp_init();
+}
+
+void service_ntp_attempt() {
+  if (!ntp_client_started) return;
+
+  const uint32_t now = millis();
+  const uint32_t age_ms = now - ntp_client_started_ms;
+  const sntp_sync_status_t status = esp_sntp_get_sync_status();
+  const uint8_t reach = sntp_getreachability(0);
+
+  if ((verbose & VERBOSE_PERF) &&
+      (ntp_last_status_ms == 0 ||
+       (uint32_t)(now - ntp_last_status_ms) >= NTP_STATUS_INTERVAL_MS)) {
+    ntp_last_status_ms = now;
+    console->printf(
+        "NTP: waiting age=%lu ms status=%d reach=0x%02x enabled=%d\n",
+        (unsigned long)age_ms, (int)status, (unsigned)reach,
+        esp_sntp_enabled() ? 1 : 0);
+  }
+
+  // Prefer the callback flag so a short-lived COMPLETED status cannot be
+  // missed.  Keep the status test as a harmless fallback.
+  if (ntp_sync_event_pending || status == SNTP_SYNC_STATUS_COMPLETED) {
+    const bool was_synced = ntp_synced_state;
+    ntp_sync_event_pending = false;
+    console->printf("NTP: synchronized after %lu ms reach=0x%02x\n",
+                    (unsigned long)age_ms, (unsigned)reach);
+    stop_ntp_service();
+    ntp_synced_state = true;
+    ntp_next_attempt_ms = millis() + NTP_NORMAL_INTERVAL_MS;
+
+    if (!was_synced) {
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "NTP\nSynchronized");
+      upd_display_info_flash(dp->lcdbuf);
     }
-  } else {
-    // Do not leave a stale connected flag after Wi-Fi has been disabled.
+    return;
+  }
+
+  if (age_ms >= NTP_SYNC_TIMEOUT_MS) {
+    const bool was_synced = ntp_synced_state;
+    console->printf(
+        "NTP: sync timeout after %lu ms status=%d reach=0x%02x; "
+        "retry in 300 s\n",
+        (unsigned long)age_ms, (int)status, (unsigned)reach);
+    stop_ntp_service();
+    ntp_synced_state = false;
+    ntp_next_attempt_ms = millis() + NTP_RETRY_BACKOFF_MS;
+
+    // Initial inability to reach NTP is quiet.  Only a real
+    // SYNCHRONIZED -> UNSYNCHRONIZED transition interrupts the LCD.
+    if (was_synced)
+      network_display_error("NETWORK ERROR\nNTP lost\nRetry in 5 min");
+  }
+}
+}  // namespace
+
+void network_display_error(const char *message) {
+  if (message == nullptr || *message == '\0') return;
+
+  // Async network callbacks may report the same transition more than once.
+  // Suppress only identical messages in a short interval; different failures
+  // are still shown immediately.  upd_display_info_flash() safely queues the
+  // request when called outside the main loop.
+  static char last_message[96] = {0};
+  static uint32_t last_message_ms = 0;
+  const uint32_t now = millis();
+  if (strncmp(last_message, message, sizeof(last_message) - 1) == 0 &&
+      (uint32_t)(now - last_message_ms) < 3000) {
+    return;
+  }
+
+  strncpy(last_message, message, sizeof(last_message) - 1);
+  last_message[sizeof(last_message) - 1] = '\0';
+  last_message_ms = now;
+  upd_display_info_flash(last_message);
+}
+
+int check_wifi() {
+  // Keep a valid local Wi-Fi link even when the tethering phone has no
+  // Internet route.  ESPWMAP.handle() may scan/reselect APs, so calling it
+  // while already associated can tear down a perfectly usable local link.
+  static uint32_t next_connect_attempt_ms = 0;
+  static wl_status_t last_reported_status = WL_NO_SHIELD;
+  constexpr uint32_t WIFI_CONNECT_RETRY_MS = 5000;
+
+  if (!wifi_enable) {
     wifi_status = 0;
     return 0;
   }
+
+  const wl_status_t current = WiFi.status();
+
+  if (current == WL_CONNECTED) {
+    const bool newly_connected = (wifi_status == 0);
+    wifi_count = 0;
+    wifi_status = 1;
+    next_connect_attempt_ms = 0;
+
+    if (newly_connected) {
+      wifi_link_connected_since_ms = millis();
+      ntp_next_attempt_ms = 0;
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "WiFi Connected\n%s\nLocal services OK",
+               WiFi.localIP().toString().c_str());
+      upd_display_info_flash(dp->lcdbuf);
+      memtrace_event("wifi connected");
+      console->printf("WIFI: link connected ip=%s rssi=%d; Internet not required\n",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
+    return 1;
+  }
+
+  // The station link is really down.  Do not treat DNS, NTP, cluster, or
+  // zserver failures as Wi-Fi failures; only WiFi.status() controls this path.
+  const bool link_was_up = (wifi_status == 1 || wifi_link_connected_since_ms != 0);
+  wifi_status = 0;
+  wifi_link_connected_since_ms = 0;
+  if (link_was_up) {
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "NETWORK ERROR\nWiFi link lost\nReconnecting...");
+    network_display_error(dp->lcdbuf);
+  }
+  if (ntp_client_started || esp_sntp_enabled()) {
+    stop_ntp_service();
+    ntp_next_attempt_ms = 0;
+    ntp_synced_state = false;
+    console->println("NTP: stopped because local Wi-Fi link is down");
+  }
+
+  const uint32_t now = millis();
+  if ((int32_t)(now - next_connect_attempt_ms) < 0) return 0;
+  next_connect_attempt_ms = now + WIFI_CONNECT_RETRY_MS;
+
+  const wl_status_t status = timed_espwmap_handle("connect");
+  if (status == WL_CONNECTED || WiFi.status() == WL_CONNECTED) {
+    wifi_count = 0;
+    wifi_status = 1;
+    wifi_link_connected_since_ms = millis();
+    next_connect_attempt_ms = 0;
+    ntp_next_attempt_ms = 0;
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "WiFi Connected\n%s\nLocal services OK",
+             WiFi.localIP().toString().c_str());
+    upd_display_info_flash(dp->lcdbuf);
+    memtrace_event("wifi connected");
+    return 1;
+  }
+
+  // Report only on state change or every fifth retry.  Repeated OLED updates
+  // and logs made an Internet outage look like a system-wide failure.
+  if (status != last_reported_status || (wifi_count % 5) == 0) {
+    console->printf("WIFI: link retry count=%d status=%d mode=%d; local AP not connected\n",
+                    wifi_count, (int)status, (int)WiFi.getMode());
+    last_reported_status = status;
+  }
+  wifi_count++;
+
+  // Do not disable Wi-Fi after a fixed number of failures.  A tethering AP may
+  // return later, and local Web access should recover automatically.
+  return 0;
 }
 
 
+
+bool network_external_service_ready(uint32_t delay_ms) {
+  if (!wifi_enable || WiFi.status() != WL_CONNECTED || wifi_status == 0)
+    return false;
+  if (wifi_link_connected_since_ms == 0) return false;
+  return (uint32_t)(millis() - wifi_link_connected_since_ms) >= delay_ms;
+}
+
+void service_network_background() {
+  if (!network_external_service_ready(NTP_START_DELAY_MS)) return;
+
+  const uint32_t now = millis();
+
+  if (ntp_client_started) {
+    service_ntp_attempt();
+    return;
+  }
+
+  if (ntp_next_attempt_ms != 0 &&
+      (int32_t)(now - ntp_next_attempt_ms) < 0) {
+    return;
+  }
+
+  start_ntp_service();
+}
+
+bool network_ntp_started() { return ntp_client_started; }
+bool network_ntp_synced() { return ntp_synced_state; }
 
 void set_wifi_enabled(int enabled) {
   wifi_count = 0;
@@ -301,6 +539,12 @@ void set_wifi_enabled(int enabled) {
 
   if (!enabled) {
     wifi_enable = 0;
+    wifi_link_connected_since_ms = 0;
+    if (ntp_client_started || esp_sntp_enabled()) {
+      stop_ntp_service();
+    }
+    ntp_next_attempt_ms = 0;
+    ntp_synced_state = false;
     console->println("WIFI: disabling station and disconnecting");
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);

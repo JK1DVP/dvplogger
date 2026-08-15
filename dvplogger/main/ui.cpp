@@ -78,6 +78,55 @@
 #include "iambic_keyer.h"
 #include "mux_transport.h"
 #include "timekeep.h"
+
+// User-initiated focus changes should refresh the bandmap immediately.
+// SO2R sequencing continues to call so2r.change_focused_radio() directly,
+// so temporary TX/RX focus changes do not switch the displayed bandmap.
+static void change_focused_radio_manual(int new_focus)
+{
+  if (new_focus < 0 || new_focus >= N_RADIO) return;
+
+  so2r.change_focused_radio(new_focus);
+
+  struct radio *radio = &radio_list[new_focus];
+  if (radio->bandid > 0) {
+    radio->bandid_bandmap = radio->bandid;
+  }
+
+  bandmap_disp.f_update = 1;
+  upd_display_bandmap();
+}
+
+struct HelpPage {
+  const char *line[6];
+};
+
+// Pages 0..6 preserve the existing HELP order and wording.
+// Later pages contain only CALLSIGN commands or only shortcut keys.
+static const HelpPage help_pages[] = {
+  {{"A-Home:SW_RIG", "A-End:Tgl_Rig", "A-x:Tgl_Xvtr", "A-m:SW_Mode", "A-t:Xmit,-b:BMapSrt", "\\:Focus Radio"}},
+  {{"SATELLITE", "NEW/READ/MAIL/", "DUMPQSOLOG", "MAKEDUPE,MEMSTAT", "LISTDIR,SAVE/LOAD", "HELP/HELPR"}},
+  {{"C-r,c,s:Rem,Cl,RST", "C-f:Rem->Mul,-v:Tgl_Voice", "C-j,p,n,o:Cur,Prev,Next,Last", "C-1,2:C/PDupe,Contest", "C-3,t,y:MaskBandmap,MultiShow", "C-S-2:Prev Contest"}},
+  {{"C-'-':editQSO", "C-4:callhist", "C-5:SO1R/SAT/SO2R", "C-u:Score", "PGUP/DN:CW SPD", "C-v:Voice"}},
+  {{"A-'-':Scope", "A-q:CW/S&P", "A-a:nextAOS", "A-p:pick sat AOS", "A-b:beacon ", "A-c:CW/RTTY edit"}},
+  {{"A-d,n:bandmap del/add.", "A-g:tone key", "A-Spc:pick spot", "A-DEL:show rig info", "A-f:set center freq.", "A-r:vfo mode sw"}},
+  {{"A-w:wipe QSO", "A-<=>:bandmap sel.", "A-m:mode", "A-<>:band", "C-l:QSLcard", "A-s:track mode"}},
+
+  // CALLSIGN command index. Common prefixes/suffixes are compacted.
+  {{"NEW/READ/MAIL-QSOLOG", "DUMPQSOLOG/LISTQSOFILE", "SWITCHLOG/ZMERGE", "MAKEDUPE/DUPERESET", "RESTARTLOG/EXITEMU", "SAVE/LOAD"}},
+  {{"LOAD/SAVE/RESETRIGS", "NEXTRIG/PREVRIG", "ENABLE/DISABLE-RIG", "BAND/RADIO", "BANDEN/BANDMASK/BANDMAP", "AUTOOFFnn/NATTO"}},
+  {{"DISPTYPE0/1/2", "RESETDISP", "DISPCLOCKJST/UTC", "OLDESTnn", "ANTENNA[STATUS]", "ANTENNAON/OFF"}},
+  {{"ESM/ALTCQ/2BSIQ", "OFF/ONCONTEST", "CONTEST", "KEY/STRAIGHT", "TOGGLEPTT", "CWJQF/CWNORMAL"}},
+  {{"KBDJP/US", "PADDLENOR/REV", "IAMBICA/B", "MUX/NOMUXTRANS", "CALLHIST<file>", "CALLHISTMAIN/SUB"}},
+  {{"WIFI", "SUBCPURESET", "VERBOSEnn/DEBUG", "LISTDIR/MEMSTAT/ADCSTAT", "HELP/HELPR", "SATELLITE"}},
+
+  // Shortcut supplement only; no CALLSIGN commands on this page.
+  {{"A-s:track mode", "\\:Focus Radio", "C-S-2:Prev Contest", "C-S-t/y:Multi prev/next", "C-S-c/r:Contest/RIG", "ESC:Cancel TX"}},
+};
+
+static constexpr int HELP_PAGE_COUNT =
+    sizeof(help_pages) / sizeof(help_pages[0]);
+
 #include "processes.h"
 #include "so2r.h"
 #include "dac-adc.h"
@@ -155,8 +204,10 @@ int ui_cursor_next_entry_partial_check (struct radio *radio)
 int ui_pick_partial_check(struct radio *radio)
 {
   plogw->ostream->println("ui_pick_partial_check()");
-  strcpy(radio->callsign+2,radio->check_entry_list.entryl[radio->check_entry_list.cursor].callsign);
-  radio->callsign[1]=strlen(radio->callsign +2);
+  set_callsign_and_request_dupe(
+      radio,
+      radio->check_entry_list.entryl[radio->check_entry_list.cursor].callsign,
+      true);
   strcpy(radio->recv_exch + 2, radio->check_entry_list.entryl[radio->check_entry_list.cursor].exch);
   radio->recv_exch[1]=strlen(radio->recv_exch+2);
   upd_display();
@@ -241,7 +292,13 @@ int ui_send_mycall(struct radio *radio)
   so2r.cancel_msg_tx();
       
   so2r.set_msg_tx_to_focused();
-  //  so2r.set_rx_in_sending_msg();
+  // Match the normal function-key transmission path.  In SO2R the message
+  // radio and the hardware TX radio are separate state variables; without
+  // this switch, an ESM MyCALL from radio 1 is queued while tx_ can still be
+  // radio 0.
+  so2r.set_rx_in_sending_msg();
+  so2r.set_tx_to_msg_tx();
+  so2r.sequence_stat(SO2R::Sending_Msg);
   if ((radio->modetype==LOG_MODETYPE_CW) || (radio->f_tone_keying) ) { 
     // send my callsign
     strcpy(radio->callsign_previously_sent, radio->callsign + 2);
@@ -457,20 +514,18 @@ if (key == 0x1f) {
 	switch (so2r.focused_radio()) {
 	case 0:
 	  //	  select_radio(1);
-	  so2r.change_focused_radio(1);
+	  change_focused_radio_manual(1);
 	  break;
 	case 1:
 	  //	  select_radio(2);
-	  so2r.change_focused_radio(2);	  
+	  change_focused_radio_manual(2);	  
 	  break;
 	case 2:
 	  //	  select_radio(0);
-	  so2r.change_focused_radio(0);	  
+	  change_focused_radio_manual(0);	  
 	  break;
 	}
 
-	upd_display();
-	bandmap_disp.f_update = 1;
 	break;
 	//
 
@@ -659,28 +714,32 @@ if (key == 0x1f) {
       return;
     }
 
-    if (key == 0x1d) {  // alt-z  // switch CW <=> PH
-      save_freq_mode_filt(radio);
+    if (key == 0x1d) {  // Alt-Z: switch the explicit CW <=> PH memory bank
+      int target_modetype;
       switch (radio->modetype) {
       case LOG_MODETYPE_CW:
-	radio->modetype = LOG_MODETYPE_PH;
-	break;
+        target_modetype = LOG_MODETYPE_PH;
+        break;
       case LOG_MODETYPE_PH:
-	radio->modetype = LOG_MODETYPE_CW;
-	break;
+        target_modetype = LOG_MODETYPE_CW;
+        break;
       default:
-	return;
+        // Do not transition digital/undefined modes implicitly.
+        return;
       }
-      // save new modetype to the bank so cq and freq is recalled in the new modetype
-      int tmp;
-      radio->modetype_bank[radio->bandid]=radio->modetype;
-      //      radio->cq_modetype_bank[radio->bandid]=radio->cq[radio->modetype]*4+(radio->modetype&0x3);
-      
-      // no transision DG and other modes
-      recall_freq_mode_filt(radio);
 
-      upd_display_bandmap();      
-      // issue: cq <-> s&p transision does not occur in this key
+      // Save the current bank, then recall exactly the requested bank.
+      // recall_freq_mode_filt() normally follows modetype_bank and could
+      // otherwise restore the bank that we have just left.
+      save_freq_mode_filt(radio);
+      recall_freq_mode_filt_for_modetype(radio, target_modetype);
+
+      // Manual rigs have no CAT response that would trigger a later right-side
+      // redraw.  Schedule both displays explicitly and keep the key handler
+      // free of synchronous OLED transfers.
+      request_display_update_on_demand();
+      request_bandmap_update_on_demand();
+      // CQ/S&P state remains the state remembered in the selected bank.
       return;
     }
 
@@ -944,8 +1003,9 @@ if (key == 0x1f) {
 	}
 	count++;
       }
-      //      band_change(radio->bandid - 1, radio);
-      upd_display();
+      // band_change() already requests both right-display and bandmap
+      // updates through the coalescing on-demand path.
+
     }
     // shift + left / right  cursor in bandmap change
     if (key == 0x52) {  // alt-left  --> remap to alt-up 0x52
@@ -1007,6 +1067,32 @@ if (key == 0x1f) {
 	
   } // end of alt+
   else if (modkey_ctrl(modkey)) {
+    // Ctrl+Enter changes the persistent SO2R receive partner without running
+    // ESM. Ctrl+Shift+Enter selects the previous enabled radio.
+    if (!modkey_alt(modkey) && key == 0x28 && radio->ptr_curr == 0) {
+      const int tx_radio = so2r.focused_radio();
+      const int direction = modkey_shift(modkey) ? -1 : 1;
+      if (so2r.select_so2r_pair_for_radio(tx_radio, direction)) {
+        const int partner = so2r.so2r_pair_radio(tx_radio);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SO2R PAIR SET\nR%d <-> R%d\nSaved",
+                 tx_radio, partner);
+        // Update the normal right/left status screens as well.  The left-side
+        // redraw is held until the confirmation flash expires, so the new pair
+        // is shown immediately and the underlying status is also refreshed.
+        request_display_update_on_demand();
+        request_bandmap_update_on_demand();
+        upd_display_info_flash(dp->lcdbuf);
+        save_settings("");
+      } else {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SO2R PAIR ERROR\nTX R%d\nNo partner",
+                 tx_radio);
+        upd_display_info_flash(dp->lcdbuf);
+      }
+      return;
+    }
+
     // Ctrl+
     // 0           1               2
     // 456789abcdef0123456789abcdef01234567
@@ -1064,8 +1150,12 @@ if (key == 0x1f) {
 	switch_logw_entry(5);
 	break;
 	
-      case 0x06:  // ctrl-c direct move to callsign
-	switch_logw_entry(3);
+      case 0x06:  // Ctrl-C: Callsign / Ctrl-Shift-C: Contest
+        if (modkey_shift(modkey)) {
+          switch_logw_entry(8);
+        } else {
+          switch_logw_entry(3);
+        }
 	break;
 	// enable/disable voice cq on/off ? if set, TU message voice record will be sent on Enter 220116
       case 0x16:  // ctrl-s direct move to his RST
@@ -1129,8 +1219,12 @@ if (key == 0x1f) {
 	  plogw->ostream->println(radio->keyer_mode);
 	}
 	break;
-      case 0x15:  // ctrl-r direct move to remarks
-	switch_logw_entry(2);
+      case 0x15:  // Ctrl-R: Remarks / Ctrl-Shift-R: RIG
+        if (modkey_shift(modkey)) {
+          switch_logw_entry(7);
+        } else {
+          switch_logw_entry(2);
+        }
 	break;
       case 0x1a:  // Crrl-w to wipe the QSO
 	wipe_log_entry();
@@ -1381,7 +1475,7 @@ if (key == 0x1f) {
 	} else {
 	  if (radio->ptr_curr == 1) { // exchange input space will make callsign window move
 	    radio->ptr_curr=0;
-	    upd_display();
+	    request_display_update_on_demand();
 	  } else {
 	    if (verbose & 1) plogw->ostream->println("switch_logw_entry(0)");
 	    switch_logw_entry(0);
@@ -1401,6 +1495,9 @@ if (key == 0x1f) {
       so2r.cancel_msg_tx();
       switch(so2r.radio_mode) {
       case SO2R::RADIO_MODE_SO2R:
+        // ESC bypasses sending_msg_finished(), so explicitly restore the
+        // operator focus saved when this message transmission started.
+        so2r.request_restore_focus_after_message(so2r.msg_tx_radio());
 	so2r.sequence_mode(SO2R::SO2R_CQSandP);
 	break;
       case SO2R::RADIO_MODE_SO1R:
@@ -1434,7 +1531,7 @@ if (key == 0x1f) {
       break;
 
     case 0x2a:  // BS
-      if (verbose & 1) plogw->ostream->print("\H(BS)");
+      if (verbose & 1) plogw->ostream->print("(BS)");
       if (radio->keyer_mode) {
 	delete_cwbuf();
       } else {
@@ -1458,13 +1555,13 @@ if (key == 0x1f) {
 
       switch (so2r.focused_radio()) {
       case 0:
-	so2r.change_focused_radio(1);
+	change_focused_radio_manual(1);
 	break;
       case 1:
-	so2r.change_focused_radio(0);
+	change_focused_radio_manual(0);
 	break;
       case 2:
-	so2r.change_focused_radio(0);
+	change_focused_radio_manual(0);
 	break;
       }
       //
@@ -1475,13 +1572,13 @@ if (key == 0x1f) {
     case 0x4b:  // PGUP
       // cw keying speed change
       cw_spd++;
-      if (cw_spd >= 35) cw_spd = 35;
+      clamp_cw_speed();
       show_cw_spd();
       break;
 
     case 0x4e:  // PGDN
       cw_spd--;
-      if (cw_spd <= 10) cw_spd = 10;
+      clamp_cw_speed();
       show_cw_spd();
       break;
       // editing related keys
@@ -1741,20 +1838,20 @@ void process_enter(int option) {
   // 21/11/7 Enter will also be processed similarly in keyer mode
   switch (radio->ptr_curr) {
   case 1:  // number entry
-    if (!plogw->f_off_contest) {        
-      // check multipliers only for QSOs belonging to the active contest
-      int ret;
-      radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
-      //   plogw->ostream->println("contest multi checking0");
-      if (check_multi_contest()) {
-	//plogw->ostream->println("contest multi checking");
-	if (radio->multi == -1) {
-	  // not valid multipliers
-	  if (!plogw->f_console_emu) plogw->ostream->println("not valid multiplier");
-	  upd_display();
-	  upd_display_info_contest_settings(radio);
-	  break;
-	}
+    // Always interpret the exchange using the currently selected contest,
+    // including OFFCONTEST operation.  OFFCONTEST changes scoring/recording
+    // policy, not the operator assistance used to interpret the exchange.
+    radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
+    //   plogw->ostream->println("contest multi checking0");
+    if (check_multi_contest() && radio->multi == -1) {
+      // In a normal contest an invalid multiplier prevents logging, as before.
+      // In OFFCONTEST it is only a warning: keep the exchange visible and
+      // allow the QSO to be recorded with C:-, without score/dupe/multi entry.
+      if (!plogw->f_console_emu) plogw->ostream->println("not valid multiplier");
+      upd_display();
+      upd_display_info_contest_settings(radio);
+      if (!plogw->f_off_contest) {
+	break;
       }
     }
 
@@ -1864,9 +1961,8 @@ void process_enter(int option) {
     
     // update display by the current focus
     so2r.qso_process_radio(so2r.focused_radio()); // set qso_process_radio to the focused 
-    upd_display();
-    bandmap_disp.f_update = 1;
-    upd_display_bandmap();
+    request_display_update_on_demand();
+    request_bandmap_update_on_demand();
     break;
   case 8:  // grid locator
     set_grid_locator_information();
@@ -1962,26 +2058,78 @@ void process_enter(int option) {
     int tmp;
     len = strlen(radio->callsign + 2);
     if (len == 0) {
-      if (!radio->cq[radio->modetype]) {  // no existing callsign entry
-	// S&P
-	pick_onfreq_station();
-      } 
-      if (plogw->f_esm==1) {
-	if (radio->cq[radio->modetype]==LOG_CQ) {
-	  // CQ & ESM -> CQ send
-	  //	  plogw->f_repeat_func_stat = 0;
-	  so2r.cancel_msg_tx();	
-	  //	  so2r.suspend();
-	  //	  set_tx_to_focused();
-	  so2r.set_msg_tx_to_focused();
-	  //	  ui_send_cq(radio);
-	  //	  so2r.msg_tx_radio(so2r.focused_radio()); // set message send tx to the currently focued radio	  
-	  so2r.send_cq();
-	}
+      if (radio->cq[radio->modetype] == LOG_SandP) {
+        // In S&P, first give an on-frequency bandmap station a chance to
+        // populate the entry.  Continue through the normal ESM path when a
+        // station was picked; do not consume this Enter prematurely.
+        pick_onfreq_station();
+        len = strlen(radio->callsign + 2);
       }
-      break;
+
+      if (len == 0) {
+        if (plogw->f_esm == 1) {
+          if (radio->cq[radio->modetype] == LOG_SandP) {
+            // N1MM+-style ESM behavior: an empty Enter in S&P sends F4
+            // (my callsign) while keeping the radio in S&P mode.
+            ui_send_mycall(radio);
+          } else {
+            // In CQ mode, an empty Enter starts/continues CQ as before.
+            so2r.cancel_msg_tx();
+            so2r.set_msg_tx_to_focused();
+            so2r.send_cq();
+          }
+        }
+        break;
+      }
     }
     // check for commands
+    if (strncmp(radio->callsign + 2, "OLDEST", 6) == 0) {
+      const char *arg = radio->callsign + 8;
+      char *endp = NULL;
+      long minutes = strtol(arg, &endp, 10);
+      if (arg != endp && *endp == '\0' && minutes >= 1 && minutes <= 1440) {
+        bandmap_lifetime_minutes = (int)minutes;
+        save_settings("");
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "Bandmap oldest\n%d min", bandmap_lifetime_minutes);
+      } else {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "OLDEST invalid\n1..1440 min");
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    if (strcmp(radio->callsign + 2, "ZSERVERON") == 0 ||
+        strcmp(radio->callsign + 2, "ZSERVEROFF") == 0) {
+      const int enabled = strcmp(radio->callsign + 2, "ZSERVERON") == 0;
+      set_zserver_auto(enabled);
+      save_settings("");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "ZSERVER\n%s", enabled ? "AUTO" : "OFF");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    if (strcmp(radio->callsign + 2, "CLUSTER1ON") == 0 ||
+        strcmp(radio->callsign + 2, "CLUSTER1OFF") == 0) {
+      const int enabled = strcmp(radio->callsign + 2, "CLUSTER1ON") == 0;
+      set_cluster_auto(1, enabled);
+      save_settings("");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "CLUSTER 1\n%s", enabled ? "AUTO" : "OFF");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    if (strcmp(radio->callsign + 2, "CLUSTER2ON") == 0 ||
+        strcmp(radio->callsign + 2, "CLUSTER2OFF") == 0) {
+      const int enabled = strcmp(radio->callsign + 2, "CLUSTER2ON") == 0;
+      set_cluster_auto(2, enabled);
+      save_settings("");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "CLUSTER 2\n%s", enabled ? "AUTO" : "OFF");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
     if (strcmp(radio->callsign + 2, "DISCONN") == 0) {
       disconnect_cluster();
       clear_buf(radio->callsign);
@@ -2177,6 +2325,23 @@ void process_enter(int option) {
       clear_buf(radio->callsign);
       break;
     }
+    if (strcmp(radio->callsign + 2, "DISPCLOCKJST") == 0) {
+      clock_display_mode = 0;
+      save_settings("");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "DISPLAY CLOCK\nJST\nSaved");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    if (strcmp(radio->callsign + 2, "DISPCLOCKUTC") == 0) {
+      clock_display_mode = 1;
+      save_settings("");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "DISPLAY CLOCK\nUTC\nSaved");
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
     if (strcmp(radio->callsign+2,"RESETDISP")==0) {
       plogw->ostream->print("reset_display()");
       init_display();
@@ -2308,6 +2473,18 @@ void process_enter(int option) {
       }
       clear_buf(radio->callsign);
       break;
+    }
+
+    if (strcmp(radio->callsign + 2, "RESTARTLOG") == 0) {
+      clear_buf(radio->callsign);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Restarting\nDVPlogger...");
+      // This command is handled in the MAIN-loop key path, so the flash
+      // message is transferred before the short grace period and reset.
+      upd_display_info_flash(dp->lcdbuf);
+      delay(500);
+      ESP.restart();
+      break;  // ESP.restart() normally does not return.
     }
 
     if (strcmp(radio->callsign + 2, "DUPERESET") == 0) {
@@ -2604,14 +2781,23 @@ void process_enter(int option) {
       break;
     }
     if (strcmp(radio->callsign + 2, "HELP") == 0) {
-      print_help(plogw->help_idx++);
-      if (plogw->help_idx >= 7) plogw->help_idx = 0;
+      // If HELP is still visible, advance to the next page.  After the
+      // 10-second timeout, show the last selected page again first.
+      if (info_disp.show_info == INFO_DISP_HELP && info_disp.timer > 0) {
+        plogw->help_idx = (plogw->help_idx + 1) % HELP_PAGE_COUNT;
+      }
+      print_help(plogw->help_idx);
       //        clear_buf(radio->callsign);
       break;
     }
     if (strcmp(radio->callsign + 2, "HELPR") == 0) {
-      print_help(plogw->help_idx--);
-      if (plogw->help_idx == -1) plogw->help_idx = 7;
+      // Mirror HELP: move backward only while a HELP page is visible.
+      // After timeout, redisplay the current page without changing it.
+      if (info_disp.show_info == INFO_DISP_HELP && info_disp.timer > 0) {
+        plogw->help_idx =
+            (plogw->help_idx + HELP_PAGE_COUNT - 1) % HELP_PAGE_COUNT;
+      }
+      print_help(plogw->help_idx);
       //        clear_buf(radio->callsign);
       break;
     }
@@ -2858,6 +3044,7 @@ void logw_handler(char key, char c)
   radio = so2r.radio_selected();
   char callsign_before[LEN_CALL_WINDOW + 1];
   bool callsign_content_changed = false;
+  bool defer_display_for_dupe = false;
   if (radio->ptr_curr == 0) {
     strncpy(callsign_before, radio->callsign + 2, LEN_CALL_WINDOW);
     callsign_before[LEN_CALL_WINDOW] = '\0';
@@ -3052,8 +3239,8 @@ void logw_handler(char key, char c)
     // Do not block keyboard handling on subcpu searches.  One combined
     // asynchronous request supplies DUPE, exact-match EXCH and partial data.
     request_async_dupe_partial(radio, true);
-      
-      
+    request_dupe_aware_display_update();
+    defer_display_for_dupe = true;
     break;
   case 1:  // recv_exch
     if (strlen(radio->recv_exch + 2) >= 1) {
@@ -3066,7 +3253,7 @@ void logw_handler(char key, char c)
   }
 
 
-  upd_display();
+  if (!defer_display_for_dupe) request_display_update_on_demand();
 }
 
 void 	check_call_show_dx_entity_info(struct radio *radio) {
@@ -3107,6 +3294,14 @@ void switch_logw_entry(int option) {
     if (strlen(radio->sent_rst+2)>=2) {
       radio->sent_rst[1]=1; // cursor move to S position
     }
+    break;
+  case 7:  // direct move to RIG name, cursor at the first character
+    radio->ptr_curr = 20;
+    radio->rig_name[1] = 0;
+    break;
+  case 8:  // direct move to Contest name, cursor at the first character
+    radio->ptr_curr = 40;
+    plogw->contest_name[1] = 0;
     break;
   case 0:  // forward
     if ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)) {
@@ -3296,7 +3491,7 @@ void switch_logw_entry(int option) {
     plogw->ostream->println(radio->ptr_curr);
     plogw->ostream->print("\t");
   }
-  upd_display();
+  request_display_update_on_demand();
 }
 
 
@@ -3316,44 +3511,11 @@ void sat_name_entered() {
       //        set_sat_info_calc(plogw->sat_name_set);
       set_sat_index(plogw->sat_name_set);
 
-      // automatically set sat_vfo_mode from
-      // 1) how many rig enabled  single and two trx
-      // 2) band assigned for the radio #0 and #2
-      // 3) rig_type (IC-705, IC-9700)
-      int n_active_rigs;
-      int i;
-      i = plogw->sat_idx_selected;
-      if (radio_list[1].enabled && radio_list[0].enabled) {
-        // two trx
-        if (freq2bandid(sat_info[i].up_f0) == radio_list[0].bandid) {
-          // uplink is radio 0
-          plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_0;
-          // select radio to 0 ( transmit focus )
-	  //          select_radio(0);
-	  so2r.change_focused_radio(0);
-
-        } else {
-          if (freq2bandid(sat_info[i].up_f0) == radio_list[1].bandid) {
-            // uplink is radio 1
-            plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_1;
-            // select radio 1
-	    //            select_radio(1);
-	    so2r.change_focused_radio(1);
-          }
-        }
-      } else {
-        // single trx
-        switch (radio_list[0].rig_spec->rig_type) {
-	case 0:  // IC-705
-	  plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_RX;
-	  break;
-	case 1:  // IC-9700
-	  plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_TX;
-	  break;
-	default:  // others RX selected
-	  plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_RX;
-	  break;
-        }
+      char auto_reason[160];
+      auto_select_sat_vfo_mode(auto_reason, sizeof(auto_reason));
+      if (verbose & 8) {
+        plogw->ostream->print("SAT Auto VFO: ");
+        plogw->ostream->println(auto_reason);
       }
       struct radio *radio;
       radio=so2r.radio_selected();
@@ -3368,30 +3530,25 @@ void sat_name_entered() {
 
 // print help on the left screen
 void print_help(int option) {
-  switch (option) {
-  case 0:  // basic help 0
-    sprintf(dp->lcdbuf, "A-Home:SW_RIG\nA-End:Tgl_Rig\nA-x:Tgl_Xvtr\nA-m:SW_Mode\nA-t:Xmit,-b:BMapSrt\n");
+  if (option < 0 || option >= HELP_PAGE_COUNT) option = 0;
 
-    break;
-  case 1:  // on the callsign enter
-    sprintf(dp->lcdbuf, "SATELLITE\nNEW/READ/MAIL/\nDUMPQSOLOG\nMAKEDUPE,MEMSTAT\nLISTDIR,SAVE/LOAD\n");
-    break;
-  case 2:  // Ctrl
-    sprintf(dp->lcdbuf, "C-r,c,s:Rem,Cl,RST\nC-f:Rem->Mul,-v:Tgl_Voice\nC-j,p,n,o:Cur,Prev,Next,Last\nC-1,2:C/PDupe,Contest\nC-3,t,y:MaskBandmap,MultiShow\n");
-    break;
-  case 3:  // Ctrl #2
-    sprintf(dp->lcdbuf, "C-'-':editQSO\nC-4:callhist\nC-5:SO1R/SAT/SO2R\nC-u:Score\nPGUP/DN:CW SPD\nC-v:Voice\n");
-    break;
-
-  case 4:  // Ctrl #2
-    sprintf(dp->lcdbuf, "A-'-':Scope\nA-q:CW/S&P\nA-a:nextAOS\nA-p:pick sat AOS\nA-b:beacon \nA-c:CW/RTTY edit\n");
-    break;
-  case 5:  // SAT
-    sprintf(dp->lcdbuf, "A-d,n:bandmap del/add.\nA-g:tone key\nA-Spc:pick spot\nA-DEL:show rig info\nA-f:set center freq.\nA-r:vfo mode sw\nA-s:track mode");
-    break;
-  case 6:  // Ctrl #2
-    sprintf(dp->lcdbuf, "A-w:wipe QSO\nA-<=>:bandmap sel.\nA-m:mode\nA-<>:band\nC-l:QSLcard\n");
-    break;
+  dp->lcdbuf[0] = '\0';
+  for (int line = 0; line < 6; ++line) {
+    if (line == 5) {
+      char numbered_line[96];
+      snprintf(numbered_line, sizeof(numbered_line), "%s\x1f%d/%d",
+               help_pages[option].line[line], option + 1, HELP_PAGE_COUNT);
+      strlcat(dp->lcdbuf, numbered_line, sizeof(dp->lcdbuf));
+    } else {
+      strlcat(dp->lcdbuf, help_pages[option].line[line], sizeof(dp->lcdbuf));
+    }
+    if (line != 5) strlcat(dp->lcdbuf, "\n", sizeof(dp->lcdbuf));
   }
   upd_display_info_flash(dp->lcdbuf);
+  // HELP is temporary, but longer-lived than ordinary flash messages.
+  // INFO_DISP_HELP also lets HELP/HELPR distinguish a visible page from a
+  // page that has already timed out and returned to the bandmap.
+  info_disp.show_info = INFO_DISP_HELP;
+  info_disp.timer = 10000;
 }
+

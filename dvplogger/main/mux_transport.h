@@ -21,6 +21,7 @@
 
 #ifndef FILE_MUX_TRANSPORT_H
 #define FILE_MUX_TRANSPORT_H
+
 // this program implements multi-port transport between BT serial, and CH9350 keyboard/mouse, and the main board serial using a single serial connection to the main board
 // packeting rule as follows;
 
@@ -61,6 +62,7 @@
 #define N_PACKET_POOL 10
 extern int f_mux_transport;
 extern int f_mux_transport_cmd; // 1: transition to f_mux_transport=1 2: transition to f_mux_transport=0
+extern bool subcpu_online;      // result of bounded startup probe
 struct mux_packet {
   uint8_t status; // 0 free 1 being filled with data 2 ready to be handed to ports
   char *buf;

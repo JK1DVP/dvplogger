@@ -27,12 +27,19 @@ unsigned char bandmode_param(int bandid,int modetype) ;
 bool dupe_check_nocallhist(char *call, byte bandmode, byte mask) ;
 bool dupe_check_with_exch(const char *call, byte bandmode, byte mask,
                           char *exch, size_t exch_size);
+bool dupe_check_with_exch_confirmed(const char *call, byte bandmode,
+                                     byte mask, char *exch,
+                                     size_t exch_size, bool *is_dupe);
 void process_dupechk_query_subcpu(char *s);
 void process_dupechk_partial_query_subcpu(char *s);
 int query_dupechk_partial_subcpu(const char *call, byte bandmode, byte mask,
                                  struct check_entry_list *entry_list);
 void process_dupechk_partial_response_maincpu(char *s);
 void request_async_dupe_partial(struct radio *radio, bool include_partial);
+// Assign a callsign from a non-keyboard source and always start the same
+// DUPE/CALLHIST/partial-check path used by normal operator entry.
+bool set_callsign_and_request_dupe(struct radio *radio, const char *callsign,
+                                   bool include_partial);
 bool request_sp_send_after_dupe(struct radio *radio);
 
 bool dupe_check(struct radio *radio,char *call, byte bandmode, byte mask, bool callhist_check) ;
@@ -50,6 +57,16 @@ void entry_makedupe_bulk_subcpu(char *s);
 void finish_makedupe_bulk_subcpu();
 void begin_makedupe_subcpu(unsigned char mask);
 void finish_makedupe_subcpu();
+void note_makedupe_accepted_maincpu();
+bool dupechk_remote_query_pending();
+bool dupechk_remote_ack_received();
+// Non-blocking exact DUPE query for low-priority background jobs.
+// start returns false while the single SUBCPU query slot is busy.
+bool dupechk_background_exact_start(const char *call, byte bandmode, byte mask);
+// poll returns true when the query has completed. confirmed distinguishes a
+// real response from timeout/cancel; is_dupe is valid only when confirmed.
+bool dupechk_background_exact_poll(bool *confirmed, bool *is_dupe);
+void dupechk_background_exact_cancel();
 void process_makedupe_score_maincpu(char *s, int group);
 void entry_makedupe_subcpu_data(const char *callsign, const char *recv_exch, unsigned char bandmode);
 void entry_dupechk(struct radio *radio) ;
@@ -63,4 +80,11 @@ void task_dupechk();
 int get_dupechk_nmaxqso();
 int get_dupechk_ncallsign();
 //extern struct dupechk *dupechk;
+void dupechk_log_timing(const char *phase, unsigned int query_id, uint32_t sub_search_us, unsigned int qso_scanned, unsigned int hist_scanned, bool cache_hit);
+
+// Four-point MAIN-side timing hook: mark entry into the matching DUPE response
+// handler before parsing/committing the result.
+void dupechk_note_main_ack(unsigned int query_id);
+void dupechk_note_main_rx();
+void dupechk_note_exact_response_success(unsigned int query_id);
 #endif
