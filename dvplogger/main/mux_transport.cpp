@@ -56,7 +56,24 @@ bool subcpu_online=false;
 void Mux_transport::sync_transport_modes_master() {
 #ifndef DVPLOGGER_EXT
   if (!subcpu_online) {
-    f_mux_transport = 0;
+    /*
+     * A failed startup service probe must not tear down the physical MUX.
+     * KBD is transported over the same serial path.
+     *
+     * If SUBCPU was merely slow to boot, periodically repeat go_mux.
+     * This is non-blocking and harmless when SUBCPU is blank/unavailable.
+     * subcpu_online intentionally remains false: remote DB placement is
+     * selected during boot and is not changed in the middle of a session.
+     */
+    static uint32_t next_late_mux_retry_ms = 0;
+    const uint32_t now = millis();
+    if (mux_stream != NULL &&
+        (next_late_mux_retry_ms == 0 ||
+         (int32_t)(now - next_late_mux_retry_ms) >= 0)) {
+      mux_stream->print("\r\ngo_mux\r\n");
+      next_late_mux_retry_ms = now + 5000U;
+    }
+    f_mux_transport = 1;
     f_mux_transport_cmd = 0;
     return;
   }

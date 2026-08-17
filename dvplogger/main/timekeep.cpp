@@ -458,15 +458,30 @@ void timekeep() {
     sprintf(plogw->tm, "%02d/%02d/%02d-%02d:%02d:%02d", my_rtc.year() % 100, my_rtc.month(), my_rtc.day(),
 	    my_rtc.hour(), my_rtc.minute(), my_rtc.second());
     if (verbose&VERBOSE_PERF) console->println(plogw->tm);
-    // Update the RAM buffer first, but postpone the slow full-buffer OLED
-    // transfer while a latency-sensitive remote DUPE request is pending.
+    // Update the RAM buffer first.
+    //
+    // Give a latency-sensitive remote DUPE reply a short chance to arrive
+    // before the relatively slow OLED transfer, but never suppress the
+    // once-per-second clock refresh indefinitely.
     if (f_mux_transport) mux_transport.recv_pkt();
     upd_display_tm();
-    if (!dupechk_remote_query_pending()) {
-      if (f_mux_transport) mux_transport.recv_pkt();
-      right_display_sendBuffer();
-      if (f_mux_transport) mux_transport.recv_pkt();
+
+    if (dupechk_remote_query_pending()) {
+      const uint32_t wait_started_us = micros();
+      static const uint32_t CLOCK_DUPE_ACK_BUDGET_US = 8000U;
+
+      while (dupechk_remote_query_pending() &&
+             (uint32_t)(micros() - wait_started_us) <
+                 CLOCK_DUPE_ACK_BUDGET_US) {
+        if (f_mux_transport) mux_transport.recv_pkt();
+        task_dupechk();
+        delay(1);
+      }
     }
+
+    if (f_mux_transport) mux_transport.recv_pkt();
+    right_display_sendBuffer();
+    if (f_mux_transport) mux_transport.recv_pkt();
     if (f_show_clock == 2) {
 
       sprintf(datestr, "%04d/%02d/%02d-%02d:%02d:%02d",

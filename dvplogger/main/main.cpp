@@ -638,19 +638,32 @@ void setup()
   mux_transport.set_port_handler(MUX_PORT_BT_SERIAL_MAIN,receive_pkt_handler_btserial);
   mux_transport.set_port_handler(MUX_PORT_USB_KEYBOARD1_MAIN,receive_pkt_handler_keyboard1_main);
 
-  // Enter MUX and perform one bounded liveness probe.  With an empty SUBCPU
-  // this costs only the timeout below; MAIN then boots without remote waits.
-  Serial2.print("\r\ngo_mux\r\n");
+  // Enter MUX and perform a small number of bounded liveness probes.
+  //
+  // A failed probe means only that SUBCPU-backed services (DUPE/CALLHIST)
+  // are unavailable at this point in boot.  The same MUX also carries the
+  // KBD connector, so keep the transport alive even if remote services
+  // have to fall back to MAIN.
+  //
+  // The total wait remains bounded so a blank/broken SUBCPU cannot prevent
+  // the MAIN CPU from booting.
   f_mux_transport=1;
-  delay(100);
-  subcpu_online = callhist_subcpu_alive(350);
+  subcpu_online=false;
+  for (int attempt = 0; attempt < 3 && !subcpu_online; ++attempt) {
+    Serial2.print("\r\ngo_mux\r\n");
+    delay(attempt == 0 ? 100 : 150);
+    subcpu_online = callhist_subcpu_alive(350);
+  }
   if (subcpu_online) {
     console->println("SUBCPU probe: online; normal remote services enabled");
   } else {
-    console->println("SUBCPU probe: no response; remote callhist/dupe/MUX requests disabled");
-    f_mux_transport=0;
-    mux_transport.mux_stream=NULL;
-    deinit_mux_serial();
+    console->println(
+      "SUBCPU probe: no response; remote callhist/dupe disabled, "
+      "MUX kept active for KBD/late recovery");
+
+    // Do not disable Serial2/MUX here.  KBD reports use this same path.
+    // Remote database services still fall back safely to MAIN below.
+    f_mux_transport=1;
     callhist_at=0;
     plogw->enable_callhist=0;
     init_dupechk(1,0);
