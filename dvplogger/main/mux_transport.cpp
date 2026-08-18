@@ -156,17 +156,26 @@ void Mux_transport::recv_pkt() {
 	}
 	break;
       case pkt_bytes:
+	// Reject a corrupt length byte before c-3 can underflow.
+	if (c < 3) {
+	  pkt_status=pkt_wait_bop;
+	  break;
+	}
 	data_bytes=c-3;
 
-	// check data_bytes not exceed the buffer size
 	if (NULL==(packet_reading=get_free_packet())) {
 	  pkt_status=pkt_wait_bop;
 	  break;
 	}
 	packet_reading->status=1;
 	if (packet_reading->size < data_bytes) {
-	  //
-	  packet_reading->buf=(char *)realloc(packet_reading->buf,sizeof(char)*data_bytes);
+	  char *newbuf=(char *)realloc(packet_reading->buf,sizeof(char)*data_bytes);
+	  if (newbuf==NULL && data_bytes!=0) {
+	    packet_reading->status=0;
+	    pkt_status=pkt_wait_bop;
+	    break;
+	  }
+	  packet_reading->buf=newbuf;
 	  packet_reading->size=data_bytes;
 	}
 	packet_reading->idx=0;
@@ -199,7 +208,8 @@ void Mux_transport::recv_pkt() {
 	debug_print(packet_reading->to);
 	debug_print("\r\n");	
 
-	pkt_status=pkt_data;
+	// A zero-length frame goes directly to checksum.
+	pkt_status=(data_bytes==0) ? pkt_cksum : pkt_data;
 	break;
       case pkt_data:
 	packet_reading->buf[packet_reading->idx++]=c;
@@ -226,7 +236,8 @@ void Mux_transport::recv_pkt() {
 	  debug_print(c);
 	  debug_print ("\r\n");	  
 	  packet_reading->status=0;
-	  pkt_status=pkt_wait_bop;
+	  // If this byte is already the next BOP, use it for resynchronization.
+	  pkt_status=(c==bop) ? pkt_bytes : pkt_wait_bop;
 	  break;
 	} else {
 	  // complete packet read if the next is eop
@@ -262,6 +273,10 @@ void Mux_transport::recv_pkt() {
 	  }
 	  packet_reading->status=0; // free packet 
 	  pkt_status=pkt_wait_bop;
+	} else {
+	  // A bad/missing EOP must not leave the parser stuck in pkt_eop.
+	  packet_reading->status=0;
+	  pkt_status=(c==bop) ? pkt_bytes : pkt_wait_bop;
 	}
 	break;
       }
@@ -280,14 +295,17 @@ int Mux_transport::send_pkt(int frm, int to, unsigned char *data,int ndata)
       return 0;
     }
 #endif
-    // construct a full packet into wbuf[]
+    // Build the frame in a call-local buffer.  On SUBCPU send_pkt() can
+    // be entered from both the normal loop and the 1 ms Ticker callback;
+    // the old shared sbuf[] allowed one caller to overwrite another frame.
+    unsigned char wbuf[258];
     unsigned char *p;uint8_t cksum1;
-    if (ndata>256) return 0;
-    if (to>=N_PORT) return 0;
-    p=sbuf;
+    if (ndata<0 || ndata>252) return 0; // one-byte length is ndata + 3
+    if (to>=N_PORT || frm>=N_PORT) return 0;
+    p=wbuf;
     *p++=bop;
     cksum1=0;
-    *p++=ndata+3; cksum1+=ndata+3;
+    *p++=(uint8_t)(ndata+3); cksum1+=(uint8_t)(ndata+3);
     *p++=frm; cksum1+=frm;
     *p++=to; cksum1+=to;
     for (int i=0;i<ndata;i++) {
@@ -295,8 +313,7 @@ int Mux_transport::send_pkt(int frm, int to, unsigned char *data,int ndata)
     }
     *p++=cksum1;
     *p++=eop;
-    // write
-    if (mux_stream!=NULL)  mux_stream->write(sbuf,ndata+6);
+    if (mux_stream!=NULL)  mux_stream->write(wbuf,ndata+6);
     return 1;
     
   }

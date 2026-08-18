@@ -436,7 +436,8 @@ static inline void service_mux_transport()
 static void report_subcpu_profile()
 {
   const uint32_t now_ms = millis();
-  if ((uint32_t)(now_ms - subprof_last_report_ms) < 1000) return;
+  // Keep diagnostics, but reduce routine traffic on the KBD/DUPE MUX.
+  if ((uint32_t)(now_ms - subprof_last_report_ms) < 5000) return;
   subprof_last_report_ms = now_ms;
 
   if (f_mux_transport) {
