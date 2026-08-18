@@ -630,14 +630,15 @@ int load_settings(const char *fn) {
   }
 
   // mux transport
-  switch (f_mux_transport) {
-  case 0:
-    f_mux_transport_cmd=2;
-    break;
-  case 1: // go to mux
-    f_mux_transport_cmd=1;
-    break;
+  //
+  // A saved f_mux_transport=0 is a legacy raw/no-MUX setting.  KBD and
+  // remote DUPE/CALLHIST now share the SUBCPU MUX, so restoring 0 after a
+  // successful startup probe would immediately tear that link down.
+  // Migrate legacy settings to MUX mode at load time.
+  if (f_mux_transport == 0) {
+    f_mux_transport = 1;
   }
+  f_mux_transport_cmd=1;
   
   // iambic keyer
   set_paddle();

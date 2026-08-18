@@ -500,7 +500,8 @@ static void setupSdFileListHandler() {
           case FileListState::Header:
             if (state->length == 0) {
               set_text("<table><tr><th align='left'>Name</th>"
-                       "<th align='left'>Size</th></tr>");
+                       "<th align='left'>Size</th>"
+                       "<th align='left'>Modified</th></tr>");
             }
             if (copy_pending()) {
               state->length = 0;
@@ -517,10 +518,21 @@ static void setupSdFileListHandler() {
             }
             {
               char size_text[32];
+              char modified_text[32] = "-";
               humanReadableSizeToBuffer(state->entry.size(), size_text, sizeof(size_text));
+
+              time_t modified = state->entry.getLastWrite();
+              if (modified > 0) {
+                struct tm tm_info;
+                if (localtime_r(&modified, &tm_info) != nullptr) {
+                  strftime(modified_text, sizeof(modified_text),
+                           "%Y-%m-%d %H:%M:%S", &tm_info);
+                }
+              }
+
               snprintf(state->text, sizeof(state->text),
-                       "<tr align='left'><td>%s</td><td>%s</td></tr>",
-                       state->entry.name(), size_text);
+                       "<tr align='left'><td>%s</td><td>%s</td><td>%s</td></tr>",
+                       state->entry.name(), size_text, modified_text);
               state->entry.close();
               state->length = strlen(state->text);
               state->offset = 0;
