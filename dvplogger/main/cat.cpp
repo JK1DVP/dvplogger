@@ -40,6 +40,7 @@
 #include "SD.h"
 #include "settings.h"
 #include "cat.h"
+#include "timekeep.h"
 #include "mux_transport.h"
 #include "processes.h"
 #include "so2r.h"
@@ -104,6 +105,123 @@ byte bcd2dec(byte data) {
   return (((data >> 4) * 10) + (data % 16));
 }
 
+
+// Icom clock synchronization -------------------------------------------------
+//
+// IC-7300 / IC-9700:
+//   1A 05 01 79 YY YY MM DD   date (packed BCD, 4-digit year)
+//   1A 05 01 80 HH MM         time (packed BCD)
+//
+// The time-setting command carries hour/minute but no seconds.  To avoid
+// introducing an arbitrary seconds error, automatic synchronization is
+// armed when a valid CI-V reply establishes/re-establishes communication,
+// then transmitted around second 00 of the next minute.
+//
+// A gap of more than 5 seconds in valid CI-V replies is treated as a new
+// connection.  This also covers a transceiver power cycle without requiring
+// DVPlogger to restart.
+static uint32_t icom_clock_last_rx_ms[N_RADIO] = {0};
+static bool icom_clock_sync_pending[N_RADIO] = {false};
+
+bool icom_clock_sync_supported(const struct radio *radio)
+{
+  if (radio == nullptr || radio->rig_spec == nullptr) return false;
+  if (radio->rig_spec->cat_type != CAT_TYPE_CIV) return false;
+
+  switch (radio->rig_spec->rig_type) {
+  case RIG_TYPE_ICOM_IC705:
+  case RIG_TYPE_ICOM_IC7300:
+  case RIG_TYPE_ICOM_IC9700:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void send_icom_clock_civ(struct radio *radio)
+{
+  if (!icom_clock_sync_supported(radio)) return;
+
+  const uint16_t year = my_rtc.year();
+
+  // Set date: 1A 05 01 79 YYYY MM DD
+  send_head_civ(radio);
+  add_civ_buf((byte)0x1a);
+  add_civ_buf((byte)0x05);
+  add_civ_buf((byte)0x01);
+  add_civ_buf((byte)0x79);
+  add_civ_buf(dec2bcd((byte)(year / 100)));
+  add_civ_buf(dec2bcd((byte)(year % 100)));
+  add_civ_buf(dec2bcd((byte)my_rtc.month()));
+  add_civ_buf(dec2bcd((byte)my_rtc.day()));
+  send_tail_civ(radio);
+
+  // Set time: 1A 05 01 80 HH MM
+  send_head_civ(radio);
+  add_civ_buf((byte)0x1a);
+  add_civ_buf((byte)0x05);
+  add_civ_buf((byte)0x01);
+  add_civ_buf((byte)0x80);
+  add_civ_buf(dec2bcd((byte)my_rtc.hour()));
+  add_civ_buf(dec2bcd((byte)my_rtc.minute()));
+  send_tail_civ(radio);
+
+  plogw->ostream->printf(
+      "CLOCKSYNC radio=%d %04u/%02u/%02u %02u:%02u civ=%02X\n",
+      radio->rig_idx, (unsigned)year,
+      (unsigned)my_rtc.month(), (unsigned)my_rtc.day(),
+      (unsigned)my_rtc.hour(), (unsigned)my_rtc.minute(),
+      radio->rig_spec->civaddr);
+}
+
+void request_icom_clock_sync(struct radio *radio)
+{
+  if (!icom_clock_sync_supported(radio)) return;
+  if (radio->rig_idx < 0 || radio->rig_idx >= N_RADIO) return;
+  icom_clock_sync_pending[radio->rig_idx] = true;
+}
+
+int request_icom_clock_sync_all()
+{
+  int n = 0;
+  for (int i = 0; i < N_RADIO; ++i) {
+    struct radio *radio = &radio_list[i];
+    if (!radio->enabled || !icom_clock_sync_supported(radio)) continue;
+    request_icom_clock_sync(radio);
+    ++n;
+  }
+  return n;
+}
+
+static void service_icom_clock_sync_on_rx(struct radio *radio)
+{
+  if (!icom_clock_sync_supported(radio)) return;
+  if (radio->rig_idx < 0 || radio->rig_idx >= N_RADIO) return;
+
+  const int idx = radio->rig_idx;
+  const uint32_t now_ms = millis();
+  const uint32_t last_ms = icom_clock_last_rx_ms[idx];
+
+  // First valid reply, or the first reply after a communication gap.
+  if (rig_clock_sync &&
+      (last_ms == 0 || (uint32_t)(now_ms - last_ms) > 5000U)) {
+    icom_clock_sync_pending[idx] = true;
+    if (verbose & VERBOSE_CAT) {
+      plogw->ostream->printf(
+          "CLOCKSYNC armed radio=%d after CI-V connect/reconnect\n", idx);
+    }
+  }
+  icom_clock_last_rx_ms[idx] = now_ms;
+
+  if (!icom_clock_sync_pending[idx]) return;
+
+  // 01 is also accepted so that a polling interval crossing the exact
+  // second boundary cannot postpone synchronization for another minute.
+  if (my_rtc.second() <= 1) {
+    send_icom_clock_civ(radio);
+    icom_clock_sync_pending[idx] = false;
+  }
+}
 
 
 // mode name string to rig mode number
@@ -889,57 +1007,74 @@ void set_scope() {
 
 void set_scope_mode(struct radio *radio,int mode) {
   int span;
-  char buf[40];  
+  char buf[40];
+
+  if (radio == nullptr || !radio->enabled || radio->rig_spec == nullptr) return;
+
   span=0;
   switch (radio->rig_spec->cat_type) {
-  case CAT_TYPE_CIV:  // icom ci-v
+  case CAT_TYPE_CIV:  // Icom CI-V
+      switch (mode) {
+        case 3:       // CW
+        case 7:       // CW-R
+        case 4:       // RTTY
+        case 8:       // RTTY-R
+          span = 0x10000;    // 10 kHz
+          break;
+        case 0:       // LSB
+        case 1:       // USB
+          span = 0x25000;    // 25 kHz
+          break;
+        case 2:       // AM
+        case 0x17:    // DV
+          span = 0x50000;    // 50 kHz
+          break;
+        case 5:       // FM
+        case 6:       // WFM
+          span = 0x0250000;  // 250 kHz
+          break;
+        default:
+          return;             // do not send an invalid/zero span
+      }
 
       send_head_civ(radio);
       add_civ_buf((byte)0x27);
       add_civ_buf((byte)0x15);
-      switch (mode) {
-        case 3:  // CW
-        case 7:
-          span = 0x10000;  // 10k
-          break;
-        case 0:
-        case 1:
-          span = 0x25000;  // 25 k
-          break;
-        case 5:              // FM
-        case 6:              // WFM
-          span = 0x0250000;  // 250k
-          break;
-      }
       add_civ_buf((byte)0x00);
       for (int i = 0; i < 5; i++) {
         add_civ_buf((byte)(span & 0xff));
         span = span >> 8;
       }
       send_tail_civ(radio);
-
       break;
-      //    case 1:  // cat
-  case CAT_TYPE_YAESU_NEW:  // Yaesu
+
+  case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:
-      
       switch (mode) {
-        case 3:  // CW
-        case 7:
-          span = 3;  // 10k
+        case 3:       // CW
+        case 7:       // CW-R
+        case 4:       // RTTY
+        case 8:       // RTTY-R
+          span = 3;   // 10 kHz
           break;
-        case 0:
-        case 1:
-          span = 5;  // 50k
+        case 0:       // LSB
+        case 1:       // USB
+        case 2:       // AM
+        case 0x17:    // DV (future Yaesu support)
+          span = 5;   // 50 kHz
           break;
-        case 5:      // FM
-        case 6:      // WFM
-          span = 6;  // 100k
+        case 5:       // FM
+        case 6:       // WFM
+          span = 6;   // 100 kHz
           break;
+        default:
+          return;
       }
-      //      sprintf(buf, "SS05%d0000;", span);
-      sprintf(buf, "SS0640000;SS05%d0000;SS0670000;", span);      
+      sprintf(buf, "SS0640000;SS05%d0000;SS0670000;", span);
       send_cat_cmd(radio, buf);
+      break;
+
+  default:
       break;
   }
 }
@@ -1769,10 +1904,22 @@ void set_mode_nonfil(const char *opmode, struct radio *radio) {
 }
 
 void set_mode(const char *opmode, byte filt, struct radio *radio) {
-  // struct radio *radio;
-  // radio=radio_selected;
+  if (radio == nullptr || radio->rig_spec == nullptr ||
+      opmode == nullptr || opmode[0] == '\0') return;
+
+  // Change the scope width only when the operating mode really changes.
+  // Repeated CAT polling reports of the same mode must not keep sending
+  // spectrum-scope commands.  The first valid mode after startup counts as
+  // a change from "unknown" and initializes the scope once.
+  const int old_mode =
+      radio->mode_initialized ? rig_modenum(radio->opmode) : -1;
 
   set_mode_nonfil(opmode, radio);
+
+  const int new_mode = rig_modenum(radio->opmode);
+  if (new_mode >= 0 && new_mode != old_mode) {
+    set_scope_mode(radio, new_mode);
+  }
 }
 
 
@@ -2796,6 +2943,11 @@ void get_civ(struct radio *radio) {
   }
   
   //  plogw->ostream->println("get_civ() addr pass");
+
+  // A correctly addressed CI-V frame proves that this radio is reachable.
+  // Use it to arm/service one-shot clock synchronization.
+  service_icom_clock_sync_on_rx(radio);
+
   radio->f_civ_response_expected = 0;
   radio->civ_response_timer = 0;
   switch (radio->cmdbuf[4]) {

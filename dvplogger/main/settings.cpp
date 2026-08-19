@@ -396,6 +396,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "rig_clock_sync";
+  settings_dict[n_settings_dict].value = (void *)&rig_clock_sync;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "so2r_pair_a";
   settings_dict[n_settings_dict].value = (void *)so2r.so2r_pair_a_setting_ptr();
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;

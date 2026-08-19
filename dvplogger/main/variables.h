@@ -97,6 +97,7 @@ extern uint8_t *dispbuf_r, *dispbuf_l;
 extern int enable_usb_keying;
 extern int rtcadj_count;
 extern int clock_display_mode; // 0: JST (internal UTC+9), 1: UTC display
+extern int rig_clock_sync;     // auto-sync supported Icom clocks on CI-V connect/reconnect
 extern int callhistf_stat ;  // 0 not open 1 open for reading 2 open for writing
 extern char qsologfn[20];    // qso log filename (append)
 extern char callhistfn[20];  // call history file to read

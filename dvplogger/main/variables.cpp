@@ -124,6 +124,7 @@ int wifi_status = 0;
 int count = 0;
 int rtcadj_count = 0;
 int clock_display_mode = 0; // 0: JST (internal UTC+9), 1: UTC display
+int rig_clock_sync = 1;     // 1: sync supported Icom rig clock on CI-V connect/reconnect
 
 //int callhistf_stat = 0;  // 0 not open 1 open for reading 2 open for writing
 char qsologfn[20];    // qso log filename (append)

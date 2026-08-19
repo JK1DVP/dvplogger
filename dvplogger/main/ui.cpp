@@ -2808,6 +2808,17 @@ void process_enter(int option) {
       clear_buf(radio->callsign);
       break;
     }
+    if (strcmp(radio->callsign + 2, "CLOCKSYNC") == 0) {
+      int n = request_icom_clock_sync_all();
+      plogw->ostream->printf(
+          "CLOCKSYNC requested for %d supported Icom radio(s); "
+          "will send at next minute boundary after valid CI-V RX\n", n);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "CLOCKSYNC\n%d radio(s) armed\nWait for :00", n);
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
     if (strcmp(radio->callsign + 2, "DUMPQSOLOG") == 0) {
       // create new QSO log
       dump_qso_log();
