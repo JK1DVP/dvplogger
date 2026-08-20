@@ -305,8 +305,11 @@ void display_cw_buf_lcd(char *buf) {
   clear_display_text_row(u8g2_r, 4, dp->hcol[0]);
   //  u8g2_r->drawStr(0, LCD_CW_POSY, dp->lcdbuf);
   u8g2_r->drawUTF8(0, LCD_CW_POSY , dp->lcdbuf);  
-  // under line according to the radio
-  switch (so2r.tx()) {
+  // Underline according to the radio that will actually be keyed.
+  // During manual keyboard CW this may differ from so2r.tx(), because the
+  // automatic SO2R sequence keeps its own TX state while manual CW uses the
+  // currently focused radio.
+  switch (effective_cw_radio()) {
   case 0: // radio 0
     break;
   case 1: // radio 1

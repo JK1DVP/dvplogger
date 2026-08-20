@@ -54,6 +54,16 @@ uint32_t rx_since = 0;
 bool force_resend = true;
 char reason_text[80] = "Disabled";
 
+// Optional DVPlogger OTRSP extension.
+// Capability is negotiated by sending ?ANTLIST after TCP connect.  Only when
+// the peer replies with "ANTLIST END" do we send RADIOx FREQ/MODE metadata.
+bool otrsp_ext_supported = false;
+char otrsp_rx_line[160] = {0};
+size_t otrsp_rx_len = 0;
+unsigned int last_meta_freq[ANTENNA_RADIOS] = {0, 0};
+char last_meta_mode[ANTENNA_RADIOS][8] = {{0}, {0}};
+bool force_meta_resend = true;
+
 int decode_ant(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
@@ -133,6 +143,107 @@ bool allocation_changed() {
   return false;
 }
 
+void reset_otrsp_extension_state() {
+  otrsp_ext_supported = false;
+  otrsp_rx_len = 0;
+  otrsp_rx_line[0] = '\0';
+  force_meta_resend = true;
+  for (int i = 0; i < ANTENNA_RADIOS; ++i) {
+    last_meta_freq[i] = 0;
+    last_meta_mode[i][0] = '\0';
+  }
+}
+
+bool otrsp_write_line(const char *line) {
+  if (!otrsp_client.connected() || line == nullptr) return false;
+  const size_t len = strlen(line);
+  if (len == 0) return true;
+  const size_t written = otrsp_client.write((const uint8_t *)line, len);
+  return written == len;
+}
+
+void handle_otrsp_extension_line(char *line) {
+  if (line == nullptr) return;
+  while (*line == ' ' || *line == '\t') ++line;
+
+  if (strcmp(line, "ANTLIST END") == 0) {
+    otrsp_ext_supported = true;
+    force_meta_resend = true;
+    Serial.println("ANTENNA OTRSP extension enabled");
+    return;
+  }
+
+  if (strncmp(line, "ANTNAME ", 8) == 0) {
+    char *p = line + 8;
+    char *endp = nullptr;
+    long ant = strtol(p, &endp, 10);
+    if (endp == p || ant < 1 || ant > ANTENNA_MAX_ID) return;
+    while (*endp == ' ' || *endp == '\t') ++endp;
+    if (*endp == '\0') return;
+
+    strlcpy(antenna_name[ant - 1], endp, sizeof(antenna_name[ant - 1]));
+    return;
+  }
+}
+
+void service_otrsp_rx() {
+  if (!otrsp_client.connected()) return;
+
+  while (otrsp_client.available()) {
+    const int v = otrsp_client.read();
+    if (v < 0) break;
+    const char c = (char)v;
+
+    if (c == '\r' || c == '\n') {
+      if (otrsp_rx_len > 0) {
+        otrsp_rx_line[otrsp_rx_len] = '\0';
+        handle_otrsp_extension_line(otrsp_rx_line);
+        otrsp_rx_len = 0;
+      }
+      continue;
+    }
+
+    if (otrsp_rx_len + 1 < sizeof(otrsp_rx_line)) {
+      otrsp_rx_line[otrsp_rx_len++] = c;
+    } else {
+      // Oversize/garbled line: discard and resynchronize at next terminator.
+      otrsp_rx_len = 0;
+    }
+  }
+}
+
+void send_radio_metadata_if_changed(bool force) {
+  if (!otrsp_ext_supported || !otrsp_client.connected()) return;
+
+  char cmd[64];
+  for (int i = 0; i < ANTENNA_RADIOS; ++i) {
+    const unsigned int freq = radio_list[i].freq;
+    const char *mode =
+        (radio_list[i].mode_initialized && radio_list[i].opmode[0])
+            ? radio_list[i].opmode : "-";
+
+    if (force || last_meta_freq[i] != freq) {
+      const unsigned long long freq_hz =
+          (unsigned long long)freq * (unsigned long long)FREQ_UNIT;
+      const int n = snprintf(cmd, sizeof(cmd),
+                             "RADIO%d FREQ %llu\r", i, freq_hz);
+      if (n > 0 && n < (int)sizeof(cmd)) {
+        otrsp_write_line(cmd);
+        last_meta_freq[i] = freq;
+      }
+    }
+
+    if (force || strcmp(last_meta_mode[i], mode) != 0) {
+      const int n = snprintf(cmd, sizeof(cmd),
+                             "RADIO%d MODE %s\r", i, mode);
+      if (n > 0 && n < (int)sizeof(cmd)) {
+        otrsp_write_line(cmd);
+        strlcpy(last_meta_mode[i], mode, sizeof(last_meta_mode[i]));
+      }
+    }
+  }
+}
+
 bool connect_otrsp() {
   if (otrsp_client.connected()) return true;
   otrsp_client.stop();
@@ -158,6 +269,13 @@ bool connect_otrsp() {
   }
   otrsp_client.setNoDelay(true);
   force_resend = true;
+  reset_otrsp_extension_state();
+
+  // Capability negotiation.  Standard OTRSP devices may simply ignore this
+  // unknown query.  No RADIOx extension traffic is sent until ANTLIST END is
+  // received, preserving compatibility with plain OTRSP devices.
+  otrsp_write_line("?ANTLIST\r");
+
   strlcpy(reason_text, "Connected; synchronizing", sizeof(reason_text));
   return true;
 }
@@ -207,6 +325,7 @@ const char *radio_status(int radio) {
 
 void antenna_settings_changed() {
   force_resend = true;
+  reset_otrsp_extension_state();
   next_connect_at = 0;
   otrsp_client.stop();
 }
@@ -240,6 +359,16 @@ void antenna_process() {
       next_connect_at = millis() + OTRSP_RETRY_INTERVAL_MS;
     }
     if (!otrsp_client.connected()) return;
+  }
+
+  // Non-blocking receive path for optional extension replies (ANTNAME list).
+  service_otrsp_rx();
+
+  // Once the server has advertised extension support, keep radio frequency
+  // and mode metadata synchronized independently of antenna switching.
+  if (otrsp_ext_supported) {
+    send_radio_metadata_if_changed(force_meta_resend);
+    force_meta_resend = false;
   }
 
   if (!allocation_changed() && !force_resend) {

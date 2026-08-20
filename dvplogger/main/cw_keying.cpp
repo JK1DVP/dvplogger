@@ -68,6 +68,33 @@ int wptr_cw_onoff_buf = 0, rptr_cw_onoff_buf = 0;
 //int f_so2r_chgstat_rx = 0;  // nonzero if changing so2r receive requested
 int f_transmission = 0;     // 0 nothing   1 force transmission on active trx 2 force stop transmission on active trx
 
+// Manual keyboard CW must not follow the automatic SO2R sequence TX radio.
+// -1 means normal/automatic operation: use so2r.radio_tx().
+static volatile int manual_cw_radio = -1;
+
+void set_manual_cw_radio(int radio_idx)
+{
+  if (radio_idx >= 0 && radio_idx < N_RADIO) {
+    manual_cw_radio = radio_idx;
+  }
+}
+
+void clear_manual_cw_radio()
+{
+  manual_cw_radio = -1;
+}
+
+// Return the radio that the CW keying layer will actually use right now.
+// Manual keyboard CW overrides the automatic SO2R TX selection.
+int effective_cw_radio()
+{
+  if (so2r.radio_mode == SO2R::RADIO_MODE_SO2R &&
+      manual_cw_radio >= 0 && manual_cw_radio < N_RADIO) {
+    return manual_cw_radio;
+  }
+  return so2r.tx();
+}
+
 #define CW_MS_ELEMENT 1200
 int cw_spd = 24;  // wpm
 
@@ -189,10 +216,13 @@ void keying(int on)
       // make sure all other hardware ports are off
       break;
   case SO2R::RADIO_MODE_SO2R:  // SO2R
-      // Use the effective TX radio for the physical CW output.
-      // This keeps the keyed port consistent with PTT/CAT routing and
-      // the CW-message underline display, both of which use so2r.tx().
-      radio = so2r.radio_tx();
+      // Automatic CW follows the SO2R sequence TX radio.  Manual keyboard
+      // CW follows the radio that was focused when the character was entered.
+      if (manual_cw_radio >= 0 && manual_cw_radio < N_RADIO) {
+        radio = &radio_list[manual_cw_radio];
+      } else {
+        radio = so2r.radio_tx();
+      }
       if (plogw->f_so2rmini) {
         // make sure all hardware ports are off
         digitalWrite(LED, 0);
@@ -269,7 +299,12 @@ void interrupt_cw_send() {
   if (enable_usb_keying) return;  // do not perform the following keying process if keying from usb
 
   //  radio = &radio_list[plogw->so2r_tx];  // set tx radio
-  radio=so2r.radio_tx();
+  if (so2r.radio_mode == SO2R::RADIO_MODE_SO2R &&
+      manual_cw_radio >= 0 && manual_cw_radio < N_RADIO) {
+    radio = &radio_list[manual_cw_radio];
+  } else {
+    radio = so2r.radio_tx();
+  }
 
   int ms;
   if (cw_count_ms == 0) {
@@ -404,7 +439,12 @@ void interrupt_cw_send() {
     if (wptr_cw_send_buf != rptr_cw_send_buf) {
       // there is next character to send in the buffer
       //      radio = so2r.radio_selected();
-      radio=so2r.radio_tx();
+      if (so2r.radio_mode == SO2R::RADIO_MODE_SO2R &&
+          manual_cw_radio >= 0 && manual_cw_radio < N_RADIO) {
+        radio = &radio_list[manual_cw_radio];
+      } else {
+        radio = so2r.radio_tx();
+      }
       if (radio->modetype == LOG_MODETYPE_DG) {
         // RTTY send
         send_baudot(cw_send_buf[rptr_cw_send_buf], &rtty_figures);
@@ -924,22 +964,39 @@ void send_char(byte cw_char, byte omit_letterspace) {
   cw_send_update = 1;
 }
 
-void set_tx_to_focused() {
-  // to make manual operation always happens to the radio which is current focus
-  // check current so2r_tx and focused_radio if different, clear buffer and switch tx ---> this should be taken care of outside the append_cwbuf
-  if (so2r.tx() != so2r.focused_radio()) {
-    if (!plogw->f_console_emu) plogw->ostream->println("clear buf and switch tx");
-    // need clear buffer
+void set_tx_to_manual_radio(int radio_idx) {
+  if (radio_idx < 0 || radio_idx >= N_RADIO) return;
+
+  // Manual CW must override any TX change queued by the automatic SO2R
+  // sequence.  Otherwise task() can restore the sequence TX immediately
+  // after set_tx(), making manual keying appear to ignore the operator focus.
+  so2r.cancel_pending_tx_change();
+
+  if (so2r.tx() != radio_idx) {
+    if (!plogw->f_console_emu) {
+      plogw->ostream->printf("manual CW: switch TX %d -> %d\n",
+                             so2r.tx(), radio_idx);
+    }
+
     clear_cwbuf();
-    // wait until current character to be sent completely
-    while ((cw_count_ms != 0) || (rptr_cw_onoff_buf != wptr_cw_onoff_buf)) {
+
+    // Finish the element already being keyed before changing the hardware TX
+    // path.  New queued characters were cleared above.
+    while ((cw_count_ms != 0) ||
+           (rptr_cw_onoff_buf != wptr_cw_onoff_buf)) {
       delay(1);
     }
     delay(100);
-    // need switch to the currently focused radio
-    so2r.set_tx(so2r.focused_radio());
-    if (!plogw->f_console_emu) plogw->ostream->println("   .. done");
+    so2r.set_tx(radio_idx);
+
+    // set_tx() is synchronous, but clear again defensively in case another
+    // sequence request was posted while the old CW element was finishing.
+    so2r.cancel_pending_tx_change();
   }
+}
+
+void set_tx_to_focused() {
+  set_tx_to_manual_radio(so2r.focused_radio());
 }
 
 char append_cwbuf_convchar(char c)
@@ -1280,6 +1337,10 @@ char *expand_macro_string(char *p,size_t p_size, const char *s) { // expand macr
 
 
 void append_cwbuf_string(const char *s) {
+  // This is the automatic/message path (F-key/ESM/CQ).  Ensure a previous
+  // manual keyboard-CW target cannot leak into the automatic SO2R sequence.
+  clear_manual_cw_radio();
+
   if (verbose & VERBOSE_SEQUENCE) {
     console->printf("[CWSTART] tx=%d msg=%d focus=%d seq=%d text=\"%.32s\"\n",
                     so2r.tx(), so2r.msg_tx_radio(), so2r.focused_radio(),

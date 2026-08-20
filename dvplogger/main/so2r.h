@@ -552,6 +552,13 @@ public:
     f_chgstat_tx_ = tx+1;
   }
 
+  // Manual keying is an explicit operator override.  A TX-change request
+  // queued by the SO2R sequence must not immediately undo that override on
+  // the next task() pass.
+  void cancel_pending_tx_change() {
+    f_chgstat_tx_ = 0;
+  }
+
   void request_set_rx(int rx) {
     f_chgstat_rx_ = rx+1;
   }

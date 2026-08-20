@@ -363,6 +363,9 @@ int modkey_alt(MODIFIERKEYS modkey)
 void send_single_char_radio(struct radio *radio,char c)
 {
   if (radio->modetype == LOG_MODETYPE_CW || (radio->f_tone_keying)) {
+    // Manual keyboard CW: remember the actual LCD/input radio.  The physical
+    // keying layer will use this instead of the SO2R sequence TX radio.
+    set_manual_cw_radio(radio->rig_idx);
     // CW
 #if JK1DVPLOG_HWVER >=2
     if (radio->f_tone_keying) {
@@ -1207,7 +1210,9 @@ if (key == 0x1f) {
 	  radio->keyer_mode = 0;
 	} else {
 	  radio->keyer_mode = 1;
-	  clear_cwbuf();
+	  // Keep already queued CW.  Ctrl-K changes only the input mode;
+	  // subsequent manual characters must be appended to the existing
+	  // transmit buffer rather than discarding pending text.
 	}
 	// need to update info line
 	upd_display_stat();
@@ -1658,7 +1663,10 @@ if (key == 0x1f) {
 	  logw_handler(key, c);
 	  break;
 	case 1:
-	  so2r.cancel_msg_tx();
+	  // Ctrl-K manual keyer mode: append characters to the existing CW
+	  // transmit buffer.  Do NOT call cancel_msg_tx() here: that routine
+	  // eventually calls cancel_keying() -> clear_cwbuf(), so invoking it
+	  // for every typed character discards previously queued manual CW.
 	  if (c == ';') {
 	    ui_response_call_and_move_to_exch(radio);
 	    break;
