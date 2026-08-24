@@ -24,4 +24,5 @@
 #include <stdint.h>
 bool is_valid_utf8_bytes(const uint8_t *src, size_t len);
 size_t cp932_to_utf8(const uint8_t *src, size_t src_len, char *dst, size_t dst_size);
+size_t utf8_to_cp932(const char *src, size_t src_len, uint8_t *dst, size_t dst_size);
 #endif

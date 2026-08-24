@@ -36,6 +36,7 @@
 #include "qso.h"
 #include "cw_keying.h"
 #include "timekeep.h"
+#include "cp932_utf8.h"
 #include "esp_heap_caps.h"
 
 
@@ -826,6 +827,26 @@ static bool zserver_is_configured() {
 }
 
 int connect_zserver() {
+  // Resolve host[:port] again immediately before connect().  This is kept
+  // here as a final guard even when reconnect_zserver() has already parsed
+  // the setting, because older/cached zserver_server values may still contain
+  // the ":port" suffix.
+  char connect_host[sizeof(zserver_server)];
+  strncpy(connect_host, zserver_server, sizeof(connect_host) - 1);
+  connect_host[sizeof(connect_host) - 1] = '\0';
+  int connect_port = zserver_port;
+
+  char *colon = strrchr(connect_host, ':');
+  if (colon != NULL && colon[1] != '\0') {
+    char *endp = NULL;
+    long port = strtol(colon + 1, &endp, 10);
+    if (endp != colon + 1 && *endp == '\0' &&
+        port >= 1 && port <= 65535) {
+      *colon = '\0';
+      connect_port = (int)port;
+    }
+  }
+
   // An empty Z-server setting explicitly disables the connection.  Check this
   // here as the final guard because connect_zserver() may be called from more
   // than one state-machine path.
@@ -842,12 +863,12 @@ int connect_zserver() {
     if (!zserver_client->connected()) {
       if (!plogw->f_console_emu) {
 	plogw->ostream->print("connecting to zserver ");
-	plogw->ostream->print(zserver_server);
+	plogw->ostream->print(connect_host);
 	plogw->ostream->print(" port:");
-	plogw->ostream->println(zserver_port);
+	plogw->ostream->println(connect_port);
       }
       memtrace_event("before zserver connect");
-      zserver_client->connect(zserver_server, zserver_port);
+      zserver_client->connect(connect_host, connect_port);
       memtrace_event("after zserver connect call");
       return 1;
     } else {
@@ -863,6 +884,125 @@ int connect_zserver() {
 }
 
 // received data  from zserver
+
+static size_t zmsg_utf8_decode(const char *s, uint32_t *cp)
+{
+  const uint8_t c0 = (uint8_t)s[0];
+  if (c0 < 0x80) {
+    *cp = c0;
+    return 1;
+  }
+  if ((c0 & 0xE0) == 0xC0 &&
+      ((uint8_t)s[1] & 0xC0) == 0x80) {
+    *cp = ((uint32_t)(c0 & 0x1F) << 6) |
+          ((uint8_t)s[1] & 0x3F);
+    return 2;
+  }
+  if ((c0 & 0xF0) == 0xE0 &&
+      ((uint8_t)s[1] & 0xC0) == 0x80 &&
+      ((uint8_t)s[2] & 0xC0) == 0x80) {
+    *cp = ((uint32_t)(c0 & 0x0F) << 12) |
+          ((uint32_t)((uint8_t)s[1] & 0x3F) << 6) |
+          ((uint8_t)s[2] & 0x3F);
+    return 3;
+  }
+  if ((c0 & 0xF8) == 0xF0 &&
+      ((uint8_t)s[1] & 0xC0) == 0x80 &&
+      ((uint8_t)s[2] & 0xC0) == 0x80 &&
+      ((uint8_t)s[3] & 0xC0) == 0x80) {
+    *cp = ((uint32_t)(c0 & 0x07) << 18) |
+          ((uint32_t)((uint8_t)s[1] & 0x3F) << 12) |
+          ((uint32_t)((uint8_t)s[2] & 0x3F) << 6) |
+          ((uint8_t)s[3] & 0x3F);
+    return 4;
+  }
+
+  *cp = c0;
+  return 1;
+}
+
+static int zmsg_display_width(uint32_t cp)
+{
+  if (cp < 0x80) return 1;
+  if (cp >= 0xFF61 && cp <= 0xFF9F) return 1;
+  return 2;
+}
+
+
+static char zmsg_ascii_fallback(uint32_t cp)
+{
+  // japanese1 fonts omit some punctuation/full-width forms.
+  // Keep all other Unicode untouched; only known-problem symbols fall back.
+  switch (cp) {
+    case 0xFF1F: return '?';  // ？
+    case 0xFF01: return '!';  // ！
+    case 0x3002: return '.';  // 。
+    case 0x3001: return ',';  // 、
+    case 0xFF1A: return ':';  // ：
+    case 0xFF1B: return ';';  // ；
+    case 0xFF08: return '(';  // （
+    case 0xFF09: return ')';  // ）
+    case 0xFF3B: return '[';  // ［
+    case 0xFF3D: return ']';  // ］
+    case 0x3000: return ' ';  // ideographic space
+    case 0x30FB: return '.';  // ・
+    default: return 0;
+  }
+}
+
+static void zmsg_wrap_utf8_20cols(const char *src, char *dst, size_t dst_size)
+{
+  static const int MAX_COLS = 20;
+  static const int MAX_LINES = 5;
+
+  if (!dst || dst_size == 0) return;
+
+  size_t si = 0;
+  size_t di = 0;
+  int cols = 0;
+  int lines = 1;
+
+  while (src && src[si] != '\0' && di + 1 < dst_size && lines <= MAX_LINES) {
+    if (src[si] == '\r') {
+      si++;
+      continue;
+    }
+    if (src[si] == '\n') {
+      if (lines >= MAX_LINES || di + 1 >= dst_size) break;
+      dst[di++] = '\n';
+      si++;
+      cols = 0;
+      lines++;
+      continue;
+    }
+
+    uint32_t cp = 0;
+    size_t clen = zmsg_utf8_decode(src + si, &cp);
+    char fallback = zmsg_ascii_fallback(cp);
+    int width = fallback ? 1 : zmsg_display_width(cp);
+
+    if (cols > 0 && cols + width > MAX_COLS) {
+      if (lines >= MAX_LINES || di + 1 >= dst_size) break;
+      dst[di++] = '\n';
+      cols = 0;
+      lines++;
+    }
+
+    if (fallback) {
+      if (di + 1 >= dst_size) break;
+      dst[di++] = fallback;
+    } else {
+      if (di + clen >= dst_size) break;
+      for (size_t i = 0; i < clen; ++i) dst[di++] = src[si + i];
+    }
+
+    si += clen;
+    cols += width;
+  }
+
+  dst[di] = '\0';
+}
+
 void handleData_zserver(void *arg, AsyncClient *client, void *data, size_t len)
 {
   if (verbose & 16) {
@@ -890,17 +1030,25 @@ void handleData_zserver(void *arg, AsyncClient *client, void *data, size_t len)
 	if (zserver.stat == 5) zmerge_queue_line(zserver.cmdbuf);
 	// check commands
 	if (strncmp(zserver.cmdbuf,"#ZLOG# PUTMESSAGE",17)==0) {
-	  //	    sprintf(dp->lcdbuf,"ZserverMSG:\n%s",zserver.cmdbuf);
-	  int pos=17;int len;
-	  len=strlen(zserver.cmdbuf);
-	  *dp->lcdbuf='\0';
-	  strcat(dp->lcdbuf,"ZserverMSG:\n");
-	  if (len>=21*5) len=21*5;
-	  while (pos<len) {
-	    strncat(dp->lcdbuf,zserver.cmdbuf+pos,21);
-	    strcat(dp->lcdbuf,"\n");
-	    pos+=21;
-	  }
+	  // Z-Server wire format is CP932. Convert the message payload to
+	  // UTF-8 before handing it to the LCD/display path.
+	  const char *msg_cp932 = zserver.cmdbuf + 17;
+	  while (*msg_cp932 == ' ') msg_cp932++;
+
+	  // Keep these off the callback stack.
+	  static char msg_utf8[256];
+	  static char msg_wrapped[256];
+
+	  cp932_to_utf8((const uint8_t *)msg_cp932, strlen(msg_cp932),
+	                 msg_utf8, sizeof(msg_utf8));
+
+	  // The LCD renderer does not auto-wrap long strings. Insert newlines
+	  // at 20 half-width columns. ASCII/half-width kana count as 1 column,
+	  // Japanese/full-width characters as 2 columns. Never split UTF-8.
+	  zmsg_wrap_utf8_20cols(msg_utf8, msg_wrapped, sizeof(msg_wrapped));
+
+	  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+	           "ZserverMSG:\n%s", msg_wrapped);
 	  upd_display_info_flash(dp->lcdbuf);
 	}
 	  
@@ -1218,7 +1366,23 @@ void zserver_send(char *buf)
 {
   if (zserver.stat==4) {
     // if stat is connected to zserver
-    println_tcpserver(zserver_client,buf);
+    const size_t len = strlen(buf);
+    const size_t space = zserver_client->space();
+    const bool can_send = zserver_client->canSend();
+    if (verbose & 1) {
+      plogw->ostream->printf(
+          "ZSERVER_SEND before len=%u space=%u canSend=%d connected=%d text=<%s>\n",
+          (unsigned)len, (unsigned)space, can_send ? 1 : 0,
+          zserver_client->connected() ? 1 : 0, buf);
+    }
+    const int ret = println_tcpserver(zserver_client,buf);
+    if (verbose & 1) {
+      plogw->ostream->printf(
+          "ZSERVER_SEND after ret=%d space=%u canSend=%d connected=%d\n",
+          ret, (unsigned)zserver_client->space(),
+          zserver_client->canSend() ? 1 : 0,
+          zserver_client->connected() ? 1 : 0);
+    }
   } else {
     if (!plogw->f_console_emu) {    
       //      plogw->ostream->println("zserver not linked."); // suppress busy message

@@ -9631,3 +9631,105 @@ static uint16_t lookup_cp932(uint16_t sjis) { int lo=0, hi=(int)(sizeof(cp932_ma
 static size_t put_utf8(uint32_t cp,char *dst,size_t avail){ if(cp<=0x7F){if(avail<1)return 0;dst[0]=(char)cp;return 1;} if(cp<=0x7FF){if(avail<2)return 0;dst[0]=(char)(0xC0|(cp>>6));dst[1]=(char)(0x80|(cp&0x3F));return 2;} if(cp<=0xFFFF){if(avail<3)return 0;dst[0]=(char)(0xE0|(cp>>12));dst[1]=(char)(0x80|((cp>>6)&0x3F));dst[2]=(char)(0x80|(cp&0x3F));return 3;} if(avail<4)return 0;dst[0]=(char)(0xF0|(cp>>18));dst[1]=(char)(0x80|((cp>>12)&0x3F));dst[2]=(char)(0x80|((cp>>6)&0x3F));dst[3]=(char)(0x80|(cp&0x3F));return 4; }
 bool is_valid_utf8_bytes(const uint8_t *src,size_t len){size_t i=0;while(i<len){uint8_t c=src[i++];if(c<0x80)continue;int need;uint32_t cp;if((c&0xE0)==0xC0){need=1;cp=c&0x1F;if(cp<2)return false;}else if((c&0xF0)==0xE0){need=2;cp=c&0x0F;}else if((c&0xF8)==0xF0){need=3;cp=c&0x07;}else return false;if(i+(size_t)need>len)return false;for(int n=0;n<need;++n){uint8_t t=src[i++];if((t&0xC0)!=0x80)return false;cp=(cp<<6)|(t&0x3F);}if((need==2&&cp<0x800)||(need==3&&cp<0x10000))return false;if(cp>=0xD800&&cp<=0xDFFF)return false;if(cp>0x10FFFF)return false;}return true;}
 size_t cp932_to_utf8(const uint8_t *src,size_t src_len,char *dst,size_t dst_size){if(dst_size==0)return 0;size_t si=0,di=0;while(si<src_len){uint8_t c=src[si++];uint32_t cp;if(c<0x80)cp=c;else if(c>=0xA1&&c<=0xDF)cp=0xFF61+(c-0xA1);else if(((c>=0x81&&c<=0x9F)||(c>=0xE0&&c<=0xFC))&&si<src_len){uint8_t trail=src[si++];cp=lookup_cp932((uint16_t)((c<<8)|trail));}else cp=0xFFFD;size_t w=put_utf8(cp,dst+di,dst_size-1-di);if(w==0)break;di+=w;}dst[di]='\0';return di;}
+
+
+static bool decode_utf8_one(const char *src, size_t src_len,
+                            size_t *consumed, uint32_t *cp)
+{
+  if (!src || src_len == 0 || !consumed || !cp) return false;
+  const uint8_t c0 = (uint8_t)src[0];
+
+  if (c0 < 0x80) {
+    *cp = c0;
+    *consumed = 1;
+    return true;
+  }
+
+  int need = 0;
+  uint32_t value = 0;
+  if ((c0 & 0xE0) == 0xC0) {
+    need = 1;
+    value = c0 & 0x1F;
+    if (value < 2) return false;
+  } else if ((c0 & 0xF0) == 0xE0) {
+    need = 2;
+    value = c0 & 0x0F;
+  } else if ((c0 & 0xF8) == 0xF0) {
+    need = 3;
+    value = c0 & 0x07;
+  } else {
+    return false;
+  }
+
+  if (src_len < (size_t)need + 1) return false;
+  for (int i = 0; i < need; ++i) {
+    const uint8_t t = (uint8_t)src[i + 1];
+    if ((t & 0xC0) != 0x80) return false;
+    value = (value << 6) | (t & 0x3F);
+  }
+
+  if ((need == 2 && value < 0x800) ||
+      (need == 3 && value < 0x10000) ||
+      (value >= 0xD800 && value <= 0xDFFF) ||
+      value > 0x10FFFF) {
+    return false;
+  }
+
+  *cp = value;
+  *consumed = (size_t)need + 1;
+  return true;
+}
+
+static uint16_t lookup_unicode_cp932(uint32_t unicode)
+{
+  const size_t n = sizeof(cp932_map) / sizeof(cp932_map[0]);
+  for (size_t i = 0; i < n; ++i) {
+    if (cp932_map[i].unicode == unicode)
+      return cp932_map[i].sjis;
+  }
+  return 0;
+}
+
+size_t utf8_to_cp932(const char *src, size_t src_len,
+                     uint8_t *dst, size_t dst_size)
+{
+  if (!dst || dst_size == 0) return 0;
+  size_t si = 0;
+  size_t di = 0;
+
+  while (src && si < src_len && src[si] != '\0') {
+    size_t consumed = 0;
+    uint32_t cp = 0;
+
+    if (!decode_utf8_one(src + si, src_len - si, &consumed, &cp)) {
+      cp = '?';
+      consumed = 1;
+    }
+    si += consumed;
+
+    if (cp < 0x80) {
+      if (di + 1 >= dst_size) break;
+      dst[di++] = (uint8_t)cp;
+      continue;
+    }
+
+    if (cp >= 0xFF61 && cp <= 0xFF9F) {
+      if (di + 1 >= dst_size) break;
+      dst[di++] = (uint8_t)(0xA1 + (cp - 0xFF61));
+      continue;
+    }
+
+    const uint16_t sjis = lookup_unicode_cp932(cp);
+    if (sjis != 0) {
+      if (di + 2 >= dst_size) break;
+      dst[di++] = (uint8_t)(sjis >> 8);
+      dst[di++] = (uint8_t)(sjis & 0xFF);
+    } else {
+      if (di + 1 >= dst_size) break;
+      dst[di++] = (uint8_t)'?';
+    }
+  }
+
+  dst[di] = '\0';
+  return di;
+}

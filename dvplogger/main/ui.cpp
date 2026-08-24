@@ -73,6 +73,7 @@
 #include "network.h"
 #include "main.h"
 #include "zserver.h"
+#include "cp932_utf8.h"
 #include "antenna.h"
 #include "cty_chk.h"
 #include "iambic_keyer.h"
@@ -1240,8 +1241,35 @@ if (key == 0x1f) {
 	upd_display();
 	break;
       case 0x1d: // ctrl-z send Remarks to Z-server
+	if (verbose & 1) {
+	  plogw->ostream->printf("CTRL-Z ptr_curr=%d zserver_connected=%d state=%s remarks=<%s>\n",
+	                         radio->ptr_curr,
+	                         zserver_is_connected() ? 1 : 0,
+	                         zserver_connection_state(),
+	                         radio->remarks + 2);
+	}
 	if (radio->ptr_curr == 6) {
-	  zserver_send(radio->remarks+2);
+	  // Remarks is only about 80 bytes.  Do not reserve two 1 KiB
+	  // NCHR_ZSERVER_CMD buffers on the ESP-IDF main task stack.
+	  // UTF-8 -> CP932 never expands the payload, and the ASCII command
+	  // prefix needs only a small fixed allowance.
+	  static constexpr size_t ZMSG_SIZE = sizeof(radio->remarks) + 32;
+	  char zmsg_utf8[ZMSG_SIZE];
+	  char zmsg_cp932[ZMSG_SIZE];
+	  snprintf(zmsg_utf8, sizeof(zmsg_utf8),
+	           "#ZLOG# PUTMESSAGE %s", radio->remarks + 2);
+	  size_t sjis_len = utf8_to_cp932(zmsg_utf8,
+	                                  strlen(zmsg_utf8),
+	                                  (uint8_t *)zmsg_cp932,
+	                                  sizeof(zmsg_cp932));
+	  if (verbose & 1) {
+	    plogw->ostream->print("CTRL-Z calling zserver_send() UTF8=<");
+	    plogw->ostream->print(zmsg_utf8);
+	    plogw->ostream->printf("> CP932-bytes=%u\n", (unsigned)sjis_len);
+	  }
+	  zserver_send(zmsg_cp932);
+	} else if (verbose & 1) {
+	  plogw->ostream->println("CTRL-Z not in Remarks");
 	}
 	break;
       case 0x19:  // Ctrl-v to toggle voice memory enable
