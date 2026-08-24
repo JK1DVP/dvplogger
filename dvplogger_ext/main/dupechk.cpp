@@ -30,6 +30,9 @@
 #include "callhist_remote.h"
 #include "dupechk.h"
 #include "mux_transport.h"
+
+#define DVP_STR_HELPER(x) #x
+#define DVP_STR(x) DVP_STR_HELPER(x)
 // dumb dupe check routine
 extern int f_spiram;
 
@@ -169,7 +172,7 @@ void process_dupechk_partial_query_subcpu(char *s) {
   char matched_qso[10][LEN_CALLSIGN + 1];
   int nmatched_qso = 0;
 
-  if (sscanf(s, "%u|%12[^|]|%u|%u|%u",
+  if (sscanf(s, "%u|%" DVP_STR(LEN_CALLSIGN) "[^|]|%u|%u|%u",
              &query_id, call, &bandmode, &mask, &max_entries) != 5) {
     snprintf(response, sizeof(response), "dupepr:0|0|0");
     mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
@@ -341,7 +344,7 @@ void process_dupechk_query_subcpu(char *s) {
   int dupe = 0;
   int has_exch = 0;
 
-  if (sscanf(s, "%u|%12[^|]|%u|%u|%u",
+  if (sscanf(s, "%u|%" DVP_STR(LEN_CALLSIGN) "[^|]|%u|%u|%u",
              &query_id, callsign, &bandmode, &mask, &want_exch) != 5) {
     snprintf(response, sizeof(response), "duper:0 0 0 -");
     mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,

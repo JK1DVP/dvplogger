@@ -186,6 +186,15 @@ void set_log_rst(struct radio *radio) {
 
 void enable_radios(int idx_radio, int radio_cmd) {
   struct radio *radio;
+
+  // Any explicit enable/disable/toggle of this radio cancels a pending
+  // Alt-I temporary-disable timer for the same radio.  Alt-I sets the
+  // temporary state again immediately after calling this function.
+  if (temporarily_disabled_radio == idx_radio) {
+    temporarily_disabled_radio = -1;
+    timeout_rig_disable_temporally = 0;
+  }
+
   radio = &radio_list[idx_radio];
   //  if (!plogw->f_console_emu) plogw->ostream->println("enable/disable  main rig");
   // Alt-Shift-HOME sub rig change

@@ -668,13 +668,17 @@ if (key == 0x1f) {
       alternate_antenna_relay();
       return;
     }
-    if (key == 0x0c) {  // Alt-i temporally disbling rig if enabled, enable if disabled
-      radio=so2r.radio_selected();
+    if (key == 0x0c) {  // Alt-i temporarily disable rig for 10 seconds
+      int idx_radio = so2r.focused_radio();
+      radio = &radio_list[idx_radio];
       if (radio->enabled) {
-	enable_radios(so2r.focused_radio(),0);
-	timeout_rig_disable_temporally=millis()+10000;
+	enable_radios(idx_radio,0);
+	temporarily_disabled_radio = idx_radio;
+	timeout_rig_disable_temporally = millis()+10000;
       } else {
-	enable_radios(so2r.focused_radio(),1);	
+	// Alt-I on a disabled rig enables it immediately.  If this radio was
+	// temporarily disabled by Alt-I, enable_radios() also cancels its timer.
+	enable_radios(idx_radio,1);
       }
       return;
     }

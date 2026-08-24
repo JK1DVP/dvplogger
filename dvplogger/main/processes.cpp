@@ -115,6 +115,7 @@ void interval_process() {
   int next_interval;
   static int query_item = 0;
   next_interval = 100;
+  service_icom_clock_sync();
   antenna_process();
   interval_diag_mark(&interval_diag, "antenna");
   if (f_mux_transport) mux_transport.recv_pkt();
@@ -247,13 +248,13 @@ void interval_process() {
   }
   interval_diag_mark(&interval_diag, "satellite_gate");
 
-  // temporally timeout rig enable
-  if (timeout_rig_disable_temporally < millis()) {
-    struct radio *radio;
-    radio=so2r.radio_selected();
-    if (!radio->enabled) {
-      enable_radios(so2r.focused_radio(),1);
-    }
+  // Re-enable only the radio that Alt-I temporarily disabled.
+  // Radios disabled explicitly with Alt-End / Shift-Alt-End / Ctrl-Alt-End
+  // must remain disabled.
+  if (temporarily_disabled_radio >= 0 &&
+      timeout_rig_disable_temporally < millis()) {
+    int idx_radio = temporarily_disabled_radio;
+    enable_radios(idx_radio,1);
   }
   interval_diag_mark(&interval_diag, "rig_reenable");
 

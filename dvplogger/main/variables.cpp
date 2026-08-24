@@ -55,6 +55,7 @@ int timeout_interval_sat = 0;     // interval job for satellite orbit management
 int timeout_cat = 0;
 int timeout_second = 0;  // interval job every second
 int timeout_rig_disable_temporally = 0; // interval job, temporally disabling rig
+int temporarily_disabled_radio = -1; // radio disabled by Alt-I only; -1 means none
 
 int f_printkey=0;
 int f_show_clock = 0;

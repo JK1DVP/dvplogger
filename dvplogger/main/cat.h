@@ -90,6 +90,7 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) ;
 bool icom_clock_sync_supported(const struct radio *radio);
 void request_icom_clock_sync(struct radio *radio);
 int request_icom_clock_sync_all();
+void service_icom_clock_sync();
 void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio);
 void send_mode_set_civ(const char *opmode, int filnr) ;
 void send_gps_query_civ(struct radio *radio) ;

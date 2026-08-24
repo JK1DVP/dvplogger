@@ -455,12 +455,23 @@ void release_callhist() {
 void set_callhistfn(char *fn) {
   if (fn == NULL || *fn == '\0') return;
 
-  const char *name = fn;
-  if (*name == '/') name++;
+  // CALLHIST/ selects the default Call History file.
+  if (strcmp(fn, "/") == 0) {
+    strcpy(callhistfn, "/CALLHIST.TXT");
+  } else {
+    const char *name = fn;
+    if (*name == '/') name++;
 
-  size_t len = strlen(name);
-  bool has_pck = len >= 4 && strcasecmp(name + len - 4, ".pck") == 0;
-  snprintf(callhistfn, sizeof(callhistfn), has_pck ? "/%s" : "/%s.pck", name);
+    size_t len = strlen(name);
+    bool has_pck = len >= 4 && strcasecmp(name + len - 4, ".pck") == 0;
+    snprintf(callhistfn, sizeof(callhistfn), has_pck ? "/%s" : "/%s.PCK", name);
+
+    // FAT filenames are case-insensitive; keep the displayed/stored 8.3 name
+    // consistently upper-case to avoid confusing mixed-case names.
+    for (char *p = callhistfn; *p != '\0'; ++p) {
+      if (*p >= 'a' && *p <= 'z') *p = *p - 'a' + 'A';
+    }
+  }
 
   plogw->ostream->print("callhistfn=");
   plogw->ostream->println(callhistfn);

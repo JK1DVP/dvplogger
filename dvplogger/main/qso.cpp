@@ -319,7 +319,7 @@ bool repair_qso_log(const uint32_t *server_ids, size_t server_count,
 
 void init_qsofiles() {
   strcpy(qsologfn, "/qso.txt");
-  strcpy(callhistfn, "/callhist.txt");
+  strcpy(callhistfn, "/CALLHIST.TXT");
 }
 
 void init_qso() {

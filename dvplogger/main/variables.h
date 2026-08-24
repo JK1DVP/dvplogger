@@ -48,6 +48,7 @@ extern int timeout_interval_sat ;     // interval job for satellite orbit manage
 extern int timeout_cat ;
 extern int timeout_second ;  // interval job every second
 extern int timeout_rig_disable_temporally;
+extern int temporarily_disabled_radio;
 extern int f_show_clock  ;
 
 extern const char *mode_str[NMODEID] ;

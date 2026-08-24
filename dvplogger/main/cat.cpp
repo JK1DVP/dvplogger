@@ -144,24 +144,24 @@ static void send_icom_clock_civ(struct radio *radio)
 
   const uint16_t year = my_rtc.year();
 
-  // Set date: 1A 05 01 79 YYYY MM DD
+  // Set date: 1A 05 01 65 YYYY MM DD
   send_head_civ(radio);
   add_civ_buf((byte)0x1a);
   add_civ_buf((byte)0x05);
   add_civ_buf((byte)0x01);
-  add_civ_buf((byte)0x79);
+  add_civ_buf((byte)0x65);
   add_civ_buf(dec2bcd((byte)(year / 100)));
   add_civ_buf(dec2bcd((byte)(year % 100)));
   add_civ_buf(dec2bcd((byte)my_rtc.month()));
   add_civ_buf(dec2bcd((byte)my_rtc.day()));
   send_tail_civ(radio);
 
-  // Set time: 1A 05 01 80 HH MM
+  // Set time: 1A 05 01 66 HH MM
   send_head_civ(radio);
   add_civ_buf((byte)0x1a);
   add_civ_buf((byte)0x05);
   add_civ_buf((byte)0x01);
-  add_civ_buf((byte)0x80);
+  add_civ_buf((byte)0x66);
   add_civ_buf(dec2bcd((byte)my_rtc.hour()));
   add_civ_buf(dec2bcd((byte)my_rtc.minute()));
   send_tail_civ(radio);
@@ -213,13 +213,25 @@ static void service_icom_clock_sync_on_rx(struct radio *radio)
   }
   icom_clock_last_rx_ms[idx] = now_ms;
 
-  if (!icom_clock_sync_pending[idx]) return;
+}
 
-  // 01 is also accepted so that a polling interval crossing the exact
-  // second boundary cannot postpone synchronization for another minute.
-  if (my_rtc.second() <= 1) {
+void service_icom_clock_sync()
+{
+  // Check the clock independently of CI-V receive timing.  Accept second 01
+  // as well so a busy loop crossing the exact boundary still synchronizes.
+  if (my_rtc.second() > 1) return;
+
+  for (int i = 0; i < N_RADIO; ++i) {
+    if (!icom_clock_sync_pending[i]) continue;
+
+    struct radio *radio = &radio_list[i];
+    if (!radio->enabled || !icom_clock_sync_supported(radio)) {
+      icom_clock_sync_pending[i] = false;
+      continue;
+    }
+
     send_icom_clock_civ(radio);
-    icom_clock_sync_pending[idx] = false;
+    icom_clock_sync_pending[i] = false;
   }
 }
 
