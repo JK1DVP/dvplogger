@@ -228,6 +228,21 @@ static void qso_repair_fixed_to_cstr(char *dst, size_t dst_size,
   dst[n] = '\0';
 }
 
+static bool qso_repair_qsoid_from_remarks(const char *remarks, uint32_t *id)
+{
+  if (remarks == NULL || id == NULL) return false;
+  const char *p = strstr(remarks, "ZQID:");
+  if (p == NULL) return false;
+  p += 5;
+  if (*p < '0' || *p > '9') return false;
+
+  char *endp = NULL;
+  unsigned long v = strtoul(p, &endp, 10);
+  if (endp == p || v == 0 || v > 0xffffffffUL) return false;
+  *id = (uint32_t)v;
+  return true;
+}
+
 static bool qso_repair_get_qsoid(const union qso_union_tag *rec, uint32_t *id)
 {
   char seqbuf[sizeof(rec->entry.seqnr) + 1];
@@ -239,6 +254,12 @@ static bool qso_repair_get_qsoid(const union qso_union_tag *rec, uint32_t *id)
                            sizeof(rec->entry.seqnr));
   qso_repair_fixed_to_cstr(remarks, sizeof(remarks), rec->entry.remarks,
                            sizeof(rec->entry.remarks));
+
+  // Records downloaded from Z-Server may carry the authoritative server
+  // QSOID as human-readable Remarks metadata. Prefer it over reconstruction
+  // from local seqnr semantics.
+  if (qso_repair_qsoid_from_remarks(remarks, id)) return true;
+
   unsigned long seq = strtoul(seqbuf, NULL, 10);
   if (seq == 0) return false;
   if (sscanf(remarks, "%2s %1u%2u", run, &tx, &rnd) != 3) return false;
@@ -277,6 +298,15 @@ static void qso_repair_normalize(union qso_union_tag *dst,
       tx <= 9 && rnd <= 99) {
     body = remarks + used;
   }
+
+  // ZQID:<id> is identity metadata, not operator memo content. Ignore it
+  // when grouping otherwise-identical QSO records. This also lets repair
+  // group old malformed/truncated ZQID records with corrected ones.
+  if (!strncmp(body, "ZQID:", 5)) {
+    const char *space = strchr(body, ' ');
+    body = space ? space + 1 : body + strlen(body);
+  }
+
   memset(dst->entry.remarks, 0, sizeof(dst->entry.remarks));
   strlcpy(dst->entry.remarks, body, sizeof(dst->entry.remarks));
 }

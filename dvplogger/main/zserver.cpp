@@ -71,7 +71,11 @@ const char *zserver_client_commands[]={ "FREQ","QSOIDS","ENDQSOIDS","PROMPTUPDAT
 
 
 
-#define ZMERGE_LINE_QUEUE 8
+// 256 slots => 255 usable entries in the ring buffer.
+// Z-Server currently sends about 20 QSO IDs per QSOIDS line, so this can
+// absorb roughly 5,000 QSO IDs even if the MAIN loop is temporarily unable
+// to drain the queue.  This queue is allocated explicitly from PSRAM.
+#define ZMERGE_LINE_QUEUE 256
 #define ZMERGE_LINE_SIZE 1024
 #define ZMERGE_SEND_INTERVAL_MS 25
 #define ZMERGE_REPLY_TIMEOUT_MS 15000
@@ -258,18 +262,61 @@ static void fixed_field_to_cstr(char *dst, size_t dst_size,
   dst[n] = '\0';
 }
 
+
+// ZQID:<decimal> is local ASCII metadata stored in Remarks for records
+// downloaded from Z-Server.  It is intentionally human-readable and is
+// stripped before operator memo text is sent back to Z-Server.
+static bool zmerge_qsoid_from_remarks(const char *remarks, uint32_t *qsoid)
+{
+  if (remarks == NULL || qsoid == NULL) return false;
+  const char *p = strstr(remarks, "ZQID:");
+  if (p == NULL) return false;
+  p += 5;
+  if (*p < '0' || *p > '9') return false;
+
+  char *endp = NULL;
+  unsigned long id = strtoul(p, &endp, 10);
+  if (endp == p || id == 0 || id > 0xffffffffUL) return false;
+  *qsoid = (uint32_t)id;
+  return true;
+}
+
+static const char *zmerge_operator_memo_from_remarks(char *remarks)
+{
+  if (remarks == NULL) return "";
+
+  char *memo = remarks;
+  if ((!strncmp(remarks, "CQ ", 3) || !strncmp(remarks, "SP ", 3)) &&
+      strlen(remarks) >= 7) {
+    memo = remarks + 7;
+  }
+
+  // Downloaded records have "ZQID:<id> " immediately after the existing
+  // local CQ/SP + tx/rnd metadata.  Keep it local; do not send it as memo.
+  if (!strncmp(memo, "ZQID:", 5)) {
+    char *space = strchr(memo, ' ');
+    memo = space ? space + 1 : memo + strlen(memo);
+  }
+  return memo;
+}
+
 static bool zmerge_qsoid_from_record(const union qso_union_tag *rec,
                                      uint32_t *qsoid)
 {
-  char seqbuf[sizeof(rec->entry.seqnr) + 1];
   char remarks[sizeof(rec->entry.remarks) + 1];
+  fixed_field_to_cstr(remarks, sizeof(remarks), rec->entry.remarks,
+                      sizeof(rec->entry.remarks));
+
+  // For QSOs downloaded from Z-Server, use the exact authoritative QSOID
+  // saved as human-readable local metadata in Remarks.
+  if (zmerge_qsoid_from_remarks(remarks, qsoid)) return true;
+
+  char seqbuf[sizeof(rec->entry.seqnr) + 1];
   char run[3] = {0};
   unsigned int tx = 0, rnd = 0;
 
   fixed_field_to_cstr(seqbuf, sizeof(seqbuf), rec->entry.seqnr,
                       sizeof(rec->entry.seqnr));
-  fixed_field_to_cstr(remarks, sizeof(remarks), rec->entry.remarks,
-                      sizeof(rec->entry.remarks));
   unsigned long seq = strtoul(seqbuf, NULL, 10);
   if (seq == 0) return false;
 
@@ -369,11 +416,9 @@ static bool zmerge_build_putlog(const union qso_union_tag *rec, uint32_t qsoid,
   fixed_field_to_cstr(rcvexch, sizeof(rcvexch), rec->entry.rcvexch, sizeof(rec->entry.rcvexch));
   fixed_field_to_cstr(remarks, sizeof(remarks), rec->entry.remarks, sizeof(rec->entry.remarks));
   if (sscanf(remarks, "%2s", run) == 1 && strcmp(run, "CQ") == 0) cq = 1;
-  // The leading "CQ/SP trr" token is DVPlogger's local QSOID metadata,
-  // not the operator memo sent to zLog.
-  char *memo = remarks;
-  if ((!strncmp(remarks, "CQ ", 3) || !strncmp(remarks, "SP ", 3)) &&
-      strlen(remarks) >= 7) memo = remarks + 7;
+  // The leading "CQ/SP trr" token and optional ZQID:<id> token are
+  // DVPlogger-local metadata, not operator memo text sent to zLog.
+  const char *memo = zmerge_operator_memo_from_remarks(remarks);
 
   int bandid = atoi(band);
   int zband = (bandid >= 0 && bandid < (int)(sizeof(zserver_bandid_freqcodes_map)/sizeof(zserver_bandid_freqcodes_map[0])))
@@ -483,6 +528,23 @@ static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
   if (qsoid == 0 || (expected_qsoid && qsoid != expected_qsoid)) return false;
   if (atoi(field[29]) != 0) return false;
 
+  // Diagnostic only: zmerge reconstructs the local QSOID later from
+  // tx + seqnr + random suffix.  If the seqnr carried in PUTLOGEX field[6]
+  // differs from the seqnr encoded in the authoritative QSOID, the same
+  // server QSO will look "missing" again on the next zmerge.
+  const unsigned long qsoid_seq =
+      (unsigned long)((qsoid % 100000000UL) / 10000UL);
+  const unsigned long server_seq = strtoul(field[6], NULL, 10);
+  if (server_seq != qsoid_seq) {
+    plogw->ostream->printf(
+      "ZMERGE DIAG QSOID/SEQ mismatch: qsoid=%lu expected=%lu "
+      "server_seq=%lu qsoid_seq=%lu call=%s\n",
+      (unsigned long)qsoid,
+      (unsigned long)expected_qsoid,
+      server_seq, qsoid_seq,
+      field[1] ? field[1] : "");
+  }
+
   memset(rec->all, ' ', sizeof(rec->all));
   rec->entry.type[0] = 'Q';
   rec->entry.type[1] = '\0';
@@ -569,10 +631,13 @@ static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
 
   unsigned tx = (unsigned)((qsoid / 100000000UL) % 100UL);
   unsigned rnd = (unsigned)((qsoid / 100UL) % 100UL);
-  snprintf(tmp, sizeof(tmp), "%s %1u%02u ", atoi(field[17]) ? "CQ" : "SP",
-           tx % 10, rnd);
-  zmerge_set_field(rec->entry.remarks, sizeof(rec->entry.remarks), tmp);
-  if (field[16][0]) strlcat(rec->entry.remarks, field[16], sizeof(rec->entry.remarks));
+  char remarks_meta[48];
+  snprintf(remarks_meta, sizeof(remarks_meta), "%s %1u%02u ZQID:%lu ",
+           atoi(field[17]) ? "CQ" : "SP",
+           tx % 10, rnd, (unsigned long)qsoid);
+  zmerge_set_field(rec->entry.remarks, sizeof(rec->entry.remarks), remarks_meta);
+  if (field[16][0])
+    strlcat(rec->entry.remarks, field[16], sizeof(rec->entry.remarks));
   return true;
 }
 
@@ -773,6 +838,12 @@ bool zserver_start_merge(bool dry_run)
   if (!qso_log_is_open()) {
     plogw->ostream->println("zmerge: QSO log is not open");
     zmerge_lcd("ZMERGE unavailable", "QSO log not open", 4000);
+    return false;
+  }
+  if (!f_spiram) {
+    plogw->ostream->println(
+      "zmerge: unavailable on this model; PSRAM is required");
+    zmerge_lcd("ZMERGE unavailable", "PSRAM required", 4000);
     return false;
   }
   zmerge_reset(false);
