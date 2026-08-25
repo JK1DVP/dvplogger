@@ -51,6 +51,110 @@
 
 
 File qsologf;
+static uint32_t makedupe_main_overflow_count = 0;
+
+// MAKEDUPE diagnostics.  These counters describe the MAIN-side QSO.TXT scan
+// before anything is sent to SUBCPU, so they can distinguish input-selection
+// changes from SUBCPU duplicate-check behavior.
+static uint32_t makedupe_diag_run = 0;
+static uint32_t makedupe_diag_records = 0;
+static uint32_t makedupe_diag_qrecords = 0;
+static uint32_t makedupe_diag_nonq = 0;
+static uint32_t makedupe_diag_offcontest = 0;
+static uint32_t makedupe_diag_contest_mismatch = 0;
+static uint32_t makedupe_diag_selected = 0;
+static uint32_t makedupe_diag_hash = 2166136261UL;  // FNV-1a 32 bit
+static int makedupe_diag_start_contest_id = 0;
+static unsigned char makedupe_diag_start_mask = 0;
+static char makedupe_diag_start_contest[32] = "";
+
+static inline void makedupe_diag_hash_byte(uint8_t v)
+{
+  makedupe_diag_hash ^= v;
+  makedupe_diag_hash *= 16777619UL;
+}
+
+static void makedupe_diag_hash_text(const char *p)
+{
+  if (p == NULL) {
+    makedupe_diag_hash_byte(0xff);
+    return;
+  }
+  while (*p) makedupe_diag_hash_byte((uint8_t)*p++);
+  makedupe_diag_hash_byte(0);
+}
+
+static void makedupe_diag_hash_selected(const union qso_union_tag *record,
+                                        unsigned char bandmode)
+{
+  // Hash exactly the information that forms the MAIN->SUBCPU dupeb payload.
+  // Order matters, so equal hashes strongly indicate the same selected input
+  // stream was sent in the same order.
+  makedupe_diag_hash_text(record->entry.hiscall);
+  makedupe_diag_hash_text(record->entry.rcvexch);
+  makedupe_diag_hash_byte(bandmode);
+  makedupe_diag_hash_byte(0xfe);  // record separator
+}
+
+static void makedupe_diag_begin()
+{
+  makedupe_diag_run++;
+  makedupe_diag_records = 0;
+  makedupe_diag_qrecords = 0;
+  makedupe_diag_nonq = 0;
+  makedupe_diag_offcontest = 0;
+  makedupe_diag_contest_mismatch = 0;
+  makedupe_diag_selected = 0;
+  makedupe_diag_hash = 2166136261UL;
+
+  makedupe_diag_start_contest_id = plogw ? plogw->contest_id : -1;
+  makedupe_diag_start_mask = plogw ? plogw->mask : 0;
+  if (plogw) {
+    strncpy(makedupe_diag_start_contest, plogw->contest_name + 2,
+            sizeof(makedupe_diag_start_contest) - 1);
+    makedupe_diag_start_contest[sizeof(makedupe_diag_start_contest) - 1] = '\0';
+  } else {
+    strcpy(makedupe_diag_start_contest, "<null>");
+  }
+
+  console->printf(
+    "MAKEDUPE BEGIN run=%lu contest_id=%d contest=<%s> mask=0x%02X "
+    "subcpu_online=%u dupe_at=%d\n",
+    (unsigned long)makedupe_diag_run,
+    makedupe_diag_start_contest_id,
+    makedupe_diag_start_contest,
+    (unsigned int)makedupe_diag_start_mask,
+    subcpu_online ? 1U : 0U,
+    dupechk ? dupechk->dupechk_at : -1);
+}
+
+static void makedupe_diag_finish()
+{
+  const int end_contest_id = plogw ? plogw->contest_id : -1;
+  const unsigned int end_mask = plogw ? (unsigned int)plogw->mask : 0U;
+  const char *end_contest = plogw ? plogw->contest_name + 2 : "<null>";
+
+  console->printf(
+    "MAKEDUPE INPUT run=%lu records=%lu q=%lu nonq=%lu "
+    "Cminus=%lu mismatch=%lu selected=%lu hash=%08lX\n",
+    (unsigned long)makedupe_diag_run,
+    (unsigned long)makedupe_diag_records,
+    (unsigned long)makedupe_diag_qrecords,
+    (unsigned long)makedupe_diag_nonq,
+    (unsigned long)makedupe_diag_offcontest,
+    (unsigned long)makedupe_diag_contest_mismatch,
+    (unsigned long)makedupe_diag_selected,
+    (unsigned long)makedupe_diag_hash);
+
+  console->printf(
+    "MAKEDUPE STATE run=%lu start[id=%d name=<%s> mask=0x%02X] "
+    "end[id=%d name=<%s> mask=0x%02X]\n",
+    (unsigned long)makedupe_diag_run,
+    makedupe_diag_start_contest_id,
+    makedupe_diag_start_contest,
+    (unsigned int)makedupe_diag_start_mask,
+    end_contest_id, end_contest, end_mask);
+}
 
 // A synchronous SD flush can take long enough to block the keyboard path.
 // Commit the record immediately, but defer the media flush briefly so the
@@ -376,26 +480,35 @@ void process_makedupe_multiplier_maincpu(const char *recv_exch, unsigned char ba
   }
 }
 
-void makedupe_qso_entry() {
+void makedupe_qso_entry(const union qso_union_tag *record) {
   // update dupe list from current qso
   // char *call, byte bandid, byte mask)
 
   // check
   //plogw->ostream->println("makedupe_qso_entry()");
 
-  if (qso.entry.type[0] != 'Q') return;
+  if (record->entry.type[0] != 'Q') return;
 
   // check if we makedupe this entry or not
   // if Remarks contains C:- entry, not do makedupe
   //      ..             C:name and name is not the same as current contest_name, not do makedupe
   char *p;
+  char parsed_value[100];
   char tmpbuf[200];
-  strcpy (tmpbuf,qso.entry.remarks);
+  // QSO.TXT is a fixed-record binary file.  Do not assume an old/corrupt
+  // fixed-width remarks field is NUL-terminated; unbounded strcpy() can read
+  // beyond the record and make C: selection depend on stack contents.
+  size_t remarks_len = sizeof(record->entry.remarks);
+  if (remarks_len >= sizeof(tmpbuf)) remarks_len = sizeof(tmpbuf) - 1;
+  memcpy(tmpbuf, record->entry.remarks, remarks_len);
+  tmpbuf[remarks_len] = '\0';
   const bool current_is_nomulti =
       strcasecmp(plogw->contest_name + 2, "NOMULTI") == 0;
-  if ((p=parse_strings(tmpbuf,"C:"))!=NULL) {
+  if (parse_strings(tmpbuf, "C:", parsed_value, sizeof(parsed_value))) {
+    p = parsed_value;
     if (strcmp(p,"-")==0) {
       // OFFCONTEST QSOs are never included in MAKEDUPE.
+      makedupe_diag_offcontest++;
       if (verbose&4) {
 	console->println("off the contest");
       }
@@ -405,6 +518,7 @@ void makedupe_qso_entry() {
       // In a named contest, use only QSOs carrying the same contest tag.
       // NOMULTI is the all-contest view: accept every normal QSO regardless
       // of its C: tag, while C:- remains excluded above.
+      makedupe_diag_contest_mismatch++;
       if (verbose&4) {
 	char buf[100];
 	strcpy(buf,p);
@@ -418,15 +532,21 @@ void makedupe_qso_entry() {
   // set bandid and modetype according to what is written in the log (needed in dupe checking)
   int bandid, modetype;
   int bandmode;
-  bandid = freq2bandid((unsigned long)(atoll(qso.entry.freq)/FREQ_UNIT));
+  bandid = freq2bandid((unsigned long)(atoll(record->entry.freq)/FREQ_UNIT));
   modetype = 0;
   for (int i = 0; i < 4; i++) {
-    if (strncmp(qso.entry.mode, modetype_str[i], 2) == 0) {
+    if (strncmp(record->entry.mode, modetype_str[i], 2) == 0) {
       modetype = i;
       break;
     }
   }
   bandmode = bandmode_param(bandid,modetype);
+
+  // This QSO passed all contest-selection filters and is about to be used for
+  // DUPE reconstruction.  Hash the same call/exchange/bandmode tuple sent to
+  // SUBCPU (or inserted into MAIN fallback).
+  makedupe_diag_selected++;
+  makedupe_diag_hash_selected(record, (unsigned char)bandmode);
 
   // update seqnr for the band
   plogw->seqnr_band[bandid-1]++;
@@ -441,23 +561,23 @@ void makedupe_qso_entry() {
     // MAKEDUPE bulk mode: the SUBCPU rejects duplicates.  For each accepted
     // QSO it sends bandmode/exchange back, so multiplier accounting uses the
     // same acceptance decision as the QSO count.
-    entry_makedupe_subcpu_data(qso.entry.hiscall, qso.entry.rcvexch, bandmode);
-  } else if (!dupe_check_nocallhist(qso.entry.hiscall, bandmode, plogw->mask)) {
+    entry_makedupe_subcpu_data(record->entry.hiscall, record->entry.rcvexch, bandmode);
+  } else if (!dupe_check_nocallhist(record->entry.hiscall, bandmode, plogw->mask)) {
     if (dupechk->ncallsign < dupechk->nmaxqso) {
-      entry_dupechk_data(qso.entry.hiscall, qso.entry.rcvexch, bandmode);
+      entry_dupechk_data(record->entry.hiscall, record->entry.rcvexch, bandmode);
       score.worked[modetype == LOG_MODETYPE_CW ? 0 : 1][bandid - 1]++;
       accepted_qso = true;
     } else {
-      plogw->ostream->println(" dupechk overflow ");
+      makedupe_main_overflow_count++;
     }
   } else if (verbose & 1) {
-    plogw->ostream->print(qso.entry.hiscall);
+    plogw->ostream->print(record->entry.hiscall);
     plogw->ostream->println(" already in dupechk");
   }
 
   // The maximum serial number is independent of duplicate elimination.
-  if (isdigit(*qso.entry.seqnr)) {
-    int seqnr = atoi(qso.entry.seqnr);
+  if (isdigit(*record->entry.seqnr)) {
+    int seqnr = atoi(record->entry.seqnr);
     if (seqnr <= 3000 && plogw->seqnr < seqnr) plogw->seqnr = seqnr + 1;
   }
 
@@ -465,7 +585,7 @@ void makedupe_qso_entry() {
   // For MAIN-side dupe checking, account the multiplier immediately.
   // In SUBCPU bulk mode this is performed only after a dupebulka response.
   if (accepted_qso) {
-    process_makedupe_multiplier_maincpu(qso.entry.rcvexch,
+    process_makedupe_multiplier_maincpu(record->entry.rcvexch,
                                         (unsigned char)bandmode);
   }
   //upd_display_info_contest_settings();
@@ -519,7 +639,8 @@ void read_qso_log(int option, Stream *out) {
   int pos, memo_pos;
   int len;
   int ret;
-  len = sizeof(qso.all);
+  union qso_union_tag qso_read;
+  len = sizeof(qso_read.all);
 
   pos = qsologf.position();
   memo_pos = pos;
@@ -540,7 +661,7 @@ void read_qso_log(int option, Stream *out) {
       goto end;
     }
     //    Serial.print("-");    
-    ret = qsologf.read(qso.all, len);
+    ret = qsologf.read(qso_read.all, len);
     delay(1);
     //    Serial.print("*");
     if (ret != len) {
@@ -554,6 +675,7 @@ void read_qso_log(int option, Stream *out) {
       //      out->print("read ");
       //      out->print(ret);
       //      out->println("bytes");
+      if (option & READQSO_MAKEDUPE) makedupe_diag_records++;
     } 
     if (option & READQSO_PRINT) {
       sprintf(dp->lcdbuf, "Reading QSO\nRead %d bytes", pos);
@@ -561,13 +683,14 @@ void read_qso_log(int option, Stream *out) {
     }
     //    Serial.print("a");
     // check type
-    if (qso.entry.type[0] != 'Q') {
+    if (qso_read.entry.type[0] != 'Q') {
+      if (option & READQSO_MAKEDUPE) makedupe_diag_nonq++;
       // not vaild qso
       if (!plogw->f_console_emu) {
 	out->print("type:");		
-	out->print(qso.entry.type[0]);
+	out->print(qso_read.entry.type[0]);
 	out->print(" all:");			
-	out->print((char *)(qso.all));	
+	out->print((char *)(qso_read.all));	
 	out->println(":not valid qso encountered");
       }
       //      goto end; // before finish
@@ -579,14 +702,15 @@ void read_qso_log(int option, Stream *out) {
     //    out->print("Pos:");out->println(pos);
     //    out->println("");
 
-    reformat_qso_entry(&qso);
+    if (option & READQSO_MAKEDUPE) makedupe_diag_qrecords++;
+    reformat_qso_entry(&qso_read);
     //    Serial.print("b");
 
     // operations
 
-    if (option & READQSO_PRINT) print_qso_entry(&qso, out);
+    if (option & READQSO_PRINT) print_qso_entry(&qso_read, out);
     if (option & READQSO_MAKEDUPE) {
-      makedupe_qso_entry();
+      makedupe_qso_entry(&qso_read);
       ++count;
       if ((count % 50) == 0) {
         snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
@@ -611,6 +735,9 @@ void read_qso_log(int option, Stream *out) {
 end:
   if ((option & READQSO_MAKEDUPE) && dupechk->dupechk_at == 1)
     finish_makedupe_subcpu();
+
+  if (option & READQSO_MAKEDUPE)
+    makedupe_diag_finish();
 
   if (option & READQSO_MAKEDUPE)
     snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
@@ -1070,21 +1197,40 @@ bool qso_file_operation_busy()
 void process_pending_makedupe_rebuild()
 {
   if (!pending_makedupe_rebuild) return;
-  if (qso_file_operation_busy() || !qso_log_is_open()) return;
-
   pending_makedupe_rebuild = false;
-  plogw->ostream->printf("Contest changed to %s: rebuilding dupe/multiplier data\n",
-                         plogw->contest_name + 2);
-  upd_display_info_flash("Contest changed\nRebuilding dupe/multi");
+
   init_score();
-  // Rebuild the contest-wide serial number from only the selected contest's
-  // QSO records. init_score() already clears every seqnr_band[] entry, so $Q
-  // is likewise restored independently for each band.
   plogw->seqnr = 0;
   clear_multi_worked();
-  init_dupechk_maincpu();
-  reset_dupechk_subcpu();
+  makedupe_main_overflow_count = 0;
+
+  if (subcpu_online) {
+    init_dupechk_maincpu();
+    if (!reset_dupechk_subcpu()) {
+      console->println(
+        "MAKEDUPE: SUBCPU reset failed; falling back to MAIN DUPE (200)");
+      subcpu_online = false;
+      callhist_at = 0;
+      plogw->enable_callhist = 0;
+      init_dupechk(200, 0);
+
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "SUBCPU OFFLINE\nMAIN DUPE: 200");
+      upd_display_info_flash(dp->lcdbuf);
+    }
+  } else {
+    init_dupechk(200, 0);
+  }
+
+  makedupe_diag_begin();
   read_qso_log(READQSO_MAKEDUPE);
+  if (makedupe_main_overflow_count != 0) {
+    console->printf(
+      "MAKEDUPE MAIN fallback: database full; %lu additional unique QSOs "
+      "not stored (capacity=%d)\n",
+      (unsigned long)makedupe_main_overflow_count,
+      get_dupechk_nmaxqso());
+  }
 }
 
 void list_qso_backup_files() {
@@ -1346,15 +1492,16 @@ void process_qso_file_operation() {
         qso_file_op.state = QSO_FILE_OP_SWITCH_FINISH;
         return;
       }
+      union qso_union_tag qso_read;
       if (!qso_file_op.file.seek(qso_file_op.record_index * QSO_RECORD_SIZE) ||
-          qso_file_op.file.read(qso.all, QSO_RECORD_SIZE) != QSO_RECORD_SIZE) {
+          qso_file_op.file.read(qso_read.all, QSO_RECORD_SIZE) != QSO_RECORD_SIZE) {
         fail_qso_file_op("Read error rebuilding");
         return;
       }
       qso_file_op.record_index++;
-      if (qso.entry.type[0] == 'Q') {
-        reformat_qso_entry(&qso);
-        makedupe_qso_entry();
+      if (qso_read.entry.type[0] == 'Q') {
+        reformat_qso_entry(&qso_read);
+        makedupe_qso_entry(&qso_read);
       }
       return;
 
@@ -1521,17 +1668,25 @@ int strcpy_to_chr(char *dest, char *src,char c) {
     return len;
 }
 
-char *parse_strings(const char *remarks,const char *parse_str) {
-  char *p;
-  char tmpbuf1[100];
-  if ((p=strstr(remarks,parse_str))!=NULL) { // my park information in POTA activation
-    strcpy(tmpbuf1,p+strlen(parse_str));
-    p=strtok(tmpbuf1," ");
-    if (p!=NULL) {
-      return p;
-    }
-  }
-  return NULL;
+bool parse_strings(const char *remarks, const char *parse_str,
+                   char *out, size_t out_size) {
+  if (remarks == NULL || parse_str == NULL || out == NULL || out_size == 0)
+    return false;
+
+  out[0] = '\0';
+  const char *p = strstr(remarks, parse_str);
+  if (p == NULL) return false;
+  p += strlen(parse_str);
+
+  size_t n = 0;
+  while (p[n] != '\0' && p[n] != ' ' && p[n] != '\r' && p[n] != '\n')
+    n++;
+  if (n == 0) return false;
+  if (n >= out_size) n = out_size - 1;
+
+  memcpy(out, p, n);
+  out[n] = '\0';
+  return true;
 }
 
 
@@ -1775,22 +1930,31 @@ void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) {
   //<SIG_INFO>
 
   char *p;
-  if ((p=parse_strings(qso->entry.remarks,"POTA_MY:"))!=NULL) {
+  char parsed_value[100];
+  if (parse_strings(qso->entry.remarks, "POTA_MY:",
+                    parsed_value, sizeof(parsed_value))) {
+    p = parsed_value;
     strcat(buf,"<MY_SIG:4>POTA");
     sprintf(tmpbuf,"<MY_SIG_INFO:%d>%s",strlen(p),p);
     strcat(buf,tmpbuf);
   }
-  if ((p=parse_strings(qso->entry.remarks,"POTA:"))!=NULL) {
+  if (parse_strings(qso->entry.remarks, "POTA:",
+                    parsed_value, sizeof(parsed_value))) {
+    p = parsed_value;
     strcat(buf,"<SIG:4>POTA");
     sprintf(tmpbuf,"<SIG_INFO:%d>%s",strlen(p),p);
     strcat(buf,tmpbuf);
   }
-  if ((p=parse_strings(qso->entry.remarks,"SOTA_MY:"))!=NULL) {
+  if (parse_strings(qso->entry.remarks, "SOTA_MY:",
+                    parsed_value, sizeof(parsed_value))) {
+    p = parsed_value;
     strcat(buf,"<MY_SIG:4>SOTA");
     sprintf(tmpbuf,"<MY_SIG_INFO:%d>%s",strlen(p),p);
     strcat(buf,tmpbuf);
   }
-  if ((p=parse_strings(qso->entry.remarks,"SOTA:"))!=NULL) {
+  if (parse_strings(qso->entry.remarks, "SOTA:",
+                    parsed_value, sizeof(parsed_value))) {
+    p = parsed_value;
     strcat(buf,"<SIG:4>SOTA");
     sprintf(tmpbuf,"<SIG_INFO:%d>%s",strlen(p),p);
     strcat(buf,tmpbuf);

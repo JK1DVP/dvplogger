@@ -902,13 +902,11 @@ void cmd_interp(char *cmd, Stream *output) {
         break;
       }
       if (strncmp("makedupe", cmd, 8) == 0 ) {
-        init_score();
-	//        init_multi();
-	clear_multi_worked();
-	//        init_dupechk(NMAXQSO,0);
-	init_dupechk_maincpu();
-	reset_dupechk_subcpu();
-        read_qso_log(READQSO_MAKEDUPE);
+        // Use the same rebuild path as startup/contest changes/late SUBCPU
+        // recovery.  Keeping one path makes startup and manual MAKEDUPE
+        // directly comparable and avoids subtly different initialization.
+        out->println("MAKEDUPE manual: rebuild scheduled");
+        request_makedupe_rebuild();
         break;
       }
       if (strncmp("focus", cmd, 5) == 0) {
@@ -926,13 +924,44 @@ void cmd_interp(char *cmd, Stream *output) {
       }
 
       if (strcmp(cmd,"reset_settings")==0) {
-	// remove files
-	SD.remove("/settings.txt");
-	SD.remove("/ch.txt");
-	SD.remove("/wifiset.txt");
-	SD.remove("/spiffs.bin");
-	SD.remove("/rigs.txt");	
-        out->println("reset_settings by removing files settings.txt ch.txt wifiset.txt");
+        // Remove settings and other personal/preference files used for
+        // development/testing.  Deliberately preserve QSO.TXT and QSO.*
+        // backup/log files so an accidental reset_settings cannot destroy
+        // irreplaceable QSO records.
+        static const char *files_to_remove[] = {
+          "/settings.txt",
+          "/ch.txt",
+          "/wifiset.txt",
+          "/wifiset.new",
+          "/spiffs.bin",
+          "/rigs.txt",
+          "/CALLHIST.TXT",
+          "/CONTEST.TXT",
+          "/QSOBAK.TXT",
+          "/QSOTMP.TXT",
+          "/qsomail.txt",
+          "/satdb.tmp",
+          "/satdb.bak",
+          "/satinfo.txt",
+          "/satdb.txt"
+        };
+
+        out->println("reset_settings: removing settings/personal files");
+        for (size_t i = 0;
+             i < sizeof(files_to_remove) / sizeof(files_to_remove[0]);
+             ++i) {
+          const char *fn = files_to_remove[i];
+          if (SD.exists(fn)) {
+            if (SD.remove(fn)) {
+              out->print("removed ");
+              out->println(fn);
+            } else {
+              out->print("FAILED to remove ");
+              out->println(fn);
+            }
+          }
+        }
+        out->println("reset_settings: QSO.TXT and QSO.* files preserved");
 	break;
       }
       if (strcmp(cmd,"restart_dvplogger")==0) {

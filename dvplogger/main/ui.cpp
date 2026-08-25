@@ -2573,28 +2573,19 @@ void process_enter(int option) {
           callhist_count = get_callhist_subcpu_count();
       }
 
-      init_score();
-      clear_multi_worked();
-      init_dupechk_maincpu();
-      read_qso_log(READQSO_MAKEDUPE);
+      request_makedupe_rebuild();
 
       snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
-               "SUBCPU RECOVERED\nDUPE rebuilt\nCALLHIST=%d",
+               "SUBCPU RECOVERED\nDUPE rebuild queued\nCALLHIST=%d",
                callhist_count);
       upd_display_info_flash(dp->lcdbuf);
       break;
     }
 
     if (strcmp(radio->callsign + 2, "MAKEDUPE") == 0) {
-      init_score();
-      //      init_multi();
-      clear_multi_worked();      
-      //      init_dupechk(NMAXQSO,0);
-      init_dupechk_maincpu();
-      reset_dupechk_subcpu();
-      sprintf(dp->lcdbuf, "Reading Log\nfor MAKEDUPE...\n");
+      sprintf(dp->lcdbuf, "MAKEDUPE\nRebuild queued...\n");
       upd_display_info_flash(dp->lcdbuf);
-      read_qso_log(READQSO_MAKEDUPE);
+      request_makedupe_rebuild();
       clear_buf(radio->callsign);
       break;
     }

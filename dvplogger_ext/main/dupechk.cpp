@@ -44,6 +44,22 @@ static unsigned char dupechk_current_mask = 0xff;
 #ifdef DVPLOGGER_EXT
 static unsigned char makedupe_bulk_mask = 0xff;
 static uint16_t makedupe_bulk_worked[2][N_BAND];
+static uint32_t makedupe_bulk_rx = 0;
+static uint32_t makedupe_bulk_accepted = 0;
+static uint32_t makedupe_bulk_duplicate = 0;
+static uint32_t makedupe_bulk_malformed = 0;
+static uint32_t makedupe_bulk_overflow = 0;
+static uint32_t makedupe_bulk_invalid = 0;
+
+#define MAKEDUPE_DUP_SAMPLE_MAX 10
+struct makedupe_dup_sample_t {
+  char call[LEN_CALLSIGN + 1];
+  uint8_t incoming_bandmode;
+  uint8_t existing_bandmode;
+  uint16_t existing_index;
+};
+static makedupe_dup_sample_t makedupe_dup_samples[MAKEDUPE_DUP_SAMPLE_MAX];
+static uint8_t makedupe_dup_sample_count = 0;
 #endif
 
 
@@ -662,20 +678,56 @@ void begin_makedupe_bulk_subcpu(unsigned char mask) {
   dupechk_current_mask = mask;
   makedupe_bulk_mask = dupechk_current_mask;
   memset(makedupe_bulk_worked, 0, sizeof(makedupe_bulk_worked));
+  makedupe_bulk_rx = 0;
+  makedupe_bulk_accepted = 0;
+  makedupe_bulk_duplicate = 0;
+  makedupe_bulk_malformed = 0;
+  makedupe_bulk_overflow = 0;
+  makedupe_bulk_invalid = 0;
+  makedupe_dup_sample_count = 0;
+
+  char begin_diag[96];
+  snprintf(begin_diag, sizeof(begin_diag),
+           "dupebulkbeginack:%u,%d,%d",
+           (unsigned int)makedupe_bulk_mask,
+           dupechk ? dupechk->ncallsign : -1,
+           dupechk ? dupechk->nmaxqso : -1);
+  mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                         (unsigned char *)begin_diag, strlen(begin_diag));
 }
 
 void entry_makedupe_bulk_subcpu(char *s) {
+  makedupe_bulk_rx++;
+
   char callsign[LEN_CALLSIGN + 1];
   char recv_exch[LEN_EXCH + 1];
   char *sep1 = strchr(s, '|');
   char *sep2 = sep1 ? strchr(sep1 + 1, '|') : NULL;
   int bandmode;
-  if (!sep1 || !sep2) return;
+
+  if (!sep1 || !sep2) {
+    makedupe_bulk_malformed++;
+    return;
+  }
   *sep1 = '\0';
   *sep2 = '\0';
   bandmode = atoi(sep2 + 1);
-  if (strlen(s) > LEN_CALLSIGN || strlen(sep1 + 1) > LEN_EXCH ||
-      bandmode < 0 || bandmode > 255) return;
+
+  if (strlen(s) > LEN_CALLSIGN || strlen(sep1 + 1) > LEN_EXCH) {
+    makedupe_bulk_malformed++;
+    return;
+  }
+  if (bandmode < 0 || bandmode > 255) {
+    makedupe_bulk_invalid++;
+    return;
+  }
+
+  int bandid = bandmode / 4;
+  int modetype = bandmode % 4;
+  if (bandid < 1 || bandid >= N_BAND || modetype < 0 || modetype > 3) {
+    makedupe_bulk_invalid++;
+    return;
+  }
 
   strncpy(callsign, s, LEN_CALLSIGN);
   callsign[LEN_CALLSIGN] = '\0';
@@ -686,31 +738,67 @@ void entry_makedupe_bulk_subcpu(char *s) {
     if (((dupechk->bandmode[i] & makedupe_bulk_mask) ==
          (((unsigned char)bandmode) & makedupe_bulk_mask)) &&
         strcmp(dupechk->callsign[i], callsign) == 0) {
+      makedupe_bulk_duplicate++;
+      if (makedupe_dup_sample_count < MAKEDUPE_DUP_SAMPLE_MAX) {
+        makedupe_dup_sample_t *sample =
+            &makedupe_dup_samples[makedupe_dup_sample_count++];
+        strncpy(sample->call, callsign, LEN_CALLSIGN);
+        sample->call[LEN_CALLSIGN] = '\0';
+        sample->incoming_bandmode = (uint8_t)bandmode;
+        sample->existing_bandmode = dupechk->bandmode[i];
+        sample->existing_index = (uint16_t)i;
+      }
       return;
     }
   }
 
-  if (dupechk->ncallsign >= dupechk->nmaxqso) return;
+  if (dupechk->ncallsign >= dupechk->nmaxqso) {
+    makedupe_bulk_overflow++;
+    return;
+  }
+
   entry_dupechk_call_exch_bandmode(callsign, recv_exch,
                                    (unsigned char)bandmode);
+  makedupe_bulk_accepted++;
 
-  // MAIN owns the contest multiplier definitions. Notify MAIN for every
-  // QSO accepted by the SUBCPU dupe filter so that MAIN counts accepted
-  // QSOs and multipliers from exactly the same filtered QSO set.
   char accepted[48];
   snprintf(accepted, sizeof(accepted), "dupebulka:%u|%.*s",
            (unsigned int)bandmode, LEN_EXCH, recv_exch);
   mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
                          (unsigned char *)accepted, strlen(accepted));
 
-  int bandid = bandmode / 4;
-  int modetype = bandmode % 4;
-  if (bandid >= 1 && bandid < N_BAND) {
-    makedupe_bulk_worked[modetype == LOG_MODETYPE_CW ? 0 : 1][bandid - 1]++;
-  }
+  makedupe_bulk_worked[modetype == LOG_MODETYPE_CW ? 0 : 1][bandid - 1]++;
 }
 
 void finish_makedupe_bulk_subcpu() {
+  char diag[128];
+  snprintf(diag, sizeof(diag),
+           "dupebulkdiag:%lu,%lu,%lu,%lu,%lu,%lu",
+           (unsigned long)makedupe_bulk_rx,
+           (unsigned long)makedupe_bulk_accepted,
+           (unsigned long)makedupe_bulk_duplicate,
+           (unsigned long)makedupe_bulk_malformed,
+           (unsigned long)makedupe_bulk_overflow,
+           (unsigned long)makedupe_bulk_invalid);
+  mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                         (unsigned char *)diag, strlen(diag));
+
+  // Send duplicate samples only after the bulk scan has completed so the
+  // diagnostic traffic does not perturb the timing of the rebuild itself.
+  for (uint8_t i = 0; i < makedupe_dup_sample_count; i++) {
+    char sample_buf[96];
+    const makedupe_dup_sample_t *sample = &makedupe_dup_samples[i];
+    snprintf(sample_buf, sizeof(sample_buf),
+             "dupebulkdup:%u|%s|%u|%u|%u",
+             (unsigned int)i,
+             sample->call,
+             (unsigned int)sample->incoming_bandmode,
+             (unsigned int)sample->existing_bandmode,
+             (unsigned int)sample->existing_index);
+    mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
+                           (unsigned char *)sample_buf, strlen(sample_buf));
+  }
+
   for (int group = 0; group < 2; group++) {
     char buf[128];
     int n = snprintf(buf, sizeof(buf), "dupebulk%d:", group);
@@ -795,6 +883,33 @@ void init_dupechk_subcpu()
 {
   invalidate_dupe_exact_cache();
   init_dupechk(NMAXQSO_SUBCPU,2);
+}
+
+int reset_dupechk_subcpu_database()
+{
+  const int before = (dupechk != NULL) ? dupechk->ncallsign : -1;
+  const uint32_t started = millis();
+
+  // A rebuild only needs to make old entries unreachable.  Every DUPE scan
+  // is bounded by ncallsign, so do not free/reallocate/clear 1300 entries on
+  // every MAKEDUPE.  Keeping the allocated arrays in place also avoids heap
+  // churn and makes repeated resets deterministic.
+  if (dupechk == NULL) {
+    init_dupechk_subcpu();
+  } else {
+    dupechk->ncallsign = 0;
+    dupechk->dupechk_status = 0;
+    dupechk->dupechk_timeout = 0;
+    dupechk->dupechk_dupe = 0;
+    dupechk->dupechk_getexch = 0;
+    dupechk->dupechk_exch[0] = '\0';
+    invalidate_dupe_exact_cache();
+  }
+
+  const int after = (dupechk != NULL) ? dupechk->ncallsign : -1;
+  console->printf("DUPE RESET logical clear before=%d after=%d elapsed=%lu ms\n",
+                  before, after, (unsigned long)(millis() - started));
+  return after;
 }
 
 void task_dupechk()

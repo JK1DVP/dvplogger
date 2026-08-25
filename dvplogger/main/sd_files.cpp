@@ -179,7 +179,25 @@ void listDir(fs::FS &fs, const char *dirname, uint8_t levels, Stream *out) {
       out->print("  FILE: ");
       out->print(file.name());
       out->print("  SIZE: ");
-      out->println(file.size());
+      out->print(file.size());
+
+      // ESP32 Arduino File timestamps are stored by FAT as time_t.
+      // Show the timestamp recorded on the card; if it is unavailable,
+      // keep the directory listing useful and report that explicitly.
+      time_t last_write = file.getLastWrite();
+      if (last_write > 0) {
+        struct tm tm_buf;
+        if (localtime_r(&last_write, &tm_buf) != NULL) {
+          char timebuf[24];
+          strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+          out->print("  TIME: ");
+          out->println(timebuf);
+        } else {
+          out->println("  TIME: unknown");
+        }
+      } else {
+        out->println("  TIME: unknown");
+      }
     }
     file = root.openNextFile();
   }

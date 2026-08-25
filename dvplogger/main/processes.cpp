@@ -44,6 +44,7 @@
 #include "antenna.h"
 #include "dupechk.h"
 #include "mux_transport.h"
+#include "callhist_remote.h"
 
 enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att,Power};
 void send_query_civ(enum QueryCIVType type,struct radio *radio) {
@@ -60,6 +61,49 @@ void send_query_civ(enum QueryCIVType type,struct radio *radio) {
   }
 }
 
+
+
+static void process_subcpu_late_recovery()
+{
+  if (subcpu_online || !f_mux_transport) return;
+
+  static uint32_t next_probe_ms = 0;
+  const uint32_t now = millis();
+  if (next_probe_ms != 0 && (int32_t)(now - next_probe_ms) < 0) return;
+  next_probe_ms = now + 10000U;
+
+  if (!callhist_subcpu_alive(120)) return;
+
+  console->println(
+    "SUBCPU late recovery: response detected; DUPE rebuild scheduled");
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "SUBCPU FOUND\nRebuilding DUPE...");
+  upd_display_info_flash(dp->lcdbuf);
+
+  subcpu_online = true;
+  callhist_at = 1;
+  init_dupechk_maincpu();
+
+  // Use the same deferred rebuild path as startup/contest changes.  This keeps
+  // all QSO.TXT -> DUPE reconstruction in one place.
+  request_makedupe_rebuild();
+
+  if (plogw->enable_callhist) {
+    if (load_callhist_subcpu(callhistfn)) {
+      console->printf("SUBCPU RECOVERED: CALLHIST=SUBCPU entries=%d\n",
+                      get_callhist_subcpu_count());
+    } else {
+      console->println("SUBCPU RECOVERED: CALLHIST reload failed");
+    }
+  } else {
+    console->println("SUBCPU RECOVERED: CALLHIST=OFF");
+  }
+
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "SUBCPU RECOVERED\nDUPE: rebuilding\nCALLHIST: %s",
+           plogw->enable_callhist ? "ON" : "OFF");
+  upd_display_info_flash(dp->lcdbuf);
+}
 
 int interval_process_stat = 0;
 
@@ -293,6 +337,7 @@ void interval_process() {
     }
     // check transport status and send command
     mux_transport.sync_transport_modes_master(); // send transport command
+    process_subcpu_late_recovery();
     interval_diag_mark(&interval_diag, "mux_sync");
     
 

@@ -44,7 +44,7 @@ bool repair_qso_log(const uint32_t *server_ids, size_t server_count,
                     struct qso_repair_stats *stats);
 void init_qsofiles() ;
 void init_qso() ;
-void makedupe_qso_entry() ;
+void makedupe_qso_entry(const union qso_union_tag *record) ;
 void process_makedupe_multiplier_maincpu(const char *recv_exch, unsigned char bandmode);
 void reformat_qso_entry(union qso_union_tag *qso) ;
 void read_qso_log(int option, Stream *out = nullptr) ;
@@ -66,7 +66,8 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso);
 void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) ;
 void string_trim_right(char *s, char c);
 void print_qso_logfile() ;
-char *parse_strings(const char *remarks,const char *parse_str);
+bool parse_strings(const char *remarks, const char *parse_str,
+                   char *out, size_t out_size);
 void print_qso_log() ;
 // operation options in read_qso_log  or'ed
 #define READQSO_MAKEDUPE 1

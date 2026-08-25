@@ -267,14 +267,32 @@ void control_pkt_handler(struct mux_packet *packet)
     process_callhist_entry_subcpu(buf);
     return;
   }
-  if (strncmp(packet->buf,"dupemask",8)==0) {
-    int mask = atoi(packet->buf + 8);
+  if (packet->idx >= 8 &&
+      memcmp(packet->buf, "dupemask", 8) == 0) {
+    // MUX payloads are length-delimited, not NUL-terminated.  Parse only
+    // bytes belonging to this packet; otherwise stale trailing digits can
+    // change e.g. "252" into "2520".
+    char mask_buf[16];
+    size_t n = min((size_t)(packet->idx - 8), sizeof(mask_buf) - 1);
+    memcpy(mask_buf, packet->buf + 8, n);
+    mask_buf[n] = '\0';
+    int mask = atoi(mask_buf);
     if (mask >= 0 && mask <= 255)
       set_dupechk_mask_subcpu((unsigned char)mask);
     return;
   }
-  if (strncmp(packet->buf,"dupebulkbegin",13)==0) {
-    begin_makedupe_bulk_subcpu((unsigned char)atoi(packet->buf + 13));
+  if (packet->idx >= 13 &&
+      memcmp(packet->buf, "dupebulkbegin", 13) == 0) {
+    // Same bounded parsing rule as dupemask.  With the old direct atoi(),
+    // an intended decimal mask "252" followed by stale '0' became 2520;
+    // casting that to uint8_t produced 216 (0xD8), exactly the observed bug.
+    char mask_buf[16];
+    size_t n = min((size_t)(packet->idx - 13), sizeof(mask_buf) - 1);
+    memcpy(mask_buf, packet->buf + 13, n);
+    mask_buf[n] = '\0';
+    int mask = atoi(mask_buf);
+    if (mask >= 0 && mask <= 255)
+      begin_makedupe_bulk_subcpu((unsigned char)mask);
     return;
   }
   if (strncmp(packet->buf,"dupebulkend",11)==0) {
@@ -289,8 +307,13 @@ void control_pkt_handler(struct mux_packet *packet)
     return;
   }
   if (strncmp(packet->buf,"dupereset",9)==0) {
-    init_dupechk_subcpu();
-    const char *response = "dupereset:ok";
+    // reset_dupechk_subcpu_database() does not return until the old DB has
+    // been freed, the new DB allocated/cleared, and ncallsign is zero.
+    // Only then send the completion ACK; MAIN will not start dupebulkbegin
+    // before receiving this packet.
+    const int ncallsign = reset_dupechk_subcpu_database();
+    char response[32];
+    snprintf(response, sizeof(response), "dupereset:done:%d", ncallsign);
     mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
                            (unsigned char *)response, strlen(response));
     return;

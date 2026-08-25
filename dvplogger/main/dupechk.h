@@ -24,7 +24,7 @@
 
 unsigned char bandmode(struct radio *radio) ;
 unsigned char bandmode_param(int bandid,int modetype) ;
-bool dupe_check_nocallhist(char *call, byte bandmode, byte mask) ;
+bool dupe_check_nocallhist(const char *call, byte bandmode, byte mask) ;
 bool dupe_check_with_exch(const char *call, byte bandmode, byte mask,
                           char *exch, size_t exch_size);
 bool dupe_check_with_exch_confirmed(const char *call, byte bandmode,
@@ -48,7 +48,7 @@ void entry_dupechk_subcpu(char *s);
 void entry_dupechk_call_exch_bandmode(char *callsign,char *recv_exch,unsigned char bandmode);
 void entry_dupechk_data(const char *callsign, const char *recv_exch, unsigned char bandmode);
 bool reset_dupechk_subcpu();
-void notify_dupechk_subcpu_reset();
+void notify_dupechk_subcpu_reset(int remote_ncallsign);
 void sync_dupechk_mask_subcpu(unsigned char mask);
 void set_dupechk_mask_subcpu(unsigned char mask);
 unsigned char get_dupechk_mask_subcpu();
@@ -68,6 +68,7 @@ bool dupechk_background_exact_start(const char *call, byte bandmode, byte mask);
 bool dupechk_background_exact_poll(bool *confirmed, bool *is_dupe);
 void dupechk_background_exact_cancel();
 void process_makedupe_score_maincpu(char *s, int group);
+void process_makedupe_diag_maincpu(char *s);
 void entry_makedupe_subcpu_data(const char *callsign, const char *recv_exch, unsigned char bandmode);
 void entry_dupechk(struct radio *radio) ;
 void init_score() ;
@@ -88,3 +89,4 @@ void dupechk_note_main_ack(unsigned int query_id);
 void dupechk_note_main_rx();
 void dupechk_note_exact_response_success(unsigned int query_id);
 #endif
+int reset_dupechk_subcpu_database();

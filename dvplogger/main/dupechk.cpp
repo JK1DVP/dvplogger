@@ -767,7 +767,7 @@ void process_dupechk_partial_response_maincpu(char *s) {
 }
 
 // only check dupe no call history retrieval
-bool dupe_check_nocallhist(char *call, byte bandmode, byte mask) {
+bool dupe_check_nocallhist(const char *call, byte bandmode, byte mask) {
   if (dupechk->dupechk_at == 1) {
     return query_dupechk_subcpu(call, bandmode, mask, false);
   }
@@ -1063,6 +1063,29 @@ void begin_makedupe_subcpu(unsigned char mask) {
                          (unsigned char *)buf, strlen(buf));
 }
 
+void process_makedupe_diag_maincpu(char *s) {
+  unsigned long rx = 0, accepted = 0, duplicate = 0;
+  unsigned long malformed = 0, overflow = 0, invalid = 0;
+  int n = sscanf(s, "%lu,%lu,%lu,%lu,%lu,%lu",
+                 &rx, &accepted, &duplicate,
+                 &malformed, &overflow, &invalid);
+  if (n == 6) {
+    console->printf(
+      "MAKEDUPE SUBCPU diag rx=%lu accepted=%lu duplicate=%lu "
+      "malformed=%lu overflow=%lu invalid=%lu\n",
+      rx, accepted, duplicate, malformed, overflow, invalid);
+    if (rx != makedupe_sent_count) {
+      console->printf(
+        "MAKEDUPE WARNING: MAIN sent=%lu but SUBCPU received=%lu "
+        "(missing=%ld)\n",
+        (unsigned long)makedupe_sent_count, rx,
+        (long)makedupe_sent_count - (long)rx);
+    }
+  } else {
+    console->printf("MAKEDUPE SUBCPU diag parse error: <%s>\n", s);
+  }
+}
+
 void process_makedupe_score_maincpu(char *s, int group) {
   if (group < 0 || group > 1) return;
   char *save = NULL;
@@ -1151,7 +1174,10 @@ unsigned char get_dupechk_mask_subcpu() {
   return dupechk_current_mask;
 }
 
-void notify_dupechk_subcpu_reset() {
+static int dupechk_reset_remote_ncallsign = -1;
+
+void notify_dupechk_subcpu_reset(int remote_ncallsign) {
+  dupechk_reset_remote_ncallsign = remote_ncallsign;
   dupechk_reset_ack = true;
 }
 
@@ -1159,17 +1185,30 @@ bool reset_dupechk_subcpu() {
   if (dupechk == NULL || dupechk->dupechk_at != 1) return false;
 
   dupechk_reset_ack = false;
+  dupechk_reset_remote_ncallsign = -1;
+  const uint32_t reset_started = millis();
   mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
                          (unsigned char *)"dupereset", strlen("dupereset"));
 
-  uint32_t timeout = millis() + 500;
+  // init_dupechk_subcpu() frees/reallocates and clears the complete remote
+  // database.  Do not start MAKEDUPE until SUBCPU explicitly reports that
+  // this work has finished.  Allow ample time on a busy SUBCPU.
+  uint32_t timeout = millis() + 5000;
   while (!dupechk_reset_ack && (int32_t)(millis() - timeout) < 0) {
     if (f_mux_transport) mux_transport.recv_pkt();
     delay(1);
   }
 
   if (!dupechk_reset_ack) {
-    console->println("reset_dupechk_subcpu() timeout");
+    console->printf("reset_dupechk_subcpu() timeout after %lu ms\n",
+                    (unsigned long)(millis() - reset_started));
+    return false;
+  }
+  console->printf("SUBCPU DUPE reset done: ncallsign=%d elapsed=%lu ms\n",
+                  dupechk_reset_remote_ncallsign,
+                  (unsigned long)(millis() - reset_started));
+  if (dupechk_reset_remote_ncallsign != 0) {
+    console->println("SUBCPU DUPE reset invalid: ncallsign is not zero");
     return false;
   }
   return true;

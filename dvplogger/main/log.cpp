@@ -329,7 +329,7 @@ void init_logwindow() {
   //plogw->bandid_bandmap = 0;
   plogw->cmd_ptr = 0;
 
-  plogw->enable_callhist = 1;  // call history search enable by default?
+  plogw->enable_callhist = 0;  // default OFF; enable explicitly when Call History is configured
   plogw->bandmap_summary_idx = 0;
 
   plogw->contest_id = 0;

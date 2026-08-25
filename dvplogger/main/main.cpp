@@ -387,6 +387,41 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
                                             (unsigned char)bandmode);
       }
     }
+  } else if (packet->idx >= 17 &&
+             memcmp(packet->buf, "dupebulkbeginack:", 17) == 0) {
+    size_t n = min((size_t)(packet->idx - 17), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 17, n);
+    buf[n] = '\0';
+    unsigned int mask = 0;
+    int ncallsign = -1, nmaxqso = -1;
+    if (sscanf(buf, "%u,%d,%d", &mask, &ncallsign, &nmaxqso) == 3) {
+      console->printf(
+        "MAKEDUPE SUBCPU begin mask=0x%02X ncallsign=%d capacity=%d\n",
+        mask & 0xffU, ncallsign, nmaxqso);
+    } else {
+      console->printf("MAKEDUPE SUBCPU begin parse error: <%s>\n", buf);
+    }
+  } else if (packet->idx >= 12 &&
+             memcmp(packet->buf, "dupebulkdup:", 12) == 0) {
+    size_t n = min((size_t)(packet->idx - 12), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 12, n);
+    buf[n] = '\0';
+    unsigned int sample_idx = 0, incoming = 0, existing = 0, match_idx = 0;
+    char call[LEN_CALLSIGN + 1];
+    call[0] = '\0';
+    if (sscanf(buf, "%u|%12[^|]|%u|%u|%u",
+               &sample_idx, call, &incoming, &existing, &match_idx) == 5) {
+      console->printf(
+        "MAKEDUPE DUP sample=%u call=%s incoming=%u existing=%u matchidx=%u\n",
+        sample_idx, call, incoming, existing, match_idx);
+    } else {
+      console->printf("MAKEDUPE DUP sample parse error: <%s>\n", buf);
+    }
+  } else if (strncmp(packet->buf,"dupebulkdiag:",13)==0) {
+    size_t n = min((size_t)(packet->idx - 13), sizeof(buf) - 1);
+    memcpy(buf, packet->buf + 13, n);
+    buf[n] = '\0';
+    process_makedupe_diag_maincpu(buf);
   } else if (strncmp(packet->buf,"dupebulk0:",10)==0 ||
              strncmp(packet->buf,"dupebulk1:",10)==0) {
     int group = packet->buf[8] - '0';
@@ -394,9 +429,17 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
     memcpy(buf, packet->buf + 10, n);
     buf[n] = '\0';
     process_makedupe_score_maincpu(buf, group);
-  } else if (strncmp(packet->buf,"dupereset:",10)==0) {
-    notify_dupechk_subcpu_reset();
-    console->println("subcpu dupe database cleared");
+  } else if (packet->idx >= 15 &&
+             memcmp(packet->buf, "dupereset:done:", 15) == 0) {
+    // MUX payloads are length-delimited and are NOT NUL-terminated.
+    // Copy only the numeric suffix before parsing; otherwise stale bytes
+    // remaining after the payload can turn "0" into "09", "092", etc.
+    char reset_count_buf[16];
+    size_t reset_count_len = min((size_t)(packet->idx - 15),
+                                 sizeof(reset_count_buf) - 1);
+    memcpy(reset_count_buf, packet->buf + 15, reset_count_len);
+    reset_count_buf[reset_count_len] = '\0';
+    notify_dupechk_subcpu_reset(atoi(reset_count_buf));
   } else if (strncmp(packet->buf,"duped:",6)==0) {
     // dupe database status
     size_t n = min((size_t)(packet->idx - 6), sizeof(buf) - 1);
@@ -567,7 +610,13 @@ void setup()
 
   load_rigs("RIGS");
   
-  load_settings("settings");
+  if (!load_settings("settings")) {
+    // No settings.txt: keep the compiled default contest_id=0, but apply it
+    // through the normal contest-selection path so contest_name/mask/multi
+    // are initialized consistently.  contest_id 0 is NOMULTI.
+    console->println("settings.txt not found; applying default contest NOMULTI");
+    set_contest_id();
+  }
 
   /*
    * On units without PSRAM, move the large databases off the MAIN CPU
@@ -655,19 +704,32 @@ void setup()
     subcpu_online = callhist_subcpu_alive(350);
   }
   if (subcpu_online) {
-    console->println("SUBCPU probe: online; normal remote services enabled");
+    console->println("SUBCPU probe: online; DUPE database rebuild scheduled");
+    callhist_at=1;
+    init_dupechk_maincpu();
   } else {
     console->println(
-      "SUBCPU probe: no response; remote callhist/dupe disabled, "
-      "MUX kept active for KBD/late recovery");
+      "SUBCPU probe: no response; using MAIN DUPE (200 entries), "
+      "MUX kept active for KBD/flasher/late recovery");
 
-    // Do not disable Serial2/MUX here.  KBD reports use this same path.
-    // Remote database services still fall back safely to MAIN below.
+    // Do not disable Serial2/MUX here.  KBD and SUBCPU flashing must remain
+    // usable even when the SUBCPU application is blank or not responding.
     f_mux_transport=1;
     callhist_at=0;
     plogw->enable_callhist=0;
-    init_dupechk(1,0);
+    init_dupechk(200,0);
+
+    console->println("SUBCPU OFFLINE: MAIN DUPE active (200 entries)");
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "SUBCPU OFFLINE\nMAIN DUPE: 200\nWiFi/FLASH OK");
+    upd_display_info_flash(dp->lcdbuf);
   }
+
+  // Build the DUPE database exactly once after startup placement is known.
+  // When settings.txt exists, set_contest_id() may already have requested a
+  // rebuild; request_makedupe_rebuild() is idempotent, so this also covers
+  // the no-settings first boot without causing a second rebuild.
+  request_makedupe_rebuild();
 
   /*
    * callhist_at is restored by load_settings().  Load the configured

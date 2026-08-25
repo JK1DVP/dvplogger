@@ -15,12 +15,21 @@ message(STATUS "Generating ${OUTPUT_FILE} from files in ${INPUT_DIR}")
 # 空のCファイル作成
 file(WRITE ${OUTPUT_FILE} "#include <stdint.h>\n\n")
 
-# バイナリファイル群を収集
-file(GLOB_RECURSE BIN_PATHS
-    "${INPUT_DIR}/*.bin"
-    "${INPUT_DIR}/bootloader/*.bin"
-    "${INPUT_DIR}/partition_table/*.bin"
+# flasher() に内蔵するのは SUBCPU 起動に必要な3ファイルだけ。
+# build tree 全体を GLOB_RECURSE すると spiffs.bin, ota_data_initial.bin,
+# CMake compiler-test binaries まで binaries.c に混入するので明示指定する。
+set(BIN_PATHS
+    "${INPUT_DIR}/bootloader/bootloader.bin"
+    "${INPUT_DIR}/partition_table/partition-table.bin"
+    "${INPUT_DIR}/jk1dvplog_ext.bin"
 )
+
+foreach(BIN_FILE IN LISTS BIN_PATHS)
+    if(NOT EXISTS "${BIN_FILE}")
+        message(FATAL_ERROR
+            "Required SUBCPU flasher image not found: ${BIN_FILE}")
+    endif()
+endforeach()
 
 foreach(BIN_FILE IN LISTS BIN_PATHS)
     # ファイル名部分だけ取得
