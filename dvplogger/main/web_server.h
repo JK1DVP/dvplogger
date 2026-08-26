@@ -31,4 +31,6 @@ void process_web_ui_queue();
 // Contest runtime preset helpers used by keyboard/terminal contest switching.
 bool save_contest_runtime_preset(const char *contest_name);
 bool apply_contest_runtime_preset(const char *contest_name);
+bool get_contest_runtime_sent_exch(const char *contest_name,
+                                   char *out, size_t out_size);
 #endif

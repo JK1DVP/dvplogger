@@ -101,6 +101,7 @@
 #define LEN_IP_ADDRESS (3*4+3+2)
 #define LEN_CALL_WINDOW (LEN_CALLSIGN+1)
 #define LEN_EXCH_WINDOW (LEN_EXCH+1)
+#define LEN_DUAL_EXCH_WINDOW (LEN_EXCH*2+1) // primary + separator + secondary
 #define LEN_SENT_EXCH_WINDOW (LEN_EXCH*2+1+1)
 #define LEN_CONTEST_NAME 20
 #define LEN_RST_WINDOW 3
@@ -147,7 +148,7 @@
 #define NMODEID 7
 
 //#define N_CONTEST 25
-#define N_CONTEST 45
+#define N_CONTEST 46
 
 
 
@@ -265,7 +266,7 @@ struct radio {
   char callsign[LEN_CALL_WINDOW + 3];
   char sent_rst[LEN_RST_WINDOW + 3];
   char recv_rst[LEN_RST_WINDOW + 3];
-  char recv_exch[LEN_EXCH_WINDOW + 3];
+  char recv_exch[LEN_DUAL_EXCH_WINDOW + 3];
   char rig_name[LEN_RIG_NAME + 3];
   char rig_spec_str[LEN_RIG_SPEC_STR + 3];
   char remarks[LEN_REMARKS_WINDOW + 3]; // remarks

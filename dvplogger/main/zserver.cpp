@@ -128,6 +128,17 @@ static void zmerge_finish(bool success, const char *reason);
 static void zmerge_process_line(const char *line);
 static bool zmerge_build_putlog(const union qso_union_tag *rec, uint32_t qsoid,
                                 char *buf, size_t buf_size);
+
+bool zserver_send_qso_record(const union qso_union_tag *record, uint32_t qsoid)
+{
+  if (record == NULL || qsoid == 0) return false;
+  char line[768];
+  if (!zmerge_build_putlog(record, qsoid, line, sizeof(line))) return false;
+  zserver_send(line);
+  return true;
+}
+
+
 static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
                                   uint32_t expected_qsoid);
 static bool zmerge_append_pending_record();

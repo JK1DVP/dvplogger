@@ -2101,6 +2101,191 @@ void print_qso_logfile() {
 
 }
 
+static void expand_dual_sent_exch(const char *preset_exch, int bandid,
+                                  char *out, size_t out_size,
+                                  char *token_buf, size_t token_buf_size)
+{
+  if (!out || out_size == 0) return;
+  out[0] = '\0';
+  if (!preset_exch || !*preset_exch || !token_buf || token_buf_size == 0)
+    return;
+
+  char raw[LEN_SENT_EXCH_WINDOW + 1];
+  strlcpy(raw, preset_exch, sizeof(raw));
+  token_buf[0] = '\0';
+  if ((bandid >= 11) && (bandid <= 13))
+    copy_token(token_buf, raw, 1, "/,;");
+  else
+    copy_token(token_buf, raw, 0, "/,;");
+  token_buf[token_buf_size - 1] = '\0';
+  expand_macro_string(out, out_size, token_buf);
+}
+
+static bool qso_replace_contest_tag(char *remarks, size_t remarks_size,
+                                    const char *contest_name, bool multi_ok)
+{
+  if (!remarks || remarks_size == 0) return false;
+
+  const size_t one = LEN_REMARKS + 1;
+  char *work = (char *)heap_caps_malloc(one * 2,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (work == NULL)
+    work = (char *)heap_caps_malloc(one * 2, MALLOC_CAP_8BIT);
+  if (work == NULL) return false;
+
+  char *src = work;
+  char *out = work + one;
+  strlcpy(src, remarks, one);
+  out[0] = '\0';
+
+  // Normalize temporary control characters so the contest tag always remains
+  // on the same printable Remarks line.
+  for (char *p = src; *p; ++p) {
+    if (*p == '\r' || *p == '\n' || *p == '\t') *p = ' ';
+  }
+
+  char *save = NULL;
+  for (char *tok = strtok_r(src, " ", &save); tok;
+       tok = strtok_r(NULL, " ", &save)) {
+    if (!strncmp(tok, "C:", 2) || !strcmp(tok, "M2:NG")) continue;
+    if (out[0]) strlcat(out, " ", one);
+    strlcat(out, tok, one);
+  }
+
+  if (out[0]) strlcat(out, " ", one);
+  strlcat(out, "C:", one);
+  strlcat(out, (contest_name && *contest_name) ? contest_name : "NOMULTI", one);
+  if (!multi_ok) strlcat(out, " M2:NG", one);
+
+  // QSO.TXT is fixed-width; do not put CR/LF inside Remarks. The record
+  // terminator is maintained separately at QSO_RECORD_SIZE-1.
+  strlcpy(remarks, out, remarks_size);
+
+  free(work);
+  return true;
+}
+
+bool append_secondary_contest_qso(const char *recv_exch,
+                                  const char *contest_name,
+                                  bool multi_ok)
+{
+  if (!recv_exch || !*recv_exch || !contest_name || !*contest_name || !qsologf)
+    return false;
+
+  // This path runs in the Arduino main task, whose normal stack headroom is
+  // small.  Keep the 256-byte QSO copy and Remarks scratch buffers on
+  // PSRAM/heap rather than on the task stack.
+  struct dual_qso_work_t {
+    union qso_union_tag second;
+    char remarks[LEN_REMARKS + 1];
+    char rebuilt[LEN_REMARKS + 1];
+    char sent_preset[LEN_SENT_EXCH_WINDOW + 1];
+    char sent_token[LEN_SENT_EXCH_WINDOW + 1];
+    char sent_expanded[LEN_SENT_EXCH_WINDOW + 1];
+  };
+
+  struct dual_qso_work_t *w =
+      (struct dual_qso_work_t *)heap_caps_malloc(
+          sizeof(*w), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (w == NULL)
+    w = (struct dual_qso_work_t *)heap_caps_malloc(
+        sizeof(*w), MALLOC_CAP_8BIT);
+  if (w == NULL) {
+    if (plogw->ostream)
+      plogw->ostream->println("DUAL QSO: cannot allocate secondary workspace");
+    return false;
+  }
+
+  w->second = qso;  // primary record was just built/written
+  memset(w->second.entry.rcvexch, ' ', sizeof(w->second.entry.rcvexch));
+  strncpy(w->second.entry.rcvexch, recv_exch,
+          sizeof(w->second.entry.rcvexch) - 1);
+
+  // The secondary record belongs to the previous contest, so use that
+  // contest's configured Sent EXCH rather than cloning the primary contest's
+  // expanded Sent EXCH.  Expansion uses the current QSO band exactly like the
+  // normal primary record path.
+  w->sent_preset[0] = '\0';
+  w->sent_expanded[0] = '\0';
+  if (previous_contest_sent_exch(w->sent_preset, sizeof(w->sent_preset))) {
+    int bandid = atoi(w->second.entry.band);
+    expand_dual_sent_exch(w->sent_preset, bandid,
+                          w->sent_expanded, sizeof(w->sent_expanded),
+                          w->sent_token, sizeof(w->sent_token));
+    memset(w->second.entry.sentexch, ' ', sizeof(w->second.entry.sentexch));
+    strncpy(w->second.entry.sentexch, w->sent_expanded,
+            sizeof(w->second.entry.sentexch) - 1);
+  } else if (plogw->ostream) {
+    plogw->ostream->printf(
+        "DUAL QSO: no Sent EXCH preset for previous contest <%s>; "
+        "keeping primary Sent EXCH\n", contest_name);
+  }
+
+  // Give the second logical contest record its own QSOID while retaining the
+  // same physical QSO time/sequence number. QSOID is encoded in CQ/SP trr.
+  const uint32_t primary_qsoid = plogw->qsoid;
+  uint32_t second_qsoid = primary_qsoid;
+  for (int tries = 0; tries < 8 && second_qsoid == primary_qsoid; ++tries)
+    second_qsoid = plogw->txnum * 100000000UL +
+                   plogw->seqnr * 10000UL + random(100) * 100UL;
+  if (second_qsoid == primary_qsoid)
+    second_qsoid = plogw->txnum * 100000000UL +
+                   plogw->seqnr * 10000UL +
+                   (((primary_qsoid / 100UL) + 1UL) % 100UL) * 100UL;
+
+  memcpy(w->remarks, w->second.entry.remarks, LEN_REMARKS);
+  w->remarks[LEN_REMARKS] = '\0';
+  char run[3] = "SP";
+  unsigned int tx = 0, rnd = 0;
+  if (sscanf(w->remarks, "%2s %1u%2u", run, &tx, &rnd) == 3) {
+    char *body = w->remarks + 6;
+    while (*body == ' ') ++body;
+    snprintf(w->rebuilt, sizeof(w->rebuilt), "%s %1lu%02lu %s", run,
+             (unsigned long)((second_qsoid / 100000000UL) % 10UL),
+             (unsigned long)((second_qsoid / 100UL) % 100UL), body);
+    strlcpy(w->remarks, w->rebuilt, sizeof(w->remarks));
+  }
+
+  if (!qso_replace_contest_tag(w->remarks, sizeof(w->remarks),
+                               contest_name, multi_ok)) {
+    if (plogw->ostream)
+      plogw->ostream->println("DUAL QSO: cannot allocate Remarks workspace");
+    free(w);
+    return false;
+  }
+
+  memset(w->second.entry.remarks, ' ', sizeof(w->second.entry.remarks));
+  strncpy(w->second.entry.remarks, w->remarks,
+          sizeof(w->second.entry.remarks) - 1);
+  w->second.all[QSO_RECORD_SIZE - 1] = 0x0d;
+
+  const size_t written = qsologf.write(w->second.all, sizeof(w->second.all));
+  qso_log_flush_pending = true;
+  qso_log_flush_due_ms = millis() + QSO_LOG_FLUSH_DELAY_MS;
+  if (written != sizeof(w->second.all)) {
+    free(w);
+    return false;
+  }
+
+  if (!plogw->f_console_emu) {
+    plogw->ostream->printf(
+        "DUAL CONTEST QSO: C:%s SENT=%s RCV=%s%s QSOID=%lu\n",
+        contest_name,
+        w->sent_expanded[0] ? w->sent_expanded : w->second.entry.sentexch,
+        recv_exch, multi_ok ? "" : " M2:NG",
+        (unsigned long)second_qsoid);
+    plogw->ostream->write(w->second.all, sizeof(w->second.all));
+    write_allTCPclients((char *)w->second.all, sizeof(w->second.all));
+    print_allTCPclients("\n");
+  }
+
+  // Keep the workspace alive through Z-Server serialization; that function
+  // receives a pointer to the record.
+  zserver_send_qso_record(&w->second, second_qsoid);
+  free(w);
+  return true;
+}
+
 void print_qso_log() {
   // print content of logw
   if (!plogw->f_console_emu) plogw->ostream->println("print_qso_log()");
@@ -2279,10 +2464,8 @@ void make_qsolog_entry() {
       strcat(qso.entry.remarks,"C:- ");
     } else {
       if (strlen(plogw->contest_name+2)>0) {
-	if (strcmp(plogw->contest_name+2,"NOMULTI")!=0) {
-	  sprintf(buf,"C:%s ",plogw->contest_name+2);
-	  strcat(qso.entry.remarks,buf);
-	}
+        sprintf(buf,"C:%s ",plogw->contest_name+2);
+        strcat(qso.entry.remarks,buf);
       }
     }
     switch(radio->f_qsl) {

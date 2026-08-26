@@ -69,6 +69,7 @@ void print_qso_logfile() ;
 bool parse_strings(const char *remarks, const char *parse_str,
                    char *out, size_t out_size);
 void print_qso_log() ;
+bool append_secondary_contest_qso(const char *recv_exch, const char *contest_name, bool multi_ok);
 // operation options in read_qso_log  or'ed
 #define READQSO_MAKEDUPE 1
 #define READQSO_PRINT 2

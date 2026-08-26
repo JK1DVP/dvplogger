@@ -191,7 +191,7 @@ struct WebUiCommand {
   char name[12];
   // input0 is also used for Sent Exch, which is longer than recv_exch.
   char input0[100];
-  char input1[LEN_EXCH_WINDOW + 1];
+  char input1[LEN_DUAL_EXCH_WINDOW + 1];
 };
 static QueueHandle_t s_web_ui_queue = nullptr;
 
@@ -254,7 +254,7 @@ void process_web_ui_queue() {
       // field is not a recognised command, process_enter() continues through
       // the normal ESM behavior.
       set_callsign_and_request_dupe(radio, cmd.input0, true);
-      strlcpy(radio->recv_exch + 2, cmd.input1, LEN_EXCH_WINDOW + 1);
+      strlcpy(radio->recv_exch + 2, cmd.input1, LEN_DUAL_EXCH_WINDOW + 1);
       radio->ptr_curr = (cmd.index == 1) ? 1 : 0;
       // value=1 is the /op "Log (No TX)" action: commit the QSO using
       // the normal Enter path, but suppress ESM exchange/TU transmission.
@@ -365,7 +365,7 @@ void process_web_ui_queue() {
         case 0:
           set_callsign_and_request_dupe(radio, cmd.input0, true);
           break;
-        case 1: strlcpy(radio->recv_exch+2, cmd.input0, LEN_EXCH_WINDOW + 1); break;
+        case 1: strlcpy(radio->recv_exch+2, cmd.input0, LEN_DUAL_EXCH_WINDOW + 1); break;
         case 2: strlcpy(radio->recv_rst+2, cmd.input0, LEN_RST_WINDOW + 1); break;
         case 3: strlcpy(radio->sent_rst+2, cmd.input0, LEN_RST_WINDOW + 1); break;
         case 4:
@@ -1875,6 +1875,17 @@ bool apply_contest_runtime_preset(const char *contest_name) {
   ContestWebPreset *p = find_contest_web_preset(contest_name, false);
   if (!p) return false;
   set_current_contest_messages(*p);
+  return true;
+}
+
+bool get_contest_runtime_sent_exch(const char *contest_name,
+                                   char *out, size_t out_size) {
+  if (out && out_size) out[0] = '\0';
+  if (!contest_name || !*contest_name || !out || out_size == 0) return false;
+  load_contest_web_presets();
+  ContestWebPreset *p = find_contest_web_preset(contest_name, false);
+  if (!p) return false;
+  strlcpy(out, p->exch, out_size);
   return true;
 }
 

@@ -666,3 +666,26 @@ const struct multi_item multi_iburihidakaout = {
 };
 
   
+const struct multi_item multi_giga0area = {
+  {
+"080101", "080102", 
+"080103", "080104", "080105", "080106", "080107", "080108", "0802", "0804", "0805", "0806", 
+"0808", "0809", "0810", "0811", "0812", "0813", "0816", "0818", "0822", "0823", 
+"0824", "0825", "0826", "0827", "0828", "08001", "08002", "08004", "08007", "08008", 
+"08011", "08013", "08015", "08016", "0901", "0902", "0903", "0904", "0905", "0906", 
+"0907", "0908", "0909", "0910", "0911", "0912", "0913", "0914", "0915", "0918", 
+"0919", "0920", "0921", "09001", "09002", "09003", "09004", "09005", "09006", "09008", 
+"09009", "09010", "09011", "09012", "09014", "09015", "09017",
+""},
+  {
+     "Niigata C Kita K", "Niigata C Higashi K", 
+    "Niigata C Chuo K", "Niigata C Konan K", "Niigata C Akiha K", "Niigata C Minami K", "Niigata C Nishi K", "Niigata C Nishikan K", "Nagaoka C", "Sanjo C", "Kashiwazaki C", "Shibata C", 
+    "Ojiya C", "Kamo C", "Tokamachi C", "Mitsuke C", "Murakami C", "Tsubame C", "Itoigawa C", "Gosen C", "Joetsu C", "Agano C", 
+    "Sado C", "Uonuma C", "Minamiuonuma C", "Myoko C", "Tainai C", "Iwafune G", "Kariwa G", "Kitakambara G", "Santo G", "Nakauonuma G", 
+    "Nishikambara G", "Higashikambara G", "Minamiuonuma G", "Minamikambara G", "Nagano C", "Matsumoto C", "Ueda C", "Okaya C", "Iida C", "Suwa C", 
+    "Suzaka C", "Komoro C", "Ina C", "Komagane C", "Nakano C", "Omachi C", "Iiyama C", "Chino C", "Shiojiri C", "Saku C", 
+    "Chikuma C", "Toumi C", "Azumino C", "Kamiina G", "Kamitakai G", "Kamiminochi G", "Kiso G", "Kitaazumi G", "Kitasaku G", "Shimoina G", 
+    "Shimotakai G", "Shimominochi G", "Suwa G", "Chiisagata G", "Hanishina G", "Higashichikuma G", "Minamisaku G",
+    ""
+  }
+};

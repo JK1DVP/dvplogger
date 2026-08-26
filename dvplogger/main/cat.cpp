@@ -4927,7 +4927,7 @@ void init_radio(struct radio *radio, const char *rig_name) {
   init_buf(radio->callsign, LEN_CALL_WINDOW);
   init_buf(radio->recv_rst, LEN_RST_WINDOW);
   init_buf(radio->sent_rst, LEN_RST_WINDOW);
-  init_buf(radio->recv_exch, LEN_EXCH_WINDOW);
+  init_buf(radio->recv_exch, LEN_DUAL_EXCH_WINDOW);
   init_buf(radio->remarks, LEN_REMARKS_WINDOW);  //37
   radio->callsign_previously_sent[0] = '\0';
   init_buf(radio->rig_name, LEN_RIG_NAME);

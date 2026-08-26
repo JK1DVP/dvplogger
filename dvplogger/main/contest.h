@@ -28,6 +28,9 @@
 void set_contest_id();
 void search_contest_id_from_name();
 bool alternate_contest();
+bool previous_contest_info(int *id, char *name, size_t name_size);
+bool previous_contest_sent_exch(char *out, size_t out_size);
+int previous_contest_multi_check(const char *exch, int bandid);
 int contest_definition_count();
 int contest_definition_id(int index);
 const char *contest_definition_name(int index);

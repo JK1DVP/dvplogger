@@ -107,6 +107,7 @@ extern const struct multi_item multi_aomori_int;
 extern const struct multi_item multi_aomori_out;
 extern const struct multi_item multi_iburihidakaout;
 extern const struct multi_item multi_iburihidakaint;
+extern const struct multi_item multi_giga0area;
 
 
 #endif

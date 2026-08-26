@@ -1817,7 +1817,12 @@ void print_off_contest()
 void set_contest_from_name()
 {
     if (is_user_md_contest_name(plogw->contest_name + 2)) {
-      start_user_md_contest(plogw->contest_name + 2);
+      // Route User MD contests through the same contest-selection path as
+      // built-in contests.  set_contest_id() records the current contest as
+      // previous before switching, so ordinary selection establishes the
+      // current/previous pair used by contest alternate and dual-contest QSO.
+      plogw->contest_id = USER_MD_CONTEST_ID;
+      set_contest_id();
       return;
     }
     search_contest_id_from_name() ;
@@ -1850,6 +1855,36 @@ int check_multi_contest()
   return 1;
 }
 
+// Split the editable receive exchange into primary/secondary parts.
+// The first ',' or '/' is the dual-contest separator.  The edit buffer itself
+// is never modified here.
+static bool split_dual_recv_exch(const char *raw,
+                                 char *primary, size_t primary_size,
+                                 char *secondary, size_t secondary_size,
+                                 char *separator_char)
+{
+  if (primary && primary_size) primary[0] = '\0';
+  if (secondary && secondary_size) secondary[0] = '\0';
+  if (separator_char) *separator_char = '\0';
+  if (!raw) return false;
+
+  const char *sep = strpbrk(raw, ",/");
+  if (!sep) {
+    if (primary && primary_size) strlcpy(primary, raw, primary_size);
+    return false;
+  }
+
+  if (separator_char) *separator_char = *sep;
+  if (primary && primary_size) {
+    size_t n = (size_t)(sep - raw);
+    if (n >= primary_size) n = primary_size - 1;
+    memcpy(primary, raw, n);
+    primary[n] = '\0';
+  }
+  if (secondary && secondary_size) strlcpy(secondary, sep + 1, secondary_size);
+  return primary && secondary && primary[0] != '\0' && secondary[0] != '\0';
+}
+
 // 入力欄でEnter を押したときの処理
 void process_enter(int option) {
   // option 0: normal
@@ -1877,7 +1912,51 @@ void process_enter(int option) {
   //          case 0: // non keyer mode
   // 21/11/7 Enter will also be processed similarly in keyer mode
   switch (radio->ptr_curr) {
-  case 1:  // number entry
+  case 1: { // number entry
+    // A comma or slash means one physical QSO should be recorded for both the
+    // active and previous contests.  Parse a copy: do not destroy the edit
+    // buffer before both sides have been captured.
+    char raw_exch[LEN_DUAL_EXCH_WINDOW + 1] = {0};
+    char primary_exch[LEN_EXCH + 1] = {0};
+    char secondary_exch[LEN_EXCH + 1] = {0};
+    char secondary_contest[sizeof(plogw->contest_name) - 2] = {0};
+    char separator_char = 0;
+    strlcpy(raw_exch, radio->recv_exch + 2, sizeof(raw_exch));
+    const bool split_ok = split_dual_recv_exch(raw_exch,
+                                                primary_exch, sizeof(primary_exch),
+                                                secondary_exch, sizeof(secondary_exch),
+                                                &separator_char);
+    bool dual_contest_qso = false;
+    int secondary_id = -1;
+    bool have_previous_contest = false;
+
+    if (separator_char != 0) {
+      have_previous_contest = previous_contest_info(&secondary_id, secondary_contest,
+                                                     sizeof(secondary_contest));
+      dual_contest_qso = split_ok && have_previous_contest;
+      plogw->ostream->printf(
+          "DUAL EXCH: raw=<%s> sep=%c primary=<%s> secondary=<%s> "
+          "split=%d previous=%d current=<%s> secondary_contest=<%s>\n",
+          raw_exch, separator_char, primary_exch, secondary_exch,
+          split_ok ? 1 : 0, have_previous_contest ? 1 : 0,
+          plogw->contest_name + 2,
+          have_previous_contest ? secondary_contest : "");
+
+      if (!split_ok) {
+        upd_display_info_flash("2ND EXCH NG\nNeed both sides");
+        info_disp.timer = 2000;
+      } else if (!have_previous_contest) {
+        upd_display_info_flash("2ND CONTEST NG\nNo previous contest");
+        info_disp.timer = 2000;
+      }
+    }
+
+    // Primary QSO always uses only the left side.  No separator means the
+    // complete exchange, exactly as before.
+    if (separator_char != 0) {
+      strlcpy(radio->recv_exch + 2, primary_exch, LEN_DUAL_EXCH_WINDOW + 1);
+      radio->recv_exch[1] = strlen(radio->recv_exch + 2);
+    }
     // Always interpret the exchange using the currently selected contest,
     // including OFFCONTEST operation.  OFFCONTEST changes scoring/recording
     // policy, not the operator assistance used to interpret the exchange.
@@ -1910,6 +1989,23 @@ void process_enter(int option) {
     
     // log current QSO
     print_qso_log();
+
+    if (dual_contest_qso) {
+      const int m2 = previous_contest_multi_check(secondary_exch, radio->bandid);
+      const bool m2_ok = (m2 >= 0);
+      plogw->ostream->printf(
+          "DUAL SECONDARY: contest=<%s> id=%d exch=<%s> multi=%d\n",
+          secondary_contest, secondary_id, secondary_exch, m2);
+      if (!append_secondary_contest_qso(secondary_exch, secondary_contest, m2_ok)) {
+        upd_display_info_flash("2ND QSO WRITE NG");
+        info_disp.timer = 2000;
+      } else if (!m2_ok) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "M2:NG %s\n%s",
+                 secondary_contest, secondary_exch);
+        upd_display_info_flash(dp->lcdbuf);
+        info_disp.timer = 2000;
+      }
+    }
     if (verbose&4) 	{
       if (!plogw->f_console_emu) plogw->ostream->println("print_qso_log() finished");
     }
@@ -2004,6 +2100,7 @@ void process_enter(int option) {
     request_display_update_on_demand();
     request_bandmap_update_on_demand();
     break;
+  }
   case 8:  // grid locator
     set_grid_locator_information();
     break;
@@ -3219,8 +3316,9 @@ void logw_handler(char key, char c)
     }
     
     if (ptr_curr_req_callsign_exch_chr(radio)) {
-      if (!(isalnum(c)||(c=='/')||(c=='.'))) { // callsign characters
-	return ;
+      if (!(isalnum(c)||(c=='/')||(c=='.')||
+            (radio->ptr_curr == 1 && c==','))) { // callsign/exchange characters
+        return ;
       }
     } else {
       if (ptr_curr_req_num(radio)) {
@@ -3284,14 +3382,23 @@ void logw_handler(char key, char c)
     request_dupe_aware_display_update();
     defer_display_for_dupe = true;
     break;
-  case 1:  // recv_exch
+  case 1: { // recv_exch
     if (strlen(radio->recv_exch + 2) >= 1) {
-      radio->multi = multi_check(radio->recv_exch+2,radio->bandid);
+      char primary_exch[LEN_EXCH + 1] = {0};
+      char secondary_exch[LEN_EXCH + 1] = {0};
+      char sep = 0;
+      split_dual_recv_exch(radio->recv_exch + 2,
+                           primary_exch, sizeof(primary_exch),
+                           secondary_exch, sizeof(secondary_exch), &sep);
+      // While editing a dual exchange, the current contest's live multiplier
+      // check is always performed on the left/primary side only.
+      radio->multi = multi_check(primary_exch, radio->bandid);
       if (radio->multi >= 0) {
 	upd_display_info_multi_bands(radio);
       }
     }
     break;
+  }
   }
 
 

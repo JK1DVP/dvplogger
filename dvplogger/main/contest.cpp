@@ -35,6 +35,7 @@
 #include "so2r.h"
 #include "user_contest_md.h"
 #include "web_server.h"
+#include "esp_heap_caps.h"
 
 
 struct contest_definition {
@@ -97,6 +98,7 @@ const struct contest_definition contest_defs[N_CONTEST+1] = {
   {37,"IburiHidakaInt",CW_PH_DUPE_NG,1,MULTI_TYPE_NORMAL,&multi_iburihidakaint,-1,-1,  NULL,-1,-1 }, 
   {39,"KagoshimaOut",CW_PH_DUPE_OK,1,(MULTI_TYPE_KENGAI_KJ | (46<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 46 is Kagoshima Ken number
   {40,"KagoshimaInt",CW_PH_DUPE_OK,1,(MULTI_TYPE_KENNAI_KJ | (46<<8)),&multi_acag,-1,-1,  NULL,-1,-1 }, // 46 is Kagoshima Ken number
+  {42,"GigaContest",CW_PH_DUPE_OK,1,MULTI_TYPE_NORMAL,&multi_giga0area,-1,-1,  NULL,-1,-1 }, 
   { -1,""         ,0   ,0,0,NULL,-1,-1,NULL,-1,-1  }
 };
 //  { 0,"NOMULTI"   ,CW_PH_DUPE_NG,1,0,&multi_test_line,-1,-1,NULL,-1,-1 }, 
@@ -276,6 +278,80 @@ void set_contest_id() {
   }
   plogw->contest_id=0;
   plogw->ostream->println("contest_id not found -> NOMULTI");
+}
+
+bool previous_contest_info(int *id, char *name, size_t name_size) {
+  if (!previous_contest_valid) return false;
+  if (id) *id = previous_contest.id;
+  if (name && name_size) strlcpy(name, previous_contest.name, name_size);
+  return true;
+}
+
+bool previous_contest_sent_exch(char *out, size_t out_size) {
+  if (out && out_size) out[0] = '\0';
+  if (!previous_contest_valid || !out || out_size == 0) return false;
+  return get_contest_runtime_sent_exch(previous_contest.name, out, out_size);
+}
+
+int previous_contest_multi_check(const char *exch, int bandid) {
+  if (!previous_contest_valid || exch == NULL || *exch == '\0') return -1;
+
+  const contest_definition *def = NULL;
+  for (int i = 0; i < N_CONTEST && contest_defs[i].id != -1; ++i) {
+    if (contest_defs[i].id == previous_contest.id) {
+      def = &contest_defs[i];
+      break;
+    }
+  }
+
+  // User-defined MD contests need their loaded runtime table; do not disturb
+  // the active contest to load another one during a RUN QSO.
+  if (def == NULL) return -1;
+
+  // multi_list is a little over 3 kB with the current N_BAND/N_MULTI values.
+  // Do not copy it onto the Arduino main-task stack. Normal operation often
+  // leaves less than 1 kB of stack headroom. Prefer PSRAM, then ordinary heap.
+  struct multi_list *saved_multi = NULL;
+  if (f_spiram) {
+    saved_multi = (struct multi_list *)heap_caps_malloc(
+        sizeof(*saved_multi), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  if (saved_multi == NULL) {
+    saved_multi = (struct multi_list *)heap_caps_malloc(
+        sizeof(*saved_multi), MALLOC_CAP_8BIT);
+  }
+  if (saved_multi == NULL) {
+    if (plogw->ostream)
+      plogw->ostream->println(
+          "DUAL MULTI: cannot allocate previous-contest workspace");
+    return -1;
+  }
+
+  memcpy(saved_multi, &multi_list, sizeof(*saved_multi));
+  const int saved_multi_type = plogw->multi_type;
+  const int saved_contest_id = plogw->contest_id;
+
+  // Build the previous contest's multiplier view only long enough to validate
+  // the second exchange, then restore the active contest including worked bits.
+  memset(&multi_list, 0, sizeof(multi_list));
+  plogw->contest_id = def->id;
+  plogw->multi_type = def->multi_type;
+
+  if (def->multi1 != NULL)
+    init_multi(def->multi1, def->multi1_start_band, def->multi1_stop_band);
+  if (def->multi2 != NULL)
+    init_multi(def->multi2, def->multi2_start_band, def->multi2_stop_band);
+
+  char tmp[LEN_EXCH + 1];
+  strlcpy(tmp, exch, sizeof(tmp));
+  const int result = multi_check(tmp, bandid);
+
+  memcpy(&multi_list, saved_multi, sizeof(*saved_multi));
+  plogw->multi_type = saved_multi_type;
+  plogw->contest_id = saved_contest_id;
+  free(saved_multi);
+
+  return result;
 }
 
 bool alternate_contest() {

@@ -44,6 +44,7 @@ int connect_zserver() ;
 void init_zserver_info();
 void zserver_process() ;
 void zserver_send(char *buf);
+bool zserver_send_qso_record(const union qso_union_tag *record, uint32_t qsoid);
 int opmode2zLogmode(char *opmode);
 void reconnect_zserver();
 void zserver_freq_notification();
