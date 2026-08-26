@@ -565,7 +565,7 @@ if (key == 0x1f) {
 	
 	// list ptr_curr Shift+ keyer mode interfere setting the window characters
 	// sent_exch, Remarks, rig_name, cluster_name, email-addr, cluster_cmd, wifi_ssid, wifi_passwd, rig_spec, zserver_name, my_name
-	if (!((radio->ptr_curr == 5) || (radio->ptr_curr == 6) || (radio->ptr_curr == 20) || (radio->ptr_curr == 21) || (radio->ptr_curr == 22) || (radio->ptr_curr == 23) || (radio->ptr_curr == 25) || (radio->ptr_curr == 26) || (radio->ptr_curr == 27) || (radio->ptr_curr == 28) || (radio->ptr_curr == 29) || (radio->ptr_curr == 40) || (radio->ptr_curr == 41) || (radio->ptr_curr == 42) || ((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)) || ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)))) {
+	if (!((radio->ptr_curr == 5) || (radio->ptr_curr == 6) || (radio->ptr_curr == 20) || (radio->ptr_curr == 21) || (radio->ptr_curr == 22) || (radio->ptr_curr == 23) || (radio->ptr_curr == 25) || (radio->ptr_curr == 26) || (radio->ptr_curr == 27) || (radio->ptr_curr == 28) || (radio->ptr_curr == 29) || (radio->ptr_curr == 40) || (radio->ptr_curr == 41) || (radio->ptr_curr == 42) || (radio->ptr_curr == 43) || ((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)) || ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)))) {
 	  if (key == 0x37) {
 	    // Shift-.  Shift-, manual band change up/down
 	    radio->bandid_bandmap++;
@@ -1886,6 +1886,31 @@ static bool split_dual_recv_exch(const char *raw,
 }
 
 // 入力欄でEnter を押したときの処理
+static bool normalize_mdns_hostname(char *name)
+{
+  if (!name || !*name) return false;
+  const size_t len = strlen(name);
+  if (len == 0 || len > LEN_HOST_NAME) return false;
+  if (name[0] == '-' || name[len - 1] == '-') return false;
+  for (size_t i = 0; i < len; ++i) {
+    unsigned char c = (unsigned char)name[i];
+    if (c >= 'A' && c <= 'Z') {
+      name[i] = (char)(c - 'A' + 'a');
+      c = (unsigned char)name[i];
+    }
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+      return false;
+  }
+  return true;
+}
+
+static void report_hostname_setting(const char *prefix)
+{
+  if (!prefix) prefix = "hostname";
+  plogw->ostream->printf("%s: %s (mDNS: %s.local)\n",
+                         prefix, plogw->hostname + 2, plogw->hostname + 2);
+}
+
 void process_enter(int option) {
   // option 0: normal
   //        1: with SHIFT 
@@ -2185,6 +2210,24 @@ void process_enter(int option) {
   case 28:  // zserver_name -> connect to zserver
     reconnect_zserver();
     break;
+  case 43: { // hostname / mDNS name
+    char tmp[LEN_HOST_NAME + 1];
+    strlcpy(tmp, plogw->hostname + 2, sizeof(tmp));
+    if (!normalize_mdns_hostname(tmp)) {
+      upd_display_info_flash("Hostname invalid\nUse a-z 0-9 -");
+      info_disp.timer = 2500;
+      break;
+    }
+    strlcpy(plogw->hostname + 2, tmp, LEN_HOST_NAME + 1);
+    plogw->hostname[1] = strlen(plogw->hostname + 2);
+    save_settings("");
+    report_hostname_setting("hostname saved");
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "Hostname saved\n%s.local\nRestart required", plogw->hostname + 2);
+    upd_display_info_flash(dp->lcdbuf);
+    info_disp.timer = 3000;
+    break;
+  }
   case 40: // contest_name
     set_contest_from_name();
     break;
@@ -2929,6 +2972,36 @@ void process_enter(int option) {
       //        clear_buf(radio->callsign);
       break;
     }
+    if (strcmp(radio->callsign + 2, "HN") == 0 ||
+        strcmp(radio->callsign + 2, "HOSTNAME") == 0) {
+      report_hostname_setting("hostname");
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "Hostname\n%s.local",
+               plogw->hostname + 2);
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+    if (strncmp(radio->callsign + 2, "HN", 2) == 0 &&
+        strlen(radio->callsign + 2) > 2) {
+      char tmp[LEN_HOST_NAME + 1];
+      strlcpy(tmp, radio->callsign + 4, sizeof(tmp));
+      if (!normalize_mdns_hostname(tmp)) {
+        plogw->ostream->println("HN: invalid hostname; use a-z, 0-9 and '-' only");
+        upd_display_info_flash("Hostname invalid\nUse a-z 0-9 -");
+      } else {
+        strlcpy(plogw->hostname + 2, tmp, LEN_HOST_NAME + 1);
+        plogw->hostname[1] = strlen(plogw->hostname + 2);
+        save_settings("");
+        report_hostname_setting("hostname saved");
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "Hostname saved\n%s.local\nRestart required",
+                 plogw->hostname + 2);
+        upd_display_info_flash(dp->lcdbuf);
+      }
+      info_disp.timer = 3000;
+      clear_buf(radio->callsign);
+      break;
+    }
     if (strcmp(radio->callsign + 2, "WIFI") == 0) {
       set_wifi_enabled(!wifi_enable);
       sprintf(dp->lcdbuf, "wifi_enable=%d", wifi_enable);
@@ -3116,6 +3189,7 @@ int check_edit_mode()  // CW key input and Remarks  return 1 (insert) else retur
   if (radio->ptr_curr == 40) return 0;  // contest_name
   if (radio->ptr_curr == 41) return 1;  // cluster2 name
   if (radio->ptr_curr == 42) return 1;  // cluster2 command
+  if (radio->ptr_curr == 43) return 1;  // hostname / mDNS name
 
   if ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)) return 1;  // CW key msg
   if ((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)) return 1;  // CW key msg
@@ -3124,7 +3198,7 @@ int check_edit_mode()  // CW key input and Remarks  return 1 (insert) else retur
 
 
 int ptr_curr_req_uppercase(struct radio *radio) {
-  if ((radio->ptr_curr != 6) && (radio->ptr_curr != 20) &&(radio->ptr_curr != 21) && (radio->ptr_curr != 22) && (radio->ptr_curr != 23) && (radio->ptr_curr != 25) && (radio->ptr_curr != 26) && (radio->ptr_curr != 27) && (radio->ptr_curr != 28) && (radio->ptr_curr != 29) && (radio->ptr_curr != 40) && (radio->ptr_curr != 41) && (radio->ptr_curr != 42) )   {
+  if ((radio->ptr_curr != 6) && (radio->ptr_curr != 20) &&(radio->ptr_curr != 21) && (radio->ptr_curr != 22) && (radio->ptr_curr != 23) && (radio->ptr_curr != 25) && (radio->ptr_curr != 26) && (radio->ptr_curr != 27) && (radio->ptr_curr != 28) && (radio->ptr_curr != 29) && (radio->ptr_curr != 40) && (radio->ptr_curr != 41) && (radio->ptr_curr != 42) && (radio->ptr_curr != 43) )   {
     return 1;
   } else {
     return 0;
@@ -3273,6 +3347,9 @@ void logw_handler(char key, char c)
       case 42:  // cluster2_cmd
 	pwin = plogw->cluster2_cmd;
 	break;
+      case 43:  // hostname / mDNS name
+        pwin = plogw->hostname;
+        break;
 	
       default:
 	// do nothing and ignore
@@ -3543,6 +3620,9 @@ void switch_logw_entry(int option) {
       radio->ptr_curr = 28;
       break;
     case 28:  // zserver_name
+      radio->ptr_curr = 43;
+      break;
+    case 43:  // hostname
       radio->ptr_curr = 0;
       break;
     }
@@ -3632,6 +3712,9 @@ void switch_logw_entry(int option) {
       break;
     case 28:  // zserver_name
       radio->ptr_curr = 26;
+      break;
+    case 43:  // hostname
+      radio->ptr_curr = 28;
       break;
     }
     break;

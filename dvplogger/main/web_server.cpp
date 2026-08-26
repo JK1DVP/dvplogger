@@ -1108,6 +1108,26 @@ void setupNearestSummit(AsyncWebServer &server) {
 
 enum InputRestrict { Allowall, Callsign, Nospace };
 
+static bool normalize_web_mdns_hostname(char *name)
+{
+  if (!name || !*name) return false;
+  const size_t len = strlen(name);
+  if (len == 0 || len > LEN_HOST_NAME) return false;
+  if (name[0] == '-' || name[len - 1] == '-') return false;
+
+  for (size_t i = 0; i < len; ++i) {
+    unsigned char c = (unsigned char)name[i];
+    if (c >= 'A' && c <= 'Z') {
+      name[i] = (char)(c - 'A' + 'a');
+      c = (unsigned char)name[i];
+    }
+    if (!((c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '-'))
+      return false;
+  }
+  return true;
+}
+
 InputRestrict pwin_type_index(int i) {
   switch (i) {
   case 0:return Callsign; // My Call
@@ -1127,7 +1147,7 @@ InputRestrict pwin_type_index(int i) {
   }
 }  
 
-const int N_EDITWIN=27;
+const int N_EDITWIN=28;
 const char *pwin_name_index(int i) {
   switch (i) {
   case 0:return "My Call";
@@ -1157,6 +1177,7 @@ const char *pwin_name_index(int i) {
   case 24:return "Cluster2 Startup Command 3";
   case 25:return "Cluster2 Startup Command 4";
   case 26:return "Cluster2 Startup Command 5";
+  case 27:return "Hostname (mDNS)";
   default : return "--";
   }
   
@@ -1191,6 +1212,7 @@ char *pwin_index(int i) {
   case 24:return cluster2_startup_cmd[2];
   case 25:return cluster2_startup_cmd[3];
   case 26:return cluster2_startup_cmd[4];
+  case 27:return plogw->hostname;
   default:return NULL;
   }
 }
@@ -2084,40 +2106,155 @@ static void setupContestPageHandler() {
 
 void setupSettingsPageHandler() {
   web_server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String html = settings_page_html;  // テンプレートを複製
-    String inputs;
-
-    // Keep the stored setting indexes unchanged, but present Cluster2
-    // immediately after the primary Cluster settings on the Web page.
-    static const uint8_t display_order[] = {
-      0, 1, 2, 3, 4, 5, 6,
-      7, 8, 20, 21, 22, 23, 24, 25, 26,
-      9, 10, 11, 12,
-      13, 14, 15, 16, 17, 18, 19
-    };
-    for (size_t pos = 0; pos < sizeof(display_order); ++pos) {
-      const int i = display_order[pos];
-      if (i >= N_EDITWIN || pwin_index(i) == NULL) continue;
+    // The old implementation built two large Arduino Strings (the complete
+    // HTML page plus a separately concatenated input-list) before send().
+    // On HWVER=1 this can require several large contiguous INTERNAL-RAM
+    // allocations and causes severe heap fragmentation / latency.  Stream the
+    // same page incrementally instead, as /rigs and /contests already do.
+    struct SettingsPageState {
+      enum Stage : uint8_t {
+        Prefix, Lifetime, Middle, Inputs, Suffix, Done
+      } stage = Prefix;
+      size_t offset = 0;
+      size_t length = 0;
+      size_t display_pos = 0;
       char line[384];
-      const char *attr="";
-      switch (pwin_type_index(i)) {
-      case Allowall:attr="";break;
-      case Callsign:attr=pattern_both;break;
-      case Nospace:attr=pattern_no_space;break;
-      }
-      snprintf(line, sizeof(line), example_input_html,
-               i,
-               pwin_name_index(i),
-               i,
-               i,
-               pwin_index(i)+2,
-               pwin_index(i)[0] - 1, attr, i);
-      inputs += line;
+      char lifetime[16];
+    };
+
+    std::shared_ptr<SettingsPageState> state =
+        std::make_shared<SettingsPageState>();
+    if (!state) {
+      request->send(503, "text/plain", "Not enough memory for Settings page");
+      return;
+    }
+    snprintf(state->lifetime, sizeof(state->lifetime), "%d",
+             bandmap_lifetime_minutes);
+
+    const size_t free_internal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_internal =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (plogw && plogw->ostream) {
+      plogw->ostream->printf(
+          "[WEB] settings streaming begin internal_free=%u largest=%u\n",
+          (unsigned)free_internal, (unsigned)largest_internal);
     }
 
-    html.replace("%SETTINGS_INPUTS%", inputs);
-    html.replace("%BANDMAP_LIFETIME%", String(bandmap_lifetime_minutes));
-    request->send(200, "text/html", html);
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "text/html",
+      [state](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+        (void)index;
+        size_t written = 0;
+
+        static const uint8_t display_order[] = {
+          0, 1, 2, 3, 4, 5, 6, 27,
+          7, 8, 20, 21, 22, 23, 24, 25, 26,
+          9, 10, 11, 12,
+          13, 14, 15, 16, 17, 18, 19
+        };
+        static const char lifetime_marker[] = "%BANDMAP_LIFETIME%";
+        static const char inputs_marker[] = "%SETTINGS_INPUTS%";
+
+        const char *life = strstr(settings_page_html, lifetime_marker);
+        const char *inputs = strstr(settings_page_html, inputs_marker);
+        if (!life || !inputs || life >= inputs) {
+          state->stage = SettingsPageState::Done;
+          return 0;
+        }
+
+        auto copy_range = [&](const char *src, size_t len) -> bool {
+          if (state->offset > len) state->offset = len;
+          const size_t remain = len - state->offset;
+          const size_t room = maxLen - written;
+          const size_t n = remain < room ? remain : room;
+          if (n) {
+            memcpy(buffer + written, src + state->offset, n);
+            written += n;
+            state->offset += n;
+          }
+          if (state->offset == len) {
+            state->offset = 0;
+            return true;
+          }
+          return false;
+        };
+
+        auto copy_cstr = [&](const char *src) -> bool {
+          return copy_range(src, strlen(src));
+        };
+
+        while (written < maxLen && state->stage != SettingsPageState::Done) {
+          switch (state->stage) {
+          case SettingsPageState::Prefix:
+            if (copy_range(settings_page_html,
+                           (size_t)(life - settings_page_html)))
+              state->stage = SettingsPageState::Lifetime;
+            break;
+
+          case SettingsPageState::Lifetime:
+            if (copy_cstr(state->lifetime))
+              state->stage = SettingsPageState::Middle;
+            break;
+
+          case SettingsPageState::Middle: {
+            const char *mid = life + strlen(lifetime_marker);
+            if (copy_range(mid, (size_t)(inputs - mid)))
+              state->stage = SettingsPageState::Inputs;
+            break;
+          }
+
+          case SettingsPageState::Inputs:
+            if (state->length == 0) {
+              while (state->display_pos < sizeof(display_order)) {
+                const int i = display_order[state->display_pos++];
+                if (i >= N_EDITWIN || pwin_index(i) == NULL) continue;
+                const char *attr = "";
+                switch (pwin_type_index(i)) {
+                case Allowall: attr = ""; break;
+                case Callsign: attr = pattern_both; break;
+                case Nospace: attr = pattern_no_space; break;
+                }
+                const int n = snprintf(state->line, sizeof(state->line),
+                                       example_input_html,
+                                       i, pwin_name_index(i), i, i,
+                                       pwin_index(i) + 2,
+                                       pwin_index(i)[0] - 1, attr, i);
+                state->length = n > 0
+                    ? ((size_t)n < sizeof(state->line)
+                       ? (size_t)n : sizeof(state->line) - 1)
+                    : 0;
+                state->offset = 0;
+                if (state->length) break;
+              }
+              if (state->display_pos >= sizeof(display_order) &&
+                  state->length == 0) {
+                state->stage = SettingsPageState::Suffix;
+                break;
+              }
+            }
+            if (state->length && copy_range(state->line, state->length)) {
+              state->length = 0;
+              if (state->display_pos >= sizeof(display_order))
+                state->stage = SettingsPageState::Suffix;
+            }
+            break;
+
+          case SettingsPageState::Suffix: {
+            const char *tail = inputs + strlen(inputs_marker);
+            if (copy_cstr(tail)) state->stage = SettingsPageState::Done;
+            break;
+          }
+
+          case SettingsPageState::Done:
+            break;
+          }
+        }
+        return written;
+      });
+
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
   });
 
 
@@ -2307,12 +2444,31 @@ void setupSettingsPageHandler() {
       int index = request->getParam("index")->value().toInt();
       String value = request->getParam("value")->value();
       if (index >= 0 && index < N_EDITWIN) {
-	if (pwin_index(index)!=NULL) {
-	  strncpy(pwin_index(index)+2, value.c_str(), pwin_index(index)[0] - 1);
-	  (pwin_index(index)+2)[pwin_index(index)[0] - 1] = '\0';
-	}
-	request->send(200, "text/plain", "Updated setting.");
-	return;
+        if (pwin_index(index) != NULL) {
+          if (index == 27) {
+            char hostname[LEN_HOST_NAME + 1];
+            strlcpy(hostname, value.c_str(), sizeof(hostname));
+            if (!normalize_web_mdns_hostname(hostname)) {
+              request->send(400, "text/plain",
+                            "Invalid hostname. Use letters, digits and '-' only; "
+                            "'-' cannot be first or last.");
+              return;
+            }
+            strlcpy(plogw->hostname + 2, hostname, LEN_HOST_NAME + 1);
+            plogw->hostname[1] = strlen(plogw->hostname + 2);
+            request->send(
+                200, "text/plain",
+                String("Hostname updated to ") + plogw->hostname + 2 +
+                ".local in RAM. Press Save, then restart for mDNS.");
+            return;
+          }
+
+          strncpy(pwin_index(index) + 2, value.c_str(),
+                  pwin_index(index)[0] - 1);
+          (pwin_index(index) + 2)[pwin_index(index)[0] - 1] = '\0';
+        }
+        request->send(200, "text/plain", "Updated setting.");
+        return;
       }
     }
     request->send(400, "text/plain", "Invalid parameters.");

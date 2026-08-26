@@ -733,6 +733,9 @@ void upd_cursor() {
         case 42:
           x = upd_cursor_calc(plogw->cluster2_cmd[1], 16);
           break;
+        case 43:  // hostname / mDNS name
+          x = upd_cursor_calc(plogw->hostname[1], 16);
+          break;
         default:
           return;
       }
@@ -929,6 +932,9 @@ static void upd_display_render(bool flush_to_oled) {
           break;
         case 42:
           upd_display_put_lcdbuf(plogw->cluster2_cmd + 2, plogw->cluster2_cmd[1], 16, 0);
+          break;
+        case 43:  // hostname / mDNS name
+          upd_display_put_lcdbuf(plogw->hostname + 2, plogw->hostname[1], 16, 0);
           break;
       }
     }
