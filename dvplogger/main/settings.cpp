@@ -341,6 +341,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
   n_settings_dict++;
 
+  settings_dict[n_settings_dict].name = "hostname";
+  settings_dict[n_settings_dict].value = (void *)&plogw->hostname + 2;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "zserver_name";
   settings_dict[n_settings_dict].value = (void *)&plogw->zserver_name + 2;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_CHARARRAY;

@@ -53,6 +53,33 @@
 
 //#include <ESP_Mail_Client.h>
 
+// Parse one /wifiset.txt line.
+// New format: <SSID><TAB><password>, so spaces are legal in SSID.
+// Legacy "<SSID> <password>" lines remain readable.
+static bool parse_wifiset_line(char *line, char **ssid, char **pass)
+{
+  if (!line || !ssid || !pass) return false;
+  *ssid = NULL;
+  *pass = NULL;
+
+  char *sep = strchr(line, '\t');
+  if (sep) {
+    *sep = '\0';
+    *ssid = line;
+    *pass = sep + 1;
+  } else {
+    // Backward compatibility with the historical first-space separator.
+    sep = strchr(line, ' ');
+    if (!sep) return false;
+    *sep = '\0';
+    *ssid = line;
+    *pass = sep + 1;
+  }
+
+  while (**pass == ' ' || **pass == '\t') ++(*pass);
+  return **ssid != '\0' && **pass != '\0';
+}
+
 // network 関連の管理について
 // setup() で1度、その後loop() で1秒ごとにwifi_enable == True であれば、wifi 接続状態を確認して接続できるようであれば接続する。-> wifi_status = True とする。
 // wifi_count が累積5回程度NGなら、wifi_enable = False として、その後は、チェックしない。WIFIコマンドで接続しなおしをすることができる。
@@ -68,17 +95,12 @@ void init_multiwifi() {
   if (f) {
     // read from wifiset.txt to add all listed ssid
     while (readline(&f, buf, 0x0d0a, 128) != 0) {
-      ssid = strtok(buf," ");
-      if (ssid!= NULL) {
-	pass= strtok(NULL," ");
-	if (pass!= NULL) {
-	  // read ssid and pass
-	  plogw->ostream->print("setting wifi:");	  	  
-	  plogw->ostream->print(ssid);
-	  //	  plogw->ostream->print(" ");
-	  //	  plogw->ostream->println(pass);	  
-	  ESPWMAP.add(ssid,pass);
-	}
+      if (parse_wifiset_line(buf, &ssid, &pass)) {
+        plogw->ostream->print("setting wifi:");
+        plogw->ostream->println(ssid);
+        ESPWMAP.add(ssid, pass);
+      } else {
+        plogw->ostream->println("wifiset: ignored malformed entry");
       }
     }
     f.close();
@@ -106,24 +128,27 @@ void multiwifi_addap(char *ssid,char *passwd)
     if (f1) {
       // read f1 (existing entries) and updat
       while (readline(&f1, buf, 0x0d0a, 128) != 0) {
-	//	plogw->ostream->print("f1 read:");
-	//	plogw->ostream->println(buf);
-	
-	if (strncmp(ssid,buf,strlen(ssid))==0) {
-	  // this entry hits the current add ap entry
-	  plogw->ostream->print(ssid);
-	  plogw->ostream->println(" already exists");
-	  // --> skip
-	} else {
-	  // copy the entry to f
-	  f.println(buf);
-	}
+        char linecopy[128];
+        strlcpy(linecopy, buf, sizeof(linecopy));
+        char *old_ssid = NULL;
+        char *old_pass = NULL;
+
+        if (parse_wifiset_line(linecopy, &old_ssid, &old_pass) &&
+            strcmp(ssid, old_ssid) == 0) {
+          plogw->ostream->print(ssid);
+          plogw->ostream->println(" already exists");
+          // skip old entry; updated one is appended below
+        } else {
+          // Preserve unrelated entries exactly, including legacy format.
+          f.println(buf);
+        }
       }
       f1.close();
     }
     // append current entry
+    // Use TAB as the unambiguous separator; SSID may contain spaces.
     f.print(ssid);
-    f.print(" ");
+    f.print("\t");
     f.println(passwd);
     f.flush();
     f.close();

@@ -3142,8 +3142,9 @@ int ptr_curr_req_nospace(struct radio *radio) {
       && (radio->ptr_curr != 28)
       && (radio->ptr_curr != 29)
       && (radio->ptr_curr != 9)
+      && (radio->ptr_curr != 25)
       ) {
-    // JCC allow space
+    // JCC and Wi-Fi SSID allow space
     return 1;
   } else {
     return 0;

@@ -1121,7 +1121,7 @@ InputRestrict pwin_type_index(int i) {
   case 24:
   case 25:
   case 26:return Allowall; // Cluster2 startup commands
-  case 5:return Nospace; // "Wifi_SSID";
+  case 5:return Allowall; // "Wifi_SSID" may legally contain spaces
   case 6:return Nospace; // "Wifi_Passwd";
   default : return Allowall;
   }
