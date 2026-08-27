@@ -2979,36 +2979,6 @@ void process_enter(int option) {
       //        clear_buf(radio->callsign);
       break;
     }
-    if (strcmp(radio->callsign + 2, "HN") == 0 ||
-        strcmp(radio->callsign + 2, "HOSTNAME") == 0) {
-      report_hostname_setting("hostname");
-      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "Hostname\n%s.local",
-               plogw->hostname + 2);
-      upd_display_info_flash(dp->lcdbuf);
-      clear_buf(radio->callsign);
-      break;
-    }
-    if (strncmp(radio->callsign + 2, "HN", 2) == 0 &&
-        strlen(radio->callsign + 2) > 2) {
-      char tmp[LEN_HOST_NAME + 1];
-      strlcpy(tmp, radio->callsign + 4, sizeof(tmp));
-      if (!normalize_mdns_hostname(tmp)) {
-        plogw->ostream->println("HN: invalid hostname; use a-z, 0-9 and '-' only");
-        upd_display_info_flash("Hostname invalid\nUse a-z 0-9 -");
-      } else {
-        strlcpy(plogw->hostname + 2, tmp, LEN_HOST_NAME + 1);
-        plogw->hostname[1] = strlen(plogw->hostname + 2);
-        save_settings("");
-        report_hostname_setting("hostname saved");
-        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
-                 "Hostname saved\n%s.local\nRestart required",
-                 plogw->hostname + 2);
-        upd_display_info_flash(dp->lcdbuf);
-      }
-      info_disp.timer = 3000;
-      clear_buf(radio->callsign);
-      break;
-    }
     if (strcmp(radio->callsign + 2, "WIFI") == 0) {
       set_wifi_enabled(!wifi_enable);
       sprintf(dp->lcdbuf, "wifi_enable=%d", wifi_enable);

@@ -2793,7 +2793,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <p><a href="/contests?lang=ja">Contest settings (jp)</a> <a href="/contests?lang=en">(en)</a></p>
 <p><a href="/rigs">/rigs</a> View/Edit RIG Settings</p>
 <p><a href="/bandmap">/bandmap</a> Multi-band Bandmap</p>
-<p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_260815.pdf">Manual DVPlogger_manual_260815.pdf</a></p>
+<p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_260827.pdf">Manual DVPlogger_manual_260827.pdf</a></p>
 <p><a href="/op">/op</a> Web Opeartion Window</p>
 <p><a href="/sat">/sat</a> Satellite Operation Helper</p>
 

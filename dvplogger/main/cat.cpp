@@ -322,15 +322,10 @@ static void service_icom_clock_sync_on_rx(struct radio *radio)
   const uint32_t now_ms = millis();
   const uint32_t last_ms = icom_clock_last_rx_ms[idx];
 
-  // First valid reply, or the first reply after a communication gap.
-  if (rig_clock_sync &&
-      (last_ms == 0 || (uint32_t)(now_ms - last_ms) > 5000U)) {
-    icom_clock_sync_pending[idx] = true;
-    if (verbose & VERBOSE_CAT) {
-      plogw->ostream->printf(
-          "CLOCKSYNC armed radio=%d after CI-V connect/reconnect\n", idx);
-    }
-  }
+  // Keep track of valid CI-V receive timing only.  Clock synchronization is
+  // intentionally NOT armed here: it must be requested explicitly with the
+  // CLOCKSYNC command.
+  (void)last_ms;
   icom_clock_last_rx_ms[idx] = now_ms;
 
 }

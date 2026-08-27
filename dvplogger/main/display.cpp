@@ -563,6 +563,9 @@ void upd_display_stat() {
         case 42:
           statstr = "C2Cm";
           break;
+        case 43:
+          statstr = "HN";
+          break;
       }
     }
   }
