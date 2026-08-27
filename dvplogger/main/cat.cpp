@@ -95,6 +95,106 @@ extern SoftwareSerial Serial3;
 // ci-v related variables
 long freq;
 char opmode[8];
+
+// ATS Mini absolute-mode emulation -----------------------------------------
+// Stock ATS Mini Ad hoc protocol exposes only M/m (next/previous mode).
+// The receiver's mode order is FM -> LSB -> USB -> AM.
+static int8_t ats_mini_mode_current[N_RADIO] = {-1, -1, -1};
+static int8_t ats_mini_mode_target[N_RADIO]  = {-1, -1, -1};
+static bool ats_mini_mode_pending[N_RADIO]   = {false, false, false};
+static uint32_t ats_mini_mode_last_cmd_ms[N_RADIO] = {0, 0, 0};
+
+// Virtual CW: DVPlogger keeps logical CW carrier frequency/mode while ATS Mini
+// actually receives USB 600 Hz above the carrier with 0.5 kHz bandwidth.
+static bool ats_mini_virtual_cw[N_RADIO] = {false, false, false};
+static uint32_t ats_mini_bw_last_cmd_ms[N_RADIO] = {0, 0, 0};
+static const long ATS_MINI_CW_PITCH_HZ = 600;
+
+static int ats_mini_mode_index(const char *mode)
+{
+  if (!mode) return -1;
+  if (!strcmp(mode, "FM"))  return 0;
+  if (!strcmp(mode, "LSB")) return 1;
+  if (!strcmp(mode, "USB")) return 2;
+  if (!strcmp(mode, "AM"))  return 3;
+  return -1;
+}
+
+static const char *ats_mini_mode_name(int idx)
+{
+  static const char *const names[] = {"FM", "LSB", "USB", "AM"};
+  return (idx >= 0 && idx < 4) ? names[idx] : "?";
+}
+
+static void ats_mini_service_mode_target(struct radio *radio)
+{
+  if (!radio || !radio->rig_spec ||
+      radio->rig_spec->cat_type != CAT_TYPE_ATS_MINI)
+    return;
+  if (radio->rig_idx < 0 || radio->rig_idx >= N_RADIO) return;
+
+  const int idx = radio->rig_idx;
+  if (!ats_mini_mode_pending[idx]) return;
+
+  const int current = ats_mini_mode_current[idx];
+  const int target = ats_mini_mode_target[idx];
+  if (current < 0 || target < 0) return;
+
+  if (current == target) {
+    ats_mini_mode_pending[idx] = false;
+    if (verbose & VERBOSE_USB)
+      console->printf("ATS-MINI mode reached: %s\n",
+                      ats_mini_mode_name(target));
+    return;
+  }
+
+  const uint32_t now = millis();
+  // One step at a time; wait for the periodic status stream before advancing.
+  if ((uint32_t)(now - ats_mini_mode_last_cmd_ms[idx]) < 300U) return;
+
+  const int forward = (target - current + 4) % 4;
+  const int backward = (current - target + 4) % 4;
+  const char cmd[2] = {(forward <= backward) ? 'M' : 'm', '\0'};
+
+  send_cat_cmd(radio, cmd);
+  ats_mini_mode_last_cmd_ms[idx] = now;
+
+  if (verbose & VERBOSE_USB) {
+    console->printf("ATS-MINI mode step: %s -> target %s cmd=%s\n",
+                    ats_mini_mode_name(current),
+                    ats_mini_mode_name(target), cmd);
+  }
+}
+
+static void ats_mini_service_cw_bandwidth(struct radio *radio,
+                                          const char *bandwidth_desc)
+{
+  if (!radio || !radio->rig_spec ||
+      radio->rig_spec->cat_type != CAT_TYPE_ATS_MINI ||
+      radio->rig_idx < 0 || radio->rig_idx >= N_RADIO)
+    return;
+
+  const int idx = radio->rig_idx;
+  if (!ats_mini_virtual_cw[idx] || ats_mini_mode_current[idx] != 2)
+    return; // virtual CW requires ATS USB
+
+  if (bandwidth_desc && !strcmp(bandwidth_desc, "0.5k"))
+    return;
+
+  const uint32_t now = millis();
+  if ((uint32_t)(now - ats_mini_bw_last_cmd_ms[idx]) < 300U)
+    return;
+
+  // Do not depend on the firmware's bandwidth table ordering. Repeatedly
+  // cycle one step and use the 500-ms status description as confirmation.
+  send_cat_cmd(radio, "w");
+  ats_mini_bw_last_cmd_ms[idx] = now;
+
+  if (verbose & VERBOSE_USB)
+    console->printf("ATS-MINI CW bandwidth step: %s -> 0.5k\\n",
+                    bandwidth_desc ? bandwidth_desc : "?");
+}
+
 // DECIMAL -> BCD
 byte dec2bcd(byte data) {
   return (((data / 10) << 4) + (data % 10));
@@ -143,35 +243,55 @@ static void send_icom_clock_civ(struct radio *radio)
   if (!icom_clock_sync_supported(radio)) return;
 
   const uint16_t year = my_rtc.year();
+  byte sub_hi = 0x01;
+  byte date_sub_lo = 0x65;
+  byte time_sub_lo = 0x66;
+  const char *rig_name = "IC-705";
 
-  // Set date: 1A 05 01 65 YYYY MM DD
+  // The Time Set subcommands are model-specific.  They are BCD-like
+  // four-digit subcommands carried as two bytes after 1A 05.
+  switch (radio->rig_spec->rig_type) {
+  case RIG_TYPE_ICOM_IC7300:
+    sub_hi = 0x00; date_sub_lo = 0x94; time_sub_lo = 0x95; rig_name = "IC-7300";
+    break;
+  case RIG_TYPE_ICOM_IC9700:
+    sub_hi = 0x01; date_sub_lo = 0x79; time_sub_lo = 0x80; rig_name = "IC-9700";
+    break;
+  case RIG_TYPE_ICOM_IC705:
+  default:
+    sub_hi = 0x01; date_sub_lo = 0x65; time_sub_lo = 0x66; rig_name = "IC-705";
+    break;
+  }
+
+  // Set date: 1A 05 <model date subcommand> YYYY MM DD
   send_head_civ(radio);
   add_civ_buf((byte)0x1a);
   add_civ_buf((byte)0x05);
-  add_civ_buf((byte)0x01);
-  add_civ_buf((byte)0x65);
+  add_civ_buf(sub_hi);
+  add_civ_buf(date_sub_lo);
   add_civ_buf(dec2bcd((byte)(year / 100)));
   add_civ_buf(dec2bcd((byte)(year % 100)));
   add_civ_buf(dec2bcd((byte)my_rtc.month()));
   add_civ_buf(dec2bcd((byte)my_rtc.day()));
   send_tail_civ(radio);
 
-  // Set time: 1A 05 01 66 HH MM
+  // Set time: 1A 05 <model time subcommand> HH MM
   send_head_civ(radio);
   add_civ_buf((byte)0x1a);
   add_civ_buf((byte)0x05);
-  add_civ_buf((byte)0x01);
-  add_civ_buf((byte)0x66);
+  add_civ_buf(sub_hi);
+  add_civ_buf(time_sub_lo);
   add_civ_buf(dec2bcd((byte)my_rtc.hour()));
   add_civ_buf(dec2bcd((byte)my_rtc.minute()));
   send_tail_civ(radio);
 
   plogw->ostream->printf(
-      "CLOCKSYNC radio=%d %04u/%02u/%02u %02u:%02u civ=%02X\n",
-      radio->rig_idx, (unsigned)year,
+      "CLOCKSYNC radio=%d rig=%s %04u/%02u/%02u %02u:%02u civ=%02X "
+      "date-sub=%02X%02X time-sub=%02X%02X\n",
+      radio->rig_idx, rig_name, (unsigned)year,
       (unsigned)my_rtc.month(), (unsigned)my_rtc.day(),
       (unsigned)my_rtc.hour(), (unsigned)my_rtc.minute(),
-      radio->rig_spec->civaddr);
+      radio->rig_spec->civaddr, sub_hi, date_sub_lo, sub_hi, time_sub_lo);
 }
 
 void request_icom_clock_sync(struct radio *radio)
@@ -299,7 +419,8 @@ void set_frequency_rig_radio(unsigned int freq, struct radio *radio) {
   }
 
   send_freq_set_civ(radio, freq);  // send to civ port
-  radio->freqchange_timer = 200;   // timeout for resending in the unit of ms
+  radio->freqchange_timer =
+      (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) ? 800 : 200;
   radio->f_freqchange_pending = 1;
   radio->freq_target = freq;
 }
@@ -344,6 +465,12 @@ void send_tail_civ(struct radio *radio) {
 
 // ptt control
 void set_ptt_rig(struct radio *radio, int on) {
+  if (radio && radio->rig_spec &&
+      radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) {
+    radio->ptt_stat = 0;
+    return; // receiver only
+  }
+
   // set hardware PTT1 or 2
   switch (radio->rig_idx) {
   case 0: // MIC1 PTT ON
@@ -613,6 +740,8 @@ static bool cat_cmd_send_raw(struct radio *radio, const char *cmd)
 
     const bool is_qmx =
       radio->rig_spec->cat_type == CAT_TYPE_QMX;
+    const bool is_ats_mini =
+      radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI;
 
     if (is_qmx && !usb_cat_ready_for_rig_type(CAT_TYPE_QMX)) {
       static uint32_t last_qmx_not_ready_log = 0;
@@ -622,6 +751,17 @@ static bool cat_cmd_send_raw(struct radio *radio, const char *cmd)
         if (verbose & VERBOSE_USB) console->printf(
           "QMX CAT TX suppressed: USB QMX not ready len=%u cmd=%s\n",
           (unsigned int)len, cmd);
+      }
+      break;
+    }
+
+    if (is_ats_mini && !usb_cat_ready_for_rig_type(CAT_TYPE_ATS_MINI)) {
+      static uint32_t last_ats_not_ready_log = 0;
+      const uint32_t now = millis();
+      if (now - last_ats_not_ready_log >= 1000) {
+        last_ats_not_ready_log = now;
+        if (verbose & VERBOSE_USB)
+          console->println("ATS-MINI TX suppressed: USB CDC ACM not ready");
       }
       break;
     }
@@ -1201,6 +1341,16 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) {
       sprintf(buf, "FA%011lld;", ((long long)freq*FREQ_UNIT));
       send_cat_cmd(radio, buf);
       return;
+  case CAT_TYPE_ATS_MINI: {
+      unsigned long long ats_hz = (unsigned long long)freq * FREQ_UNIT;
+      if (radio->rig_idx >= 0 && radio->rig_idx < N_RADIO &&
+          ats_mini_virtual_cw[radio->rig_idx]) {
+        ats_hz += 600ULL;
+      }
+      snprintf(buf, sizeof(buf), "F%llu\r", ats_hz);
+      send_cat_cmd(radio, buf);
+      return;
+  }
   case CAT_TYPE_ELECRAFT_KX:
       // Elecraft KX-line FA command also uses an 11-digit frequency in Hz.
       sprintf(buf, "FA%011lld;", ((long long)freq*FREQ_UNIT));
@@ -1254,8 +1404,6 @@ void send_freq_set_civ(struct radio *radio, unsigned int freq) {
 }
 
 
-
-
 void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio) {
   if (!radio || !radio->enabled || !radio->rig_spec) return;
 
@@ -1270,6 +1418,56 @@ void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio)
   }
 
   switch (radio->rig_spec->cat_type) {
+  case CAT_TYPE_ATS_MINI: {
+    if (radio->rig_idx < 0 || radio->rig_idx >= N_RADIO) return;
+    const int idx = radio->rig_idx;
+
+    if (!strcmp(opmode, "CW")) {
+      ats_mini_virtual_cw[idx] = true;
+      ats_mini_mode_target[idx] = ats_mini_mode_index("USB");
+      ats_mini_mode_pending[idx] = true;
+      ats_mini_bw_last_cmd_ms[idx] = 0;
+
+      // Logical/DVPlogger mode remains CW; physical ATS Mini mode is USB.
+      set_mode_nonfil("CW", radio);
+
+      if (verbose & VERBOSE_USB)
+        console->println(
+            "ATS-MINI virtual CW request: USB +600Hz BW=0.5k");
+
+      ats_mini_service_mode_target(radio);
+
+      // Re-send current logical carrier frequency; send_freq_set_civ()
+      // applies the +600 Hz physical offset while virtual CW is active.
+      if (radio->freq > 0)
+        send_freq_set_civ(radio, radio->freq);
+      return;
+    }
+
+    // Explicit non-CW mode exits virtual-CW translation.
+    ats_mini_virtual_cw[idx] = false;
+
+    const int ats_target = ats_mini_mode_index(opmode);
+    if (ats_target < 0) {
+      if (!plogw->f_console_emu) {
+        plogw->ostream->printf(
+            "ATS-MINI mode unsupported: %s "
+            "(supported: CW LSB USB AM FM)\n",
+            opmode);
+      }
+      return;
+    }
+
+    ats_mini_mode_target[idx] = ats_target;
+    ats_mini_mode_pending[idx] = true;
+
+    if (verbose & VERBOSE_USB)
+      console->printf("ATS-MINI mode request: %s\n",
+                      ats_mini_mode_name(ats_target));
+
+    ats_mini_service_mode_target(radio);
+    return;
+  }
   case CAT_TYPE_YAESU_NEW: // FTDX3000  etc
   case CAT_TYPE_YAESU_OLD:    
       // cat
@@ -1387,6 +1585,7 @@ void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio)
   }
 }
 
+
 void send_mode_set_civ(const char *opmode, int filnr) {
   send_mode_set_civ_radio(opmode, filnr, so2r.radio_selected());
 }
@@ -1397,6 +1596,8 @@ void send_freq_query_civ(struct radio *radio) {
   int type;
   type = radio->rig_spec->cat_type;
   switch (type) {
+  case CAT_TYPE_ATS_MINI:
+    return; // periodic ATS monitor stream supplies frequency/mode
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:      
   case CAT_TYPE_KENWOOD:
@@ -1771,7 +1972,9 @@ void set_frequency(int freq, struct radio *radio) {
     if (freq != radio->freq) {
       // A program-originated CAT set may be followed by delayed/stale frequency
       // reports.  Do not interpret those as a human dial movement.
-      if (!is_manual_rig(radio) && radio->freqchange_program_guard > 0) {
+      if (!is_manual_rig(radio) &&
+          radio->rig_spec->cat_type != CAT_TYPE_ATS_MINI &&
+          radio->freqchange_program_guard > 0) {
         radio->freq_change_count = 0;
         radio->freq_change_candidate = 0;
         if (verbose & 16) {
@@ -1784,7 +1987,8 @@ void set_frequency(int freq, struct radio *radio) {
       // Confirm a manual dial movement only when the *same* new frequency is
       // received twice.  The old code merely counted any two different
       // values, so two CAT glitches could force CQ -> S&P.
-      if (!is_manual_rig(radio)) {
+      if (!is_manual_rig(radio) &&
+          radio->rig_spec->cat_type != CAT_TYPE_ATS_MINI) {
         if (radio->freq_change_count == 0 ||
             radio->freq_change_candidate != (unsigned int)freq) {
           radio->freq_change_candidate = freq;
@@ -1798,7 +2002,10 @@ void set_frequency(int freq, struct radio *radio) {
       }
 
       if (verbose & 16) {
-        console->print("set_frequency():confirm change freq=");
+        if (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI)
+          console->print("set_frequency():ATS immediate freq=");
+        else
+          console->print("set_frequency():confirm change freq=");
         console->println(freq);
       }
       radio->freq_change_count = 0;
@@ -2477,6 +2684,20 @@ void get_cat(struct radio *radio) {
 
 
 void conv_smeter(struct radio *radio) {
+  // ATS Mini status RSSI is reported by the SI4732/5 in dBuV.
+  // For a 50-ohm system, dBm ~= dBuV - 107.
+  // show_smeter==2 is kept as a diagnostic/raw mode and displays the ATS
+  // RSSI count itself instead of applying the dBm conversion.
+  if (radio->rig_spec->rig_type == RIG_TYPE_ATS_MINI) {
+    if (plogw->show_smeter == 2) {
+      radio->smeter *= SMETER_UNIT_DBM;
+    } else {
+      radio->smeter =
+          (radio->smeter - 107) * SMETER_UNIT_DBM;
+    }
+    return;
+  }
+
   // QMX SM responses are already in S-meter units (for example SM007; = 7).
   // Store them in the common internal 0.1-unit representation used by the
   // display, including zero so that SM000; actively clears the old reading.
@@ -2646,9 +2867,11 @@ void conv_smeter(struct radio *radio) {
 
 void smeter_postprocess(struct radio *radio)
 {
-  const bool qmx_zero_is_valid =
-      radio->rig_spec->rig_type == RIG_TYPE_QMX && radio->smeter == 0;
-  if ((radio->smeter != 0 || qmx_zero_is_valid) &&
+  const bool zero_is_valid =
+      (radio->rig_spec->rig_type == RIG_TYPE_QMX ||
+       radio->rig_spec->rig_type == RIG_TYPE_ATS_MINI) &&
+      radio->smeter == 0;
+  if ((radio->smeter != 0 || zero_is_valid) &&
       radio->smeter != SMETER_MINIMUM_DBM) {
     // if smeter value is valid
     if (verbose & VERBOSE_CAT) {
@@ -4178,8 +4401,19 @@ void select_rig(struct radio *radio) {
    * newly selected QMX session.  This also gives the diagnostics a known
    * empty-queue starting point.
    */
+  if (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI &&
+      radio->rig_idx >= 0 && radio->rig_idx < N_RADIO) {
+    ats_mini_mode_current[radio->rig_idx] = -1;
+    ats_mini_mode_target[radio->rig_idx] = -1;
+    ats_mini_mode_pending[radio->rig_idx] = false;
+    ats_mini_mode_last_cmd_ms[radio->rig_idx] = 0;
+    ats_mini_virtual_cw[radio->rig_idx] = false;
+    ats_mini_bw_last_cmd_ms[radio->rig_idx] = 0;
+  }
+
   if (radio->rig_spec->civport_num == -1 &&
-      radio->rig_spec->cat_type == CAT_TYPE_QMX &&
+      (radio->rig_spec->cat_type == CAT_TYPE_QMX ||
+       radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) &&
       xQueueCATUSBTx != NULL) {
     struct catmsg_t stale = {};
     unsigned int cleared = 0;
@@ -4529,7 +4763,19 @@ void init_rigspec() {
   rig_spec[19].pttmethod = 2;
   rig_spec[19].transverter_freq[0][0] = 0;
   rig_spec[19].band_mask = ~(0b001111111|BAND_MASK_WARC); // HF-6m+WARC
-  
+
+  strcpy(rig_spec[20].name , "ATS-MINI");
+  rig_spec[20].cat_type = CAT_TYPE_ATS_MINI;
+  rig_spec[20].civaddr = 0;
+  rig_spec[20].civport_num = -1; // USB CDC ACM
+  rig_spec[20].civport_reversed = 0;
+  rig_spec[20].civport_baud = 115200;
+  rig_spec[20].cwport = 0;
+  rig_spec[20].rig_type = RIG_TYPE_ATS_MINI;
+  rig_spec[20].pttmethod = 0;
+  rig_spec[20].transverter_freq[0][0] = 0;
+  rig_spec[20].band_mask = ~(BAND_MASK_HF | BAND_MASK_WARC);
+
 }
 
 
@@ -5081,6 +5327,124 @@ static int receive_civ_frame(struct radio *radio, char c);
 static int receive_cat_frame(struct radio *radio, char c);
 static int receive_protocol_frame(struct radio *radio);
 
+void get_cat_ats_mini(struct radio *radio)
+{
+  if (!radio || !radio->rig_spec) return;
+
+  char line[sizeof(radio->cmdbuf)];
+  strlcpy(line, radio->cmdbuf, sizeof(line));
+
+  char *field[15] = {};
+  char *save = NULL;
+  int n = 0;
+  for (char *tok = strtok_r(line, ",", &save);
+       tok && n < 15;
+       tok = strtok_r(NULL, ",", &save))
+    field[n++] = tok;
+
+  if (n != 15) {
+    if ((verbose & VERBOSE_USB) && radio->cmdbuf[0])
+      console->printf("ATS-MINI RX ignored: %s\n", radio->cmdbuf);
+    return;
+  }
+
+  char *endp = NULL;
+  const long base = strtol(field[1], &endp, 10);
+  if (!endp || *endp != '\0' || base <= 0) return;
+
+  endp = NULL;
+  const long bfo = strtol(field[2], &endp, 10);
+  if (!endp || *endp != '\0') return;
+
+  const char *mode = field[5];
+  const long long physical_hz = !strcmp(mode, "FM")
+      ? (long long)base * 10000LL
+      : (long long)base * 1000LL + (long long)bfo;
+  if (physical_hz <= 0) return;
+
+  const int ridx = radio->rig_idx;
+  const int reported_ats_mode = ats_mini_mode_index(mode);
+
+  // Once virtual CW has reached USB, a later physical-mode change made on
+  // ATS itself means the user wants to leave CW; resume normal mode following.
+  if (ridx >= 0 && ridx < N_RADIO &&
+      ats_mini_virtual_cw[ridx] &&
+      !ats_mini_mode_pending[ridx] &&
+      reported_ats_mode >= 0 && reported_ats_mode != ats_mini_mode_index("USB")) {
+    ats_mini_virtual_cw[ridx] = false;
+    if (verbose & VERBOSE_USB)
+      console->printf("ATS-MINI virtual CW exited by receiver mode=%s\n", mode);
+  }
+
+  long long logical_hz = physical_hz;
+  if (ridx >= 0 && ridx < N_RADIO && ats_mini_virtual_cw[ridx]) {
+    logical_hz -= ATS_MINI_CW_PITCH_HZ;
+    if (logical_hz <= 0) return;
+  }
+
+  const unsigned int freq = (unsigned int)(logical_hz / FREQ_UNIT);
+  if (freq2bandid(freq) == 0) {
+    if (verbose & VERBOSE_USB)
+      console->printf(
+          "ATS-MINI status outside DVP bands: physical=%lld logical=%lld Hz %s\n",
+          physical_hz, logical_hz, mode);
+    return;
+  }
+
+  const unsigned int old_freq = radio->freq;
+  const int old_mode = radio->modetype;
+  const int old_smeter = radio->smeter;
+
+  set_frequency((int)freq, radio);
+
+  // field[10] is ATS Mini RSSI (0..127 dBuV). Feed it into the same common
+  // S-meter path used by the other rigs, including peak/QSO/antenna handling.
+  char *rssi_endp = NULL;
+  const long ats_rssi = strtol(field[10], &rssi_endp, 10);
+  if (rssi_endp && *rssi_endp == '\0' &&
+      ats_rssi >= 0 && ats_rssi <= 127) {
+    radio->smeter = (int)ats_rssi;
+    conv_smeter(radio);
+    smeter_postprocess(radio);
+  }
+
+  const int ats_mode = reported_ats_mode;
+  if (ats_mode >= 0) {
+    if (ridx >= 0 && ridx < N_RADIO)
+      ats_mini_mode_current[ridx] = ats_mode;
+
+    if (ridx >= 0 && ridx < N_RADIO && ats_mini_virtual_cw[ridx]) {
+      // During virtual CW, ATS reports USB but DVPlogger remains CW.
+      set_mode_nonfil("CW", radio);
+    } else {
+      // Normal physical mode changes on ATS follow into DVPlogger.
+      set_mode_nonfil(mode, radio);
+    }
+
+    ats_mini_service_mode_target(radio);
+
+    // field[7] is the current bandwidth description (e.g. "0.5k").
+    ats_mini_service_cw_bandwidth(radio, field[7]);
+  }
+
+  // ATS Mini pushes status every 500 ms. Refresh the main LCD only when the
+  // displayed radio state really changed, not on every periodic status frame.
+  if (radio->freq != old_freq || radio->modetype != old_mode ||
+      (plogw->show_smeter && radio->smeter != old_smeter)) {
+    request_display_update_on_demand();
+    upd_display_stat();
+  }
+
+  if (verbose & VERBOSE_USB) {
+    console->printf(
+      "ATS-MINI status ver=%s band=%s physical=%lld logical=%lld "
+      "mode=%s bw=%s rssi=%s snr=%s smeter=%d seq=%s\n",
+      field[0], field[4], physical_hz, logical_hz,
+      mode, field[7], field[10], field[11],
+      radio->smeter / SMETER_UNIT_DBM, field[14]);
+  }
+}
+
 static void process_cat_frame(struct radio *radio)
 {
   switch (radio->rig_spec->cat_type) {
@@ -5089,6 +5453,10 @@ static void process_cat_frame(struct radio *radio)
     yaesu_query_response_received(radio);
     get_cat(radio);
     print_cat(radio);
+    break;
+
+  case CAT_TYPE_ATS_MINI:
+    get_cat_ats_mini(radio);
     break;
 
   case CAT_TYPE_KENWOOD:
@@ -5128,7 +5496,8 @@ static void process_protocol_frame(struct radio *radio)
     case CAT_TYPE_YAESU_NEW:
     case CAT_TYPE_YAESU_OLD:
     case CAT_TYPE_KENWOOD:
-  case CAT_TYPE_QMX:
+    case CAT_TYPE_QMX:
+    case CAT_TYPE_ATS_MINI:
     case CAT_TYPE_ELECRAFT_KX:
         process_cat_frame(radio);
         break;
@@ -5302,6 +5671,16 @@ static int receive_cat_frame(struct radio *radio, char c) {
     }
     if (c == ';') {
       radio->cmdbuf[radio->cmd_ptr] = '\0';
+      return 1;
+    }
+    return 0;
+
+  case CAT_TYPE_ATS_MINI:
+    if (c == '\n') {
+      if (radio->cmd_ptr >= 2 && radio->cmdbuf[radio->cmd_ptr - 2] == '\r')
+        radio->cmdbuf[radio->cmd_ptr - 2] = '\0';
+      else
+        radio->cmdbuf[radio->cmd_ptr - 1] = '\0';
       return 1;
     }
     return 0;

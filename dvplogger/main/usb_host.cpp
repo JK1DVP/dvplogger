@@ -474,6 +474,7 @@ static constexpr uint16_t QMX_USB_PID = 0xA34C;
 uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
   uint8_t rcode;
   const bool is_qmx = pacm->IsDevice(QMX_USB_VID, QMX_USB_PID);
+  const bool is_ats_mini = pacm->IsDevice(0x303A, 0x1001);
   const usb_cat_profile_t &profile = usb_cat_profile(
     is_qmx ? USB_CAT_BACKEND_ACM_QMX : USB_CAT_BACKEND_ACM_GENERIC);
 
@@ -493,6 +494,20 @@ uint8_t ACMAsyncOper::OnInit(ACM *pacm) {
         "USB ACM detail: VID=%04X PID=%04X CDC control skipped queue cleared=%u\n",
         pacm->GetVid(), pacm->GetPid(), (unsigned int)cleared);
     }
+    return 0;
+  }
+
+  if (is_ats_mini) {
+    // ATS Mini Ad hoc uses TinyUSB CDC data endpoints directly.  Avoid
+    // SET_CONTROL_LINE_STATE / SET_LINE_CODING: they are unnecessary for the
+    // protocol and can disturb/restart some ESP32-S3 TinyUSB builds.
+    const UBaseType_t cleared = usb_cat_reset_tx_queue();
+    usb_cat_set_backend(USB_CAT_BACKEND_ACM_GENERIC);
+    console->printf("USB ACM connected: ATS-MINI VID=%04X PID=%04X\n",
+                    pacm->GetVid(), pacm->GetPid());
+    if (verbose & VERBOSE_USB)
+      console->printf("ATS-MINI CDC control skipped queue cleared=%u\n",
+                      (unsigned int)cleared);
     return 0;
   }
 
@@ -534,6 +549,10 @@ bool usb_cat_ready_for_rig_type(uint8_t cat_type) {
   switch (cat_type) {
   case CAT_TYPE_QMX:
     return Acm.isReady() && Acm.IsDevice(QMX_USB_VID, QMX_USB_PID);
+  case CAT_TYPE_ATS_MINI:
+    // ATS Mini is standard ESP32-S3 CDC ACM. The selected rig profile
+    // identifies the protocol, so do not depend on a fixed VID/PID.
+    return Acm.isReady() && !Acm.IsDevice(QMX_USB_VID, QMX_USB_PID);
   case CAT_TYPE_YAESU_NEW:
   case CAT_TYPE_YAESU_OLD:
   case CAT_TYPE_YAESU_FT817:
@@ -714,6 +733,50 @@ bool CP2105sendRaw(uint8_t port, const char *text)
     return rcode == 0;
 }
 
+static bool ats_mini_monitor_started = false;
+static uint32_t ats_mini_monitor_retry_ms = 0;
+
+static bool ats_mini_usb_rig_active()
+{
+  for (int i = 0; i < N_RADIO; ++i) {
+    if (!radio_list[i].enabled || radio_list[i].rig_spec == NULL) continue;
+    if (radio_list[i].rig_spec->civport_num == -1 &&
+        radio_list[i].rig_spec->cat_type == CAT_TYPE_ATS_MINI)
+      return true;
+  }
+  return false;
+}
+
+static void ats_mini_start_monitor_if_needed()
+{
+  if (!Acm.isReady() || !Acm.IsDevice(0x303A, 0x1001) ||
+      !ats_mini_usb_rig_active() || ats_mini_monitor_started)
+    return;
+
+  const uint32_t now = millis();
+  if ((int32_t)(now - ats_mini_monitor_retry_ms) < 0) return;
+
+  // Send 't' directly and consider the monitor started ONLY after the USB OUT
+  // transfer succeeds. hrNAK means "try again later", not failure.
+  uint8_t cmd = 't';
+  const uint8_t rcode = Acm.SndData(1, &cmd);
+  if (rcode == 0) {
+    ats_mini_monitor_started = true;
+    usb_cat_set_backend(USB_CAT_BACKEND_ACM_GENERIC);
+    console->println("ATS-MINI USB: status monitor enabled");
+    return;
+  }
+
+  if (rcode == hrNAK) {
+    ats_mini_monitor_retry_ms = now + 100;
+    return;
+  }
+
+  ats_mini_monitor_retry_ms = now + 500;
+  if (verbose & VERBOSE_USB)
+    console->printf("ATS-MINI monitor start rcode=0x%02X; retrying\\n", rcode);
+}
+
 void ACMprocess() {
   /*
    * One-second heartbeat for the USB CAT path.  Print while QMX is attached
@@ -726,6 +789,8 @@ void ACMprocess() {
   const uint32_t now = millis();
   if (!Acm.isReady() && !Cp2105.isReady()) {
     usb_cat_set_backend(USB_CAT_BACKEND_NONE);
+    ats_mini_monitor_started = false;
+    ats_mini_monitor_retry_ms = 0;
   }
   if ((verbose & VERBOSE_USB) &&
       (qmx_attached || tx_waiting != 0) &&
@@ -796,6 +861,8 @@ void ACMprocess() {
   qmx_ready_prev = qmx_ready_now;
 
   if (Acm.isReady()) {
+    ats_mini_start_monitor_if_needed();
+
     // check queue and forward to USB
     while (usb_cat_dequeue(&catmsg)) {
       ret = pdTRUE;
@@ -804,10 +871,20 @@ void ACMprocess() {
                                    : USB_CAT_BACKEND_ACM_GENERIC);
         usb_cat_dump("TX", catmsg.buf, catmsg.size);
 	rcode = Acm.SndData(catmsg.size, (uint8_t *)catmsg.buf);
+        const bool is_ats_mini = Acm.IsDevice(0x303A, 0x1001);
 	if (verbose & VERBOSE_USB) {
 	  console->printf("%sUSB CAT TX complete rcode=0x%02X len=%d\n",
-	                  is_qmx ? "QMX " : "", rcode, catmsg.size);
+	                  is_qmx ? "QMX " : (is_ats_mini ? "ATS-MINI " : ""),
+                          rcode, catmsg.size);
 	}
+        if (is_ats_mini && rcode == hrNAK) {
+          // TinyUSB may NAK briefly after enumeration or while its CDC task is
+          // busy. Preserve command order and retry instead of silently losing
+          // F<Hz> or other ATS commands.
+          if (!usb_cat_requeue_front(&catmsg) && (verbose & VERBOSE_USB))
+            console->println("ATS-MINI TX NAK: failed to requeue command");
+          break;
+        }
 	if (rcode) {
 	  ErrorMessage<uint8_t>(PSTR("SndData CATUSBTx"), rcode);
 	  plogw->ostream->println("SndData CATUSBTx error");

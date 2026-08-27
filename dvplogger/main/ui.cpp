@@ -2914,11 +2914,17 @@ void process_enter(int option) {
     if (strcmp(radio->callsign + 2, "CALLHISTSUB") == 0) {
       callhist_at = 1;
       plogw->enable_callhist = 1;
-      int n = load_callhist_subcpu(callhistfn) ? get_callhist_subcpu_count() : 0;
-      plogw->ostream->printf("Call History location: SUB CPU, entries=%d\n", n);
+      bool fallback = false;
+      int n = load_callhist_subcpu_or_main(callhistfn, &fallback);
+      plogw->ostream->printf("Call History location: %s, entries=%d%s\n",
+                             callhist_at ? "SUB CPU" : "MAIN-PSRAM", n,
+                             fallback ? " (fallback)" : "");
       snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
-               "Call History\n%s\n%d entries\nAt SUBCPU\n%s",
-               callhistfn, n, n > 0 ? "Enabled" : "Load failed");
+               "Call History\n%s\n%d entries\n%s\n%s",
+               callhistfn, n,
+               n > 0 ? (fallback ? "MAIN-PSRAM fallback" : "At SUBCPU")
+                     : "SUB load failed",
+               n > 0 ? "Enabled" : "No PSRAM / Disabled");
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
@@ -2930,8 +2936,9 @@ void process_enter(int option) {
       const char *arg = radio->callsign + 10; // CALLHIST + filename, no space
       if (*arg != '\0') set_callhistfn((char *)arg);
       plogw->enable_callhist = 1;
-      int n = (callhist_at == 1) ? (load_callhist_subcpu(callhistfn) ? get_callhist_subcpu_count() : 0)
-	: read_callhist_list(callhistfn);
+      bool fallback = false;
+      int n = (callhist_at == 1) ? load_callhist_subcpu_or_main(callhistfn, &fallback)
+                                 : read_callhist_list(callhistfn);
       snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
                "Call History\n%s\n%d entries\nAt %s\n%s",
                callhistfn, n, callhist_at ? "SUBCPU" : (f_spiram ? "MAIN-PSRAM" : "MAIN-RAM"),

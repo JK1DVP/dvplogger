@@ -27,6 +27,7 @@
 #include "decl.h"
 #include "variables.h"
 #include "callhist.h"
+#include "callhist_mem.h"
 #include "callhist_remote.h"
 #include "dupechk.h"
 #include "mux_transport.h"
@@ -655,6 +656,42 @@ bool request_sp_send_after_dupe(struct radio *radio) {
   return false;
 }
 
+
+static void append_main_callhist_partial(const char *call,
+                                         struct check_entry_list *entry_list) {
+  if (!call || !*call || !entry_list || !plogw->enable_callhist ||
+      callhist_at != 0 || callhist_list == NULL) return;
+
+  const size_t call_len = strlen(call);
+  for (int i = 0; i < n_callhist_list &&
+                  entry_list->nentry < entry_list->nmax_entry &&
+                  entry_list->nentry < 10; ++i) {
+    if (callhist_list[i] == NULL || callhist_list[i][0] == '\0') continue;
+    char item[LEN_CALLSIGN + LEN_EXCH + 4];
+    strlcpy(item, callhist_list[i], sizeof(item));
+    char *sp = strchr(item, ' ');
+    if (!sp) continue;
+    *sp++ = '\0';
+    while (*sp == ' ') ++sp;
+    if (strstr(item, call) == NULL) continue;
+
+    bool duplicate = false;
+    for (int j = 0; j < entry_list->nentry; ++j) {
+      if (strcmp(entry_list->entryl[j].callsign, item) == 0) {
+        duplicate = true; break;
+      }
+    }
+    if (duplicate) continue;
+
+    struct check_entry *e = &entry_list->entryl[entry_list->nentry++];
+    memset(e, 0, sizeof(*e));
+    strlcpy(e->callsign, item, sizeof(e->callsign));
+    strlcpy(e->exch, sp, sizeof(e->exch));
+    e->flag = CHECK_ENTRY_FLAG_CALLHIST_LIST;
+    if (call_len == strlen(e->callsign)) e->flag |= CHECK_ENTRY_FLAG_EXACT_MATCH;
+  }
+}
+
 // Decode a partial-match response on the main CPU.
 void process_dupechk_partial_response_maincpu(char *s) {
   char *saveptr = NULL;
@@ -718,6 +755,11 @@ void process_dupechk_partial_response_maincpu(char *s) {
     entry->flag = atoi(flags);
     entry_list->nentry++;
   }
+
+  // When CALLHISTSUB could not fit and fell back to MAIN-PSRAM, the SUBCPU
+  // response contains QSO-history matches only.  Merge MAIN Call History here
+  // so normal 3-character partial lookup behaves the same in either placement.
+  append_main_callhist_partial(dupechk_async_call, entry_list);
 
   dupechk_log_timing("partial", query_id, sub_search_us, qso_scanned,
                      hist_scanned, false);

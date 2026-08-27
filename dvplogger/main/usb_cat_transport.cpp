@@ -66,6 +66,12 @@ bool usb_cat_dequeue(catmsg_t *msg)
          xQueueReceive(xQueueCATUSBTx, msg, 0) == pdTRUE;
 }
 
+bool usb_cat_requeue_front(const catmsg_t *msg)
+{
+  return msg != nullptr && xQueueCATUSBTx != nullptr &&
+         xQueueSendToFront(xQueueCATUSBTx, msg, 0) == pdTRUE;
+}
+
 bool usb_cat_deliver_rx(const uint8_t *data, size_t len)
 {
   if (xQueueCATUSBRx == nullptr || data == nullptr || len == 0) return false;

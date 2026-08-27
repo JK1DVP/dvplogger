@@ -761,9 +761,18 @@ void setup()
     if (callhist_at == 1) {
       delay(100);  // allow the SUB CPU MUX command handler to become ready
       if (!callhist_subcpu_alive(350)) {
-        console->println("startup callhist: SUBCPU unavailable; transfer skipped");
-      } else if (load_callhist_subcpu(callhistfn)) {
-        n = get_callhist_subcpu_count();
+        console->println("startup callhist: SUBCPU unavailable; trying fallback");
+        if (f_spiram) {
+          callhist_at = 0;
+          n = read_callhist_list(callhistfn);
+          if (n <= 0) plogw->enable_callhist = 0;
+        } else {
+          plogw->enable_callhist = 0;
+          console->println("startup callhist: no MAIN PSRAM; CALLHIST disabled");
+        }
+      } else {
+        bool fallback = false;
+        n = load_callhist_subcpu_or_main(callhistfn, &fallback);
       }
     } else {
       n = read_callhist_list(callhistfn);

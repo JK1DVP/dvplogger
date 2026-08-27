@@ -24,6 +24,9 @@
 #include "decl.h"
 extern int callhist_at; // 0: main CPU, 1: sub CPU
 bool load_callhist_subcpu(const char *fn);
+// Prefer SUBCPU.  If the SUBCPU cannot hold the database, fall back to
+// MAIN only when PSRAM is available.  Otherwise disable Call History.
+int load_callhist_subcpu_or_main(const char *fn, bool *fell_back = nullptr);
 bool callhist_subcpu_alive(uint32_t timeout_ms = 350);
 void clear_callhist_subcpu_main();
 void process_callhist_control_response_main(const char *buf);

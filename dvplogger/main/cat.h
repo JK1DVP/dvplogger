@@ -35,6 +35,7 @@
 #define RIG_TYPE_ELECRAFT_KX 6
 #define RIG_TYPE_XIEGU_X6100 7 // Xiegu X6100 (ICOM CI-V derivative)
 #define RIG_TYPE_QMX 8 // QRP Labs QMX
+#define RIG_TYPE_ATS_MINI 9 // ATS Mini SI4732 receiver
 
 #define CAT_TYPE_CIV 0
 #define CAT_TYPE_YAESU_NEW 1
@@ -44,6 +45,7 @@
 #define CAT_TYPE_ELECRAFT_KX 5  // elecraft
 #define CAT_TYPE_YAESU_FT817 6  // FT817
 #define CAT_TYPE_QMX 7  // QRP Labs QMX (Kenwood-derived CAT)
+#define CAT_TYPE_ATS_MINI 8 // ATS Mini USB Ad hoc remote protocol
 
 
 
@@ -114,6 +116,7 @@ void set_mode(const char *opmode, byte filt, struct radio *radio) ;
 void get_cat_kenwood(struct radio *radio) ;
 void get_cat_elecraft(struct radio *radio) ;
 void get_cat_ft817(struct radio *radio) ;
+void get_cat_ats_mini(struct radio *radio) ;
 void get_cat(struct radio *radio) ;
 void conv_smeter(struct radio *radio) ;
 void smeter_postprocess(struct radio *radio);

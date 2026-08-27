@@ -36,6 +36,7 @@ UBaseType_t usb_cat_reset_tx_queue();
 bool usb_cat_enqueue(const uint8_t *data, size_t len,
                      bool drop_oldest, bool *dropped_oldest = nullptr);
 bool usb_cat_dequeue(struct catmsg_t *msg);
+bool usb_cat_requeue_front(const struct catmsg_t *msg);
 bool usb_cat_deliver_rx(const uint8_t *data, size_t len);
 UBaseType_t usb_cat_tx_waiting();
 UBaseType_t usb_cat_tx_free();

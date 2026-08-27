@@ -124,7 +124,7 @@
 #define LOG_SandP 0
 
 //#define N_RIG 9
-#define N_RIG 20
+#define N_RIG 21
 //#define N_RIG 5
 // number of radios in operation so3r = 3 
 #define N_RADIO 3

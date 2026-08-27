@@ -23,6 +23,7 @@
 #include "variables.h"
 #include "settings.h"
 #include "callhist_remote.h"
+#include "callhist.h"
 #include "mux_transport.h"
 #ifdef DVPLOGGER_EXT
 struct remote_callhist_entry { char call[LEN_CALLSIGN+1]; char exch[LEN_EXCH+1]; };
@@ -265,6 +266,37 @@ bool load_callhist_subcpu(const char *fn) {
       ch_count, sent, (unsigned)ch_bytes, ch_done ? 1 : 0);
 
   return ch_done && ch_count == sent;
+}
+
+int load_callhist_subcpu_or_main(const char *fn, bool *fell_back) {
+  if (fell_back) *fell_back = false;
+
+  if (load_callhist_subcpu(fn)) {
+    callhist_at = 1;
+    plogw->enable_callhist = 1;
+    return get_callhist_subcpu_count();
+  }
+
+  console->println("CALLHIST: SUBCPU load failed; considering MAIN fallback");
+  if (f_spiram) {
+    callhist_at = 0;
+    int n = read_callhist_list((char *)fn);
+    if (n > 0) {
+      plogw->enable_callhist = 1;
+      if (fell_back) *fell_back = true;
+      console->printf("CALLHIST: fallback to MAIN-PSRAM entries=%d\n", n);
+      return n;
+    }
+    console->println("CALLHIST: MAIN-PSRAM load also failed");
+  } else {
+    console->println("CALLHIST: MAIN has no PSRAM; fallback not attempted");
+  }
+
+  close_callhist();
+  callhist_at = 1;             // preserve SUBCPU as the preferred placement
+  plogw->enable_callhist = 0;
+  console->println("CALLHIST: disabled after SUBCPU/fallback failure");
+  return 0;
 }
 
 void clear_callhist_subcpu_main(){const char*b="chreset0";mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL,MUX_PORT_EXT_BRD_CTRL,(unsigned char*)b,strlen(b));}

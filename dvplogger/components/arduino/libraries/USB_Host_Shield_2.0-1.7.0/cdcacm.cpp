@@ -64,6 +64,7 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
         UsbDevice *p = NULL;
         EpInfo *oldep_ptr = NULL;
         uint8_t num_of_conf; // number of configurations
+        bool ats_mini_bulk_only = false;
 
         AddressPool &addrPool = pUsb->GetAddressPool();
 
@@ -200,10 +201,29 @@ uint8_t ACM::Init(uint8_t parent, uint8_t port, bool lowspeed) {
                         break;
         } // for
 
-        if(bNumEP < 4) {
+        /*
+         * Normal CDC ACM devices expose EP0 + interrupt IN + bulk IN + bulk OUT
+         * (bNumEP >= 4).  ATS Mini (ESP32-S3 TinyUSB, VID 0x303A PID 0x1001)
+         * exposes only the two bulk data endpoints for its USB Ad hoc stream,
+         * which is sufficient for DVPlogger's read/write use.
+         *
+         * Keep the original >=4 requirement for every other device so QMX and
+         * the existing generic ACM paths are unaffected.
+         */
+        ats_mini_bulk_only =
+                (idVendor == 0x303A && idProduct == 0x1001 &&
+                 bNumEP >= 3 &&
+                 epInfo[epDataInIndex].epAddr != 0 &&
+                 epInfo[epDataOutIndex].epAddr != 0);
+
+        if(bNumEP < 4 && !ats_mini_bulk_only) {
 	  USBTRACE2("cdcacm init, usb dev conf error dev not suppored numep:", bNumEP);	  
                 return USB_DEV_CONFIG_ERROR_DEVICE_NOT_SUPPORTED;
 	}
+
+        if(ats_mini_bulk_only) {
+                USBTRACE2("cdcacm init ATS-MINI bulk-only accepted numep:", bNumEP);
+        }
 
         // Assign epInfo to epinfo pointer
         rcode = pUsb->setEpInfoEntry(bAddress, bNumEP, epInfo);

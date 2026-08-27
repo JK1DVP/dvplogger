@@ -89,11 +89,13 @@ static void process_subcpu_late_recovery()
   request_makedupe_rebuild();
 
   if (plogw->enable_callhist) {
-    if (load_callhist_subcpu(callhistfn)) {
-      console->printf("SUBCPU RECOVERED: CALLHIST=SUBCPU entries=%d\n",
-                      get_callhist_subcpu_count());
+    bool fallback = false;
+    int n = load_callhist_subcpu_or_main(callhistfn, &fallback);
+    if (n > 0) {
+      console->printf("SUBCPU RECOVERED: CALLHIST=%s entries=%d\n",
+                      fallback ? "MAIN-PSRAM(fallback)" : "SUBCPU", n);
     } else {
-      console->println("SUBCPU RECOVERED: CALLHIST reload failed");
+      console->println("SUBCPU RECOVERED: CALLHIST disabled (no usable memory)");
     }
   } else {
     console->println("SUBCPU RECOVERED: CALLHIST=OFF");
