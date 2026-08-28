@@ -1353,15 +1353,16 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
   <li><strong>TP:<em>cat_type</em>_<em>rig_type</em></strong><br>
     <strong>cat_type</strong> (CAT protocol/transport handler):<br>
     0 ICOM CI-V, 1 Yaesu New CAT, 2 Kenwood CAT, 3 Manual (No CAT),
-    4 Yaesu Old CAT, 5 Elecraft KX, 6 Yaesu FT-817/818, 7 QRP Labs QMX USB CAT<br>
+    4 Yaesu Old CAT, 5 Elecraft KX, 6 Yaesu FT-817/818, 7 QRP Labs QMX USB CAT,
+    8 ATS Mini USB remote protocol<br>
     <strong>rig_type</strong> (model-specific behavior):<br>
     0 IC-705, 1 IC-9700, 2 Yaesu, 3 Kenwood, 4 Manual,
-    5 IC-7300, 6 Elecraft KX, 7 Xiegu X6100, 8 QRP Labs QMX<br>
+    5 IC-7300, 6 Elecraft KX, 7 Xiegu X6100, 8 QRP Labs QMX, 9 ATS Mini<br>
     <strong>Typical combinations:</strong>
     IC-705 = TP:0_0, IC-9700 = TP:0_1, IC-7300 = TP:0_5,
     Yaesu New = TP:1_2, Yaesu Old = TP:4_2, FT-817/818 = TP:6_2,
     Kenwood = TP:2_3, Elecraft KX = TP:5_6, X6100 = TP:0_7,
-    Manual = TP:3_4, QMX = TP:7_8
+    Manual = TP:3_4, QMX = TP:7_8, ATS Mini = TP:8_9
   </li>
 </ul>
 <p>Press Enter or tap Apply beside an input box to reflect changes.</p>

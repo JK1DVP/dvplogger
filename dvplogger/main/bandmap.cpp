@@ -39,6 +39,7 @@
 #include "misc.h"
 #include "timekeep.h"
 #include "so2r.h"
+#include "edit_buf.h"
 
 
 // now bandmap[N_BAND] is bandmap entry list for all valid band sorted by time of arrival 25/8/16
@@ -601,6 +602,17 @@ void pick_entry_bandmap() {
   }
 
   struct radio *target_radio = &radio_list[target_radio_idx];
+
+  /*
+   * Alt-Space selects a new station for the radio chosen from the spot band.
+   * The target radio is not necessarily the currently focused radio, so clear
+   * the exchange on the actual target before starting DUPE/CALLHIST lookup.
+   * This prevents an exchange left from the previous station from blocking
+   * automatic exchange fill for the newly selected callsign.
+   */
+  clear_buf(target_radio->recv_exch);
+  target_radio->multi = -1;
+
   if (!plogw->f_console_emu) {
     console->print("pick_entry_bandmap target radio=");
     console->println(target_radio_idx);

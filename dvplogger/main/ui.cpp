@@ -111,7 +111,7 @@ static const HelpPage help_pages[] = {
   {{"C-'-':editQSO", "C-4:callhist", "C-5:SO1R/SAT/SO2R", "C-u:Score", "PGUP/DN:CW SPD", "C-v:Voice"}},
   {{"A-'-':Scope", "A-q:CW/S&P", "A-a:nextAOS", "A-p:pick sat AOS", "A-b:beacon ", "A-c:CW/RTTY edit"}},
   {{"A-d,n:bandmap del/add.", "A-g:tone key", "A-Spc:pick spot", "A-DEL:show rig info", "A-f:set center freq.", "A-r:vfo mode sw"}},
-  {{"A-w:wipe QSO", "A-<=>:bandmap sel.", "A-m:mode", "A-<>:band", "C-l:QSLcard", "A-s:track mode"}},
+  {{"A-w:wipe QSO", "C-w:clear field", "A-<=>:bandmap sel.", "A-m:mode", "A-<>:band", "C-l:QSLcard"}},
 
   // CALLSIGN command index. Common prefixes/suffixes are compacted.
   {{"NEW/READ/MAIL-QSOLOG", "DUMPQSOLOG/LISTQSOFILE", "SWITCHLOG/ZMERGE", "MAKEDUPE/DUPERESET", "RESTARTLOG/EXITEMU", "SAVE/LOAD"}},
@@ -388,6 +388,67 @@ void send_single_char_radio(struct radio *radio,char c)
     if (c=='\"') c='/';
     sprintf(buf,"%c",tolower(c));
     play_string_cmd(buf);
+  }
+}
+
+static char *current_edit_buffer(struct radio *radio) {
+  if ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)) {
+    return plogw->cw_msg[radio->ptr_curr - 10];
+  }
+  if ((radio->ptr_curr >= 30) && (radio->ptr_curr <= 30 + N_CWMSG - 1)) {
+    return plogw->rtty_msg[radio->ptr_curr - 30];
+  }
+
+  switch (radio->ptr_curr) {
+  case 0:  return radio->callsign;
+  case 1:  return radio->recv_exch;
+  case 2:  return radio->sent_rst;
+  case 3:  return radio->recv_rst;
+  case 4:  return plogw->my_callsign;
+  case 5:  return plogw->sent_exch;
+  case 6:  return radio->remarks;
+  case 7:  return plogw->sat_name;
+  case 8:  return plogw->grid_locator;
+  case 9:  return plogw->jcc;
+  case 20: return radio->rig_name;
+  case 21: return plogw->cluster_name;
+  case 22: return plogw->email_addr;
+  case 23: return plogw->cluster_cmd;
+  case 24: return plogw->power_code;
+  case 25: return plogw->wifi_ssid;
+  case 26: return plogw->wifi_passwd;
+  case 27: return radio->rig_spec_str;
+  case 28: return plogw->zserver_name;
+  case 29: return plogw->my_name;
+  case 40: return plogw->contest_name;
+  case 41: return plogw->cluster2_name;
+  case 42: return plogw->cluster2_cmd;
+  case 43: return plogw->hostname;
+  default: return nullptr;
+  }
+}
+
+static void clear_current_edit_field(struct radio *radio) {
+  char *pwin = current_edit_buffer(radio);
+  if (pwin == nullptr) {
+    if (verbose & 1) {
+      plogw->ostream->printf("Ctrl-W: no editable field for ptr_curr=%d\n", radio->ptr_curr);
+    }
+    return;
+  }
+
+  clear_buf(pwin);
+
+  // Keep derived QSO indicators consistent with the field that was cleared,
+  // without wiping any of the other QSO fields.
+  if (radio->ptr_curr == 0) {
+    radio->dupe = 0;
+  } else if (radio->ptr_curr == 1) {
+    radio->multi = -1;
+  }
+
+  if (verbose & 1) {
+    plogw->ostream->printf("Ctrl-W: cleared field ptr_curr=%d\n", radio->ptr_curr);
   }
 }
 
@@ -1236,10 +1297,10 @@ if (key == 0x1f) {
           switch_logw_entry(2);
         }
 	break;
-      case 0x1a:  // Crrl-w to wipe the QSO
-	wipe_log_entry();
-	upd_display();
-	break;
+      case 0x1a:  // Ctrl-W: clear only the currently edited field
+        clear_current_edit_field(radio);
+        upd_display();
+        break;
       case 0x1d: // ctrl-z send Remarks to Z-server
 	if (verbose & 1) {
 	  plogw->ostream->printf("CTRL-Z ptr_curr=%d zserver_connected=%d state=%s remarks=<%s>\n",
