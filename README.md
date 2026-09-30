@@ -40,7 +40,7 @@ flashersd spiffs [Enter]<br>により書き込みを行ってください。<br>
 
 プログラムを書き換えた場合には、<br>
 restart_dvplogger<br>
-コマンド、または電源抜き差しにより再起動することをおすすめします（多分必要）。<br>
+コマンド、本体LCD画面へのRESTARTLOGコマンド、または電源抜き差しにより再起動することをおすすめします（多分必要）。<br>
 
 subcpuへの書き込みについては、以前のハードウェアの場合は下記の通り、少々改造が必要です。<br>
 <img width="782" height="605" alt="image" src="https://github.com/user-attachments/assets/fad1a7f8-5d5b-4aea-9dcf-ff3e408ce474" /><br>
