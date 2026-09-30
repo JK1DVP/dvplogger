@@ -26,9 +26,23 @@ along with this program. If not, see http://www.gnu.org/licenses/.
 Release で配布されているバイナリイメージを書き込む方法は[esptool](https://github.com/espressif/esptool) をインストールした上で、bootloader.bin partition-table.bin dvplogger.bin をディレクトリに置き、
 
 python esptool.py -p シリアルポート -b 460800 --before default_reset --after hard_reset --chip esp32  write_flash --flash_mode dio --flash_size detect --flash_freq 40m 0x1000 bootloader.bin 0x8000 partition-table.bin 0x10000 dvplogger.bin
-`
+
 で書き込めるはずです。
-subcpu への書き込みは、Hamfair 2025以降の頒布ハードウェアではいずれも基板にアクセスせずともできるようになっていますが、それ以前の場合は下記の通り、少々改造が必要です。<br>
+
+本機はmaincpu subcpuが連携して動作するようになっているため、subcpuのプログラムもmainプログラム更新時に更新が必要です。<br>
+subcpu への書き込みは、Hamfair 2025以降の頒布ハードウェアではいずれも基板にアクセスせずともできるようになっています。
+
+サブCPUのプログラムは配布、binariesの下に、機種の種別(mini/Wide)別のディレクトリ、さらに下のsubcpu/の下に、app0.bin , bootload.bin, parttio.bin, spiffs.binのようにあります。<br>
+mainプログラムの中にsubcpuのapp0, boot, part 部分が組み込まれており、terminalから<br>
+flasher<br>
+コマンドでこれらの一括書き込みができます。しかし、spiffsファイルについては、ここには容量の関係で含められませんので、別途Webサーバーからやterminalからspiffs.binファイルのアップロードを行い、<br>
+flashersd spiffs [Enter]<br>により書き込みを行ってください。<br>
+
+プログラムを書き換えた場合には、<br>
+restart_dvplogger<br>
+コマンド、または電源抜き差しにより再起動することをおすすめします（多分必要）。<br>
+
+subcpuへの書き込みについては、以前のハードウェアの場合は下記の通り、少々改造が必要です。<br>
 <img width="782" height="605" alt="image" src="https://github.com/user-attachments/assets/fad1a7f8-5d5b-4aea-9dcf-ff3e408ce474" /><br>
 のように、２本の線を10pin コネクターと秋月モジュールの間に接続を行ってください。
 
@@ -82,8 +96,11 @@ idf.py -B build-main-hw3 flash monitor (mini版の場合) <br>
 サブCPUのプログラムはdvplogger のWebサーバーにアクセスし、DVPloggerのSDメモリにアップロードをしてください。
 そのうえで、dvploggerのターミナル接続(idf.py monitorなどでやると良いでしょう）から、<br>
 flashersd app0 boot part spiffs [Enter]<br>
-とコマンドを打つことで、サブCPUへのflash書き込みができるようになっています。
+
+とコマンドを打つことで、サブCPUへのflash書き込みができるようになっています。<br>
+
+または、mainプログラムの中にもsubcpuのapp0, boot, part 部分が組み込まれており、terminalからflasherコマンドでこれらの一括書き込みができます。spiffsファイルについては、容量の関係で含められませんので、別途Webサーバーからやterminalからのファイルアップロードを行い、<br>flashersd spiffs [Enter]<br>により書き込みを行ってください。
 
 プログラムを書き換えた場合には、<br>
-restart_dvplogger<br>
+restart_dvplogger<br>ocale=ja
 コマンドで再起動することをおすすめします。
