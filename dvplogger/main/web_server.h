@@ -33,4 +33,7 @@ bool save_contest_runtime_preset(const char *contest_name);
 bool apply_contest_runtime_preset(const char *contest_name);
 bool get_contest_runtime_sent_exch(const char *contest_name,
                                    char *out, size_t out_size);
+bool get_contest_runtime_dupe_mask(const char *contest_name, int *mask);
+// Refresh CONTEST.TXT once before a MAKEDUPE pass.  Per-QSO lookups use RAM.
+void reload_contest_runtime_presets();
 #endif

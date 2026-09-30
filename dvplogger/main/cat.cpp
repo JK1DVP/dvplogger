@@ -25,6 +25,7 @@
 
 #include "Arduino.h"
 #include "Ticker.h"
+#include <math.h>
 #include "decl.h"
 #include "variables.h"
 #include "hardware.h"
@@ -37,6 +38,10 @@
 #include "edit_buf.h"
 #include "main.h"
 #include "mcp.h"
+#include "misc.h"
+
+// Normal operation: keep rig setup logging compact. Set to 1 for CAT/serial diagnostics.
+#define RIG_SETUP_VERBOSE 0
 #include "SD.h"
 #include "settings.h"
 #include "cat.h"
@@ -44,6 +49,7 @@
 #include "mux_transport.h"
 #include "processes.h"
 #include "so2r.h"
+#include "satellite.h"
 #include <driver/uart.h>
 #include <soc/soc.h>
 #include <soc/uart_reg.h>
@@ -51,6 +57,10 @@
 #include <maidenhead.h>
 
 QueueHandle_t xQueueCATUSBRx,xQueueCATUSBTx;
+
+// Independent receive-only CAT/CI-V monitor.  This intentionally does not
+// enable the other diagnostics controlled by verbose bit 0.
+int cat_rx_monitor = 0;
 
 static void verbose_cat_rx_dump(const struct radio *radio,
                                 const char *source,
@@ -375,7 +385,8 @@ int rig_modenum(const char *opmode) {
   else if (strcmp(opmode, "WFM") == 0) mode = 6;
   else if (strcmp(opmode, "CW-R") == 0) mode = 7;
   else if (strcmp(opmode, "RTTY-R") == 0) mode = 8;
-  else if (strcmp(opmode, "DV") == 0) mode = 0x17;
+  else if (strcmp(opmode, "DV") == 0 || strcmp(opmode, "DSTAR") == 0) mode = 0x17;
+  else if (strcmp(opmode, "C4FM") == 0) mode = 0x18;
   else mode = -1;
   return mode;
 }
@@ -391,7 +402,8 @@ char *opmode_string(int modenum) {
     case 6: return "WFM"; break;
     case 7: return "CW-R"; break;
     case 8: return "RTTY-R"; break;
-    case 0x17: return "DV"; break;
+    case 0x17: return "DSTAR"; break;
+    case 0x18: return "C4FM"; break;
     default: return ""; break;
   }
 }
@@ -496,6 +508,20 @@ void set_ptt_rig(struct radio *radio, int on) {
     return; // receiver only
   }
 
+  // Normalize locally commanded TX/RX immediately for every rig family.
+  // The subsequent CAT/CI-V status reply remains authoritative and can
+  // correct this state, but meter selection must not depend on radio->ptt.
+  if (radio) {
+    radio->ptt_stat_prev = radio->ptt_stat;
+    radio->ptt_stat = on ? 1 : 0;
+    if (!on) {
+      // Do not leave a stale TX meter value visible after returning to RX.
+      radio->swr_x100 = 0;
+      radio->swr_updated_ms = 0;
+      radio->swr_high_count = 0;
+    }
+  }
+
   // Hardware MIC/PTT always follows the RADIO slot:
   // Radio0 -> PTT1, Radio1 -> PTT2, Radio2 -> PTT3.
   // This is independent of the rig PTT: setting.
@@ -508,7 +534,7 @@ void set_ptt_rig(struct radio *radio, int on) {
   // 3: USB DTR
   // 4: USB RTS
   if (radio->rig_spec->pttmethod == 3 || radio->rig_spec->pttmethod == 4) {
-    usb_keying_request((uint8_t)radio->rig_spec->pttmethod, on != 0);
+    usb_keying_request((uint8_t)radio->rig_spec->pttmethod, on != 0, 2);
   }
 
   if (radio->rig_spec->pttmethod == 2) {
@@ -734,15 +760,17 @@ enum {
   YAESU_QUERY_PC,
   YAESU_QUERY_ID,
   YAESU_QUERY_RIGANT,
+  YAESU_QUERY_SWR,
   YAESU_QUERY_COUNT
 };
 
 static const char *const yaesu_query_commands[YAESU_QUERY_COUNT] = {
-  "IF;", "SM0;", "TX;", "RA0;", "PA0;", "PC;", "ID;", "EX030704;"
+  "IF;", "SM0;", "TX;", "RA0;", "PA0;", "PC;", "ID;", "EX030704;",
+  "RM6;"
 };
 
 static const char *const yaesu_query_prefixes[YAESU_QUERY_COUNT] = {
-  "IF", "SM", "TX", "RA", "PA", "PC", "ID", "EX"
+  "IF", "SM", "TX", "RA", "PA", "PC", "ID", "EX", "RM"
 };
 
 static bool is_yaesu_ascii_radio(const struct radio *radio)
@@ -863,9 +891,142 @@ static bool cat_cmd_send_raw(struct radio *radio, const char *cmd)
   return sent;
 }
 
+static int swr_from_icom_meter(int raw)
+{
+  if (raw <= 0) return 100;
+  if (raw <= 120) return 100 + raw * 50 / 120;
+  if (raw <= 241) return 150 + (raw - 120) * 150 / 121;
+  return 300;
+}
+
+static int swr_from_kenwood_meter(int raw)
+{
+  if (raw <= 0) return 100;
+  if (raw <= 10) return 100 + raw * 5;
+  if (raw <= 20) return 150 + (raw - 10) * 15;
+  return 300;
+}
+
+static int swr_from_yaesu_meter(int raw)
+{
+  // FTDX10 bench comparison shows RM6 is linear in reflection coefficient:
+  // raw=39 corresponds to about SWR 1.4 on the front panel.  Treating it as
+  // reflected power and taking sqrt(raw/255) incorrectly produced SWR 2.28.
+  if (raw <= 0) return 100;
+  if (raw >= 255) return 999;
+  const float gamma = (float)raw / 255.0f;
+  const float swr = (1.0f + gamma) / (1.0f - gamma);
+  int swr_x100 = (int)(swr * 100.0f + 0.5f);
+  if (swr_x100 < 100) swr_x100 = 100;
+  if (swr_x100 > 999) swr_x100 = 999;
+  return swr_x100;
+}
+
+bool radio_tx_meter_active(const struct radio *radio)
+{
+  if (!radio) return false;
+  if (radio->tune_active) return true;
+  if (radio->local_ptt_rx_hold_until_ms != 0 &&
+      (int32_t)(millis() - radio->local_ptt_rx_hold_until_ms) < 0)
+    return false;
+
+  // Meter selection must follow the normalized TX state, not radio->ptt.
+  // radio->ptt is a local command/request flag and can remain stale after
+  // abort/break-in paths.  set_ptt_rig() updates ptt_stat immediately for
+  // locally initiated PTT, while CAT/CI-V replies refresh it for external TX.
+  // This rule is intentionally common to Yaesu, Icom, Kenwood/QMX, etc.
+  return radio->ptt_stat == 1;
+}
+
+static void autotuner_start(struct radio *radio, bool alt_t)
+{
+  if (!radio || !radio->rig_spec || radio->rig_spec->tuner_port == 0) return;
+  const uint32_t now = millis();
+  radio->tune_active = true;
+  radio->tune_stop_ms = now + 10000U;
+  radio->tune_cooldown_until_ms = now + 30000U;
+  radio->swr_high_count = 0;
+  radio->swr_x100 = 0; // do not finish from a stale pre-tune reading
+  if (alt_t && radio->rig_spec->tuner_port != 5 && radio->ptt == 0) {
+    if (radio->power > 0) radio->power_bak = radio->power;
+    set_power(radio, 8);
+    radio->ptt = 1;
+    set_ptt_rig(radio, 1);
+  }
+  if (radio->rig_spec->tuner_port == 5) {
+    switch (radio->rig_spec->cat_type) {
+    case CAT_TYPE_QMX: send_cat_cmd(radio, "MD8;"); break;
+    case CAT_TYPE_KENWOOD: send_cat_cmd(radio, "AC111;"); break;
+    case CAT_TYPE_YAESU_NEW:
+    case CAT_TYPE_YAESU_OLD: send_cat_cmd(radio, "AC002;"); break;
+    default:
+      send_head_civ(radio); add_civ_buf((byte)0x1c); add_civ_buf((byte)0x01);
+      add_civ_buf((byte)0x02); send_tail_civ(radio); break;
+    }
+  } else {
+    keying_port_direct(radio->rig_spec->tuner_port, 1);
+    radio->tune_key_asserted = true;
+    radio->tune_key_release_ms = now + radio->rig_spec->tuner_hold_ms;
+  }
+}
+
+static void autotuner_stop(struct radio *radio)
+{
+  if (!radio || !radio->tune_active) return;
+  if (radio->tune_key_asserted) {
+    keying_port_direct(radio->rig_spec->tuner_port, 0);
+    radio->tune_key_asserted = false;
+  }
+  if (radio->rig_spec->tuner_port == 5 &&
+      radio->rig_spec->cat_type == CAT_TYPE_QMX) send_cat_cmd(radio, "MD0;");
+  if (radio->ptt) {
+    radio->ptt = 0; set_ptt_rig(radio, 0);
+    if (radio->power_bak > 0) set_power(radio, radio->power_bak);
+  }
+  radio->tune_active = false;
+}
+
+void autotuner_toggle(struct radio *radio)
+{
+  if (!radio || !radio->rig_spec || radio->rig_spec->tuner_port == 0) {
+    if (!radio) return;
+    if (radio->ptt == 0) {
+      if (radio->power > 0) radio->power_bak = radio->power;
+      set_power(radio, 8);
+    }
+    radio->ptt = 1 - radio->ptt; set_ptt_rig(radio, radio->ptt);
+    if (radio->ptt == 0 && radio->power_bak > 0) set_power(radio, radio->power_bak);
+    return;
+  }
+  if (radio->tune_active) autotuner_stop(radio); else autotuner_start(radio, true);
+}
+
+void autotuner_service(struct radio *radio)
+{
+  if (!radio || !radio->rig_spec) return;
+  const uint32_t now = millis();
+  if (radio->tune_key_asserted && (int32_t)(now - radio->tune_key_release_ms) >= 0) {
+    keying_port_direct(radio->rig_spec->tuner_port, 0);
+    radio->tune_key_asserted = false;
+  }
+  if (radio->tune_active && ((int32_t)(now - radio->tune_stop_ms) >= 0 ||
+      (radio->rig_spec->swr_limit_x100 > 0 && radio->swr_x100 > 0 &&
+       radio->swr_x100 <= radio->rig_spec->swr_limit_x100))) autotuner_stop(radio);
+  if (!radio->tune_active && radio->swr_updated_ms != radio->swr_evaluated_ms &&
+      radio->rig_spec->tuner_port &&
+      radio->rig_spec->swr_limit_x100 > 0 && radio->ptt_stat &&
+      radio->swr_x100 > radio->rig_spec->swr_limit_x100 &&
+      (int32_t)(now - radio->tune_cooldown_until_ms) >= 0) {
+    radio->swr_evaluated_ms = radio->swr_updated_ms;
+    if (++radio->swr_high_count >= 2) autotuner_start(radio, false);
+  } else if (!radio->ptt_stat || radio->swr_x100 <= radio->rig_spec->swr_limit_x100) {
+    radio->swr_high_count = 0;
+  }
+}
+
 static void yaesu_query_service(struct radio *radio)
 {
-  if (!is_yaesu_ascii_radio(radio)) return;
+  if (!is_yaesu_ascii_radio(radio) || !radio->enabled) return;
 
   uint32_t now = millis();
 
@@ -921,6 +1082,45 @@ static void yaesu_query_service(struct radio *radio)
   }
 }
 
+void request_yaesu_tx_meter_poll(struct radio *radio)
+{
+  if (!is_yaesu_ascii_radio(radio) || !radio->enabled) return;
+
+  /*
+   * TX and meter are one logical periodic poll.  Ask TX first; after its
+   * answer has been parsed, queue SM0 (RX) or RM6 (TX) immediately.
+   */
+  radio->yaesu_meter_after_tx = 1;
+  radio->yaesu_query_request_mask |= (uint16_t)1U << YAESU_QUERY_TX;
+  yaesu_query_service(radio);
+}
+
+void cat_periodic_polling_enable_changed(struct radio *radio)
+{
+  if (!is_yaesu_ascii_radio(radio)) return;
+
+  if (!radio->enabled) {
+    // Alt-I/explicit disable means *all periodic polling stops now*.
+    // Drop queued periodic reads and forget an outstanding expectation; a
+    // late answer is still harmlessly parsed as an unsolicited CAT frame.
+    radio->yaesu_query_request_mask = 0;
+    radio->yaesu_query_pending_prefix[0] = '\0';
+    radio->yaesu_query_pending_until = 0;
+    radio->yaesu_query_next_send_at = 0;
+    radio->yaesu_query_next_slot = 0;
+    radio->yaesu_meter_after_tx = 0;
+    return;
+  }
+
+  // Re-enable with a clean scheduler.  The next interval slot repopulates
+  // exactly the query appropriate for that slot.
+  radio->yaesu_query_request_mask = 0;
+  radio->yaesu_query_pending_prefix[0] = '\0';
+  radio->yaesu_query_pending_until = 0;
+  radio->yaesu_query_next_send_at = 0;
+  radio->yaesu_meter_after_tx = 0;
+}
+
 static void yaesu_query_response_received(struct radio *radio)
 {
   if (!is_yaesu_ascii_radio(radio)) return;
@@ -929,8 +1129,42 @@ static void yaesu_query_response_received(struct radio *radio)
   if (strncmp(radio->cmdbuf, radio->yaesu_query_pending_prefix, 2) != 0)
     return;
 
+  const bool tx_response =
+      radio->yaesu_query_pending_prefix[0] == 'T' &&
+      radio->yaesu_query_pending_prefix[1] == 'X';
+  // For the TX->meter chain, use the transceiver's TX; reply itself as the
+  // authority.  Local ptt/ptt_stat can intentionally lag during CW break-in,
+  // keyboard keying and abort cleanup.  Using those cached flags here could
+  // therefore keep RM6 queued after the rig had already returned to RX.
+  const bool tx_reported =
+      tx_response && radio->cmdbuf[0] == 'T' && radio->cmdbuf[1] == 'X' &&
+      radio->cmdbuf[2] != '0';
+
   radio->yaesu_query_pending_prefix[0] = '\0';
   radio->yaesu_query_next_send_at = millis() + YAESU_QUERY_INTERVAL_MS;
+
+  if (tx_response && radio->yaesu_meter_after_tx && radio->enabled) {
+    radio->yaesu_meter_after_tx = 0;
+
+    const uint16_t sm_bit = (uint16_t)1U << YAESU_QUERY_SM;
+    const uint16_t swr_bit = (uint16_t)1U << YAESU_QUERY_SWR;
+
+    // Do not leave the meter for the previous TX/RX state queued.  The TX;
+    // reply is the common truth for every transmit path (CW break-in, RTTY,
+    // Shift+keyboard keying, CAT/PTT and ESC abort), so meter selection does
+    // not depend on how transmission was started or stopped.
+    if (tx_reported) {
+      radio->yaesu_query_request_mask &= (uint16_t)~sm_bit;
+      radio->yaesu_query_request_mask |= swr_bit;
+    } else {
+      radio->yaesu_query_request_mask &= (uint16_t)~swr_bit;
+      radio->yaesu_query_request_mask |= sm_bit;
+    }
+
+    // Second half of the same logical poll: do not wait for another 100 ms.
+    radio->yaesu_query_next_send_at = millis();
+    yaesu_query_service(radio);
+  }
 }
 
 void send_cat_cmd(struct radio *radio, const char *cmd)
@@ -1262,6 +1496,12 @@ bool yaesu_scope_supported(const struct radio *radio)
          radio->rig_spec->cat_type == CAT_TYPE_YAESU_OLD;
 }
 
+static bool is_ftdx10(const struct radio *radio)
+{
+  return radio != nullptr && radio->rig_spec != nullptr &&
+         strncmp(radio->rig_spec->rig_identification, "0761", 4) == 0;
+}
+
 static void yaesu_scope_set_mode_code(struct radio *radio, char code)
 {
   if (!yaesu_scope_supported(radio)) return;
@@ -1373,8 +1613,8 @@ void recenter_scope()
   // There is no CAT field on either FTDX10 or FTX-1 for the numeric
   // CURSOR display-window position.  SS02 controls only marker visibility.
   //
-  // FTDX10 keeps the newly centered window when returning CENTER->CURSOR,
-  // so retain the established sequence through set_scope_mode().
+  // FTDX10 (ID 0761) can operate directly in CURSOR mode, so the manual
+  // scope setup follows set_scope_mode() and leaves it in CURSOR.
   //
   // FTX-1 restores its previous CURSOR window when SS0670000 is sent.
   // Therefore an explicit Alt-' recenter must remain in CENTER mode; this
@@ -1455,9 +1695,14 @@ void set_scope_mode(struct radio *radio,int mode) {
       span = yaesu_scope_span_for_mode(mode);
       if (span == 0) return;
 
-      // Common Yaesu scope sequence:
-      // CENTER(NORMAL) -> SPAN -> CURSOR(NORMAL).
-      yaesu_scope_set_mode_code(radio, '4');
+      // FTDX10 (CAT ID 0761) can change span while staying in
+      // W/F CURSOR (NORMAL).  Do not force CENTER on band/mode changes.
+      // Other Yaesu rigs retain the established CENTER -> SPAN -> CURSOR
+      // sequence.
+      if (is_ftdx10(radio))
+        yaesu_scope_set_mode_code(radio, '7');
+      else
+        yaesu_scope_set_mode_code(radio, '4');
       yaesu_scope_set_span_code(radio, span);
 
       if (radio->bandid >= 1 && radio->bandid <= N_BAND) {
@@ -1467,11 +1712,12 @@ void set_scope_mode(struct radio *radio,int mode) {
       }
 
       // FTX-1 needs a short settling interval before switching back to
-      // CURSOR; FTDX10 can take the common final command immediately.
+      // CURSOR.  FTDX10 is already in CURSOR above.  Other Yaesu rigs keep
+      // the established immediate CENTER -> CURSOR behavior.
       if (radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1) {
         radio->scope_cursor_restore_pending = 1;
         radio->scope_cursor_restore_due_ms = millis() + 120;
-      } else {
+      } else if (!is_ftdx10(radio)) {
         yaesu_scope_set_mode_code(radio, '7');
       }
       break;
@@ -2108,7 +2354,15 @@ void send_mode_set_civ_radio(const char *opmode, int filnr, struct radio *radio)
         case 8:  // RTTY-R
           send_cat_cmd(radio, "MD09;");
           break;
-        case 0x17:  // DV
+        case 0x17:  // D-STAR is Icom CI-V only
+          break;
+        case 0x18:  // C4FM
+          // FT-991A uses E for C4FM. FTX-1 has DN/VW; when a generic
+          // C4FM mode is requested, select the normal DN voice/data mode.
+          if (radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1)
+            send_cat_cmd(radio, "MD0H;");
+          else if (strncmp(radio->rig_spec->rig_identification, "0670", 4) == 0)
+            send_cat_cmd(radio, "MD0E;");
           break;
       }
       break;
@@ -2619,9 +2873,30 @@ void send_smeter_query_civ(struct radio *radio) {
   radio->civ_response_timer = 50;  // 0.1 s wait for (any) response
 }
 
+void send_swr_query_civ(struct radio *radio) {
+  if (!radio || !radio->enabled || !radio->rig_spec) return;
+  switch (radio->rig_spec->cat_type) {
+  case CAT_TYPE_QMX: send_cat_cmd(radio, "SW;"); return;
+  case CAT_TYPE_YAESU_NEW:
+  case CAT_TYPE_YAESU_OLD: send_cat_cmd(radio, "RM6;"); return;
+  case CAT_TYPE_KENWOOD:
+    send_cat_cmd(radio, "RM1;"); send_cat_cmd(radio, "RM;"); return;
+  case CAT_TYPE_NOCAT: return;
+  default:
+    send_head_civ(radio); add_civ_buf((byte)0x15); add_civ_buf((byte)0x12);
+    send_tail_civ(radio); radio->f_civ_response_expected = 1;
+    radio->civ_response_timer = 50; return;
+  }
+}
+
 
 // set frequency (received from rig) to the logging system
 void set_frequency(int freq, struct radio *radio) {
+
+  // Satellite tuning treats a rig frequency report as an operator input when
+  // it differs from both the current target and our last CAT write.  Do this
+  // before the normal two-identical-reports dial filter so re-anchoring is fast.
+  if (plogw->sat) sat_accept_generic_frequency_report(radio, freq);
 
   //  if (verbose & 16) plogw->ostream->println("set_frequency()");
   if ((radio->f_freqchange_pending) &&
@@ -2800,48 +3075,9 @@ void set_frequency(int freq, struct radio *radio) {
         bandmap_disp.f_update = 1;  // just request update flag (updated in interval jobs
 
       } else {
-        // satellite mode
-        // set frequency to uplink down link frequency
-        switch (plogw->sat_vfo_mode) {
-          case SAT_VFO_SINGLE_A_RX:  //
-            if (plogw->sat_freq_tracking_mode == SAT_RX_FIX) {
-              plogw->dn_f = radio->freq*FREQ_UNIT; // satellite related frequency is in Hz unit (not FREQ_UNIT Hz)
-            }
-            break;
-          case SAT_VFO_SINGLE_A_TX:  // received frequency is TX
-            if (plogw->sat_freq_tracking_mode == SAT_TX_FIX) {
-              plogw->up_f = radio->freq*FREQ_UNIT;
-            }
-            break;
-          case SAT_VFO_MULTI_TX_0:
-            if (radio->rig_idx == 0) {
-              // received frequency is TX
-              if (plogw->sat_freq_tracking_mode == SAT_TX_FIX) {
-                plogw->up_f = radio->freq*FREQ_UNIT;
-              }
-            }
-            if (radio->rig_idx == 1) {
-              // received frequency is RX
-              if (plogw->sat_freq_tracking_mode == SAT_RX_FIX) {
-                plogw->dn_f = radio->freq*FREQ_UNIT;
-              }
-            }
-            break;
-          case SAT_VFO_MULTI_TX_1:  //
-            if (radio->rig_idx == 1) {
-              // received frequency is TX
-              if (plogw->sat_freq_tracking_mode == SAT_TX_FIX) {
-                plogw->up_f = radio->freq*FREQ_UNIT;
-              }
-            }
-            if (radio->rig_idx == 0) {
-              // received frequency is RX
-              if (plogw->sat_freq_tracking_mode == SAT_RX_FIX) {
-                plogw->dn_f = radio->freq*FREQ_UNIT;
-              }
-            }
-            break;
-        }
+        // Satellite re-anchoring is handled at report arrival by
+        // sat_accept_generic_frequency_report().  Do not overwrite the new
+        // anchor here after the normal dial-confirmation delay.
       }
     }
     radio->f_recall_freq_mode_filt = 0;    
@@ -2887,10 +3123,69 @@ void set_mode(const char *opmode, byte filt, struct radio *radio) {
 }
 
 
+// Snapshot only fields that can affect the normal focused-radio display.
+// CAT polling replies are frequent; do not redraw/flush the OLED when a reply
+// merely repeats the state we already have.  This mirrors the CI-V path.
+struct cat_display_state_snapshot {
+  unsigned int freq;
+  int bandid;
+  int filt;
+  int smeter;
+  int swr_x100;
+  int ptt_stat;
+  int power;
+  int att;
+  int preamp;
+  bool mode_initialized;
+  char opmode[sizeof(((struct radio *)0)->opmode)];
+};
+
+static void capture_cat_display_state(const struct radio *radio,
+                                      struct cat_display_state_snapshot *s)
+{
+  s->freq = radio->freq;
+  s->bandid = radio->bandid;
+  s->filt = radio->filt;
+  s->smeter = radio->smeter;
+  s->swr_x100 = radio->swr_x100;
+  s->ptt_stat = radio->ptt_stat;
+  s->power = radio->power;
+  s->att = radio->att;
+  s->preamp = radio->preamp;
+  s->mode_initialized = radio->mode_initialized;
+  strlcpy(s->opmode, radio->opmode, sizeof(s->opmode));
+}
+
+static bool cat_display_state_changed(const struct radio *radio,
+                                      const struct cat_display_state_snapshot *s)
+{
+  return radio->freq != s->freq ||
+         radio->bandid != s->bandid ||
+         radio->filt != s->filt ||
+         radio->smeter != s->smeter ||
+         radio->swr_x100 != s->swr_x100 ||
+         radio->ptt_stat != s->ptt_stat ||
+         radio->power != s->power ||
+         radio->att != s->att ||
+         radio->preamp != s->preamp ||
+         radio->mode_initialized != s->mode_initialized ||
+         strcmp(radio->opmode, s->opmode) != 0;
+}
+
+static void request_cat_display_if_changed(
+    struct radio *radio, const struct cat_display_state_snapshot *old_state)
+{
+  if (radio->rig_idx == so2r.focused_radio() &&
+      cat_display_state_changed(radio, old_state))
+    request_display_update_on_demand();
+}
+
 // analyze cmdbuf as Elecraft KX line 
 void get_cat_elecraft(struct radio *radio) {
 
   if (!radio->enabled) return;
+  struct cat_display_state_snapshot display_old_state;
+  capture_cat_display_state(radio, &display_old_state);
   int len;
   len=strlen(radio->cmdbuf);
 
@@ -3016,7 +3311,7 @@ The fixed-value fields (space, 0, and 1) are provided for syntactic compatibilit
     }
     //    check_repeat_function();
     //    sequence_manager_tx_status_updated();
-    so2r.onTx_stat_update();
+    so2r.onTx_stat_update(radio);
 
   } else if (strncmp(radio->cmdbuf, "SM", 2) == 0) {
     // Elecraft firmware variants may return different numbers of decimal
@@ -3038,10 +3333,7 @@ The fixed-value fields (space, 0, and 1) are provided for syntactic compatibilit
   } else {
     return;
   }
-  if (radio->rig_idx == so2r.focused_radio()) {
-    //    if (radio->rig_idx == plogw->focused_radio) {
-    upd_display();
-  }
+  request_cat_display_if_changed(radio, &display_old_state);
 }
 
 
@@ -3049,6 +3341,8 @@ The fixed-value fields (space, 0, and 1) are provided for syntactic compatibilit
 void get_cat_kenwood(struct radio *radio) {
 
   if (!radio->enabled) return;
+  struct cat_display_state_snapshot display_old_state;
+  capture_cat_display_state(radio, &display_old_state);
   int len;
   len=strlen(radio->cmdbuf);
 
@@ -3147,7 +3441,7 @@ void get_cat_kenwood(struct radio *radio) {
     }
     //    check_repeat_function();
     //    sequence_manager_tx_status_updated();
-    so2r.onTx_stat_update();
+    so2r.onTx_stat_update(radio);
   } else if (strncmp(radio->cmdbuf,"PC",2)==0) {
     // power
     tmp=radio->cmdbuf[2] -'0';
@@ -3159,6 +3453,18 @@ void get_cat_kenwood(struct radio *radio) {
       plogw->ostream->print("power:");
       plogw->ostream->println(radio->power);
     }
+  } else if (strncmp(radio->cmdbuf, "SW", 2) == 0) {
+    int v = 0, n = 0;
+    for (int i = 2; radio->cmdbuf[i] >= '0' && radio->cmdbuf[i] <= '9'; ++i) {
+      v = v * 10 + radio->cmdbuf[i] - '0'; ++n;
+    }
+    if (n) { radio->swr_x100 = v; radio->swr_updated_ms = millis(); }
+  } else if (strncmp(radio->cmdbuf, "RM", 2) == 0 && radio->cmdbuf[2] == '1') {
+    int v = 0, n = 0;
+    for (int i = 3; radio->cmdbuf[i] >= '0' && radio->cmdbuf[i] <= '9'; ++i) {
+      v = v * 10 + radio->cmdbuf[i] - '0'; ++n;
+    }
+    if (n) { radio->swr_x100 = swr_from_kenwood_meter(v); radio->swr_updated_ms = millis(); }
   } else if (strncmp(radio->cmdbuf, "SM", 2) == 0) {
     // read meter
     // could be HEX ?
@@ -3187,10 +3493,7 @@ void get_cat_kenwood(struct radio *radio) {
   } else {
     return;
   }
-  if (radio->rig_idx == so2r.focused_radio()) {
-    //    if (radio->rig_idx == plogw->focused_radio) {
-    upd_display();
-  }
+  request_cat_display_if_changed(radio, &display_old_state);
 }
 
 
@@ -3205,9 +3508,19 @@ void print_cat_cmdbuf(struct radio *radio)
 
 }
 
+// Detailed timing for the current Yaesu ASCII frame.  These values are
+// written and consumed in the main-loop CAT path only; they do not touch the
+// USB transport task or CW/FSK control paths.
+static uint32_t yaesu_diag_smeter_us = 0;
+static uint32_t yaesu_diag_display_us = 0;
+
 // analyze cmdbuf as Yaesu Cat response
 void get_cat(struct radio *radio) {
+  yaesu_diag_smeter_us = 0;
+  yaesu_diag_display_us = 0;
   if (!radio->enabled) return;
+  struct cat_display_state_snapshot display_old_state;
+  capture_cat_display_state(radio, &display_old_state);
   int len;
   len=strlen(radio->cmdbuf);
   int tmp;
@@ -3350,6 +3663,19 @@ void get_cat(struct radio *radio) {
       case '9':  // RTTY-USB
         sprintf(opmode, "RTTY-R");
         break;
+      case 'E':  // FT-991A C4FM (FTX-1: PSK)
+        if (strncmp(radio->rig_spec->rig_identification, "0670", 4) == 0)
+          sprintf(opmode, "C4FM");
+        else
+          sprintf(opmode, "Other");
+        break;
+      case 'H':  // FTX-1 C4FM-DN
+      case 'I':  // FTX-1 C4FM-VW
+        if (radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1)
+          sprintf(opmode, "C4FM");
+        else
+          sprintf(opmode, "Other");
+        break;
       case '8':  // DATA-R
       case 'A':  // DATA-FM
       case 'B':  // FM-NB
@@ -3365,6 +3691,28 @@ void get_cat(struct radio *radio) {
 
     accept_mode_report(opmode, filt, radio);
     // }
+  } else if (strncmp(radio->cmdbuf, "RM6", 3) == 0) {
+    // Yaesu RM6 answer is RM6P2P2P2P3P3P3;: the first three digits are
+    // the 0..255 SWR meter value and the final "000" is a fixed field.
+    // Parsing every digit changed, for example, 128 into 128000 and pinned
+    // the displayed result at the conversion ceiling (SWR 3.0).
+    if (radio->cmdbuf[3] >= '0' && radio->cmdbuf[3] <= '9' &&
+        radio->cmdbuf[4] >= '0' && radio->cmdbuf[4] <= '9' &&
+        radio->cmdbuf[5] >= '0' && radio->cmdbuf[5] <= '9') {
+      int raw = (radio->cmdbuf[3] - '0') * 100 +
+                (radio->cmdbuf[4] - '0') * 10 +
+                (radio->cmdbuf[5] - '0');
+      if (raw <= 255) {
+        radio->swr_x100 = swr_from_yaesu_meter(raw);
+        radio->swr_updated_ms = millis();
+        // Keep this visible without VERBOSE_CAT while the conversion is
+        // being checked against the transceiver's front-panel meter.
+        if (plogw->ostream)
+          plogw->ostream->printf("RM6 raw=%d SWR=%d.%02d response=%s\n",
+                                 raw, radio->swr_x100 / 100,
+                                 radio->swr_x100 % 100, radio->cmdbuf);
+      }
+    }
   } else if (strncmp(radio->cmdbuf, "SM", 2) == 0) {
     // read meter
     tmp = 0;
@@ -3374,8 +3722,10 @@ void get_cat(struct radio *radio) {
     }
 
     radio->smeter = tmp;
+    const uint32_t yaesu_diag_smeter_start_us = micros();
     conv_smeter(radio);
     smeter_postprocess(radio);
+    yaesu_diag_smeter_us = micros() - yaesu_diag_smeter_start_us;
     //  }
 
   } else if (strncmp(radio->cmdbuf, "TX", 2) == 0) {
@@ -3386,20 +3736,24 @@ void get_cat(struct radio *radio) {
 
     radio->ptt_stat_prev = radio->ptt_stat;
     if (radio->cmdbuf[2] == '0') {
-      //plogw->ostream->print("0");
-      if ((radio->ptt_stat == 1) || (radio->ptt_stat == 2)) {
-        // previously sending
-        radio->ptt_stat = 2;
-      } else {
-        radio->ptt_stat = 0;  // receiving
-      }
+      // TX0; is the rig's authoritative RX indication.  Do not retain the
+      // legacy ptt_stat==2 transition state here: it can survive long enough
+      // to keep SWR/RM6 selected after ESC, CW break-in or Shift+ keying.
+      radio->ptt_stat = 0;
+
+      // Drop any stale SWR request/value immediately.  The TX->meter chain
+      // will queue SM0 from this same TX0; response.
+      radio->yaesu_query_request_mask &=
+          (uint16_t)~((uint16_t)1U << YAESU_QUERY_SWR);
+      radio->swr_x100 = 0;
+      radio->swr_updated_ms = 0;
     } else {
       radio->ptt_stat = 1;  // transmitting
       //plogw->ostream->print("1");
     }
     //    check_repeat_function();
     //    sequence_manager_tx_status_updated();
-    so2r.onTx_stat_update();
+    so2r.onTx_stat_update(radio);
 
   } else if (strncmp(radio->cmdbuf, "RA", 2) == 0) {
     // RF attenuator
@@ -3504,9 +3858,11 @@ void get_cat(struct radio *radio) {
   //  } else {
   //    return ;
   //  }
-  if (radio->rig_idx == so2r.focused_radio()) {
-
-    upd_display();
+  if (radio->rig_idx == so2r.focused_radio() &&
+      cat_display_state_changed(radio, &display_old_state)) {
+    const uint32_t yaesu_diag_display_start_us = micros();
+    request_display_update_on_demand();
+    yaesu_diag_display_us = micros() - yaesu_diag_display_start_us;
   }
 }
 
@@ -3748,6 +4104,8 @@ void smeter_postprocess(struct radio *radio)
 
 void get_cat_ft817(struct radio *radio) {
   if (!radio->enabled) return;
+  struct cat_display_state_snapshot display_old_state;
+  capture_cat_display_state(radio, &display_old_state);
   int tmp;
   int filt;
   byte mode_code;
@@ -3777,7 +4135,7 @@ void get_cat_ft817(struct radio *radio) {
         radio->ptt_stat = 0;  // receiving
       }
     }
-    so2r.onTx_stat_update();
+    so2r.onTx_stat_update(radio);
     // others ignore
     break;
   case 0x30: // awaiting Freq & Mode status
@@ -3838,10 +4196,7 @@ void get_cat_ft817(struct radio *radio) {
     break;
   }
 
-  if (radio->rig_idx == so2r.focused_radio()) {
-
-    upd_display();
-  }
+  request_cat_display_if_changed(radio, &display_old_state);
   
 }
 
@@ -4012,6 +4367,22 @@ void get_civ(struct radio *radio) {
   
   //  plogw->ostream->println("get_civ() addr pass");
 
+  // Snapshot only fields that can affect the normal right OLED.  CI-V polling
+  // returns many identical frequency/mode/meter frames; those used to request
+  // a full framebuffer redraw even when nothing visible had changed.
+  const unsigned int display_old_freq = radio->freq;
+  const int display_old_bandid = radio->bandid;
+  const int display_old_filt = radio->filt;
+  const int display_old_smeter = radio->smeter;
+  const int display_old_swr_x100 = radio->swr_x100;
+  const int display_old_ptt = radio->ptt_stat;
+  const int display_old_power = radio->power;
+  const int display_old_att = radio->att;
+  const int display_old_preamp = radio->preamp;
+  const bool display_old_mode_initialized = radio->mode_initialized;
+  char display_old_opmode[sizeof(radio->opmode)];
+  strlcpy(display_old_opmode, radio->opmode, sizeof(display_old_opmode));
+
   // A correctly addressed CI-V frame proves that this radio is reachable.
   // Use it to arm/service one-shot clock synchronization.
   service_icom_clock_sync_on_rx(radio);
@@ -4033,7 +4404,10 @@ void get_civ(struct radio *radio) {
     freq = freq * 100 + bcd2dec(radio->cmdbuf[6]);
     freq = freq * (100/FREQ_UNIT) + bcd2dec(radio->cmdbuf[5])/FREQ_UNIT;
 
-    check_and_set_frequency(radio,freq);
+    // Explicit satellite queries (notably IC-9700 MAIN/SUB) carry side
+    // information that radio->freq alone cannot represent.  Consume them here.
+    if (!sat_accept_icom_frequency_report(radio, freq))
+      check_and_set_frequency(radio,freq);
     /*    
     //    console->print("Freq received=");
     //    console->println(freq);
@@ -4151,6 +4525,13 @@ void get_civ(struct radio *radio) {
 
       //          radio->smeter = cmdbuf[6] * 256 + cmdbuf[7];  // s-meter reading is BCD not binary  corrected 21/12/30
       break;
+    case 0x12:  // SWR meter
+      if (!civ_check_size(radio,9,"SWR")) break;
+      if (!civ_check_postamble(radio,"SWR")) break;
+      tmp = bcd2dec(radio->cmdbuf[6]) * 100 + bcd2dec(radio->cmdbuf[7]);
+      radio->swr_x100 = swr_from_icom_meter(tmp);
+      radio->swr_updated_ms = millis();
+      break;
     }
     break;
   case 0x23: // GPS data (IC-705)
@@ -4228,7 +4609,7 @@ void get_civ(struct radio *radio) {
       }
       //      check_repeat_function();
       //      sequence_manager_tx_status_updated();
-      so2r.onTx_stat_update();
+      so2r.onTx_stat_update(radio);
     }
     break;
   case 1:  // mode
@@ -4264,8 +4645,8 @@ void get_civ(struct radio *radio) {
     case 8:  // RTTY
       sprintf(opmode, "RTTY-R");
       break;
-    case 17: // DV
-      sprintf(opmode, "DV");
+    case 0x17: // DV / D-STAR (CI-V mode byte is hexadecimal 0x17)
+      sprintf(opmode, "DSTAR");
       break;
     case 5:  // FM
       sprintf(opmode, "FM");
@@ -4298,12 +4679,35 @@ void get_civ(struct radio *radio) {
   }
   //
   if (radio->rig_idx == so2r.focused_radio()) {
-    upd_display();
+    // Suppress redraw requests from identical CI-V polling replies.  Keep the
+    // conservative path for GPS and SAT frequency reports because those can
+    // update display inputs outside struct radio.
+    const bool display_state_changed =
+        radio->freq != display_old_freq ||
+        radio->bandid != display_old_bandid ||
+        radio->filt != display_old_filt ||
+        radio->smeter != display_old_smeter ||
+        radio->swr_x100 != display_old_swr_x100 ||
+        radio->ptt_stat != display_old_ptt ||
+        radio->power != display_old_power ||
+        radio->att != display_old_att ||
+        radio->preamp != display_old_preamp ||
+        radio->mode_initialized != display_old_mode_initialized ||
+        strcmp(radio->opmode, display_old_opmode) != 0;
+    const bool display_external_state_may_change =
+        radio->cmdbuf[4] == 0x23 ||
+        (plogw->sat && (radio->cmdbuf[4] == 0 ||
+                        radio->cmdbuf[4] == CAT_TYPE_NOCAT));
+
+    if (display_state_changed || display_external_state_may_change)
+      request_display_update_on_demand();
   }
 }
 
 void print_civ(struct radio *radio) {
-  if (!(verbose & 1)) return;
+  // catrx=1 shows all CAT/CI-V receive frames.  catrx=2 is the
+  // Yaesu AI observation mode, so CI-V traffic is intentionally suppressed.
+  if (!(verbose & 1) && cat_rx_monitor != 1) return;
   char ostr[32];
   sprintf(ostr, "print_civ():");
   plogw->ostream->print(ostr);
@@ -4314,8 +4718,45 @@ void print_civ(struct radio *radio) {
   plogw->ostream->println("");
 }
 
+static bool cat_ai_observation_frame(struct radio *radio) {
+  if (!radio || radio->cmd_ptr < 2) return false;
+  const char c0 = (char)radio->cmdbuf[0];
+  const char c1 = (char)radio->cmdbuf[1];
+
+  // FA and the undocumented FD notification are the primary dial events.
+  if ((c0 == 'F' && c1 == 'A') || (c0 == 'F' && c1 == 'D')) return true;
+
+  // IF is useful only when its 9-digit receive frequency changes.
+  if (c0 == 'I' && c1 == 'F' && radio->cmd_ptr >= 16) {
+    static char last_if_freq[3][10] = {{0}};
+    int idx = radio->rig_idx;
+    if (idx < 0 || idx >= 3) idx = 0;
+    char freq[10];
+    for (int i = 0; i < 9; i++) freq[i] = (char)radio->cmdbuf[7 + i];
+    freq[9] = '\0';
+    if (strncmp(last_if_freq[idx], freq, 9) != 0) {
+      memcpy(last_if_freq[idx], freq, sizeof(freq));
+      return true;
+    }
+    return false;
+  }
+
+  // Suppress responses generated by DVPlogger's normal polling.  Anything
+  // else is kept so undocumented AI notifications are not hidden.
+  static const char *const noisy[] = {
+    "SM", "TX", "ID", "PA", "RM", "PC", "EX", "SS"
+  };
+  for (unsigned int i = 0; i < sizeof(noisy) / sizeof(noisy[0]); i++) {
+    if (c0 == noisy[i][0] && c1 == noisy[i][1]) return false;
+  }
+  return true;
+}
+
 void print_cat(struct radio *radio) {
-  if (!(verbose & 1)) return;
+  if (!(verbose & 1)) {
+    if (cat_rx_monitor == 0) return;
+    if (cat_rx_monitor == 2 && !cat_ai_observation_frame(radio)) return;
+  }
   if (!plogw->f_console_emu) {  
     plogw->ostream->print("print_cat():");
 
@@ -4815,6 +5256,10 @@ struct serial_spec {
 
 void print_serial_instance(Stream *out)
 {
+#if !RIG_SETUP_VERBOSE
+  (void)out;
+  return;
+#else
   if (!out) out = console;
   out->print("Serial Instance-port map\n");
   for (int j=0;j<4;j++) {
@@ -4822,12 +5267,14 @@ void print_serial_instance(Stream *out)
     out->print(" ");
   }
   out->println("");
+#endif
   
 }
 void config_serial_instance(Stream **civport,int civport_num,int serial_num,int baud,int reverse)
 {
   // link  serial port with serial instances
 
+#if RIG_SETUP_VERBOSE
   console->print("config_serial_instance():civport_num=");
   console->print(civport_num);
   console->print(" serial_num=");  
@@ -4836,6 +5283,7 @@ void config_serial_instance(Stream **civport,int civport_num,int serial_num,int 
   console->print(baud);
   console->print(" reverse=");  
   console->println(reverse);
+#endif
   
   
   int txPin,rxPin;
@@ -4857,17 +5305,23 @@ void config_serial_instance(Stream **civport,int civport_num,int serial_num,int 
     }
     break;
   case 2: // port2 CIV
-    console->println("CI-V port");    
+#if RIG_SETUP_VERBOSE
+    console->println("CI-V port");
+#endif    
     rxPin=SERIAL2_RX;
     txPin=SERIAL2_TX;
     break;
   case 3: // port3 TTL-SER
 #if JK1DVPLOG_HWVER >=3
+#if RIG_SETUP_VERBOSE
     console->println("HWVER 3 CAT RX/TX swap");
+#endif
     rxPin=15;
     txPin=27;
 #else
-    console->println("HWVER <= CAT RX/TX not swap");    
+#if RIG_SETUP_VERBOSE
+    console->println("HWVER <= CAT RX/TX not swap");
+#endif    
     rxPin=27;
     txPin=15;
 #endif
@@ -4932,6 +5386,8 @@ void config_serial_instance(Stream **civport,int civport_num,int serial_num,int 
     serial_spec.port[serial_num]=civport_num; // update connection information
     break;
   }
+  if (civport_num == 0) local_console = *civport;
+#if RIG_SETUP_VERBOSE
   if (!plogw->f_console_emu) {    
     console->print("init Serial");
     console->print(serial_num);
@@ -4946,6 +5402,7 @@ void config_serial_instance(Stream **civport,int civport_num,int serial_num,int 
     console->print(" reversed=");
     console->println(reverse);
   }
+#endif
 }
 
 
@@ -5047,7 +5504,9 @@ int console_to_softwareserial() {
 
 int console_to_hardwareserial() {
   // make console move back to hardware serial
+#if RIG_SETUP_VERBOSE
   console->println("console_to_hardwareserial()");
+#endif
   for (int i=3;i<=3;i++) {
     if (serial_spec.port[i]==0) {
       // identify serial port from
@@ -5072,9 +5531,11 @@ int console_to_hardwareserial() {
   }
   for (int j=0;j<2;j++) {
     if (serial_spec.port[j]==0) {
+#if RIG_SETUP_VERBOSE
       console->print(" console is j=");
       console->println(j);
       console->println("console is already hardwareserial");
+#endif
       return j; // console is already hardware
     }
   }
@@ -5083,7 +5544,9 @@ int console_to_hardwareserial() {
 
 int find_free_hardwareserial() {
   int j;
+#if RIG_SETUP_VERBOSE
   console->println("find_free_hardwareserial");
+#endif
   if ((j=find_free_serial())>=3) {
     console_to_softwareserial();
     return find_free_serial();
@@ -5124,13 +5587,17 @@ void config_rig_serialport(struct radio *radio)
     // check if presently allocated
     serial_num=find_connected_serial(civport_num);
     if (serial_num!= -1) {
+#if RIG_SETUP_VERBOSE
       console->println("use existing allocated serial for CIV");
+#endif
       config_serial_instance(&radio->rig_spec->civport,radio->rig_spec->civport_num,serial_num, radio->rig_spec->civport_baud,radio->rig_spec->civport_reversed);
       // need to receive only in one radio for the CIV this will be checked in receive_civ
     } else {
       serial_num= find_free_hardwareserial();
       if (serial_num != -1) {
+#if RIG_SETUP_VERBOSE
 	console->println("configure new serial for CIV");
+#endif
 	config_serial_instance(&radio->rig_spec->civport,radio->rig_spec->civport_num,serial_num, radio->rig_spec->civport_baud,radio->rig_spec->civport_reversed);      
       } else {
 	console->print("No free serial");
@@ -5143,14 +5610,18 @@ void config_rig_serialport(struct radio *radio)
     // check if presently allocated
     serial_num=find_connected_serial(civport_num);
     if (serial_num!= -1) {
+#if RIG_SETUP_VERBOSE
       console->println("use existing allocated serial for CAT");
+#endif
       // release attached 
       release_civport_serial(civport_num);
       // and configure this 
       config_serial_instance(&radio->rig_spec->civport,radio->rig_spec->civport_num,serial_num, radio->rig_spec->civport_baud,radio->rig_spec->civport_reversed);         } else {
       serial_num= find_free_hardwareserial();
       if (serial_num != -1) {
-	console->println("configure new serial for CAT");	
+#if RIG_SETUP_VERBOSE
+	console->println("configure new serial for CAT");
+#endif	
 	config_serial_instance(&radio->rig_spec->civport,radio->rig_spec->civport_num,serial_num, radio->rig_spec->civport_baud,radio->rig_spec->civport_reversed);
       } else {
 	console->print("No free serial");
@@ -5235,6 +5706,7 @@ static void release_rig_serial_resource(struct radio *radio) {
 
 // set radio->rig_spec from radio->rig_spec_idx
 void select_rig(struct radio *radio) {
+#if RIG_SETUP_VERBOSE
   console->printf(
     "[USBBIND] SELECT_BEFORE radio=%d target_spec=%d old_name=%s "
     "old_civport=%d old_cat_type=%d qmx_ready=%d txq=%u rxq=%u r=%d w=%d\n",
@@ -5247,11 +5719,14 @@ void select_rig(struct radio *radio) {
     xQueueCATUSBTx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx) : 0U,
     xQueueCATUSBRx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBRx) : 0U,
     radio ? radio->r_ptr : -1, radio ? radio->w_ptr : -1);
+#endif
 
+#if RIG_SETUP_VERBOSE
   if (!plogw->f_console_emu) {
     plogw->ostream->print("select_rig() spec:");
     plogw->ostream->println(radio->rig_spec_idx);
   }
+#endif
 
   // before changing rig, release Serial resource
   release_rig_serial_resource(radio);
@@ -5265,6 +5740,7 @@ void select_rig(struct radio *radio) {
   // set serial port characteristics
   config_rig_serialport(radio);
 
+#if RIG_SETUP_VERBOSE
   console->printf(
     "[USBBIND] SELECT_AFTER radio=%d spec=%d name=%s "
     "civport=%d cat_type=%d qmx_ready=%d txq=%u rxq=%u r=%d w=%d\n",
@@ -5276,6 +5752,7 @@ void select_rig(struct radio *radio) {
     xQueueCATUSBTx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx) : 0U,
     xQueueCATUSBRx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBRx) : 0U,
     radio->r_ptr, radio->w_ptr);
+#endif
 
   /*
    * Do not carry CAT requests from the previously selected USB rig into a
@@ -5292,6 +5769,7 @@ void select_rig(struct radio *radio) {
     ats_mini_bw_last_cmd_ms[radio->rig_idx] = 0;
   }
 
+#if RIG_SETUP_VERBOSE
   console->printf(
     "SELECT_RIG_USB_DIAG rig_idx=%d spec=%d name=%s civport=%d cat_type=%d "
     "qmx_const=%d ats_const=%d qmx_ready=%d txq=%u rxq=%u\n",
@@ -5303,6 +5781,7 @@ void select_rig(struct radio *radio) {
     usb_cat_ready_for_rig_type(CAT_TYPE_QMX) ? 1 : 0,
     xQueueCATUSBTx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBTx) : 0U,
     xQueueCATUSBRx ? (unsigned int)uxQueueMessagesWaiting(xQueueCATUSBRx) : 0U);
+#endif
 
   if (radio->rig_spec->civport_num == -1 &&
       (radio->rig_spec->cat_type == CAT_TYPE_QMX ||
@@ -5366,13 +5845,25 @@ void select_rig(struct radio *radio) {
   radio->f_civ_response_expected = 0;
   radio->civ_response_timer = 0;
   //  if (radio->rig_spec->band_mask != 0 ) {
+#if RIG_SETUP_VERBOSE
   console->print("set radio band_mask from rig_spec");
+#endif
   radio->band_mask = radio->rig_spec->band_mask;
 
   // initialize ptt hardware status
   set_ptt_rig(radio,0);
   //  }
+#if RIG_SETUP_VERBOSE
   if (!plogw->f_console_emu) plogw->ostream->println("select_rig()end");
+#else
+  console->printf("RIG%d: %s spec=%d CAT=%d port=%d baud=%d CW=%d FSK=%d PTT=%d BM=%04X\n",
+                  radio->rig_idx,
+                  radio->rig_spec->name ? radio->rig_spec->name : "(null)",
+                  radio->rig_spec_idx, radio->rig_spec->cat_type,
+                  radio->rig_spec->civport_num, radio->rig_spec->civport_baud,
+                  radio->rig_spec->cwport, radio->rig_spec->fskport,
+                  radio->rig_spec->pttmethod, radio->rig_spec->band_mask);
+#endif
 }
 
 // initialization of KENWOOD cat over software serial 22/05/09 (for QCX mini)
@@ -5833,9 +6324,11 @@ void init_all_radio() {
 void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
 {
   char s1[300];char *p;
+#if RIG_SETUP_VERBOSE
   console->print("RIGSPEC=[");
   console->print(s);
   console->println("]");
+#endif
   // The rig specification string is a complete replacement, not a partial
   // update.  Clear fields which may be omitted from the serialized string so
   // deleting e.g. XVTR: from the web editor also removes the old RAM value.
@@ -5845,6 +6338,9 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
   rig_spec->fskport = -1;
   rig_spec->rtty_polarity = -1;
   rig_spec->pttmethod = 0;
+  rig_spec->tuner_port = 0;
+  rig_spec->swr_limit_x100 = 0;
+  rig_spec->tuner_hold_ms = 1500;
   memset(rig_spec->transverter_freq, 0, sizeof(rig_spec->transverter_freq));
   char *saveptr1, *saveptr2;  
   char *p1; int idx1,idx2; long long val;// for arg parse
@@ -5852,16 +6348,22 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
   strlcpy(s1, s, sizeof(s1));
   p=strtok_r(s1,", ",&saveptr1);
 
+#if RIG_SETUP_VERBOSE
   console->println("set_rig_spec_from_str_rig()");
+#endif
   while (p!=NULL) {
     //    console->print("parsed:");console->println(p);
     if (strncmp(p,"CW:",3)==0) {
-      console->println("CW: process");      
+#if RIG_SETUP_VERBOSE
+      console->println("CW: process");
+#endif      
       // CW port
       n=atoi(p+3);
       if (n>=0 && n<=4) {
 	rig_spec->cwport=n;
+#if RIG_SETUP_VERBOSE
 	console->print("rig_spec cwport =");console->println(	rig_spec->cwport);
+#endif
       }
     } else if (strncmp(p,"FSK:",4)==0) {
       n=atoi(p+4);
@@ -5870,7 +6372,9 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
       n=atoi(p+3);
       if (n>=0 && n<=1) rig_spec->rtty_polarity=n;
     } else if (strncmp(p,"B:",2)==0) {
-      console->println("B: baudrate");            
+#if RIG_SETUP_VERBOSE
+      console->println("B: baudrate");
+#endif            
       // baudrate
       n=atoi(p+2);
       if (n>=1 && n<=115200) {
@@ -5891,7 +6395,9 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
     } else if (strncmp(p,"NAME:",5)==0) {
       if (*(p+5)!='\0') {
 	strlcpy(rig_spec->name, p + 5, sizeof(rig_spec->name));
+#if RIG_SETUP_VERBOSE
 	console->print("name set to rig_spec->name=;");console->println(rig_spec->name);
+#endif
       }
     } else if (strncmp(p,"XVTR:",5)==0) {
       // transverter frequencies freq jointed by _ from index 0iflo_0ifhi_0rflo_0rfhi_1iflo ...
@@ -5932,20 +6438,34 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
 	rig_spec->pttmethod=n;
       }
 
+    } else if (strncmp(p,"T:",2)==0) {
+      n=atoi(p+2);
+      if (n>=0 && n<=5) rig_spec->tuner_port=n;
+    } else if (strncmp(p,"SWR:",4)==0) {
+      n=atoi(p+4);
+      if (n==0 || (n>=110 && n<=999)) rig_spec->swr_limit_x100=n;
+    } else if (strncmp(p,"TH:",3)==0) {
+      n=atoi(p+3);
+      if (n>=500 && n<=3000) rig_spec->tuner_hold_ms=n;
+
     } else if (strncmp(p,"BM:",3)==0) {
+#if RIG_SETUP_VERBOSE
       console->print("BM token=");
       console->println(p);
-
       console->print("BM before=");
-      console->println(rig_spec->band_mask, HEX);      
-      // bandmask hex 
+      console->println(rig_spec->band_mask, HEX);
+#endif
+      // bandmask hex
       if (sscanf(p+3,"%x",&n)==1) {
+#if RIG_SETUP_VERBOSE
 	console->print("parsed=");
-	console->println(n, HEX);	
+	console->println(n, HEX);
+#endif
 	rig_spec->band_mask = n;
-	//	console->print("BM;");console->println(	rig_spec->band_mask ,HEX);
+#if RIG_SETUP_VERBOSE
 	console->print("after=");
 	console->println(rig_spec->band_mask, HEX);
+#endif
       }
     } else if (strncmp(p,"TP:",3)==0) {
       // CAT type and rig type.  Historically both were one digit and this
@@ -6077,6 +6597,15 @@ void print_rig_spec_str(int rig_idx,char *buf) // reverse set rig_spec_string fr
   if (p->pttmethod!=0) {
     sprintf(buf1,"PTT:%d,",p->pttmethod);  strcat(buf,buf1);
   }
+  if (p->tuner_port != 0) {
+    sprintf(buf1,"T:%d,",p->tuner_port); strcat(buf,buf1);
+  }
+  if (p->swr_limit_x100 != 0) {
+    sprintf(buf1,"SWR:%d,",p->swr_limit_x100); strcat(buf,buf1);
+  }
+  if (p->tuner_hold_ms != 1500) {
+    sprintf(buf1,"TH:%d,",p->tuner_hold_ms); strcat(buf,buf1);
+  }
   if (p->transverter_freq[0][0]!=0) {
     sprintf(buf1,"XVTR:"); strcat(buf,buf1);
     for (int i=0;i<NMAX_TRANSVERTER;i++) {
@@ -6119,11 +6648,13 @@ void set_rig_spec_str_from_spec(struct radio *radio) // reverse set rig_spec_str
   // need adjust cursor position rig_spec_str
   adjust_cursor_buf(radio->rig_spec_str);
       
+#if RIG_SETUP_VERBOSE
   if (!plogw->f_console_emu) {
     plogw->ostream->print(radio->rig_spec->name);
     plogw->ostream->print(" ");    
     plogw->ostream->println(buf);
   }
+#endif
 }
 
 
@@ -6175,7 +6706,6 @@ void save_rigs(const char *fn)
 void load_rigs(const char *fn)
 {
   char fnbuf[30],spec_buf[300];
-  plogw->ostream->print("load rigs from:");
   if (*fn == '\0') {
     strcpy(fnbuf, "/rigs");
   } else {
@@ -6183,7 +6713,10 @@ void load_rigs(const char *fn)
     strcat(fnbuf, fn);
   }
   strcat(fnbuf, ".txt");
+#if RIG_SETUP_VERBOSE
+  plogw->ostream->print("load rigs from:");
   plogw->ostream->println(fnbuf);
+#endif
   // f = SPIFFS.open(fnbuf, FILE_READ);
   f = SD.open(fnbuf, FILE_READ);
 
@@ -6192,11 +6725,13 @@ void load_rigs(const char *fn)
     return ;
   }
   while (readline(&f, spec_buf, 0x0d0a, 300) != 0) {
+#if RIG_SETUP_VERBOSE
     if (!plogw->f_console_emu) {
       plogw->ostream->print("line:");
       plogw->ostream->print(spec_buf);
       plogw->ostream->print(":\r\n");
     }
+#endif
     //    assign_settings(buf, settings_dict);
     char *p;int idx;
     p=strtok(spec_buf," ");
@@ -6246,6 +6781,15 @@ void init_radio(struct radio *radio, const char *rig_name) {
     radio->preamp_band[i] = -1;
   }
   radio->smeter = 0;
+  radio->swr_x100 = 0;
+  radio->swr_updated_ms = 0;
+  radio->swr_evaluated_ms = 0;
+  radio->swr_high_count = 0;
+  radio->tune_active = false;
+  radio->tune_key_asserted = false;
+  radio->tune_key_release_ms = 0;
+  radio->tune_stop_ms = 0;
+  radio->tune_cooldown_until_ms = 0;
   radio->smeter_peak = SMETER_MINIMUM_DBM;
   radio->bandid = 0;
   radio->bandid_prev = 0;
@@ -6271,6 +6815,7 @@ void init_radio(struct radio *radio, const char *rig_name) {
   radio->yaesu_query_pending_until = 0;
   radio->yaesu_query_next_send_at = 0;
   radio->yaesu_query_next_slot = 0;
+  radio->yaesu_meter_after_tx = 0;
 
   radio->bandid_bandmap = 0;
 
@@ -6279,7 +6824,9 @@ void init_radio(struct radio *radio, const char *rig_name) {
   radio->qsodata_loaded = 0;
 
   radio->multi = -1;
-  init_buf(radio->callsign, LEN_CALL_WINDOW);
+  // The edit buffer can hold three queued calls.  LEN_CALLSIGN and the QSO
+  // record layout remain unchanged; only the interactive input capacity grows.
+  init_buf(radio->callsign, LEN_CALL_STACK_WINDOW);
   init_buf(radio->recv_rst, LEN_RST_WINDOW);
   init_buf(radio->sent_rst, LEN_RST_WINDOW);
   init_buf(radio->recv_exch, LEN_DUAL_EXCH_WINDOW);
@@ -6561,11 +7108,59 @@ static void process_cat_frame(struct radio *radio)
 {
   switch (radio->rig_spec->cat_type) {
   case CAT_TYPE_YAESU_NEW:
-  case CAT_TYPE_YAESU_OLD:
-    yaesu_query_response_received(radio);
+  case CAT_TYPE_YAESU_OLD: {
+    // Split Yaesu ASCII processing without changing the order.  In
+    // particular, TX is still parsed before the query scheduler sees the
+    // response, and no USB/DTR/RTS path is touched.
+    const int diag_len = radio->cmd_ptr;
+    char diag_cmd[5] = { 0, 0, 0, 0, 0 };
+    int diag_cmd_len = 0;
+    while (diag_cmd_len < 4 && diag_cmd_len < diag_len) {
+      const char c = radio->cmdbuf[diag_cmd_len];
+      if (c == ';' || c == '\0' || (c >= '0' && c <= '9')) break;
+      diag_cmd[diag_cmd_len++] = c;
+    }
+    if (diag_cmd_len == 0 && diag_len > 0) {
+      diag_cmd[0] = radio->cmdbuf[0];
+      diag_cmd[1] = '\0';
+    }
+
+    const uint32_t diag_process_start_us = micros();
+
+    const uint32_t diag_get_start_us = micros();
     get_cat(radio);
+    const uint32_t diag_get_us = micros() - diag_get_start_us;
+
+    const uint32_t diag_ack_start_us = micros();
+    yaesu_query_response_received(radio);
+    const uint32_t diag_ack_us = micros() - diag_ack_start_us;
+
+    const uint32_t diag_print_start_us = micros();
     print_cat(radio);
+    const uint32_t diag_print_us = micros() - diag_print_start_us;
+
+    const uint32_t diag_process_us = micros() - diag_process_start_us;
+    if ((verbose & VERBOSE_PERF) && diag_process_us >= 10000U) {
+      const uint32_t diag_known_get_us =
+          yaesu_diag_smeter_us + yaesu_diag_display_us;
+      const uint32_t diag_get_other_us =
+          (diag_get_us > diag_known_get_us)
+              ? (diag_get_us - diag_known_get_us) : 0;
+      console->printf(
+          "YAESU FRAME SLOW rig=%d cmd=%s len=%d total=%lu "
+          "get=%lu smeter=%lu display=%lu get_other=%lu "
+          "ack=%lu print=%lu\n",
+          radio->rig_idx, diag_cmd, diag_len,
+          (unsigned long)diag_process_us,
+          (unsigned long)diag_get_us,
+          (unsigned long)yaesu_diag_smeter_us,
+          (unsigned long)yaesu_diag_display_us,
+          (unsigned long)diag_get_other_us,
+          (unsigned long)diag_ack_us,
+          (unsigned long)diag_print_us);
+    }
     break;
+  }
 
   case CAT_TYPE_ATS_MINI:
     get_cat_ats_mini(radio);
@@ -6682,19 +7277,96 @@ void civ_process() {
      */
     int byte_budget = byte_budget_per_radio;
     while ((byte_budget-- > 0) && (radio->r_ptr != radio->w_ptr)) {
-      if (!receive_protocol_frame(radio)) continue;
-      
-      process_protocol_frame(radio);
-      clear_civ(radio);
+      time_measure_start_name(PROF_CIV_RX, "civ_rx");
+      const int frame_complete = receive_protocol_frame(radio);
+      time_measure_stop(PROF_CIV_RX);
+      if (!frame_complete) continue;
+
+      // PROF_CIV_FRAME is a historical name: it covers every completed CAT
+      // protocol frame, not only Icom CI-V.  Keep local wall-clock stamps so
+      // a slow frame can be attributed to the actual rig/protocol without
+      // changing USB/CW/FSK service timing.
+      const uint32_t diag_frame_start_us = micros();
+      const TickType_t diag_tick_start = xTaskGetTickCount();
+      const int diag_core_start = xPortGetCoreID();
+      uint32_t diag_process_us = 0;
+      uint32_t diag_clear_us = 0;
+      uint8_t diag_cmd = 0xff;
+      uint8_t diag_sub = 0xff;
+      const int diag_len = radio->cmd_ptr;
+
+      time_measure_start_name(PROF_CIV_FRAME, "civ_frame");
+      if (radio->rig_spec->cat_type == CAT_TYPE_CIV) {
+        // Split CI-V frame handling so long stalls can be attributed to
+        // printing, parsing/state update, or frame cleanup.  Snapshot the
+        // command before clear_civ() resets the receive buffer.
+        diag_cmd = (radio->cmd_ptr > 4) ? (uint8_t)radio->cmdbuf[4] : 0xff;
+        diag_sub = (radio->cmd_ptr > 5) ? (uint8_t)radio->cmdbuf[5] : 0xff;
+
+        const uint32_t diag_process_start_us = micros();
+        time_measure_start_name(PROF_CIV_PRINT, "civ_print");
+        print_civ(radio);
+        time_measure_stop(PROF_CIV_PRINT);
+
+        const uint32_t diag_get_start_us = micros();
+        time_measure_start_name(PROF_CIV_GET, "civ_get");
+        get_civ(radio);
+        time_measure_stop(PROF_CIV_GET);
+        const uint32_t diag_get_us = micros() - diag_get_start_us;
+        diag_process_us = micros() - diag_process_start_us;
+
+        const uint32_t diag_clear_start_us = micros();
+        time_measure_start_name(PROF_CIV_CLEAR, "civ_clear");
+        clear_civ(radio);
+        time_measure_stop(PROF_CIV_CLEAR);
+        diag_clear_us = micros() - diag_clear_start_us;
+
+        if ((verbose & VERBOSE_PERF) && diag_get_us >= 10000U) {
+          console->printf(
+              "CIV SLOW rig=%d cmd=%02X sub=%02X len=%d get=%lu us\n",
+              radio->rig_idx, diag_cmd, diag_sub, diag_len,
+              (unsigned long)diag_get_us);
+        }
+      } else {
+        const uint32_t diag_process_start_us = micros();
+        process_protocol_frame(radio);
+        diag_process_us = micros() - diag_process_start_us;
+
+        const uint32_t diag_clear_start_us = micros();
+        clear_civ(radio);
+        diag_clear_us = micros() - diag_clear_start_us;
+      }
+      time_measure_stop(PROF_CIV_FRAME);
+
+      const uint32_t diag_frame_us = micros() - diag_frame_start_us;
+      if ((verbose & VERBOSE_PERF) && diag_frame_us >= 10000U) {
+        const uint32_t diag_accounted_us = diag_process_us + diag_clear_us;
+        const uint32_t diag_other_us =
+            (diag_frame_us > diag_accounted_us)
+                ? (diag_frame_us - diag_accounted_us) : 0;
+        console->printf(
+            "CAT FRAME SLOW rig=%d type=%d len=%d cmd=%02X sub=%02X "
+            "total=%lu process=%lu clear=%lu other=%lu "
+            "tick=%lu->%lu core=%d->%d\n",
+            radio->rig_idx, radio->rig_spec->cat_type, diag_len,
+            diag_cmd, diag_sub, (unsigned long)diag_frame_us,
+            (unsigned long)diag_process_us, (unsigned long)diag_clear_us,
+            (unsigned long)diag_other_us, (unsigned long)diag_tick_start,
+            (unsigned long)xTaskGetTickCount(), diag_core_start,
+            xPortGetCoreID());
+      }
     }
 
   /*
    * Check timeout and send the next query only after draining the
    * received data.
    */
+  time_measure_start_name(PROF_CIV_QUERY, "civ_query");
   yaesu_query_service(radio);
+  time_measure_stop(PROF_CIV_QUERY);
   }
 
+  time_measure_start_name(PROF_CIV_TAIL, "civ_tail");
   radio = so2r.radio_selected();
   // check smeter reading trigger
   // S&P and Phone
@@ -6721,6 +7393,7 @@ void civ_process() {
   if (radio->ptt_stat == 2) {
     radio->ptt_stat = 0;  // force receive ptt why??? 23/1/11
   }
+  time_measure_stop(PROF_CIV_TAIL);
 }
 
 static int receive_civ_frame(struct radio *radio, char c) {
@@ -6875,12 +7548,23 @@ void Control_TX_process() {
   // Also service deferred Yaesu TX-CLAR release requests from the CW ticker.
   service_xit_cw_message();
   struct radio *radio;
-  radio = &radio_list[so2r.tx()];
+  const int tx_radio_idx = effective_cw_radio();
+  radio = &radio_list[tx_radio_idx];
   switch (f_transmission) {
     case 0:  // do nothing
       break;
     case 1:  // force transmission
       set_ptt_rig(radio, 1);
+      // A locally initiated RTTY/CW transmission is known immediately.
+      // Waiting for a later IF/TX poll caused short transmissions to finish
+      // before the SWR scheduler ever saw ptt_stat asserted.
+      radio->ptt_stat_prev = radio->ptt_stat;
+      radio->ptt_stat = 1;
+      radio->ptt = 1;
+      radio->local_ptt_rx_hold_until_ms = 0;
+      if (is_yaesu_ascii_radio(radio))
+        radio->yaesu_query_request_mask &=
+            (uint16_t)~((uint16_t)1U << YAESU_QUERY_SM);
       // For USB FSK RTTY, measure the MARK lead from here, after the PTT ON
       // command has actually been issued.  Previously the lead started in
       // the 1-ms CW ticker before this main-loop PTT operation, so a busy
@@ -6888,7 +7572,7 @@ void Control_TX_process() {
       if (f_rtty_usb_lead_pending) {
         const uint8_t fskport = (uint8_t)rig_fsk_port(radio->rig_spec);
         if (!radio->f_tone_keying && (fskport == 3 || fskport == 4)) {
-          int lead_ms = rtty_ptt_lead_ms;
+          int lead_ms = rtty_pending_lead_ms;
           if (lead_ms < 0) lead_ms = 0;
           if (lead_ms > 2000) lead_ms = 2000;
           usb_rtty_begin(fskport, (uint32_t)lead_ms, rig_rtty_invert(radio->rig_spec));
@@ -6898,7 +7582,7 @@ void Control_TX_process() {
       }
       if (!plogw->f_console_emu) {
         plogw->ostream->println("PTT ON TX=");
-        plogw->ostream->println(so2r.tx());
+        plogw->ostream->println(tx_radio_idx);
       }
       if (radio->f_tone_keying) {
 	keying(1); // PTT in tone keying by keying contact
@@ -6906,6 +7590,13 @@ void Control_TX_process() {
       break;
     case 2:  // force stop transmission
       set_ptt_rig(radio, 0);
+      radio->ptt_stat_prev = radio->ptt_stat;
+      radio->ptt_stat = 0;
+      radio->ptt = 0;
+      radio->local_ptt_rx_hold_until_ms = millis() + 750U;
+      if (is_yaesu_ascii_radio(radio))
+        radio->yaesu_query_request_mask &=
+            ~((uint16_t)1U << YAESU_QUERY_SWR);
       if (radio->f_tone_keying) {
 	//        ledcWrite(LEDC_CHANNEL_0, 0);  // stop sending tone
 	keying(0);
@@ -6915,7 +7606,14 @@ void Control_TX_process() {
       }
       if (!plogw->f_console_emu) {
         plogw->ostream->print("PTT OFF TX=");
-        plogw->ostream->println(so2r.tx());
+        plogw->ostream->println(tx_radio_idx);
+      }
+      // Local RTTY messages do not carry CW's '$' END_OF_MSG marker.
+      // Finish the SO2R message only after ETX has completed and PTT is
+      // physically released, so RX/audio focus returns at the right time.
+      if (f_rtty_message_end_pending) {
+        f_rtty_message_end_pending = false;
+        so2r.tx_msg_finished();
       }
 
       break;
@@ -6980,40 +7678,56 @@ void set_sat_opmode(struct radio *radio, char *opmode) {
   switch (radio->rig_spec->rig_type) {
     case 0:  // IC-705 VFO sel/unselected to set RX/TX frequency
       break;
-    case 1:  // IC-9700 main (TX) and sub (RX) frequencies  normally select sub
-      send_head_civ(radio);
-      add_civ_buf((byte)0x07);  // select vfo
-      add_civ_buf((byte)0xd0);  // main (TX)
-      send_tail_civ(radio);
+    case 1: { // IC-9700: native SAT R_A_T_B is MAIN=RX, SUB=TX
+      const bool native_sat = plogw->sat &&
+                              plogw->sat_vfo_mode == SAT_VFO_SINGLE_A_RX;
+      const byte tx_vfo = native_sat ? 0xd1 : 0xd0;
+      const byte rx_vfo = native_sat ? 0xd0 : 0xd1;
 
-      // set mode for uplink
-      send_head_civ(radio);
-      add_civ_buf((byte)0x06);  // set mode
-      add_civ_buf((byte)rig_modenum(opmode));
-      add_civ_buf((byte)0x01);  // FIL1
-      send_tail_civ(radio);
-
-      send_head_civ(radio);
-      add_civ_buf((byte)0x07);  // select vfo
-      add_civ_buf((byte)0xd1);  // sub (RX)
-      send_tail_civ(radio);
-
-      // set mode for downlink
-      send_head_civ(radio);
-      add_civ_buf((byte)0x06);  // mode
-      if ((strcmp(opmode, "CW-R") == 0) || (strcmp(opmode, "CW") == 0)) {
-        add_civ_buf((byte)rig_modenum("USB"));
-
-      } else {
-        add_civ_buf((byte)rig_modenum(opmode));
+      // TX/uplink is either the satellite DB uplink mode or CW (Alt-M).
+      // RX/downlink normally follows the DB downlink mode independently.
+      // For CW uplink operation, receive the linear transponder in USB.
+      const int satidx = plogw->sat_idx_selected;
+      const bool tx_is_cw = strcmp(opmode, "CW") == 0 || strcmp(opmode, "CW-R") == 0;
+      const char *rx_mode = opmode;
+      if (tx_is_cw) {
+        rx_mode = "USB";
+      } else if (satidx >= 0 && satidx < N_SATELLITES && sat_info[satidx].dn_mode[0]) {
+        rx_mode = sat_info[satidx].dn_mode;
       }
-      add_civ_buf((byte)0x01);  // FIL1
+
+      send_head_civ(radio);
+      add_civ_buf((byte)0x07);
+      add_civ_buf(tx_vfo);
       send_tail_civ(radio);
 
-      // set opmode, and filt for operation purpose
-      set_mode(opmode, 1, radio);
+      send_head_civ(radio);
+      add_civ_buf((byte)0x06);
+      add_civ_buf((byte)rig_modenum(opmode));
+      add_civ_buf((byte)0x01);
+      send_tail_civ(radio);
 
+      // RX/downlink: database mode, except CW uplink => USB receive.
+      send_head_civ(radio);
+      add_civ_buf((byte)0x07);
+      add_civ_buf(rx_vfo);
+      send_tail_civ(radio);
+
+      send_head_civ(radio);
+      add_civ_buf((byte)0x06);
+      add_civ_buf((byte)rig_modenum(rx_mode));
+      add_civ_buf((byte)0x01);
+      send_tail_civ(radio);
+
+      // Keep the operator-facing mode as the TX mode; MAIN remains selected
+      // as RX in native IC-9700 Satellite mode.
+      set_mode(opmode, 1, radio);
+      if (verbose & 8)
+        plogw->ostream->printf("SAT MODE IC9700 RX=%s TX=%s (%s)\n",
+                              rx_mode, opmode,
+                              native_sat ? "MAIN=RX SUB=TX" : "MAIN=TX SUB=RX");
       break;
+    }
   }
 }
 
@@ -7041,7 +7755,13 @@ void adjust_frequency(int dfreq) {
         if (plogw->satdn_f != 0) plogw->satdn_f += dfreq*FREQ_UNIT;
         break;
     }
-    //    set_sat_freq_calc();   // finally set frequency
+    // Recalculate the companion frequency with the existing common Ofs.
+    // A DVPlogger key operation is never an Ofs-learning event: after the
+    // calculation explicitly queue both sides so the requested side and its
+    // companion move together in both DUAL and native SATELLITE modes.
+    set_sat_freq_calc();
+    set_sat_freq_to_rig_vfo(plogw->up_f, 1);
+    set_sat_freq_to_rig_vfo(plogw->dn_f, 0);
   } else {
     set_frequency_rig((int)(so2r.radio_selected()->freq + dfreq));  //
   }

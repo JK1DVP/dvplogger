@@ -49,6 +49,7 @@ int opmode2zLogmode(char *opmode);
 void reconnect_zserver();
 void zserver_freq_notification();
 bool zserver_start_merge(bool dry_run=false);
+bool zserver_start_merge_new(uint8_t batch_size=10);
 bool zserver_start_repair();
 bool zserver_merge_active();
 extern int f_show_zserver;

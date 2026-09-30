@@ -165,13 +165,35 @@ build_set()
 [[ -d "${EXT_DIR}" ]] ||
     die "Directory not found: ${EXT_DIR}"
 
-build_set 1 mini
-build_set 3 Wide
+TARGET="${1:-all}"
+
+case "${TARGET,,}" in
+    all)
+        BUILD_HW1=1
+        BUILD_HW3=1
+        ;;
+    hw1|1|mini)
+        BUILD_HW1=1
+        BUILD_HW3=0
+        ;;
+    hw3|3|wide)
+        BUILD_HW1=0
+        BUILD_HW3=1
+        ;;
+    *)
+        die "Usage: $0 [all|hw1|hw3]"
+        ;;
+esac
+
+(( BUILD_HW1 )) && build_set 1 mini
+(( BUILD_HW3 )) && build_set 3 Wide
 
 echo
 echo "============================================================"
-echo " All builds completed successfully"
+echo " Selected build(s) completed successfully"
 echo "============================================================"
+
+if (( BUILD_HW1 )); then
 echo
 echo "HW1 / mini:"
 echo "  binaries/mini/dvplogger.bin"
@@ -182,6 +204,9 @@ echo "  binaries/mini/subcpu/bootload.bin"
 echo "  binaries/mini/subcpu/partitio.bin"
 echo "  binaries/mini/subcpu/spiffs.bin"
 echo "  binaries/mini/CRC32SUMS.txt"
+fi
+
+if (( BUILD_HW3 )); then
 echo
 echo "HW3 / Wide:"
 echo "  binaries/Wide/dvplogger.bin"
@@ -192,3 +217,4 @@ echo "  binaries/Wide/subcpu/bootload.bin"
 echo "  binaries/Wide/subcpu/partitio.bin"
 echo "  binaries/Wide/subcpu/spiffs.bin"
 echo "  binaries/Wide/CRC32SUMS.txt"
+fi

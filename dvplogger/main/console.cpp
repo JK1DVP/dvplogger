@@ -32,6 +32,7 @@
 #include "console.h"
 #include "so2r.h"
 #include "SD.h"
+#include "callhist.h"
 
 
 
@@ -112,6 +113,8 @@ static bool sdput_commit() {
     return false;
   }
   if (had_target && SD.exists(sdput.backup)) SD.remove(sdput.backup);
+
+  callhist_source_updated(sdput.target);
 
   if (out) {
     out->printf("SDPUT OK name=%s size=%lu crc=%08lX\r\n",
@@ -326,6 +329,7 @@ static bool ymodem_verify_and_commit() {
   if (had_target && SD.exists(ymodem.backup)) SD.remove(ymodem.backup);
   ymodem.final_crc = read_crc;
   ymodem.committed = true;
+  callhist_source_updated(ymodem.target);
   (void)out;
   return true;
 }
@@ -1141,7 +1145,7 @@ void emulate_keyboard(char c) {
     plogw->ostream->println(modkey.bmLeftAlt);
   }
   if ((verbose & 16) && ((uint8_t)key == 0x36 || (uint8_t)key == 0x37)) {
-    Serial.printf("KBDLOW t=%lu src=CONSOLE hid=0x%02X mod=0x%02X on=1\n",
+    console->printf("KBDLOW t=%lu src=CONSOLE hid=0x%02X mod=0x%02X on=1\n",
                   (unsigned long)millis(), (unsigned int)(uint8_t)key,
                   (unsigned int)(*((uint8_t *)&modkey)));
   }

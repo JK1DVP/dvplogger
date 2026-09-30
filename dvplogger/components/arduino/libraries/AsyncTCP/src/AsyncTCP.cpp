@@ -350,6 +350,21 @@ static void _stop_async_task(){
 }
 */
 
+uint32_t asyncTCPStackHighWaterMark() {
+  if (!_async_service_task_handle) {
+    return 0;
+  }
+  return (uint32_t)uxTaskGetStackHighWaterMark(_async_service_task_handle);
+}
+
+uint32_t asyncTCPStackConfiguredSize() {
+  return (uint32_t)CONFIG_ASYNC_TCP_STACK_SIZE;
+}
+
+uint32_t asyncTCPQueueMessagesWaiting() {
+  return _async_queue ? (uint32_t)uxQueueMessagesWaiting(_async_queue) : 0;
+}
+
 static bool customTaskCreateUniversal(
   TaskFunction_t pxTaskCode, const char *const pcName, const uint32_t usStackDepth, void *const pvParameters, UBaseType_t uxPriority,
   TaskHandle_t *const pxCreatedTask, const BaseType_t xCoreID

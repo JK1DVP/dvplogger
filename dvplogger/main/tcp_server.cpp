@@ -35,6 +35,7 @@
 #include "usb_host.h"
 #include "tcp_server.h"
 #include "console.h"
+#include "misc.h"
 
 
 #include <AsyncTCP.h>
@@ -45,7 +46,15 @@
 #include "esp_task_wdt.h"
 #include <new>
 #include <limits.h>
+#include <stdarg.h>
 
+static void telnet_diag(const char *fmt, ...) {
+    if (!lowmem_trace || !local_console || !fmt) return;
+    char line[192];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap); va_end(ap);
+    local_console->print("[TELNETDBG] "); local_console->print(line);
+}
 
 // AsyncTCPBufferedStream.h
 //#pragma once
@@ -65,15 +74,18 @@ public:
                            TickType_t flushInterval = pdMS_TO_TICKS(100))
         : client(client), maxQueueSize(maxQueueSize), ackTimeout(ackTimeoutTicks),
           flushSizeThreshold(flushThreshold), flushTimeThreshold(flushInterval) {
+        telnet_diag("stream ctor sizeof=%u buffer=%u senditem=%u qlen=%u free=%u\n", (unsigned)sizeof(*this), (unsigned)sizeof(bufferBuf), (unsigned)sizeof(SendBuffer), (unsigned)maxQueueSize, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
         sendQueue = xQueueCreate(maxQueueSize, sizeof(SendBuffer));
+        telnet_diag("send queue created handle=%p free=%u\n", sendQueue, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
         _writing = false;
         bufferLen = 0;
         lastFlushTime = xTaskGetTickCount();
         client->onAck([](void* arg, AsyncClient*, size_t len, uint32_t time) {
             static_cast<AsyncTCPBufferedStream*>(arg)->_writing = false;
-	    //Serial.println("Ack");
+	    //console->println("Ack");
         }, this);
-        xTaskCreatePinnedToCore(senderTaskWrapper, "SenderTask", 4096, this, 1, &senderHandle, 1);
+        BaseType_t task_rc = xTaskCreatePinnedToCore(senderTaskWrapper, "SenderTask", 2560, this, 1, &senderHandle, 1);
+        telnet_diag("sender task create rc=%d handle=%p free=%u\n", (int)task_rc, senderHandle, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
     }
 
     ~AsyncTCPBufferedStream() {
@@ -102,7 +114,7 @@ public:
     }
 
     size_t write(const uint8_t* buffer, size_t size) override {
-        if (!client || !client->connected()) return 0;
+        if (!client || !client->connected()) { telnet_diag("TX write rejected size=%u client=%p connected=%d\n", (unsigned)size, client, client ? client->connected() : 0); return 0; }
         size_t sent = 0;
         for (size_t i = 0; i < size; ++i) {
 	  TickType_t now = xTaskGetTickCount();
@@ -125,10 +137,29 @@ public:
     void flush() override {
         if (bufferLen == 0 || !client || !client->connected()) return;
         uint8_t* copy = (uint8_t*)malloc(bufferLen);
-        if (!copy) return;
+        if (!copy) { telnet_diag("TX flush malloc FAILED len=%u free=%u largest=%u\n", (unsigned)bufferLen, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)); return; }
         memcpy(copy, bufferBuf, bufferLen);
         SendBuffer buf = {copy, bufferLen};
-        if (xQueueSend(sendQueue, &buf, 0) != pdTRUE) {
+        // Apply bounded backpressure instead of immediately spinning when TCP is
+        // congested.  Never block indefinitely: after 100 ms drop this chunk.
+        BaseType_t qrc = xQueueSend(sendQueue, &buf, pdMS_TO_TICKS(100));
+        UBaseType_t qwait = uxQueueMessagesWaiting(sendQueue);
+        if (qwait > txQueueHighWater) {
+            txQueueHighWater = qwait;
+            if (qwait == 5 || qwait == 8 || qwait >= maxQueueSize) {
+                telnet_diag("TX queue high-water=%u/%u drops=%u free=%u\n",
+                            (unsigned)qwait, (unsigned)maxQueueSize,
+                            (unsigned)txDroppedChunks,
+                            (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            }
+        }
+        if (qrc != pdTRUE) {
+            ++txDroppedChunks;
+            telnet_diag("TX queue timeout/drop len=%u qwait=%u/%u drops=%u free=%u largest=%u\n",
+                        (unsigned)buf.length, (unsigned)qwait, (unsigned)maxQueueSize,
+                        (unsigned)txDroppedChunks,
+                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
             free(copy);
         }
         bufferLen = 0;
@@ -152,15 +183,28 @@ private:
     volatile bool stopping = false;
     TickType_t ackTimeout;
 
-    uint8_t bufferBuf[1024];
+    uint8_t bufferBuf[512];
     size_t bufferLen = 0;
     TickType_t lastFlushTime;
     size_t flushSizeThreshold;
     TickType_t flushTimeThreshold;
+    UBaseType_t txQueueHighWater = 0;
+    uint32_t txDroppedChunks = 0;
+    UBaseType_t senderMinWatermark = UINT_MAX;
 
     void senderTaskImpl() {
         SendBuffer buf;
+        senderMinWatermark = uxTaskGetStackHighWaterMark(nullptr);
+        telnet_diag("sender task start watermark=%u\n", (unsigned)senderMinWatermark);
         while (!stopping && xQueueReceive(sendQueue, &buf, portMAX_DELAY) == pdTRUE) {
+            UBaseType_t watermark = uxTaskGetStackHighWaterMark(nullptr);
+            if (watermark < senderMinWatermark) {
+                senderMinWatermark = watermark;
+                telnet_diag("sender new low watermark=%u used~=%u qwait=%u/%u\n",
+                            (unsigned)watermark, (unsigned)(2560 - watermark),
+                            (unsigned)uxQueueMessagesWaiting(sendQueue),
+                            (unsigned)maxQueueSize);
+            }
             while (!stopping && client && client->connected() &&
                    client->space() < buf.length) {
                 vTaskDelay(1);
@@ -170,7 +214,12 @@ private:
                 continue;
             }
             _writing = true;
-            client->write((const char*)buf.data, buf.length);
+            size_t nw = client->write((const char*)buf.data, buf.length);
+            if (nw != buf.length) {
+                telnet_diag("sender short write requested=%u returned=%u space_after=%u\n",
+                            (unsigned)buf.length, (unsigned)nw,
+                            (unsigned)client->space());
+            }
 
             // ACK待ち with timeout
             TickType_t startTick = xTaskGetTickCount();
@@ -257,7 +306,9 @@ static int findClientSlot(AsyncClient *client) {
 }
 
 static bool enqueueTelnetEvent(const TelnetEvent& ev) {
-  if (!telnetEventQueue || xQueueSend(telnetEventQueue, &ev, 0) != pdTRUE) {
+  BaseType_t rc = telnetEventQueue ? xQueueSend(telnetEventQueue, &ev, 0) : pdFALSE;
+  telnet_diag("event enqueue type=%u slot=%u len=%u rc=%d qwait=%u\n", (unsigned)ev.type, (unsigned)ev.slot, (unsigned)ev.len, (int)rc, telnetEventQueue ? (unsigned)uxQueueMessagesWaiting(telnetEventQueue) : 0);
+  if (!telnetEventQueue || rc != pdTRUE) {
     ++telnetDroppedEvents;
     return false;
   }
@@ -268,6 +319,7 @@ static void handleData(void *, AsyncClient *client, void *data, size_t len) {
   int slot = findClientSlot(client);
   if (slot < 0 || !data) return;
 
+  telnet_diag("RX callback slot=%d len=%u free=%u\n", slot, (unsigned)len, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
   const char *src = static_cast<const char *>(data);
   while (len > 0) {
     TelnetEvent ev{};
@@ -314,6 +366,8 @@ static void handleTimeOut(void *, AsyncClient *client, uint32_t time) {
 static void handleNewClient(void *, AsyncClient *client) {
   if (!client) return;
 
+  memtrace_event("telnet connect callback");
+
   int slot = -1;
   portENTER_CRITICAL(&telnetPoolMux);
   for (int i = 0; i < N_TCPCLIENTS; ++i) {
@@ -332,7 +386,9 @@ static void handleNewClient(void *, AsyncClient *client) {
     return;
   }
 
+  memtrace_event("before telnet stream");
   streamWrapper[slot] = new (std::nothrow) AsyncTCPBufferedStream(client);
+  memtrace_event("after telnet stream");
   if (!streamWrapper[slot]) {
     portENTER_CRITICAL(&telnetPoolMux);
     clientPool[slot] = nullptr;
@@ -354,6 +410,7 @@ static void handleNewClient(void *, AsyncClient *client) {
   ev.slot = (uint8_t)slot;
   ev.client = client;
   enqueueTelnetEvent(ev);
+  memtrace_event("after telnet connect setup");
 }
 
 static void closeTelnetClient(int slot, AsyncClient *expected) {
@@ -375,11 +432,12 @@ static void closeTelnetClient(int slot, AsyncClient *expected) {
 
   if (activeTelnetSlot == slot) activeTelnetSlot = -1;
 
-  // Return asynchronous/debug output to the hardware serial console when the
-  // active Telnet session goes away.
-  if (console == stream) console = &Serial;
-  if (plogw && plogw->ostream == stream) plogw->ostream = &Serial;
-  rebind_memstat_output(stream, &Serial);
+  // Return output to the serial instance currently allocated as the local
+  // console. UART0 may meanwhile belong to CAT.
+  Stream *fallback = local_console ? local_console : &Serial;
+  if (console == stream) console = fallback;
+  if (plogw && plogw->ostream == stream) plogw->ostream = fallback;
+  rebind_memstat_output(stream, fallback);
 
   delete stream;
   client->onData(nullptr, nullptr);
@@ -394,6 +452,7 @@ static void closeTelnetClient(int slot, AsyncClient *expected) {
 static void executeTelnetCommand(int slot) {
   TelnetClientState& state = telnetState[slot];
   state.command[state.command_len] = '\0';
+  telnet_diag("command slot=%d len=%u text=<%s>\n", slot, (unsigned)state.command_len, state.command);
   AsyncTCPBufferedStream *stream = streamWrapper[slot];
   AsyncClient *client = clientPool[slot];
   if (!stream || !client) {
@@ -409,7 +468,9 @@ static void executeTelnetCommand(int slot) {
     return;
   }
 
+  telnet_diag("command before cmd_interp slot=%d\n", slot);
   cmd_interp(state.command, stream);
+  telnet_diag("command after cmd_interp slot=%d; flushing\n", slot);
   stream->flush();
   state.command_len = 0;
 }
@@ -433,7 +494,7 @@ static void processTelnetByte(int slot, uint8_t c) {
     *((uint8_t *)&modkey) = state.modifier;
     uint8_t ascii = kbd_oemtoascii2(state.modifier, c);
     if ((verbose & 16) && (c == 0x36 || c == 0x37)) {
-      Serial.printf("KBDLOW t=%lu src=TCP hid=0x%02X mod=0x%02X on=1\n",
+      console->printf("KBDLOW t=%lu src=TCP hid=0x%02X mod=0x%02X on=1\n",
                     (unsigned long)millis(), (unsigned int)c,
                     (unsigned int)state.modifier);
     }
@@ -507,7 +568,8 @@ void process_tcpserver() {
   TelnetEvent ev;
   int budget = 16;
   while (budget-- > 0 && xQueueReceive(telnetEventQueue, &ev, 0) == pdTRUE) {
-    if (ev.slot >= N_TCPCLIENTS || clientPool[ev.slot] != ev.client) continue;
+    telnet_diag("event dequeue type=%u slot=%u len=%u qremain=%u\n", (unsigned)ev.type, (unsigned)ev.slot, (unsigned)ev.len, (unsigned)uxQueueMessagesWaiting(telnetEventQueue));
+    if (ev.slot >= N_TCPCLIENTS || clientPool[ev.slot] != ev.client) { telnet_diag("event discarded stale/invalid slot=%u\n", (unsigned)ev.slot); continue; }
 
     switch (ev.type) {
       case TELNET_EVENT_DATA:
@@ -526,7 +588,7 @@ void process_tcpserver() {
           closeTelnetClient(oldSlot, oldClient);
         }
 
-        Serial.printf("telnet: connected %s slot=%u permits=%d\n",
+        console->printf("telnet: connected %s slot=%u permits=%d\n",
                       ev.client->remoteIP().toString().c_str(), ev.slot, permits);
         if (streamWrapper[ev.slot] && clientPool[ev.slot] == ev.client) {
           activeTelnetSlot = ev.slot;
@@ -572,7 +634,10 @@ void print_allTCPclients(char *buf) {
 }
 
 void init_tcpserver() {
+  telnet_diag("static sizes event=%u eventQ=%u*%u=%u state=%u*%u=%u stream=%u\n", (unsigned)sizeof(TelnetEvent), (unsigned)TELNET_EVENT_QUEUE_LEN, (unsigned)sizeof(TelnetEvent), (unsigned)(TELNET_EVENT_QUEUE_LEN * sizeof(TelnetEvent)), (unsigned)sizeof(TelnetClientState), (unsigned)N_TCPCLIENTS, (unsigned)(N_TCPCLIENTS * sizeof(TelnetClientState)), (unsigned)sizeof(AsyncTCPBufferedStream));
+  memtrace_event("telnet init entry");
   telnetEventQueue = xQueueCreate(TELNET_EVENT_QUEUE_LEN, sizeof(TelnetEvent));
+  memtrace_event("after telnet event queue");
   if (!telnetEventQueue) {
     console->println("telnet: cannot allocate event queue");
     return;
@@ -585,7 +650,9 @@ void init_tcpserver() {
     telnetDisconnectPending[i] = false;
   }
 
+  memtrace_event("before new AsyncServer");
   telnetServer = new (std::nothrow) AsyncServer(TCP_SERVER_PORT);
+  memtrace_event("after new AsyncServer");
   if (!telnetServer) {
     console->println("telnet: cannot allocate AsyncServer");
     vQueueDelete(telnetEventQueue);
@@ -593,5 +660,7 @@ void init_tcpserver() {
     return;
   }
   telnetServer->onClient(&handleNewClient, telnetServer);
+  memtrace_event("after telnet onClient");
   telnetServer->begin();
+  memtrace_event("after telnet begin");
 }

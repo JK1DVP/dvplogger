@@ -42,7 +42,9 @@ SoftwareSerial Serial3;
 
 
 //#include "dac_playback.h"
+#if JK1DVPLOG_HWVER != 1
 #include "AudioPlayer.h"
+#endif
 
 // issues
 // 25/4/21
@@ -251,6 +253,7 @@ void control_pkt_handler(struct mux_packet *packet)
     f_mux_transport=0;
     return;
   }
+#if JK1DVPLOG_HWVER != 1
   if (strncmp(packet->buf,"play",4)==0) {
     // playback command
     strncpy(buf,packet->buf+4,packet->idx-4);
@@ -259,6 +262,7 @@ void control_pkt_handler(struct mux_packet *packet)
     play_sound(buf);
     return;
   }
+#endif
   if (strncmp(packet->buf,"key",3)==0) {
     // cw key on/off
     key_control(packet->buf+3);
@@ -270,6 +274,7 @@ void control_pkt_handler(struct mux_packet *packet)
     cwbuf_control(packet->buf+5);
     return;
   }
+#if JK1DVPLOG_HWVER != 1
   if (strncmp(packet->buf,"chreset",7)==0) {
     process_callhist_reset_subcpu(packet->buf + 7);
     return;
@@ -285,6 +290,7 @@ void control_pkt_handler(struct mux_packet *packet)
     process_callhist_entry_subcpu(buf);
     return;
   }
+#endif
   if (packet->idx >= 8 &&
       memcmp(packet->buf, "dupemask", 8) == 0) {
     // MUX payloads are length-delimited, not NUL-terminated.  Parse only
@@ -297,6 +303,14 @@ void control_pkt_handler(struct mux_packet *packet)
     int mask = atoi(mask_buf);
     if (mask >= 0 && mask <= 255)
       set_dupechk_mask_subcpu((unsigned char)mask);
+    return;
+  }
+  if (packet->idx >= 7 && memcmp(packet->buf, "dupectx", 7) == 0) {
+    char id_buf[8];
+    size_t n = min((size_t)(packet->idx - 7), sizeof(id_buf) - 1);
+    memcpy(id_buf, packet->buf + 7, n); id_buf[n] = '\0';
+    int id = atoi(id_buf);
+    if (id >= 0 && id <= 255) set_dupechk_contest_id((uint8_t)id);
     return;
   }
   if (packet->idx >= 13 &&
@@ -325,13 +339,28 @@ void control_pkt_handler(struct mux_packet *packet)
     return;
   }
   if (strncmp(packet->buf,"dupereset",9)==0) {
-    // reset_dupechk_subcpu_database() does not return until the old DB has
-    // been freed, the new DB allocated/cleared, and ncallsign is zero.
-    // Only then send the completion ACK; MAIN will not start dupebulkbegin
-    // before receiving this packet.
-    const int ncallsign = reset_dupechk_subcpu_database();
-    char response[32];
-    snprintf(response, sizeof(response), "dupereset:done:%d", ncallsign);
+    int requested_capacity = NMAXQSO_SUBCPU;
+    if (packet->idx > 10 && packet->buf[9] == ':') {
+      size_t n = min((size_t)(packet->idx - 10), sizeof(buf) - 1);
+      memcpy(buf, packet->buf + 10, n);
+      buf[n] = '\0';
+      requested_capacity = atoi(buf);
+    }
+    // Keep the protocol-level range in sync with MAIN/settings.  The actual
+    // SUBCPU allocation is further limited by reset_dupechk_subcpu_database()
+    // using currently available heap, so this is only the absolute request cap.
+    if (requested_capacity < 200) requested_capacity = 200;
+    // Bitmap DUPE DB capacity counts unique callsigns (per contest), not QSOs.
+    // HW1/HW3 SUBCPU use the same representation.  2500 calls is the tested
+    // target; the four SoA allocations avoid requiring one ~100 kB block.
+    if (requested_capacity > NMAXQSO_SUBCPU) requested_capacity = NMAXQSO_SUBCPU;
+
+    // Reallocate only when the requested capacity changes; ordinary MAKEDUPE
+    // resets remain a fast logical clear.
+    const int ncallsign = reset_dupechk_subcpu_database(requested_capacity);
+    char response[40];
+    snprintf(response, sizeof(response), "dupereset:done:%d:%d", ncallsign,
+             get_dupechk_nmaxqso());
     mux_transport.send_pkt(MUX_PORT_EXT_BRD_CTRL, MUX_PORT_MAIN_BRD_CTRL,
                            (unsigned char *)response, strlen(response));
     return;
@@ -625,7 +654,9 @@ extern "C" void app_main(void)
   setup();
   //  app_main_test1() ;
   //  app_main_test();
+#if JK1DVPLOG_HWVER != 1
   init_AudioPlayer();
+#endif
 
   //dac_playback_test();
   while (1) {

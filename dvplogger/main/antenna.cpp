@@ -169,7 +169,7 @@ void handle_otrsp_extension_line(char *line) {
   if (strcmp(line, "ANTLIST END") == 0) {
     otrsp_ext_supported = true;
     force_meta_resend = true;
-    Serial.println("ANTENNA OTRSP extension enabled");
+    console->println("ANTENNA OTRSP extension enabled");
     return;
   }
 
@@ -261,7 +261,7 @@ bool connect_otrsp() {
     snprintf(reason_text, sizeof(reason_text),
              "OTRSP connect failed (%lu ms)", (unsigned long)elapsed);
     if (elapsed > (uint32_t)(OTRSP_CONNECT_TIMEOUT_MS + 50)) {
-      Serial.printf("ANTENNA connect slow host=%s port=%d elapsed=%lu ms timeout=%d ms\n",
+      console->printf("ANTENNA connect slow host=%s port=%d elapsed=%lu ms timeout=%d ms\n",
                     antenna_host, antenna_port, (unsigned long)elapsed,
                     OTRSP_CONNECT_TIMEOUT_MS);
     }

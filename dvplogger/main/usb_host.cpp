@@ -24,6 +24,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "Arduino.h"
+
+#ifndef CAPS2_DIAG
+#define CAPS2_DIAG 0
+#endif
 #include "decl.h"
 #include "variables.h"
 #include "usb_host.h"
@@ -326,29 +330,29 @@ void PrintAllAddresses(UsbDevice *pdev)
 {
   UsbDeviceAddress adr;
   adr.devAddress = pdev->address.devAddress;
-  Serial.print("\r\nAddr:");
-  Serial.print(adr.devAddress, HEX);
-  Serial.print("(");
-  Serial.print(adr.bmHub, HEX);
-  Serial.print(".");
-  Serial.print(adr.bmParent, HEX);
-  Serial.print(".");
-  Serial.print(adr.bmAddress, HEX);
-  Serial.println(")");
+  console->print("\r\nAddr:");
+  console->print(adr.devAddress, HEX);
+  console->print("(");
+  console->print(adr.bmHub, HEX);
+  console->print(".");
+  console->print(adr.bmParent, HEX);
+  console->print(".");
+  console->print(adr.bmAddress, HEX);
+  console->println(")");
 }
 
 void PrintAddress(uint8_t addr)
 {
   UsbDeviceAddress adr;
   adr.devAddress = addr;
-  Serial.print("\r\nADDR:\t");
-  Serial.println(adr.devAddress, HEX);
-  Serial.print("DEV:\t");
-  Serial.println(adr.bmAddress, HEX);
-  Serial.print("PRNT:\t");
-  Serial.println(adr.bmParent, HEX);
-  Serial.print("HUB:\t");
-  Serial.println(adr.bmHub, HEX);
+  console->print("\r\nADDR:\t");
+  console->println(adr.devAddress, HEX);
+  console->print("DEV:\t");
+  console->println(adr.bmAddress, HEX);
+  console->print("PRNT:\t");
+  console->println(adr.bmParent, HEX);
+  console->print("HUB:\t");
+  console->println(adr.bmHub, HEX);
 }
 uint8_t getdevdescr( uint8_t addr, uint8_t &num_conf );
 
@@ -364,7 +368,7 @@ void PrintDescriptors(uint8_t addr)
     printProgStr(Gen_Error_str);
     print_hex( rcode, 8 );
   }
-  Serial.print("\r\n");
+  console->print("\r\n");
 
   for (int i = 0; i < num_conf; i++)
   {
@@ -374,15 +378,15 @@ void PrintDescriptors(uint8_t addr)
       printProgStr(Gen_Error_str);
       print_hex(rcode, 8);
     }
-    Serial.println("\r\n");
+    console->println("\r\n");
   }
 }
 
 void PrintAllDescriptors(UsbDevice *pdev)
 {
-  Serial.println("\r\n");
+  console->println("\r\n");
   print_hex(pdev->address.devAddress, 8);
-  Serial.println("\r\n--");
+  console->println("\r\n--");
   PrintDescriptors( pdev->address.devAddress );
 }
 
@@ -434,37 +438,37 @@ void printhubdescr(uint8_t *descrptr, uint8_t addr)
 
   printProgStr(PSTR("\r\n\r\nHub Descriptor:\r\n"));
   printProgStr(PSTR("bDescLength:\t\t"));
-  Serial.println(pHub->bDescLength, HEX);
+  console->println(pHub->bDescLength, HEX);
 
   printProgStr(PSTR("bDescriptorType:\t"));
-  Serial.println(pHub->bDescriptorType, HEX);
+  console->println(pHub->bDescriptorType, HEX);
 
   printProgStr(PSTR("bNbrPorts:\t\t"));
-  Serial.println(pHub->bNbrPorts, HEX);
+  console->println(pHub->bNbrPorts, HEX);
 
   printProgStr(PSTR("LogPwrSwitchMode:\t"));
-  Serial.println(pHub->LogPwrSwitchMode, BIN);
+  console->println(pHub->LogPwrSwitchMode, BIN);
 
   printProgStr(PSTR("CompoundDevice:\t\t"));
-  Serial.println(pHub->CompoundDevice, BIN);
+  console->println(pHub->CompoundDevice, BIN);
 
   printProgStr(PSTR("OverCurrentProtectMode:\t"));
-  Serial.println(pHub->OverCurrentProtectMode, BIN);
+  console->println(pHub->OverCurrentProtectMode, BIN);
 
   printProgStr(PSTR("TTThinkTime:\t\t"));
-  Serial.println(pHub->TTThinkTime, BIN);
+  console->println(pHub->TTThinkTime, BIN);
 
   printProgStr(PSTR("PortIndicatorsSupported:"));
-  Serial.println(pHub->PortIndicatorsSupported, BIN);
+  console->println(pHub->PortIndicatorsSupported, BIN);
 
   printProgStr(PSTR("Reserved:\t\t"));
-  Serial.println(pHub->Reserved, HEX);
+  console->println(pHub->Reserved, HEX);
 
   printProgStr(PSTR("bPwrOn2PwrGood:\t\t"));
-  Serial.println(pHub->bPwrOn2PwrGood, HEX);
+  console->println(pHub->bPwrOn2PwrGood, HEX);
 
   printProgStr(PSTR("bHubContrCurrent:\t"));
-  Serial.println(pHub->bHubContrCurrent, HEX);
+  console->println(pHub->bHubContrCurrent, HEX);
 
   for (uint8_t i = 7; i < len; i++)
     print_hex(descrptr[i], 8);
@@ -530,7 +534,7 @@ void print_hex(int v, int num_places)
   }
   do {
     digit = ((v >> (num_nibbles - 1) * 4)) & 0x0f;
-    Serial.print(digit, HEX);
+    console->print(digit, HEX);
   }
   while (--num_nibbles);
 }
@@ -610,7 +614,7 @@ void printProgStr(const char* str)
   char c;
   if (!str) return;
   while ((c = pgm_read_byte(str++)))
-    Serial.print(c);
+    console->print(c);
 }
 // these are from USB_desc.ino
 
@@ -742,7 +746,30 @@ static constexpr uint16_t ATS_MINI_USB_PID = 0x1001;
 struct UsbKeyingEvent {
   uint8_t cwport;
   uint8_t on;
+  uint8_t source; // 0=unknown, 1=CW, 2=PTT
 };
+static volatile bool usb_key_trace = false;
+
+static const char *usb_key_source_name(uint8_t source)
+{
+  switch (source) {
+  case 1: return "CW";
+  case 2: return "PTT";
+  default: return "KEY";
+  }
+}
+
+void USBKeyTraceSet(bool enable, Print *out)
+{
+  usb_key_trace = enable;
+  if (!out) out = console;
+  if (out) out->printf("USBKEYTRACE=%d\n", enable ? 1 : 0);
+}
+
+bool USBKeyTraceGet()
+{
+  return usb_key_trace;
+}
 static constexpr uint8_t USB_KEYING_QUEUE_LEN = 32;
 static volatile UsbKeyingEvent usb_keying_queue[USB_KEYING_QUEUE_LEN];
 static volatile uint8_t usb_keying_head = 0;
@@ -789,6 +816,7 @@ static bool usb_rtty_active_invert = true;
 static bool usb_control_line_ready();
 static uint8_t usb_control_line_apply(uint8_t new_state);
 static uint8_t usb_control_line_state();
+static bool yaesu_cp2105_keying_ready();
 
 struct UsbRttyTimingSample {
   uint32_t dt_us;
@@ -910,6 +938,60 @@ bool usb_rtty_fast_service_needed()
   return usb_rtty_active || (usb_rtty_head != usb_rtty_tail);
 }
 
+static bool cp2105_fsk_test_active = false;
+static uint8_t cp2105_fsk_test_edges = 0;
+static uint32_t cp2105_fsk_test_next_ms = 0;
+static bool cp2105_fsk_test_dtr = false;
+
+bool CP2105fskPhysicalTestStart(Stream *out)
+{
+  if (!out) out = console;
+  if (!yaesu_cp2105_keying_ready()) {
+    out->println("CP2105 FSK test: Yaesu keying port not ready");
+    return false;
+  }
+  if (cp2105_fsk_test_active || usb_rtty_fast_service_needed()) {
+    out->println("CP2105 FSK test: keying busy");
+    return false;
+  }
+
+  // Physical Standard-COM test independent of the Baudot scheduler:
+  // hold RTS (PTT) ON and toggle DTR every 500 ms for ten edges.
+  uint8_t rcode = usb_control_line_apply(0x02);
+  if (rcode != 0) {
+    out->printf("CP2105 FSK test: PTT setup failed rc=0x%02X\n", rcode);
+    return false;
+  }
+  cp2105_fsk_test_dtr = false;
+  cp2105_fsk_test_edges = 0;
+  cp2105_fsk_test_next_ms = millis() + 500U;
+  cp2105_fsk_test_active = true;
+  out->println("CP2105 FSK test: RTS=PTT ON, toggling DTR every 500 ms x10");
+  return true;
+}
+
+static void cp2105_fsk_physical_test_process()
+{
+  if (!cp2105_fsk_test_active) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - cp2105_fsk_test_next_ms) < 0) return;
+
+  cp2105_fsk_test_dtr = !cp2105_fsk_test_dtr;
+  const uint8_t state = 0x02 | (cp2105_fsk_test_dtr ? 0x01 : 0x00);
+  const uint8_t rcode = usb_control_line_apply(state);
+  console->printf("CP2105 FSK TEST edge=%u DTR=%u RTS=1 rc=0x%02X\n",
+                  (unsigned)(cp2105_fsk_test_edges + 1),
+                  cp2105_fsk_test_dtr ? 1 : 0, rcode);
+  ++cp2105_fsk_test_edges;
+  if (rcode != 0 || cp2105_fsk_test_edges >= 10) {
+    const uint8_t release_rc = usb_control_line_apply(0x00);
+    console->printf("CP2105 FSK TEST done DTR=0 RTS=0 rc=0x%02X\n", release_rc);
+    cp2105_fsk_test_active = false;
+    return;
+  }
+  cp2105_fsk_test_next_ms = now + 500U;
+}
+
 static void usb_rtty_process()
 {
   if (!usb_control_line_ready()) return;
@@ -948,6 +1030,14 @@ static void usb_rtty_process()
   uint8_t rcode = 0;
   if (new_state != old_state)
     rcode = usb_control_line_apply(new_state);
+
+  if (usb_key_trace) {
+    console->printf("USBTRACE FSK port=%u line=%s mark=%u asserted=%u invert=%u old=0x%02X new=0x%02X rc=0x%02X dur=%lu\n",
+                    ev.cwport, ev.cwport == 3 ? "DTR" : "RTS",
+                    ev.mark ? 1 : 0, line_asserted ? 1 : 0,
+                    usb_rtty_active_invert ? 1 : 0, old_state, new_state,
+                    rcode, (unsigned long)ev.duration_us);
+  }
 
   // Timestamp after the control transfer: this is closest to the instant
   // at which the rig has accepted the new DTR/RTS state.
@@ -1055,7 +1145,7 @@ static void usb_keying_queue_clear()
   usb_keying_tail = usb_keying_head;
 }
 
-void usb_keying_request(uint8_t cwport, bool on)
+void usb_keying_request(uint8_t cwport, bool on, uint8_t source)
 {
   if (cwport != 3 && cwport != 4) return;
 
@@ -1068,6 +1158,7 @@ void usb_keying_request(uint8_t cwport, bool on)
 
   usb_keying_queue[head].cwport = cwport;
   usb_keying_queue[head].on = on ? 1 : 0;
+  usb_keying_queue[head].source = source;
   usb_keying_head = next;
 }
 
@@ -1242,6 +1333,46 @@ bool CP2105controlTest(uint8_t port, char line, bool on, Stream *out)
   }
 
   return rcode == 0;
+}
+
+bool CP2105lineStateTest(uint8_t port, uint8_t state, Stream *out)
+{
+  if (!out) out = console;
+  if (!Cp2105.isReady() || port >= CP2105::PORTS || !Cp2105.portReady(port)) {
+    out->printf("CP2105 port%u not ready\n", port);
+    return false;
+  }
+  state &= 0x03;
+  const bool dtr = (state & 0x01) != 0;
+  const bool rts = (state & 0x02) != 0;
+  const uint8_t rd = Cp2105.SetDTR(port, dtr);
+  const uint8_t rr = Cp2105.SetRTS(port, rts);
+  if (port == CP2105_YAESU_KEY_PORT && rd == 0 && rr == 0)
+    cp2105_key_line_state = state;
+  out->printf("CP2105 STATE port=%u if=%u state=%u DTR=%u RTS=%u DTR_rcode=0x%02X RTS_rcode=0x%02X\n",
+              port, Cp2105.interfaceNumber(port), state,
+              dtr ? 1 : 0, rts ? 1 : 0, rd, rr);
+  return rd == 0 && rr == 0;
+}
+
+bool CP2105diag(uint8_t port, Stream *out)
+{
+  if (!out) out = console;
+  if (!Cp2105.isReady() || port >= CP2105::PORTS || !Cp2105.portReady(port)) {
+    out->printf("CP2105 port%u not ready\n", port);
+    return false;
+  }
+  out->printf("CP2105 DIAG port=%u if=%u%s\n", port,
+              Cp2105.interfaceNumber(port),
+              port == CP2105_YAESU_KEY_PORT ? " (Yaesu Standard/keying)" : "");
+  CP2105flowStatus(port, out);
+  out->println("State test (may key PTT/CW/FSK depending on rig menu):");
+  out->println("  cp2105state <port> 0   DTR=0 RTS=0");
+  out->println("  cp2105state <port> 1   DTR=1 RTS=0");
+  out->println("  cp2105state <port> 2   DTR=0 RTS=1");
+  out->println("  cp2105state <port> 3   DTR=1 RTS=1");
+  out->println("Use state 0 after testing to release both lines.");
+  return true;
 }
 
 static uint32_t cp2105_le32(const uint8_t *p)
@@ -1450,7 +1581,8 @@ void usb_keying_process()
 
   const uint8_t tail = usb_keying_tail;
   const UsbKeyingEvent ev = {
-    usb_keying_queue[tail].cwport, usb_keying_queue[tail].on
+    usb_keying_queue[tail].cwport, usb_keying_queue[tail].on,
+    usb_keying_queue[tail].source
   };
   usb_keying_tail = static_cast<uint8_t>((tail + 1) % USB_KEYING_QUEUE_LEN);
 
@@ -1463,6 +1595,12 @@ void usb_keying_process()
   if (new_state == old_state) return;
 
   const uint8_t rcode = usb_control_line_apply(new_state);
+  if (usb_key_trace) {
+    console->printf("USBTRACE %s port=%u line=%s value=%u old=0x%02X new=0x%02X rc=0x%02X\n",
+                    usb_key_source_name(ev.source), ev.cwport,
+                    ev.cwport == 3 ? "DTR" : "RTS", ev.on,
+                    old_state, new_state, rcode);
+  }
   if (rcode == 0) {
     if (verbose & VERBOSE_USB) {
       console->printf("USB KEY if=%u %s=%u state=0x%02X drops=%lu\n",
@@ -2078,7 +2216,7 @@ void receive_pkt_handler_keyboard1_main(struct mux_packet *packet)
         // Exact retransmission/duplicate.  Do NOT resync and, importantly,
         // do NOT pass the same key transition to Parse_extKbd() twice.
         if (verbose & 16) {
-          Serial.printf(
+          console->printf(
               "KBD EXT duplicate seq=%u expected=%u hid=0x%02X on=%u; ignored\n",
               (unsigned int)received_seq, (unsigned int)expected_seq,
               packet->idx >= 1 ? (unsigned int)(uint8_t)packet->buf[0] : 0U,
@@ -2090,7 +2228,7 @@ void receive_pkt_handler_keyboard1_main(struct mux_packet *packet)
       if (received_seq != expected_seq) {
         // Genuine gap/out-of-order event: parser state may no longer match
         // the extension keyboard, so resync before accepting this event.
-        Serial.printf("KBD EXT sequence gap expected=%u received=%u; resync\n",
+        console->printf("KBD EXT sequence gap expected=%u received=%u; resync\n",
                       (unsigned int)expected_seq,
                       (unsigned int)received_seq);
         Prs1.resync_extKbd("sequence gap");
@@ -2131,14 +2269,26 @@ void KbdRptParser::resync_extKbd(const char *reason)
   prevState.bInfo[0] = 0;
   buf_ext[0] = 0;
   f_capslock = 0;
+  ext_caps_shift_2_down = false;
 
-  Serial.printf("KBD EXT resync t=%lu reason=%s old_mod=0x%02X\n",
+  console->printf("KBD EXT resync t=%lu reason=%s old_mod=0x%02X\n",
                 (unsigned long)millis(),
                 reason ? reason : "unknown", (unsigned int)old_mod);
 }
 
 void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on) 
 {
+  // Always trace only the four usages involved in CapsLock+Shift+2.  This is
+  // intentionally independent of verbose so an input event lost on the
+  // extension-board path can be distinguished from a UI dispatch problem.
+  if (hid_code == UHS_HID_BOOT_KEY_CAPS_LOCK || hid_code == 0x1f ||
+      hid_code == 0xe1 || hid_code == 0xe5) {
+#if CAPS2_DIAG
+    console->printf("CAPS2 EXT raw hid=%02X on=%d mod=%02X\n",
+                  (unsigned)hid_code, on ? 1 : 0,
+                  (unsigned)prevState.bInfo[0]);
+#endif
+  }
   if ((verbose & 16) && (hid_code == 0x36 || hid_code == 0x37)) {
     bool already_pressed = false;
     int slot = -1;
@@ -2149,7 +2299,7 @@ void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on)
         break;
       }
     }
-    Serial.printf(
+    console->printf(
         "EXT_RAW t=%lu hid=0x%02X on=%d mod=0x%02X pressed=%d slot=%d "
         "keys=%02X,%02X,%02X,%02X,%02X,%02X\n",
         (unsigned long)millis(), (unsigned int)hid_code, on ? 1 : 0,
@@ -2213,6 +2363,42 @@ void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on)
     send_keyrpt_queue();
   }
 
+  // Extension keyboards deliver one transition per packet rather than a
+  // complete boot-keyboard report.  Handle this chord at that packet boundary
+  // so it does not depend on the ordinary pressed-key table or queue timing.
+  if (hid_code == 0x1f) {  // keyboard '2'
+    const bool ctrl = (buf_ext[0] & 0x11) != 0;
+    const bool shift = (buf_ext[0] & 0x22) != 0;
+    const bool alt = (buf_ext[0] & 0x44) != 0;
+    const bool chord = ctrl && shift && !alt;
+
+    if (on && chord) {
+      if (!ext_caps_shift_2_down) {
+        msg.arg1=buf_ext[0];
+        msg.arg2=0x1f;
+        msg.type=KEYMSG_TYPE_ONKEYDOWN;
+        bool queued=send_keyrpt_queue();
+#if CAPS2_DIAG
+        console->printf("CAPS2 EXT synth mod=%02X queued=%d\n",
+                      (unsigned)buf_ext[0], queued ? 1 : 0);
+#endif
+        ext_caps_shift_2_down = true;
+      }
+      // Suppress the generic copy; it would invoke alternate_contest twice.
+      prevState.bInfo[0]=buf_ext[0];
+      return;
+    }
+    if (!on && ext_caps_shift_2_down) {
+      msg.arg1=buf_ext[0];
+      msg.arg2=0x1f;
+      msg.type=KEYMSG_TYPE_ONKEYUP;
+      send_keyrpt_queue();
+      ext_caps_shift_2_down = false;
+      prevState.bInfo[0]=buf_ext[0];
+      return;
+    }
+  }
+
   // HID usages 0xE0..0xE7 are modifier keys, not ordinary scan codes.
   // The old code fell through here and also inserted Alt/Ctrl/Shift into
   // prevState.bInfo[2..7], producing states such as keys=E2,37,01,...
@@ -2224,9 +2410,9 @@ void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on)
 
   bool found=false;  
   for (uint8_t i = 2; i < 8; i++) {
-    //      Serial.print("prevState0:");
-    //      Serial.print(prevState.bInfo[i]);
-    //      Serial.println(":");
+    //      console->print("prevState0:");
+    //      console->print(prevState.bInfo[i]);
+    //      console->println(":");
     
     // search hid_code in prevState.binfo[]
     if (prevState.bInfo[i] == hid_code) {
@@ -2249,19 +2435,19 @@ void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on)
     // add to key list
     found=false;
     for (uint8_t i = 2; i < 8; i++) {
-      //      Serial.print("prevState:");
-      //      Serial.print(prevState.bInfo[i]);
-      //      Serial.println(":");
+      //      console->print("prevState:");
+      //      console->print(prevState.bInfo[i]);
+      //      console->println(":");
       if (prevState.bInfo[i]==1) {
 	found=true;
 	// empty entry found
 	if (on) {
 	  // update directly prevState 
 	  prevState.bInfo[i]=hid_code;
-	  //	  Serial.print("prevState2:");
-	  //	  Serial.print(i);
-	  //	  Serial.print(":");
-	  //	  Serial.println(prevState.bInfo[i]);
+	  //	  console->print("prevState2:");
+	  //	  console->print(i);
+	  //	  console->print(":");
+	  //	  console->println(prevState.bInfo[i]);
 	  
 	  // handle locking keys 
 	  msg.hid=(USBHID *)buf_ext[0];
@@ -2291,9 +2477,60 @@ void KbdRptParser::Parse_extKbd(uint8_t hid_code,bool on)
 }
 
 void KbdRptParser::Parse(USBHID *hid, bool is_rpt_id __attribute__((unused)), uint8_t len __attribute__((unused)), uint8_t *buf) {
+        bool trace_caps2_report = len > 0 && (buf[0] & 0x22);
+        for (uint8_t i = 2; i < len && i < 8; ++i) {
+          if (buf[i] == UHS_HID_BOOT_KEY_CAPS_LOCK || buf[i] == 0x1f) {
+            trace_caps2_report = true;
+          }
+        }
+#if CAPS2_DIAG
+        if (trace_caps2_report) {
+          console->printf("CAPS2 MAIN raw len=%u", (unsigned)len);
+          for (uint8_t i = 0; i < len && i < 8; ++i) {
+            console->printf(" %02X", (unsigned)buf[i]);
+          }
+          console->println();
+        }
+#endif
+
         // On error - return
         if (buf[2] == 1)
                 return;
+
+        // Normalize CapsLock-as-Ctrl on MAIN before generating queued key
+        // events.  Keeping CapsLock as an ordinary key and setting
+        // f_capslock later in OnKeyDown() makes a chord depend on queue/event
+        // ordering.  While usage 0x39 is present in the boot report, expose
+        // Left Ctrl in the modifier byte and remove the locking-key usage.
+        // The release report naturally clears Ctrl again.  This is the MAIN
+        // USB path; extension-keyboard events are normalized by Parse_extKbd()
+        // on MAIN as well.
+        uint8_t normalized[8];
+        bool caps_shift_2 = false;
+        if (len >= sizeof(normalized)) {
+          memcpy(normalized, buf, sizeof(normalized));
+          bool caps_present = false;
+          for (uint8_t i = 2; i < sizeof(normalized); ++i) {
+            if (normalized[i] == UHS_HID_BOOT_KEY_CAPS_LOCK) {
+              caps_present = true;
+              normalized[0] |= 0x01;  // Left Ctrl
+              normalized[i] = 1;     // unused slot in this parser
+            }
+          }
+          if (caps_present && (normalized[0] & 0x22) &&
+              !(normalized[0] & 0x44)) {
+            for (uint8_t i = 2; i < sizeof(normalized); ++i) {
+              if (normalized[i] == 0x1f) {  // keyboard '2'
+                caps_shift_2 = true;
+                // Generate this chord explicitly below.  Some boot keyboards
+                // reorder the six key slots when CapsLock is held, which can
+                // otherwise make the generic report-difference loop lose it.
+                normalized[i] = 1;
+              }
+            }
+          }
+          buf = normalized;
+        }
 
         //KBDINFO       *pki = (KBDINFO*)buf;
 
@@ -2307,11 +2544,32 @@ void KbdRptParser::Parse(USBHID *hid, bool is_rpt_id __attribute__((unused)), ui
 	  send_keyrpt_queue();
         }
 
-	//	Serial.print("HID:");	
+        // Detect CapsLock+Shift+2 at the raw MAIN report boundary.  Inject the
+        // same HID event as Ctrl+Shift+2, once per press, before the generic
+        // six-key diff logic.  The diagnostic distinguishes an input-path
+        // problem from a UI dispatch problem.
+        if (caps_shift_2 && !caps_shift_2_down) {
+          msg.arg1=buf[0];
+          msg.arg2=0x1f;
+          msg.type=KEYMSG_TYPE_ONKEYDOWN;
+          bool queued=send_keyrpt_queue();
+#if CAPS2_DIAG
+          console->printf("CAPS2 MAIN synth mod=%02X queued=%d\n",
+                        (unsigned)buf[0], queued ? 1 : 0);
+#endif
+        } else if (!caps_shift_2 && caps_shift_2_down) {
+          msg.arg1=prevState.bInfo[0];
+          msg.arg2=0x1f;
+          msg.type=KEYMSG_TYPE_ONKEYUP;
+          send_keyrpt_queue();
+        }
+        caps_shift_2_down = caps_shift_2;
+
+	//	console->print("HID:");
 	//        for (uint8_t i = 2; i < 8; i++) {
-	//	  Serial.print(buf[i],HEX);
+	//	  console->print(buf[i],HEX);
 	//	}
-	//	Serial.println("");	
+	//	console->println("");
         for (uint8_t i = 2; i < 8; i++) {
                 bool down = false;
                 bool up = false;
@@ -2329,8 +2587,8 @@ void KbdRptParser::Parse(USBHID *hid, bool is_rpt_id __attribute__((unused)), ui
 		  msg.type=KEYMSG_TYPE_HANDLELOCKINGKEYS;
 		  send_keyrpt_queue();
 			
-		  //		Serial.print("down i=");Serial.print(i);Serial.print("buf=");
-		  //			Serial.println(buf[i],HEX);
+		  //		console->print("down i=");console->print(i);console->print("buf=");
+		  //			console->println(buf[i],HEX);
 		  //                        OnKeyDown(*buf, buf[i]);
 		  msg.arg1=*buf; // OnKeyDown(mod, key) 
 		  msg.arg2=buf[i];
@@ -2380,7 +2638,7 @@ bool KbdRptParser::send_keyrpt_queue(){
     if (key_queue_drop_last_report_ms == 0 ||
         (uint32_t)(now_ms - key_queue_drop_last_report_ms) >= 1000U) {
       key_queue_drop_last_report_ms = now_ms;
-      Serial.printf("KBD queue full drops=%lu type=%u arg1=0x%02X arg2=0x%02X depth=%u\n",
+      console->printf("KBD queue full drops=%lu type=%u arg1=0x%02X arg2=0x%02X depth=%u\n",
                     (unsigned long)key_queue_drop_count,
                     (unsigned int)msg.type, (unsigned int)msg.arg1,
                     (unsigned int)msg.arg2,
@@ -2392,6 +2650,38 @@ bool KbdRptParser::send_keyrpt_queue(){
 }
 
 void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
+  /*
+   * Keep the normal keyboard path deliberately lightweight.  The detailed
+   * profiler used to run whenever VERBOSE_PERF was enabled; besides many
+   * micros()/queue-depth calls, its once-per-second console->printf() summary
+   * measurably stretched both key_main and key_ext processing.  Keyboard
+   * profiling is therefore opt-in through VERBOSE_KEYPERF.
+   */
+  const bool keyperf_verbose = (verbose & VERBOSE_KEYPERF) != 0;
+
+  struct keymsg_t msg;
+  if (!keyperf_verbose) {
+    while (xQueueReceive(xQueueKeyRpt, &msg, 0) == pdTRUE) {
+      switch (msg.type) {
+      case KEYMSG_TYPE_ONCONTROLKEYSCHANGED:
+        OnControlKeysChanged(msg.arg1, msg.arg2);
+        break;
+      case KEYMSG_TYPE_HANDLELOCKINGKEYS:
+        HandleLockingKeys(msg.hid, msg.arg2);
+        break;
+      case KEYMSG_TYPE_ONKEYDOWN:
+        OnKeyDown(msg.arg1, msg.arg2);
+        break;
+      case KEYMSG_TYPE_ONKEYUP:
+        OnKeyUp(msg.arg1, msg.arg2);
+        break;
+      default:
+        break;
+      }
+    }
+    return;
+  }
+
   struct key_profile_stats_t {
     uint32_t window_start_ms;
     uint32_t calls;
@@ -2415,7 +2705,6 @@ void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
       (profile_name != NULL && profile_name[0] == 'e') ? 1 : 0;
   key_profile_stats_t &st = stats[profile_index];
   const char *name = (profile_name != NULL) ? profile_name : "unknown";
-  const bool perf_verbose = (verbose & VERBOSE_PERF) != 0;
   const uint32_t slow_threshold_us = 5000;
   const uint32_t total_start_us = micros();
 
@@ -2427,7 +2716,6 @@ void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
   if (dt > st.max_waiting_us) st.max_waiting_us = dt;
   if (waiting > st.max_depth) st.max_depth = waiting;
 
-  struct keymsg_t msg;
   BaseType_t ret;
 
   while (waiting > 0) {
@@ -2460,7 +2748,7 @@ void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
         handler_name = "keydown";
         if ((verbose & 16) &&
             (msg.arg2 == 0x10 || msg.arg2 == 0x36 || msg.arg2 == 0x37)) {
-          Serial.printf("KBDLOW t=%lu src=%s hid=0x%02X mod=0x%02X on=1 depth=%u\n",
+          console->printf("KBDLOW t=%lu src=%s hid=0x%02X mod=0x%02X on=1 depth=%u\n",
                         (unsigned long)millis(), name,
                         (unsigned int)msg.arg2, (unsigned int)msg.arg1,
                         (unsigned int)uxQueueMessagesWaiting(xQueueKeyRpt));
@@ -2484,15 +2772,13 @@ void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
 
       if (dt >= slow_threshold_us) {
         st.slow_handler++;
-        if (perf_verbose) {
-          Serial.printf(
-              "KEY PROFILE SLOW keyboard=%s stage=%s dt=%luus type=%u "
-              "arg1=0x%02X arg2=0x%02X depth=%u core=%d\n",
-              name, handler_name, (unsigned long)dt,
-              (unsigned int)msg.type, (unsigned int)msg.arg1,
-              (unsigned int)msg.arg2, (unsigned int)waiting,
-              xPortGetCoreID());
-        }
+        console->printf(
+            "KEY PROFILE SLOW keyboard=%s stage=%s dt=%luus type=%u "
+            "arg1=0x%02X arg2=0x%02X depth=%u core=%d\n",
+            name, handler_name, (unsigned long)dt,
+            (unsigned int)msg.type, (unsigned int)msg.arg1,
+            (unsigned int)msg.arg2, (unsigned int)waiting,
+            xPortGetCoreID());
       }
     }
 
@@ -2507,19 +2793,19 @@ void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
   if (total_us > st.max_total_us) st.max_total_us = total_us;
   if (total_us >= slow_threshold_us) {
     st.slow_total++;
-    if (perf_verbose) {
-      Serial.printf(
-          "KEY PROFILE SLOW keyboard=%s stage=total dt=%luus messages=%lu "
-          "max_depth=%u core=%d\n",
-          name, (unsigned long)total_us, (unsigned long)st.messages,
-          (unsigned int)st.max_depth, xPortGetCoreID());
-    }
+    console->printf(
+        "KEY PROFILE SLOW keyboard=%s stage=total dt=%luus messages=%lu "
+        "max_depth=%u core=%d\n",
+        name, (unsigned long)total_us, (unsigned long)st.messages,
+        (unsigned int)st.max_depth, xPortGetCoreID());
   }
 
   const uint32_t now_ms = millis();
   if (st.window_start_ms == 0) st.window_start_ms = now_ms;
-  if (perf_verbose && (uint32_t)(now_ms - st.window_start_ms) >= 1000U) {
-    Serial.printf(
+  // Detailed summary is intentionally less frequent: it is itself synchronous
+  // serial I/O and should not dominate the path being measured.
+  if ((uint32_t)(now_ms - st.window_start_ms) >= 5000U) {
+    console->printf(
         "KEY PROFILE summary keyboard=%s calls=%lu messages=%lu depth=%u "
         "total=%lu waiting=%lu receive=%lu control=%lu locking=%lu "
         "keydown=%lu keyup=%lu slow_total=%lu slow_handler=%lu\n",
@@ -2535,7 +2821,6 @@ void KbdRptParser::process_keyrpt_queue(const char *profile_name) {
     st = cleared;
   }
 }
-
 
 
 
@@ -2752,7 +3037,7 @@ void init_usb()
 
     int8_t ret = Usb.Init(1500);
 
-    Serial.printf(
+    console->printf(
 		  "Usb.Init(1500) returned %d, vbus=%02x\n",
 		  ret,
 		  Usb.getVbusState()
@@ -2763,7 +3048,7 @@ void init_usb()
     }
  
     //    int8_t ret = Usb.Init();
-    //    Serial.printf("Usb.Init() returned %d\n", ret);
+    //    console->printf("Usb.Init() returned %d\n", ret);
     //    if (ret == -1) {
     //        plogw->ostream->println("OSC did not start.");
     //    }
@@ -2813,6 +3098,7 @@ void loop_usb()
     static uint32_t last_report = 0;
 
     Usb.Task();
+    cp2105_fsk_physical_test_process();
     usb_rtty_process();
     usb_keying_process();
 
@@ -2821,7 +3107,7 @@ void loop_usb()
 
     if ((verbose & VERBOSE_USB) &&
         (state != previous_state || vbus != previous_vbus)) {
-        Serial.printf(
+        console->printf(
             "USB: state 0x%02x -> 0x%02x, "
             "vbus 0x%02x -> 0x%02x, ACM=%d\n",
             previous_state,
@@ -2840,7 +3126,7 @@ void loop_usb()
     if (millis() - last_report >= 1000) {
         last_report = millis();
 
-        Serial.printf(
+        console->printf(
             "USB heartbeat: state=0x%02x vbus=0x%02x ACM=%d\n",
             state,
             vbus,
@@ -2862,7 +3148,7 @@ void loop_usb_bak1()
     uint8_t state = Usb.getUsbTaskState();
 
     if (state != previous_state) {
-        Serial.printf(
+        console->printf(
             "USB state changed: 0x%02x -> 0x%02x, ACM ready=%d\n",
             previous_state,
             state,
@@ -2879,7 +3165,7 @@ void loop_usb_bak1()
     if (millis() - last_report >= 1000) {
         last_report = millis();
 
-        Serial.printf(
+        console->printf(
             "USB heartbeat: count=%lu state=0x%02x ACM=%d\n",
             (unsigned long)task_count,
             state,
@@ -3002,5 +3288,3 @@ void usb_receive_cat_data(struct radio *radio) {
   }
 }
 // key input from usb running in separate task 24/10/29 
-
-

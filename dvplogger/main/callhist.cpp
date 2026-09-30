@@ -49,6 +49,35 @@ static bool callhist_in_psram = false;
 
 int read_callhist_list(char *fn)
 {
+  // Keep the disposable packed cache synchronized with the authoritative PCK.
+  // Prefer the packed runtime representation; retain the legacy PCK loader only
+  // as a fallback if PKB build/load/validation fails.
+  if (ensure_callhist_pkb(fn) && callhist_pkb_load(fn)) {
+    if (callhist_list != NULL) free(callhist_list);
+    if (callhist_list_mem != NULL) free(callhist_list_mem);
+    callhist_list = NULL;
+    callhist_list_mem = NULL;
+    n_callhist_list = callhist_pkb_count();
+    callhist_memory_bytes = callhist_pkb_memory_bytes();
+    callhist_in_psram = f_spiram != 0;
+    callhist_loaded = true;
+    console->printf("CALLHIST: using PKB runtime entries=%d memory=%u bytes RAM=%s\n",
+                    n_callhist_list,(unsigned)callhist_memory_bytes,
+                    callhist_in_psram ? "PSRAM" : "Internal");
+    return n_callhist_list;
+  }
+  callhist_pkb_release();
+#if JK1DVPLOG_HWVER == 1
+  if (!f_spiram) {
+    console->println("CALLHIST: HW1 MAIN-SD backend unavailable; refusing legacy internal-RAM load");
+    n_callhist_list = 0;
+    callhist_memory_bytes = 0;
+    callhist_loaded = false;
+    callhist_in_psram = false;
+    return 0;
+  }
+#endif
+  console->println("CALLHIST: PKB runtime unavailable; using legacy PCK RAM");
   //  if (!init_callhist_list()) return 0;
   //  FILE *inf;
   
@@ -137,6 +166,10 @@ int read_callhist_list(char *fn)
   ptmp=callhist_list_mem;
   //  pcallhist_list=callhist_list[0];
   int n=0;
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "Call History\nLoading %s\n0 / %d",
+           f_spiram ? "MAIN-PSRAM" : "MAIN-RAM", n_callhist_list);
+  upd_display_info_flash(dp->lcdbuf);
   while (readline(&inf,buf,0x0d0a,128)!=0) {
     //    console->printf("readA :%s:",buf);    console->print((int) ptmp);console->print(" n ");console->print(n);
     callhist_list[n]=ptmp;
@@ -144,6 +177,12 @@ int read_callhist_list(char *fn)
     ptmp+=strlen(buf)+1;
     //    console->printf(" stored, callhist_list[]:%s:\n",callhist_list[n]);
     n++;
+    if ((n % 200) == 0 || n == n_callhist_list) {
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Call History\nLoading %s\n%d / %d",
+               f_spiram ? "MAIN-PSRAM" : "MAIN-RAM", n, n_callhist_list);
+      upd_display_info_flash(dp->lcdbuf);
+    }
   }
   inf.close();
   //  *callhist_list++=ptmp;
@@ -363,69 +402,34 @@ int search_callhist (char *callsign) {
 
 // search callhist and if found obtain exchange to the getexch
 int search_callhist_getexch (char *callsign,char *getexch) {
-  if (callsign == NULL || getexch == NULL || callhist == NULL) return 0;
-  if (strlen(callsign) <= 3 || !callhistf) return 0;
+  if (callsign == NULL || getexch == NULL) return 0;
+  if (strlen(callsign) <= 3) return 0;
 
-  unsigned long usec = micros();
-  char base[LEN_CALLSIGN + 1];
-  normalize_dupe_callsign(callsign, base, sizeof(base));
-  const char base_tail = base[0] ? base[strlen(base) - 1] : '\0';
-
-  // Call History is grouped by the last character to conserve RAM.  A base
-  // call can match a stored portable form whose last character is a digit,
-  // P (/P,/QRP) or M (/M,/MM,/AM), so scan those candidate groups too.
-  for (int i = 0; i < ncallhist; i++) {
-    char tailbuf[10];
-    copy_tail_character(tailbuf, callhist[i].u.entry.callsign);
-    const char tail = tailbuf[0];
-    const bool portable_tail = (tail >= '0' && tail <= '9') ||
-                               tail == 'P' || tail == 'p' ||
-                               tail == 'M' || tail == 'm';
-    if (tail != base_tail && !portable_tail) continue;
-
-    if (callhist[i].nstations != 1) {
-      if (!callhistf.seek(callhist[i].pos)) {
-        if (!plogw->f_console_emu)
-          plogw->ostream->println("file seek failed in search_callhist()");
-        continue;
-      }
-    }
-
-    for (int n = 0; n < callhist[i].nstations; n++) {
-      if (callhist[i].nstations == 1) {
-        memcpy(callhist_work.u.buffer, callhist[i].u.buffer,
-               sizeof(callhist_work.u.buffer));
-      } else {
-        int ret = callhistf.read(callhist_work.u.buffer,
-                                 sizeof(callhist_work.u.buffer));
-        if (ret != sizeof(callhist_work.u.buffer)) break;
-      }
-
-      if (!dupe_callsign_equal(callhist_work.u.entry.callsign, callsign))
-        continue;
-
-      if (!plogw->f_console_emu) {
-        plogw->ostream->print(micros() - usec);
-        plogw->ostream->print(" usec matched:");
-        plogw->ostream->print(callsign);
-        plogw->ostream->print(" exch:");
-        plogw->ostream->println(callhist_work.u.entry.exch);
-      }
-      strcpy(getexch, callhist_work.u.entry.exch);
-      return 1;
-    }
-  }
-
-  if (!plogw->f_console_emu) {
-    plogw->ostream->print(micros() - usec);
-    plogw->ostream->println(" usec not found");
-  }
-  return 0;
+  // Keep this legacy API as a compatibility wrapper, but use the same
+  // packed/SD/legacy iterator-backed exact lookup everywhere.  This avoids
+  // HW3 (MAIN/PSRAM) and HW1 (compact SD runtime) taking different CALLHIST
+  // search paths.  QSO-history precedence is decided by the caller before
+  // reaching here, so an existing QSO with an empty EXCH remains authoritative
+  // and is not filled from CALLHIST.
+  getexch[0] = '\0';
+  return callhist_lookup_exact(callsign, getexch, LEN_EXCH + 1) ? 1 : 0;
 }
 
 void release_callhist() {
   free(callhist);
   callhist = NULL;
+}
+
+void release_callhist_list() {
+  callhist_pkb_release();
+  if (callhist_list != NULL) free(callhist_list);
+  if (callhist_list_mem != NULL) free(callhist_list_mem);
+  callhist_list = NULL;
+  callhist_list_mem = NULL;
+  n_callhist_list = 0;
+  callhist_memory_bytes = 0;
+  callhist_loaded = false;
+  callhist_in_psram = false;
 }
 void set_callhistfn(char *fn) {
   if (fn == NULL || *fn == '\0') return;

@@ -29,6 +29,7 @@
 #include "variables.h"
 #include "settings.h"
 #include "contest.h"
+#include "user_contest_md.h"
 #include "cat.h"
 #include "cluster.h"
 #include "network.h"
@@ -367,7 +368,12 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   n_settings_dict++;
 
   settings_dict[n_settings_dict].name = "dupechk_at";
-  settings_dict[n_settings_dict].value = (void *)&dupechk->dupechk_at;
+  settings_dict[n_settings_dict].value = (void *)&dupechk_at;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "dupechk_max";
+  settings_dict[n_settings_dict].value = (void *)&dupechk_max;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
   
@@ -431,6 +437,13 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
+  // Persist the LOWMEM boot tracer so it is already enabled when the next
+  // boot reaches init_network()/init_webserver().
+  settings_dict[n_settings_dict].name = "lowmem_trace";
+  settings_dict[n_settings_dict].value = (void *)&lowmem_trace;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
   settings_dict[n_settings_dict].name = "clock_display_mode";
   settings_dict[n_settings_dict].value = (void *)&clock_display_mode;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
@@ -458,6 +471,11 @@ REGISTER_SETTING_AUTO(settings_dict, plogw, show_qso_interval);
 
   settings_dict[n_settings_dict].name = "wipe_key_swap";
   settings_dict[n_settings_dict].value = (void *)&plogw->wipe_key_swap;
+  settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
+  n_settings_dict++;
+
+  settings_dict[n_settings_dict].name = "call_stack_mode";
+  settings_dict[n_settings_dict].value = (void *)&plogw->call_stack_mode;
   settings_dict[n_settings_dict].value_type = DICT_VALUE_TYPE_INT;
   n_settings_dict++;
 
@@ -644,6 +662,19 @@ int load_settings(const char *fn) {
   f.close();
 
   // post process
+  // Keep a bad settings.txt value from requesting an unreasonable allocation.
+  // 1300 remains the legacy/default size; 10000 is a practical MAIN-PSRAM upper bound
+  // while SUBCPU placement is additionally clamped by its live free-heap budget.
+  // DUPE placement setting is independent of the runtime dupechk->dupechk_at
+  // state (0=local MAIN DB, 1=MAIN proxy to SUBCPU, 2=SUBCPU itself).
+  // Persisted setting: 0=AUTO, 1=SUBCPU, 2=MAIN.
+  if (dupechk_at < 0 || dupechk_at > 2) dupechk_at = 0;
+
+  // Migrate the former fixed SUBCPU default to the bitmap DB target.
+  if (dupechk_max == 1300) dupechk_max = 2500;
+  if (dupechk_max < 200) dupechk_max = 200;
+  if (dupechk_max > 10000) dupechk_max = 10000;
+
   if (bandmap_lifetime_minutes < 1) bandmap_lifetime_minutes = 1;
   if (bandmap_lifetime_minutes > 1440) bandmap_lifetime_minutes = 1440;
 
@@ -674,6 +705,12 @@ int load_settings(const char *fn) {
   }
   // grid_locator
   set_grid_locator_information();
+
+  // RADIO_MODE_SAT is a legacy persisted value.  Satellite operation is now
+  // independent (plogw->sat); radio_mode represents SO1R/SO2R only.
+  if (so2r.radio_mode == SO2R::RADIO_MODE_SAT) {
+    so2r.radio_mode = SO2R::RADIO_MODE_SO1R;
+  }
 
   // set sequence_mode according to the radio_mode
   switch(so2r.radio_mode) {
@@ -712,11 +749,19 @@ int load_settings(const char *fn) {
   }
   f_mux_transport_cmd=1;
   
+  // Restore the exact active/previous contest names before selecting the
+  // contest.  contest_id alone cannot distinguish User MD contests.
+  restore_saved_contest_selection();
+
   // iambic keyer
   set_paddle();
 
   //  multiwifi_addap(plogw->wifi_ssid+2,plogw->wifi_passwd+2);  // do not try to remember wifi settings here but wifiset.txt
-  set_contest_id();
+  // Restoring a pair of User contests starts an asynchronous SUB -> MAIN
+  // preload.  Do not start MAIN a second time while SUB is still loading;
+  // process_pending_contest_pair() selects MAIN when both cached tables are
+  // ready.  All other contest combinations retain the normal direct path.
+  if (!user_md_contest_loading()) set_contest_id();
   cluster1_auto_enable = cluster1_auto_enable ? 1 : 0;
   cluster2_auto_enable = cluster2_auto_enable ? 1 : 0;
   zserver_auto_enable = zserver_auto_enable ? 1 : 0;

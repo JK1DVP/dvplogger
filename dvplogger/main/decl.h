@@ -66,6 +66,8 @@
 #define VERBOSE_PADDLE  2048   // paddle ADC/queue diagnostics
 #define VERBOSE_MEM     4096   // memory diagnostics
 #define VERBOSE_USB     8192   // USB host and USB CAT transport diagnostics
+#define VERBOSE_KEYPERF 16384  // detailed keyboard queue/handler timing diagnostics
+#define VERBOSE_OLED    32768  // periodic OLED/I2C health report
 
 #define LOG_MODETYPE_CW 1
 #define LOG_MODETYPE_PH 2
@@ -101,6 +103,9 @@
 #define LEN_JCC_WINDOW 30
 #define LEN_IP_ADDRESS (3*4+3+2)
 #define LEN_CALL_WINDOW (LEN_CALLSIGN+1)
+// Input-only capacity for three queued calls plus two separators.  This does
+// not change LEN_CALLSIGN or any QSO log/on-disk record layout.
+#define LEN_CALL_STACK_WINDOW (LEN_CALL_WINDOW * 3 + 2)
 #define LEN_EXCH_WINDOW (LEN_EXCH+1)
 #define LEN_DUAL_EXCH_WINDOW (LEN_EXCH*2+1) // primary + separator + secondary
 #define LEN_SENT_EXCH_WINDOW (LEN_EXCH*2+1+1)
@@ -146,7 +151,7 @@
 #define N_MULTI (1346+14+47) // ACAG + ALLJA
 
 #define NBANDMODE (N_BAND*2)
-#define NMODEID 8
+#define NMODEID 10
 
 //#define N_CONTEST 25
 #define N_CONTEST 46
@@ -171,6 +176,9 @@ struct cluster {
 #include <HardwareSerial.h>
 
 extern Stream *console;
+// Physical/local console selected by the serial-port allocator. Unlike
+// console, this is not replaced temporarily by a Telnet session.
+extern Stream *local_console;
 //#include <SoftwareSerial.h>
 //extern SoftwareSerial Serial3;
 
@@ -193,6 +201,9 @@ struct rig {
   int rtty_polarity; // -1 legacy/global, 0 normal, 1 reverse
   int rig_type ; // 0 IC-705 1 IC-9700 2 FT-991  3 QCX mini 4 Manual
   int pttmethod; // additional PTT: 0/1 don't care, 2 CAT/CI-V, 3 USB DTR, 4 USB RTS
+  int tuner_port; // 0 disabled, 1 KEY1, 2 KEY2, 3 USB DTR, 4 USB RTS, 5 rig CAT tuner
+  int swr_limit_x100; // automatic tuner threshold; 0 disables automatic action
+  int tuner_hold_ms; // external tuner contact hold time
   int rig_spec_idx; // index number of the rig specification
   char rig_identification[6]; // rig identification number (although cat control share the same protocol (Yaesu/Kenwood/Icom) behavior of each rig differs, so receive ID by ID; command (yaesu) and store them here.)
   int transverter_enable[NMAX_TRANSVERTER];
@@ -266,7 +277,7 @@ struct check_entry_list {
 
 struct radio {
   // the following entry need to be defined per radio
-  char callsign[LEN_CALL_WINDOW + 3];
+  char callsign[LEN_CALL_STACK_WINDOW + 3];
   char sent_rst[LEN_RST_WINDOW + 3];
   char recv_rst[LEN_RST_WINDOW + 3];
   char recv_exch[LEN_DUAL_EXCH_WINDOW + 3];
@@ -356,6 +367,7 @@ struct radio {
   int ptt; // tx 1 from cat
   int ptt_stat ; // 2 if transmitting from rig PTT   
   int ptt_stat_prev; // to check previous status of ptt in ci-v/cat function
+  uint32_t local_ptt_rx_hold_until_ms; // ignore delayed CAT TX reports after local PTT OFF
   // these interractive buffer the first byte is current editing pointer, second byte size of the buffer from the third byte contents
 
   char opmode[8];
@@ -391,6 +403,15 @@ struct radio {
 
   // s meter reading
   int smeter; int smeter_peak;
+  int swr_x100;
+  uint32_t swr_updated_ms;
+  uint32_t swr_evaluated_ms;
+  uint8_t swr_high_count;
+  bool tune_active;
+  bool tune_key_asserted;
+  uint32_t tune_key_release_ms;
+  uint32_t tune_stop_ms;
+  uint32_t tune_cooldown_until_ms;
   int smeter_stat; // 1 obtain peak of the smeter reading
   int smeter_record[4]; // composite record of s-meter reading in dBm and azimuth (if available) index is status of relay relay1+relay2*2
   int smeter_azimuth[4]; // -1 if not available rotator
@@ -417,6 +438,7 @@ struct radio {
   uint32_t yaesu_query_pending_until;
   uint32_t yaesu_query_next_send_at;
   uint8_t yaesu_query_next_slot;
+  uint8_t yaesu_meter_after_tx;
     
   // buffer for radio control ci-v and cat
   char *bt_buf;
@@ -455,6 +477,7 @@ struct logwindow {
   
   int f_esm ; // 0: default 1: ESM (Enter Sends Message) mode
   int wipe_key_swap; // 0: Alt-W=wipe QSO, Ctrl-W=clear field; 1: swapped
+  int call_stack_mode; // comma-separated calls in CALL; Enter selects cursor item
   
   int show_smeter; // if set, show Smeter value (or dBm) on the number of QSO area
 
@@ -586,6 +609,9 @@ struct logwindow {
   int inner_pts; // points for inner stations
   int contest_band_mask; // workable band in this contest ( changing this also reflected to bandmap_mask  (, need reverse bits ), ), this mask also affects switch_bands in ui.c, but not for frequency change on the rig side.
   char contest_name[20 + 3]; // contest name
+  // Editable Test/Contest field.  Unlike contest_name (active/Main only),
+  // this may contain the normalized "Main,Sub" pair.
+  char contest_entry[LEN_CONTEST_NAME * 2 + 2 + 3];
   int contest_id; // contest id number
   int multi_type; // multiplier type 1 JARL contest with power code  0 other  3 JARL contest power code but not check multi(ACAG) 2 UEC 4 multi check ignoring the last character (for JA8 contest)
   int seqnr; // sequential number of the QSO
@@ -696,6 +722,7 @@ union qso_union_tag {
 // if more than that, allocation added by 50?
 #define NSTN_BANDMAP 50
 
+#define BANDMAP_ENTRY_FLAG_DUPE_PENDING 8
 #define BANDMAP_ENTRY_FLAG_NEWMULTI 4
 #define BANDMAP_ENTRY_FLAG_WORKED 2
 #define BANDMAP_ENTRY_FLAG_ONFREQ 1
@@ -704,7 +731,6 @@ struct bandmap_entry {
 //  char station[10];
   char station[LEN_CALLSIGN+1];
   byte mode;
-  char remarks[30];
   int time;
   uint16_t receive_order; // arrival order within the same second
   byte type ; // 1 .. qso/s&p bit 2 ... cluster bit  ... (3= qso and cluster)
@@ -752,7 +778,8 @@ struct bandmap_disp {
 //#define NMAXQSO 50
 //#define NMAXQSO_MAINCPU 300
 #define NMAXQSO_MAINCPU 500
-#define NMAXQSO_SUBCPU 1300
+#define NMAXQSO_SUBCPU_DEFAULT 1300
+#define NMAXQSO_SUBCPU 2500
 //#define NMAXQSO 200
 
 // dupe check link for each band/mode
@@ -762,7 +789,8 @@ struct dupechk {
   //  byte bandmode[NMAXQSO]; // band and mode identity for each callsign
   char (*callsign)[LEN_CALLSIGN+1];
   char (*exch)[LEN_EXCH+1]; // exchange in the previous contact
-  byte *bandmode; // band and mode identity for each callsign  
+  uint64_t *worked_bitmap; // 16 bands x 4 modes, dense bits 0..63
+  byte *contest_id; // persistent contest identity (shared DUPE pool)
   int ncallsign; // number of currently registered callsigns
   int nmaxqso; // <= NMAXQSO
   int dupechk_at ; // 0:main cpu 1:I am main cpu and query to sub cpu 2: I am subcpu

@@ -88,6 +88,55 @@ static uint8_t *active_wildcard_type = NULL;
 static uint8_t *active_wildcard_length = NULL;
 static int active_count = 0;
 static bool active_allow_other = false;
+static int active_dupe_mask = CW_PH_DUPE_NG;
+static char active_contest_name[LEN_CONTEST_NAME + 1] = "";
+
+// Keep the immediately preceding User contest table alive.  Two User
+// contests are commonly operated together; freeing this table made M2 use
+// the built-in USER_MD_CONTEST_ID definition (which has no multiplier table).
+static struct multi_item *previous_table = NULL;
+static char *previous_buffer = NULL;
+static char *previous_name_pool = NULL;
+static uint8_t *previous_wildcard_type = NULL;
+static uint8_t *previous_wildcard_length = NULL;
+static int previous_count = 0;
+static bool previous_allow_other = false;
+static int previous_dupe_mask = CW_PH_DUPE_NG;
+static char previous_contest_name[LEN_CONTEST_NAME + 1] = "";
+
+#define USER_MD_ID_MAX 16
+struct UserMdIdEntry {
+  uint8_t id;
+  char name[LEN_CONTEST_NAME + 1];
+};
+static UserMdIdEntry user_ids[USER_MD_ID_MAX];
+static uint8_t user_id_count = 0;
+static bool user_ids_loaded = false;
+
+static void load_user_ids() {
+  if (user_ids_loaded) return;
+  user_ids_loaded = true;
+  File f = SD.open("/CONTEST.TXT", FILE_READ);
+  if (!f) return;
+  while (f.available() && user_id_count < USER_MD_ID_MAX) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.startsWith("#USER_ID=")) continue;
+    int comma = line.indexOf(',');
+    if (comma < 10) continue;
+    int id = line.substring(9, comma).toInt();
+    char canonical[LEN_CONTEST_NAME + 1];
+    if (id < USER_MD_RUNTIME_ID_FIRST || id > USER_MD_RUNTIME_ID_LAST ||
+        !canonicalize_user_md_contest_name(line.substring(comma + 1).c_str(),
+                                           canonical, sizeof(canonical)))
+      continue;
+    user_ids[user_id_count].id = (uint8_t)id;
+    strlcpy(user_ids[user_id_count].name, canonical,
+            sizeof(user_ids[user_id_count].name));
+    user_id_count++;
+  }
+  f.close();
+}
 
 static void *user_alloc(size_t size) {
   if (f_spiram) {
@@ -391,7 +440,21 @@ static void show_progress() {
 }
 
 static void activate_loaded_table() {
-  release_user_md_contest();
+  if (previous_table != NULL) free(previous_table);
+  if (previous_buffer != NULL) free(previous_buffer);
+  if (previous_name_pool != NULL) free(previous_name_pool);
+  if (previous_wildcard_type != NULL) free(previous_wildcard_type);
+  if (previous_wildcard_length != NULL) free(previous_wildcard_length);
+  previous_table = active_table;
+  previous_buffer = active_buffer;
+  previous_name_pool = active_name_pool;
+  previous_wildcard_type = active_wildcard_type;
+  previous_wildcard_length = active_wildcard_length;
+  previous_count = active_count;
+  previous_allow_other = active_allow_other;
+  previous_dupe_mask = active_dupe_mask;
+  strlcpy(previous_contest_name, active_contest_name,
+          sizeof(previous_contest_name));
   active_table = ctx.table;
   active_buffer = ctx.buffer;
   active_name_pool = ctx.name_pool;
@@ -399,6 +462,9 @@ static void activate_loaded_table() {
   active_wildcard_length = ctx.wildcard_length;
   active_count = ctx.count;
   active_allow_other = ctx.allow_other;
+  active_dupe_mask = ctx.dupe_mask;
+  strlcpy(active_contest_name, ctx.contest_name,
+          sizeof(active_contest_name));
 
   ctx.table = NULL;
   ctx.buffer = NULL;
@@ -457,6 +523,45 @@ bool is_user_md_contest_name(const char *contest_name) {
   return contest_name != NULL && strncasecmp(contest_name, "User", 4) == 0;
 }
 
+bool canonicalize_user_md_contest_name(const char *contest_name,
+                                       char *out, size_t out_size) {
+  if (out == NULL || out_size < 6 || !is_user_md_contest_name(contest_name))
+    return false;
+  const char *base = contest_name + 4;
+  if (!valid_basename(base)) return false;
+  if (strlen(base) + 5 > out_size) return false;
+  memcpy(out, "User", 4);
+  size_t i = 0;
+  for (; base[i] != '\0'; ++i)
+    out[4 + i] = (char)toupper((unsigned char)base[i]);
+  out[4 + i] = '\0';
+  return true;
+}
+
+uint8_t user_md_runtime_id(const char *contest_name, bool create) {
+  char canonical[LEN_CONTEST_NAME + 1];
+  if (!canonicalize_user_md_contest_name(contest_name, canonical,
+                                         sizeof(canonical))) return 0;
+  load_user_ids();
+  uint8_t highest = USER_MD_RUNTIME_ID_FIRST - 1;
+  for (uint8_t i = 0; i < user_id_count; ++i) {
+    if (strcasecmp(user_ids[i].name, canonical) == 0) return user_ids[i].id;
+    if (user_ids[i].id > highest) highest = user_ids[i].id;
+  }
+  if (!create || user_id_count >= USER_MD_ID_MAX ||
+      highest >= USER_MD_RUNTIME_ID_LAST) return 0;
+  File f = SD.open("/CONTEST.TXT", FILE_APPEND);
+  if (!f) return 0;
+  uint8_t id = highest + 1;
+  f.printf("#USER_ID=%u,%s\n", (unsigned)id, canonical);
+  f.close();
+  user_ids[user_id_count].id = id;
+  strlcpy(user_ids[user_id_count].name, canonical,
+          sizeof(user_ids[user_id_count].name));
+  user_id_count++;
+  return id;
+}
+
 bool start_user_md_contest(const char *contest_name) {
   if (ctx.state != USER_MD_IDLE) {
     upd_display_info_flash("User contest\nload already active");
@@ -464,10 +569,41 @@ bool start_user_md_contest(const char *contest_name) {
   }
   if (!is_user_md_contest_name(contest_name)) return false;
 
-  const char *base = contest_name + 4;
-  if (!valid_basename(base)) {
+  char canonical[LEN_CONTEST_NAME + 1];
+  if (!canonicalize_user_md_contest_name(contest_name, canonical,
+                                         sizeof(canonical))) {
     upd_display_info_flash("User contest\ninvalid filename\nA-Z 0-9 _ - only");
     return false;
+  }
+
+  // Fast path for active<->previous User contest switching.  The v1 cache
+  // already owns both tables; swap their ownership and rebuild only the small
+  // multiplier view.  The ID-keyed DUPE pool remains untouched.
+  if (previous_table != NULL &&
+      strcasecmp(canonical, previous_contest_name) == 0) {
+    struct multi_item *t = active_table; active_table = previous_table; previous_table = t;
+    char *b = active_buffer; active_buffer = previous_buffer; previous_buffer = b;
+    char *n = active_name_pool; active_name_pool = previous_name_pool; previous_name_pool = n;
+    uint8_t *wt = active_wildcard_type; active_wildcard_type = previous_wildcard_type; previous_wildcard_type = wt;
+    uint8_t *wl = active_wildcard_length; active_wildcard_length = previous_wildcard_length; previous_wildcard_length = wl;
+    int count = active_count; active_count = previous_count; previous_count = count;
+    bool allow = active_allow_other; active_allow_other = previous_allow_other; previous_allow_other = allow;
+    int mask = active_dupe_mask; active_dupe_mask = previous_dupe_mask; previous_dupe_mask = mask;
+    char old_name[LEN_CONTEST_NAME + 1];
+    strlcpy(old_name, active_contest_name, sizeof(old_name));
+    strlcpy(active_contest_name, previous_contest_name, sizeof(active_contest_name));
+    strlcpy(previous_contest_name, old_name, sizeof(previous_contest_name));
+    init_multi(NULL, 1, N_BAND - 1);
+    init_multi(active_table, -1, -1);
+    plogw->contest_id = USER_MD_CONTEST_ID;
+    plogw->multi_type = MULTI_TYPE_USER_MD;
+    plogw->mask = active_dupe_mask;
+    plogw->cw_pts = 1;
+    strlcpy(plogw->contest_name + 2, canonical,
+            sizeof(plogw->contest_name) - 2);
+    set_dupechk_contest_id(user_md_runtime_id(canonical, false));
+    sync_dupechk_mask_subcpu(plogw->mask);
+    return true;
   }
 
   reset_loading_objects();
@@ -477,8 +613,10 @@ bool start_user_md_contest(const char *contest_name) {
   ctx.score_format = false;
   ctx.error[0] = '\0';
   ctx.next_progress_ms = 0;
-  snprintf(ctx.contest_name, sizeof(ctx.contest_name), "%s", contest_name);
-  snprintf(ctx.filename, sizeof(ctx.filename), "/%s.MD", base);
+  snprintf(ctx.contest_name, sizeof(ctx.contest_name), "%s", canonical);
+  snprintf(ctx.filename, sizeof(ctx.filename), "/%s.MD", canonical + 4);
+  strlcpy(plogw->contest_name + 2, canonical,
+          sizeof(plogw->contest_name) - 2);
   upd_display_info_flash("User contest\nopening MD file");
   return true;
 }
@@ -499,9 +637,17 @@ void process_user_md_contest() {
         activate_no_multi_contest();
         reset_loading_objects();
         ctx.state = USER_MD_IDLE;
-        request_makedupe_rebuild();
+        // Restoring a previously rebuilt slot also restores its multiplier
+        // worked bitmap after the User table has been activated.
+        if (!contest_stats_restore_current()) request_makedupe_rebuild();
         break;
       }
+      if (user_md_runtime_id(ctx.contest_name, true) == 0) {
+        ctx.file.close();
+        set_error("User contest ID allocation failed");
+        break;
+      }
+      set_dupechk_contest_id(user_md_runtime_id(ctx.contest_name, false));
       ctx.file_size = ctx.file.size();
       if (ctx.file_size == 0 || ctx.file_size > 65535) {
         set_error("invalid MD file size");
@@ -557,7 +703,7 @@ void process_user_md_contest() {
       activate_loaded_table();
       reset_loading_objects();
       ctx.state = USER_MD_IDLE;
-      request_makedupe_rebuild();
+      if (!contest_stats_restore_current()) request_makedupe_rebuild();
       break;
 
     case USER_MD_ERROR: {
@@ -575,27 +721,31 @@ void process_user_md_contest() {
   }
 }
 
-int user_md_multi_check(const char *exchange, int bandid) {
+static int check_user_table(const struct multi_item *table, int count,
+                            const uint8_t *wildcard_type,
+                            const uint8_t *wildcard_length,
+                            bool allow_other, const char *exchange,
+                            int bandid) {
   if (exchange == NULL || *exchange == '\0') return -1;
   if (bandid <= 0 || bandid > N_BAND) return -1;
-  if (active_table == NULL || multi_list.multi[bandid - 1] != active_table) return -1;
+  if (table == NULL) return -1;
 
   size_t exchange_len = strlen(exchange);
   int best_index = -1;
   size_t best_base_len = 0;
 
-  for (int i = 0; i < active_count; ++i) {
-    const char *base = active_table->mul[i];
+  for (int i = 0; i < count; ++i) {
+    const char *base = table->mul[i];
     size_t base_len = strlen(base);
     if (strncasecmp(exchange, base, base_len) != 0) continue;
 
     bool match = false;
-    switch ((UserMdWildcard)active_wildcard_type[i]) {
+    switch ((UserMdWildcard)wildcard_type[i]) {
       case USER_MD_EXACT:
         match = exchange_len == base_len;
         break;
       case USER_MD_ANY_FIXED:
-        match = exchange_len == base_len + active_wildcard_length[i];
+        match = exchange_len == base_len + wildcard_length[i];
         break;
       case USER_MD_ANY_VARIABLE:
         match = exchange_len >= base_len;
@@ -619,7 +769,33 @@ int user_md_multi_check(const char *exchange, int bandid) {
   }
 
   if (best_index >= 0) return best_index;
-  return active_allow_other ? -2 : -1;
+  return allow_other ? -2 : -1;
+}
+
+int user_md_multi_check(const char *exchange, int bandid) {
+  if (bandid <= 0 || bandid > N_BAND) return -1;
+  if (active_table == NULL || multi_list.multi[bandid - 1] != active_table)
+    return -1;
+  return check_user_table(active_table, active_count, active_wildcard_type,
+                          active_wildcard_length, active_allow_other,
+                          exchange, bandid);
+}
+
+int user_md_multi_check_for(const char *contest_name,
+                            const char *exchange, int bandid) {
+  char canonical[LEN_CONTEST_NAME + 1];
+  if (!canonicalize_user_md_contest_name(contest_name, canonical,
+                                         sizeof(canonical))) return -1;
+  if (strcasecmp(canonical, active_contest_name) == 0)
+    return check_user_table(active_table, active_count, active_wildcard_type,
+                            active_wildcard_length, active_allow_other,
+                            exchange, bandid);
+  if (strcasecmp(canonical, previous_contest_name) == 0)
+    return check_user_table(previous_table, previous_count,
+                            previous_wildcard_type,
+                            previous_wildcard_length,
+                            previous_allow_other, exchange, bandid);
+  return -1;
 }
 
 void release_user_md_contest() {
@@ -635,4 +811,5 @@ void release_user_md_contest() {
   active_wildcard_length = NULL;
   active_count = 0;
   active_allow_other = false;
+  active_contest_name[0] = '\0';
 }

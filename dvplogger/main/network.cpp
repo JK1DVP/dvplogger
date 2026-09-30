@@ -483,6 +483,7 @@ int check_wifi() {
   wifi_status = 0;
   wifi_link_connected_since_ms = 0;
   if (link_was_up) {
+    memtrace_event("wifi link lost");
     snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
              "NETWORK ERROR\nWiFi link lost\nReconnecting...");
     network_display_error(dp->lcdbuf);
@@ -498,7 +499,9 @@ int check_wifi() {
   if ((int32_t)(now - next_connect_attempt_ms) < 0) return 0;
   next_connect_attempt_ms = now + WIFI_CONNECT_RETRY_MS;
 
+  memtrace_event("wifi retry before");
   const wl_status_t status = timed_espwmap_handle("connect");
+  memtrace_event("wifi retry after");
   if (status == WL_CONNECTED || WiFi.status() == WL_CONNECTED) {
     wifi_count = 0;
     wifi_status = 1;

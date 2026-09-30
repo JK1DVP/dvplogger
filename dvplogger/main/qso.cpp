@@ -27,8 +27,11 @@
 #include "decl.h"
 #include "variables.h"
 #include "dupechk.h"
+#include "contest.h"
+#include "user_contest_md.h"
 #include "callhist.h"
 #include "qso.h"
+#include "satellite.h"
 #include "display.h"
 #include "multi_process.h"
 #include "multi.h"
@@ -48,6 +51,8 @@
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 #include "so2r.h"
+#include "web_server.h"
+#include "bandmap.h"
 
 
 File qsologf;
@@ -61,6 +66,7 @@ static uint32_t makedupe_diag_records = 0;
 static uint32_t makedupe_diag_qrecords = 0;
 static uint32_t makedupe_diag_nonq = 0;
 static uint32_t makedupe_diag_offcontest = 0;
+static uint32_t makedupe_diag_no_contest_tag = 0;
 static uint32_t makedupe_diag_contest_mismatch = 0;
 static uint32_t makedupe_diag_selected = 0;
 static uint32_t makedupe_diag_hash = 2166136261UL;  // FNV-1a 32 bit
@@ -103,6 +109,7 @@ static void makedupe_diag_begin()
   makedupe_diag_qrecords = 0;
   makedupe_diag_nonq = 0;
   makedupe_diag_offcontest = 0;
+  makedupe_diag_no_contest_tag = 0;
   makedupe_diag_contest_mismatch = 0;
   makedupe_diag_selected = 0;
   makedupe_diag_hash = 2166136261UL;
@@ -136,12 +143,13 @@ static void makedupe_diag_finish()
 
   console->printf(
     "MAKEDUPE INPUT run=%lu records=%lu q=%lu nonq=%lu "
-    "Cminus=%lu mismatch=%lu selected=%lu hash=%08lX\n",
+    "Cminus=%lu C:none=%lu mismatch=%lu selected=%lu hash=%08lX\n",
     (unsigned long)makedupe_diag_run,
     (unsigned long)makedupe_diag_records,
     (unsigned long)makedupe_diag_qrecords,
     (unsigned long)makedupe_diag_nonq,
     (unsigned long)makedupe_diag_offcontest,
+    (unsigned long)makedupe_diag_no_contest_tag,
     (unsigned long)makedupe_diag_contest_mismatch,
     (unsigned long)makedupe_diag_selected,
     (unsigned long)makedupe_diag_hash);
@@ -532,8 +540,9 @@ void makedupe_qso_entry(const union qso_union_tag *record) {
   if (remarks_len >= sizeof(tmpbuf)) remarks_len = sizeof(tmpbuf) - 1;
   memcpy(tmpbuf, record->entry.remarks, remarks_len);
   tmpbuf[remarks_len] = '\0';
-  const bool current_is_nomulti =
-      strcasecmp(plogw->contest_name + 2, "NOMULTI") == 0;
+  uint8_t record_contest_id = current_contest_dupe_id();
+  uint8_t record_dupe_mask = plogw->mask;
+  const uint8_t active_dupe_id = record_contest_id;
   if (parse_strings(tmpbuf, "C:", parsed_value, sizeof(parsed_value))) {
     p = parsed_value;
     if (strcmp(p,"-")==0) {
@@ -543,20 +552,27 @@ void makedupe_qso_entry(const union qso_union_tag *record) {
 	console->println("off the contest");
       }
       return ;
-    } else if (!current_is_nomulti &&
-               strcasecmp(p,plogw->contest_name+2)!=0) {
-      // In a named contest, use only QSOs carrying the same contest tag.
-      // NOMULTI is the all-contest view: accept every normal QSO regardless
-      // of its C: tag, while C:- remains excluded above.
-      makedupe_diag_contest_mismatch++;
-      if (verbose&4) {
-	char buf[100];
-	strcpy(buf,p);
-	console->print(buf);console->print(" not match current contest:");
-	console->println(plogw->contest_name+2);
+    } else {
+      int tagged_builtin_id = -1;
+      for (int ci = 0; ci < contest_definition_count(); ++ci) {
+        if (strcasecmp(p, contest_definition_name(ci)) == 0) {
+          tagged_builtin_id = contest_definition_id(ci); break;
+        }
       }
-      return;
+      record_contest_id = contest_dupe_id_for_name(p, tagged_builtin_id);
+      record_dupe_mask = (uint8_t)contest_dupe_mask_for_name(
+          p, tagged_builtin_id, plogw->mask);
     }
+    // Keep every named contest in the shared DUPE pool.  The contest ID and
+    // that contest's own CW/Phone mask travel with the entry; only score and
+    // multiplier reconstruction below are limited to the active contest.
+    // Filtering here used to empty the other contest whenever MAKEDUPE ran.
+  } else {
+    // Legacy QSO record without a C: tag.  Current behavior intentionally
+    // remains unchanged: it is treated as belonging to the active contest.
+    // Count it so the operator can see why an apparently unrelated contest
+    // may acquire QSOs after MAKEDUPE.
+    makedupe_diag_no_contest_tag++;
   }
   
   // set bandid and modetype according to what is written in the log (needed in dupe checking)
@@ -579,7 +595,7 @@ void makedupe_qso_entry(const union qso_union_tag *record) {
   makedupe_diag_hash_selected(record, (unsigned char)bandmode);
 
   // update seqnr for the band
-  plogw->seqnr_band[bandid-1]++;
+  if (record_contest_id == active_dupe_id) plogw->seqnr_band[bandid-1]++;
   
   //  bandmode = bandid * 4 + modetype;
   //plogw->ostream->print("makedupe3");
@@ -591,18 +607,29 @@ void makedupe_qso_entry(const union qso_union_tag *record) {
     // MAKEDUPE bulk mode: the SUBCPU rejects duplicates.  For each accepted
     // QSO it sends bandmode/exchange back, so multiplier accounting uses the
     // same acceptance decision as the QSO count.
-    entry_makedupe_subcpu_data(record->entry.hiscall, record->entry.rcvexch, bandmode);
-  } else if (!dupe_check_nocallhist(record->entry.hiscall, bandmode, plogw->mask)) {
+    entry_makedupe_subcpu_data_for(record->entry.hiscall,
+        record->entry.rcvexch, bandmode, record_contest_id, record_dupe_mask);
+  } else {
+    const uint8_t saved_contest_id = get_dupechk_contest_id();
+    set_dupechk_contest_id(record_contest_id);
+    const bool already = dupe_check_nocallhist(record->entry.hiscall,
+                                                bandmode, record_dupe_mask);
+    set_dupechk_contest_id(saved_contest_id);
+    if (!already) {
     if (dupechk->ncallsign < dupechk->nmaxqso) {
-      entry_dupechk_data(record->entry.hiscall, record->entry.rcvexch, bandmode);
-      score.worked[modetype == LOG_MODETYPE_CW ? 0 : 1][bandid - 1]++;
-      accepted_qso = true;
+      entry_dupechk_data_for(record->entry.hiscall, record->entry.rcvexch,
+                             bandmode, record_contest_id);
+      contest_stats_record_rebuild(record_contest_id,
+                                   (unsigned char)bandmode,
+                                   record->entry.rcvexch);
+      accepted_qso = (record_contest_id == active_dupe_id);
     } else {
       makedupe_main_overflow_count++;
     }
-  } else if (verbose & 1) {
-    plogw->ostream->print(record->entry.hiscall);
-    plogw->ostream->println(" already in dupechk");
+    } else if (verbose & 1) {
+      plogw->ostream->print(record->entry.hiscall);
+      plogw->ostream->println(" already in dupechk");
+    }
   }
 
   // The maximum serial number is independent of duplicate elimination.
@@ -614,10 +641,7 @@ void makedupe_qso_entry(const union qso_union_tag *record) {
 
   // For MAIN-side dupe checking, account the multiplier immediately.
   // In SUBCPU bulk mode this is performed only after a dupebulka response.
-  if (accepted_qso) {
-    process_makedupe_multiplier_maincpu(record->entry.rcvexch,
-                                        (unsigned char)bandmode);
-  }
+  (void)accepted_qso;
   //upd_display_info_contest_settings();
 }
 
@@ -1213,6 +1237,8 @@ static void append_qso_backup_line(int number) {
 
 
 static volatile bool pending_makedupe_rebuild = false;
+static uint8_t active_makedupe_contest_id = 0;
+static uint32_t makedupe_open_retry_ms = 0;
 
 struct makedupe_rebuild_context {
   bool active;
@@ -1229,6 +1255,25 @@ static File makedupe_rebuild_file;
 
 void request_makedupe_rebuild()
 {
+  if (verbose & 16384) {
+    console->printf("[DUPE-TRACE] REBUILD-REQ pending=%u active=%u current_cid=%u active_cid=%u ms=%lu\n",
+                    pending_makedupe_rebuild ? 1U : 0U,
+                    makedupe_rebuild.active ? 1U : 0U,
+                    (unsigned)current_contest_dupe_id(),
+                    (unsigned)active_makedupe_contest_id,
+                    (unsigned long)millis());
+  }
+  // Startup and contest restoration can request the same rebuild through
+  // several paths.  A request made while a complete rebuild is already in
+  // progress must not schedule a second reset immediately afterward.  Keep a
+  // genuinely different contest request, however, so an operator contest
+  // switch during a rebuild is not lost.
+  if (pending_makedupe_rebuild) return;
+  if (makedupe_rebuild.active) {
+    if (current_contest_dupe_id() != active_makedupe_contest_id)
+      pending_makedupe_rebuild = true;
+    return;
+  }
   pending_makedupe_rebuild = true;
 }
 
@@ -1257,18 +1302,43 @@ static void finish_incremental_makedupe_rebuild()
                   (unsigned long)(millis() - makedupe_rebuild.started_ms));
   makedupe_rebuild.active = false;
   makedupe_rebuild.waiting_subcpu_finish = false;
+  bandmap_dupe_rebuild_end();
+  if (dupechk->dupechk_at != 1) contest_stats_finish_rebuild(true);
 }
 
-static void start_incremental_makedupe_rebuild()
+static bool start_incremental_makedupe_rebuild()
 {
-  pending_makedupe_rebuild = false;
+  // Never clear the existing DUPE database until the source log is open.
+  // At startup the live append handle may transiently prevent a second open;
+  // the old order reset the database first and then abandoned the rebuild.
+  close_qso_log_readonly(&makedupe_rebuild_file);
+  if (!open_qso_log_readonly(&makedupe_rebuild_file)) {
+    makedupe_open_retry_ms = millis() + 1000U;
+    console->println(
+        "MAKEDUPE: QSO log open failed; keeping database and retrying");
+    return false;
+  }
 
+  pending_makedupe_rebuild = false;
+  makedupe_open_retry_ms = 0;
+
+  // The DUPE context is about to be rebuilt.  Existing Bandmap WORKED state
+  // belongs to the previous context, so invalidate it before resetting DB.
+  bandmap_dupe_rebuild_begin();
+
+  // Read the current CONTEST.TXT exactly once for this rebuild.  Every QSO
+  // below resolves contest IDs, sent exchanges and CW/Phone masks from the
+  // in-memory snapshot; never reopen the file inside the record loop.
+  reload_contest_runtime_presets();
+
+  contest_stats_begin_rebuild();
   init_score();
   plogw->seqnr = 0;
   clear_multi_worked();
   makedupe_main_overflow_count = 0;
 
-  if (subcpu_online) {
+  const bool want_dupe_subcpu = dupechk_setting_wants_subcpu();
+  if (want_dupe_subcpu && subcpu_online) {
     init_dupechk_maincpu();
     if (!reset_dupechk_subcpu()) {
       console->println(
@@ -1276,25 +1346,21 @@ static void start_incremental_makedupe_rebuild()
       subcpu_online = false;
       callhist_at = 0;
       plogw->enable_callhist = 0;
-      init_dupechk(200, 0);
+      init_dupechk(f_spiram ? dupechk_max : 200, 0);
 
       snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
                "SUBCPU OFFLINE\nMAIN DUPE: 200");
       upd_display_info_flash(dp->lcdbuf);
     }
   } else {
-    init_dupechk(200, 0);
+    // MAIN placement is intentional when AUTO resolves to MAIN (HW3) or
+    // setting=MAIN.  Do not treat an online SUBCPU as a DUPE backend.
+    init_dupechk(f_spiram ? dupechk_max : 200, 0);
   }
 
   makedupe_diag_begin();
-  close_qso_log_readonly(&makedupe_rebuild_file);
-  if (!open_qso_log_readonly(&makedupe_rebuild_file)) {
-    console->println("MAKEDUPE incremental: cannot open QSO log for reading");
-    makedupe_diag_finish();
-    return;
-  }
-
   makedupe_rebuild.active = true;
+  active_makedupe_contest_id = current_contest_dupe_id();
   makedupe_rebuild.waiting_subcpu_finish = false;
   makedupe_rebuild.pos = 0;
   makedupe_rebuild.count = 0;
@@ -1303,16 +1369,31 @@ static void start_incremental_makedupe_rebuild()
   makedupe_rebuild.next_record_ms = makedupe_rebuild.started_ms;
 
   if (dupechk->dupechk_at == 1) begin_makedupe_subcpu(plogw->mask);
+  if (verbose & 16384) {
+    console->printf("[DUPE-TRACE] REBUILD-START cid=%u contest=<%s> mask=0x%02X ms=%lu\n",
+                    (unsigned)active_makedupe_contest_id,
+                    plogw->contest_name + 2, (unsigned)plogw->mask,
+                    (unsigned long)millis());
+  }
   console->printf("MAKEDUPE incremental started record_size=%d union_size=%u\n",
                   makedupe_rebuild.len,
                   (unsigned int)sizeof(union qso_union_tag));
+  return true;
 }
 
 void process_pending_makedupe_rebuild()
 {
   if (!makedupe_rebuild.active) {
     if (!pending_makedupe_rebuild) return;
-    start_incremental_makedupe_rebuild();
+    // A User contest loads its multiplier table incrementally.  Starting a
+    // rebuild before that table is active produces a valid QSO count but zero
+    // multipliers, then USER_MD_DONE requests a second redundant rebuild.
+    // Leave the request pending and start it once the final table (and, for a
+    // restored dual-User pair, the final MAIN contest) is ready.
+    if (user_md_contest_loading()) return;
+    if (makedupe_open_retry_ms != 0 &&
+        (int32_t)(millis() - makedupe_open_retry_ms) < 0) return;
+    if (!start_incremental_makedupe_rebuild()) return;
   }
 
   if (makedupe_rebuild.waiting_subcpu_finish) {
@@ -1619,6 +1700,7 @@ void process_qso_file_operation() {
     }
 
     case QSO_FILE_OP_SWITCH_PREPARE_REBUILD:
+      contest_stats_begin_rebuild();
       init_dupechk_maincpu();
       reset_dupechk_subcpu();
       init_score();
@@ -1745,7 +1827,16 @@ void sprint_qso_entry(char *buf,union qso_union_tag *qso) {
   strcat(buf," ");
 
   // opmode
-  strcat(buf,qso->entry.opmode);
+  // DVPlogger keeps the internal D-STAR name as "DSTAR" (matching ADIF
+  // SUBMODE).  CTESTWIN text import expects "D-STAR", so translate only
+  // this human-readable/CTESTWIN-oriented text export.  Keep the stored
+  // QSO record and ADIF export unchanged.
+  if (strcmp(qso->entry.opmode, "DSTAR") == 0 ||
+      strcmp(qso->entry.opmode, "DV") == 0) {
+    strcat(buf, "D-STAR");
+  } else {
+    strcat(buf, qso->entry.opmode);
+  }
   strcat(buf," ");
 
   // check rst in phone
@@ -1903,6 +1994,7 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
   char contest_name[100];
   char remarks1[400];
   char remarks2[500];
+  char value[100];
 
   buf[0] = '\0';
 
@@ -1927,9 +2019,21 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
   append_hamlog_csv_field(buf, qso->entry.rcvrst);
 
   // 7. 周波数（MHz）
-  float freq = 0.0f;
-  sscanf(qso->entry.freq, "%f", &freq);
-  snprintf(tmpbuf, sizeof(tmpbuf), "%.5f", freq / 1000000.0f);
+  // Satellite QSOs are stored with the uplink (our TX) in entry.freq and
+  // the downlink (our RX) as RX:<Hz> in Remarks.  Turbo HAMLOG understands
+  // the TX/RX split notation (e.g. 145.950/435.650), which also makes its
+  // transmit/receive-band variables available to hQSL.
+  double freq = 0.0;
+  sscanf(qso->entry.freq, "%lf", &freq);
+  char sat_rx_hz[24];
+  if (extract_remark_value(qso->entry.remarks, "SAT:", value, sizeof(value)) &&
+      extract_remark_value(qso->entry.remarks, "RX:", sat_rx_hz, sizeof(sat_rx_hz))) {
+    long long rx_hz = atoll(sat_rx_hz);
+    snprintf(tmpbuf, sizeof(tmpbuf), "%.6f/%.6f",
+             freq / 1000000.0, (double)rx_hz / 1000000.0);
+  } else {
+    snprintf(tmpbuf, sizeof(tmpbuf), "%.5f", freq / 1000000.0);
+  }
   append_hamlog_csv_field(buf, tmpbuf);
 
   // 8. モード
@@ -1970,7 +2074,6 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
     strncat(remarks1, " ", sizeof(remarks1) - strlen(remarks1) - 1);
   }
 
-  char value[100];
   if (extract_remark_value(qso->entry.remarks, "POTA_MY:", value, sizeof(value))) {
     strncat(remarks1, "POTA_MY:", sizeof(remarks1) - strlen(remarks1) - 1);
     strncat(remarks1, value, sizeof(remarks1) - strlen(remarks1) - 1);
@@ -2008,6 +2111,86 @@ void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso) {
   append_hamlog_csv_field(buf, remarks2);
 
   strcat(buf, "\n");
+}
+
+bool qso_contest_name(const union qso_union_tag *qso, char *out, size_t out_size) {
+  if (!out || out_size == 0) return false;
+  out[0] = '\0';
+  if (!qso) return false;
+  if (!extract_remark_value(qso->entry.remarks, "C:", out, out_size)) return false;
+  if (strcmp(out, "-") == 0) { out[0] = '\0'; return false; }
+  return out[0] != '\0';
+}
+
+void sprint_qso_entry_cabrillo(char *buf, union qso_union_tag *qso) {
+  if (!buf || !qso) return;
+  buf[0] = '\0';
+
+  unsigned long long hz = strtoull(qso->entry.freq, NULL, 10);
+  unsigned long khz = (unsigned long)((hz + 500ULL) / 1000ULL);
+  char freq[12];
+  if      (hz >=  50000000ULL && hz <   54000000ULL) strlcpy(freq, "50", sizeof(freq));
+  else if (hz >= 144000000ULL && hz <  148000000ULL) strlcpy(freq, "144", sizeof(freq));
+  else if (hz >= 222000000ULL && hz <  225000000ULL) strlcpy(freq, "222", sizeof(freq));
+  else if (hz >= 420000000ULL && hz <  450000000ULL) strlcpy(freq, "432", sizeof(freq));
+  else if (hz >= 902000000ULL && hz <  928000000ULL) strlcpy(freq, "902", sizeof(freq));
+  else if (hz >= 1240000000ULL && hz < 1300000000ULL) strlcpy(freq, "1.2G", sizeof(freq));
+  else if (hz >= 2300000000ULL && hz < 2450000000ULL) strlcpy(freq, "2.3G", sizeof(freq));
+  else if (hz >= 3300000000ULL && hz < 3500000000ULL) strlcpy(freq, "3.4G", sizeof(freq));
+  else if (hz >= 5650000000ULL && hz < 5925000000ULL) strlcpy(freq, "5.7G", sizeof(freq));
+  else if (hz >= 10000000000ULL && hz < 10500000000ULL) strlcpy(freq, "10G", sizeof(freq));
+  else snprintf(freq, sizeof(freq), "%lu", khz);
+
+  char mode[4] = "DG";
+  if (strncmp(qso->entry.mode, "CW", 2) == 0 || strncmp(qso->entry.opmode, "CW", 2) == 0)
+    strlcpy(mode, "CW", sizeof(mode));
+  else if (strncmp(qso->entry.mode, "PH", 2) == 0 ||
+           strcmp(qso->entry.opmode, "USB") == 0 || strcmp(qso->entry.opmode, "LSB") == 0 ||
+           strcmp(qso->entry.opmode, "SSB") == 0 || strcmp(qso->entry.opmode, "AM") == 0)
+    strlcpy(mode, "PH", sizeof(mode));
+  else if (strcmp(qso->entry.opmode, "FM") == 0)
+    strlcpy(mode, "FM", sizeof(mode));
+  else if (strstr(qso->entry.opmode, "RTTY") || strstr(qso->entry.opmode, "FSK"))
+    strlcpy(mode, "RY", sizeof(mode));
+
+  // QSO records are stored in JST. Cabrillo QSO date/time is UTC, as in ADIF export.
+  struct tm jst_tm = parse_datetime(qso->entry.tm);
+  time_t utc_time = mktime(&jst_tm) - 9 * 3600;
+  struct tm utc_tm = *localtime(&utc_time);
+
+  // CQ WW RTTY keeps Zone/QTH as "25/DX" or "03/CA" internally so '/'
+  // does not conflict with normal keyboard use.  Cabrillo requires them as
+  // separate whitespace-delimited fields.
+  char contest_name[LEN_CONTEST_NAME + 1];
+  if (qso_contest_name(qso, contest_name, sizeof(contest_name)) &&
+      strcasecmp(contest_name, "CQWWRTTY") == 0) {
+    struct exchange_fields sent_fields, recv_fields;
+    bool sent_ok = split_exchange_fields(qso->entry.sentexch, '/', &sent_fields) &&
+                   sent_fields.count == 2;
+    bool recv_ok = split_exchange_fields(qso->entry.rcvexch, '/', &recv_fields) &&
+                   recv_fields.count == 2;
+    if (sent_ok && recv_ok) {
+      snprintf(buf, 1024,
+               "QSO: %5s %-2s %04d-%02d-%02d %02d%02d %-13s %-3s %2s %-3s %-13s %-3s %2s %-3s\r\n",
+               freq, mode,
+               utc_tm.tm_year + 1900, utc_tm.tm_mon + 1, utc_tm.tm_mday,
+               utc_tm.tm_hour, utc_tm.tm_min,
+               qso->entry.mycall, qso->entry.sentrst, sent_fields.field[0], sent_fields.field[1],
+               qso->entry.hiscall, qso->entry.rcvrst, recv_fields.field[0], recv_fields.field[1]);
+      return;
+    }
+  }
+
+  // Cabrillo fields use the standard minimum widths, but do not truncate a
+  // longer callsign or exchange. Keeping all logged information is safer than
+  // forcing a long field into the nominal presentation width.
+  snprintf(buf, 1024,
+           "QSO: %5s %-2s %04d-%02d-%02d %02d%02d %-13s %-3s %-6s %-13s %-3s %-6s\r\n",
+           freq, mode,
+           utc_tm.tm_year + 1900, utc_tm.tm_mon + 1, utc_tm.tm_mday,
+           utc_tm.tm_hour, utc_tm.tm_min,
+           qso->entry.mycall, qso->entry.sentrst, qso->entry.sentexch,
+           qso->entry.hiscall, qso->entry.rcvrst, qso->entry.rcvexch);
 }
 
 void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) {
@@ -2051,6 +2234,12 @@ void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) {
     strcat(buf,tmpbuf);    
   } else if ((strcmp(qso->entry.opmode,"CW")==0)||(strcmp(qso->entry.opmode,"CW-R")==0)) {
     strcat(buf,"<MODE:2>CW");
+  } else if (strcmp(qso->entry.opmode,"DSTAR")==0 || strcmp(qso->entry.opmode,"DV")==0) {
+    // ADIF 3.1.3+: D-STAR is a DIGITALVOICE submode.  Accept legacy
+    // internal "DV" records as DSTAR on export as well.
+    strcat(buf,"<MODE:12>DIGITALVOICE<SUBMODE:5>DSTAR");
+  } else if (strcmp(qso->entry.opmode,"C4FM")==0) {
+    strcat(buf,"<MODE:12>DIGITALVOICE<SUBMODE:4>C4FM");
   } else {
     sprintf(tmpbuf,"<MODE:%d>%s",strlen(qso->entry.opmode),qso->entry.opmode);
     strcat(buf,tmpbuf);        
@@ -2062,6 +2251,46 @@ void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) {
   ret=sscanf(qso->entry.band,"%d",&tmp);
   sprintf(tmpbuf,"<BAND:%d>%s",strlen(band_str_adif[tmp-1]),band_str_adif[tmp-1]);
   strcat(buf,tmpbuf);
+
+  // ADIF FREQ is always our transmit frequency.  For satellite records
+  // make_qsolog_entry() stores the uplink in entry.freq.
+  long long tx_hz = atoll(qso->entry.freq);
+  // Format the MHz value first so the ADIF length is exact.
+  char freq_value[32];
+  snprintf(freq_value, sizeof(freq_value), "%.6f", (double)tx_hz / 1000000.0);
+  snprintf(tmpbuf, sizeof(tmpbuf), "<FREQ:%d>%s", (int)strlen(freq_value), freq_value);
+  strcat(buf,tmpbuf);
+
+  char sat_name[32];
+  char sat_rx_hz[24];
+  if (extract_remark_value(qso->entry.remarks, "SAT:", sat_name, sizeof(sat_name)) &&
+      extract_remark_value(qso->entry.remarks, "RX:", sat_rx_hz, sizeof(sat_rx_hz))) {
+    long long rx_hz = atoll(sat_rx_hz);
+    strcat(buf, "<PROP_MODE:3>SAT");
+    snprintf(tmpbuf, sizeof(tmpbuf), "<SAT_NAME:%d>%s", (int)strlen(sat_name), sat_name);
+    strcat(buf,tmpbuf);
+    snprintf(freq_value, sizeof(freq_value), "%.6f", (double)rx_hz / 1000000.0);
+    snprintf(tmpbuf, sizeof(tmpbuf), "<FREQ_RX:%d>%s", (int)strlen(freq_value), freq_value);
+    strcat(buf,tmpbuf);
+    int rx_band = freq2bandid((unsigned long)(rx_hz / FREQ_UNIT));
+    if (rx_band >= 1 && rx_band <= N_BAND) {
+      snprintf(tmpbuf, sizeof(tmpbuf), "<BAND_RX:%d>%s",
+               (int)strlen(band_str_adif[rx_band-1]), band_str_adif[rx_band-1]);
+      strcat(buf,tmpbuf);
+    }
+    char my_grid[16];
+    if (extract_remark_value(qso->entry.remarks, "MYGL:", my_grid, sizeof(my_grid))) {
+      snprintf(tmpbuf, sizeof(tmpbuf), "<MY_GRIDSQUARE:%d>%s",
+               (int)strlen(my_grid), my_grid);
+      strcat(buf,tmpbuf);
+    }
+    char his_grid[16];
+    if (extract_remark_value(qso->entry.remarks, "GL:", his_grid, sizeof(his_grid))) {
+      snprintf(tmpbuf, sizeof(tmpbuf), "<GRIDSQUARE:%d>%s",
+               (int)strlen(his_grid), his_grid);
+      strcat(buf,tmpbuf);
+    }
+  }
 
   //<RST_RCVD:2>59
   sprintf(tmpbuf,"<RST_RCVD:%d>%s",strlen(qso->entry.rcvrst),qso->entry.rcvrst);
@@ -2468,6 +2697,37 @@ static void copy_qso_callsign(char *dst, const char *src) {
   dst[LEN_QSO_CALLSIGN] = '\0';
 }
 
+// Return true for a 4/6/8-character Maidenhead locator token.
+static bool is_maidenhead_locator(const char *s) {
+  if (s == NULL) return false;
+  size_t n = strlen(s);
+  if (n != 4 && n != 6 && n != 8) return false;
+  if (toupper((unsigned char)s[0]) < 'A' || toupper((unsigned char)s[0]) > 'R' ||
+      toupper((unsigned char)s[1]) < 'A' || toupper((unsigned char)s[1]) > 'R' ||
+      !isdigit((unsigned char)s[2]) || !isdigit((unsigned char)s[3])) return false;
+  if (n >= 6 &&
+      (toupper((unsigned char)s[4]) < 'A' || toupper((unsigned char)s[4]) > 'X' ||
+       toupper((unsigned char)s[5]) < 'A' || toupper((unsigned char)s[5]) > 'X')) return false;
+  if (n == 8 && (!isdigit((unsigned char)s[6]) || !isdigit((unsigned char)s[7]))) return false;
+  return true;
+}
+
+static bool find_maidenhead_locator(const char *text, char *out, size_t out_size) {
+  if (text == NULL || out == NULL || out_size == 0) return false;
+  char work[80];
+  strlcpy(work, text, sizeof(work));
+  const char *delim = " ,;/\\|\t";
+  char *save = NULL;
+  for (char *tok = strtok_r(work, delim, &save); tok != NULL;
+       tok = strtok_r(NULL, delim, &save)) {
+    if (!is_maidenhead_locator(tok)) continue;
+    strlcpy(out, tok, out_size);
+    for (char *p = out; *p; ++p) *p = toupper((unsigned char)*p);
+    return true;
+  }
+  return false;
+}
+
 // create a single QSO log file entry (fixed length string)
 void make_qsolog_entry() {
   struct radio *radio;
@@ -2476,6 +2736,26 @@ void make_qsolog_entry() {
   char *p1;
   //  radio = so2r.radio_selected();
   radio= so2r.radio_qso_process();
+
+  // SAT is a global operating state, but a QSO is a satellite QSO only when
+  // the radio that owns this QSO participates in the CURRENT SAT VFO layout.
+  // Recompute the mask here so an Alt-R/Web/automatic VFO-layout change takes
+  // effect immediately and cannot leave a stale SAT-radio assignment behind.
+  const uint32_t sat_radio_mask = sat_current_radio_mask();
+  int qso_radio_idx = -1;
+  for (int ri = 0; ri < N_RADIO; ++ri) {
+    if (radio == &radio_list[ri]) {
+      qso_radio_idx = ri;
+      break;
+    }
+  }
+  const bool qso_is_sat =
+      plogw->sat && qso_radio_idx >= 0 && qso_radio_idx < 32 &&
+      ((sat_radio_mask & (1UL << qso_radio_idx)) != 0);
+  if ((verbose & 8) && plogw->sat)
+    plogw->ostream->printf("SAT QSO classify radio=%d mask=0x%08lx vfo=%d => %s\n",
+                          qso_radio_idx, (unsigned long)sat_radio_mask,
+                          plogw->sat_vfo_mode, qso_is_sat ? "SAT" : "NORMAL");
   // clear all
   memset(qso.all, ' ', sizeof(qso.all));
   strcpy(qso.entry.type, "Q");
@@ -2492,25 +2772,45 @@ void make_qsolog_entry() {
     strcpy(qso.entry.opmode, radio->opmode_loaded);
     strcpy(qso.entry.mode, modetype_str[modetype_string(radio->opmode_loaded)]);
   } else {
-    //    sprintf(qso.entry.freq, "%-10lld", radio->freq*((long long)FREQ_UNIT));
-    sprintf(stmp, "%-11lld", radio->freq*((long long)FREQ_UNIT));
+    // For satellite QSOs the primary QSO frequency is always our uplink/TX,
+    // independent of which VFO happens to be selected on the radio.
+    long long qso_freq_hz = qso_is_sat && plogw->up_f > 0
+                                ? (long long)plogw->up_f
+                                : radio->freq*((long long)FREQ_UNIT);
+    sprintf(stmp, "%-11lld", qso_freq_hz);
     strncpy(qso.entry.freq,stmp,11);
     strcpy(qso.entry.tm, plogw->tm);
     sprintf(qso.entry.seqnr, "%-d", plogw->seqnr);
-    sprintf(qso.entry.band, "%-d", freq2bandid(radio->freq));
-    strcpy(qso.entry.opmode, radio->opmode);
-    strcpy(qso.entry.mode, modetype_str[modetype_string(radio->opmode)]);
+    sprintf(qso.entry.band, "%-d",
+            freq2bandid((unsigned long)(qso_freq_hz / FREQ_UNIT)));
+    const char *qso_opmode = radio->opmode;
+    if (qso_is_sat && plogw->sat_idx_selected >= 0 &&
+        sat_info[plogw->sat_idx_selected].up_mode[0] != '\0')
+      qso_opmode = sat_info[plogw->sat_idx_selected].up_mode;
+    strcpy(qso.entry.opmode, qso_opmode);
+    strcpy(qso.entry.mode, modetype_str[modetype_string(qso_opmode)]);
   }
   copy_qso_callsign(qso.entry.mycall, plogw->my_callsign + 2);
   strcpy(qso.entry.sentrst, radio->sent_rst + 2);
   
   char sentexch_buf[100];
   expand_sent_exch(sentexch_buf, sizeof(sentexch_buf));
-  strcpy(qso.entry.sentexch, sentexch_buf);
+  if ((plogw->multi_type & 0xff) == MULTI_TYPE_CQWWRTTY)
+    normalize_cqwwrtty_exchange(sentexch_buf, sizeof(sentexch_buf));
+  strlcpy(qso.entry.sentexch, sentexch_buf, sizeof(qso.entry.sentexch));
 //  strcpy(qso.entry.sentexch, expand_sent_exch());
   copy_qso_callsign(qso.entry.hiscall, radio->callsign + 2);
   strcpy(qso.entry.rcvrst, radio->recv_rst + 2);
-  strcpy(qso.entry.rcvexch, radio->recv_exch + 2);
+  if ((plogw->multi_type & 0xff) == MULTI_TYPE_CQWWRTTY) {
+    char recvexch_buf[LEN_EXCH + 1];
+    strlcpy(recvexch_buf, radio->recv_exch + 2, sizeof(recvexch_buf));
+    if (normalize_cqwwrtty_exchange(recvexch_buf, sizeof(recvexch_buf)))
+      strlcpy(qso.entry.rcvexch, recvexch_buf, sizeof(qso.entry.rcvexch));
+    else
+      strlcpy(qso.entry.rcvexch, radio->recv_exch + 2, sizeof(qso.entry.rcvexch));
+  } else {
+    strlcpy(qso.entry.rcvexch, radio->recv_exch + 2, sizeof(qso.entry.rcvexch));
+  }
   qso.entry.remarks[0] = '\0';
 
   if (!radio->qsodata_loaded) {
@@ -2526,15 +2826,25 @@ void make_qsolog_entry() {
       // F2A
       strcat(qso.entry.remarks,"F2A ");
     }
-    if (plogw->sat) {
-      // satellite qso add satellite name and grid locator before remarks
-      strcat(qso.entry.remarks, plogw->sat_name_set);
-      strcat(qso.entry.remarks, " ");
-      strcat(qso.entry.remarks, plogw->grid_locator_set);
-      strcat(qso.entry.remarks, " ");
-      char buf[30];
-      sprintf(buf, "O:%d ", sat_info[plogw->sat_idx_selected].offset_freq);
-      strcat(qso.entry.remarks, buf);
+    if (qso_is_sat) {
+      // Keep satellite metadata machine-readable inside the existing 256-byte
+      // QSO record.  entry.freq is UP/TX; RX: carries DN/RX in Hz.
+      // MYGL: preserves our grid; GL: is added when rcvexch contains a valid Maidenhead locator.
+      char satmeta[72];
+      int sat_ofs = 0;
+      if (plogw->sat_idx_selected >= 0)
+        sat_ofs = sat_info[plogw->sat_idx_selected].offset_freq;
+      snprintf(satmeta, sizeof(satmeta), "SAT:%s RX:%d MYGL:%s O:%d ",
+               plogw->sat_name_set, plogw->dn_f, plogw->grid_locator_set, sat_ofs);
+      strncat(qso.entry.remarks, satmeta,
+              sizeof(qso.entry.remarks) - strlen(qso.entry.remarks) - 1);
+      char his_grid[12];
+      if (find_maidenhead_locator(qso.entry.rcvexch, his_grid, sizeof(his_grid))) {
+        char glmeta[20];
+        snprintf(glmeta, sizeof(glmeta), "GL:%s ", his_grid);
+        strncat(qso.entry.remarks, glmeta,
+                sizeof(qso.entry.remarks) - strlen(qso.entry.remarks) - 1);
+      }
     }
     if (strlen(plogw->jcc + 2) > 0) {
       // check POTA and SOTA number designators P: S: (after JCC/JCG numbers )

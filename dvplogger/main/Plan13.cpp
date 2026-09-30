@@ -25,6 +25,7 @@
 
 #include <Arduino.h>
 #include "Plan13.h"
+#include "decl.h"
 #define DEBUG false
 #define TEST false
 
@@ -67,13 +68,13 @@ double Plan13::FNday(int year, int month, int day)
 {
   double JulianDate;
 if (DEBUG) {
-  Serial.print("## FNDay:  ");
-  Serial.print("Year: ");
-  Serial.print(year);
-  Serial.print(" Month: ");
-  Serial.print(month);
-  Serial.print(" Day: ");
-  Serial.print(day);
+  console->print("## FNDay:  ");
+  console->print("Year: ");
+  console->print(year);
+  console->print(" Month: ");
+  console->print(month);
+  console->print(" Day: ");
+  console->print(day);
 }
   if (month <= 2)
   {
@@ -84,8 +85,8 @@ if (DEBUG) {
  
  JulianDate = (long)(year * YM) + (int)((month + 1) * 30.6) + (day - 428);
  if (DEBUG) {
-   Serial.print(" JD: ");
-   Serial.println(JulianDate);
+   console->print(" JD: ");
+   console->println(JulianDate);
  }
    return (JulianDate);
 }
@@ -96,7 +97,7 @@ void Plan13::initSat(void)
   //readElements(SAT); //now done beforehand
 
    /* Observer's location */
-   if (DEBUG) {Serial.println("Start initSat()");}
+   if (DEBUG) {console->println("Start initSat()");}
   LA = rad( observer_lat );
   LO = rad( observer_lon );
   HT = ((float) observer_height)/1000.0; // this needs to be in km
@@ -162,10 +163,10 @@ void Plan13::initSat(void)
   
   TE = TE - (int)TE;
   if (DEBUG) {
-    Serial.print("DE: ");
-    Serial.println(DE);
-    Serial.print("TE: ");
-    Serial.println(TE);
+    console->print("DE: ");
+    console->println(DE);
+    console->print("TE: ");
+    console->println(TE);
   }
    /* Average Precession rates */
   GM = 3.986E5;               /* Earth's gravitational constant km^3/s^2   */
@@ -216,16 +217,16 @@ void Plan13::initSat(void)
 
    /* Miscellaneous */
   OLDRN = -99999;
- if (DEBUG) { Serial.println("End initSat()");}
+ if (DEBUG) { console->println("End initSat()");}
 }
 
 void Plan13::satvec(void)
 {
-  if (DEBUG) {Serial.println("Start satvec()");}
+  if (DEBUG) {console->println("Start satvec()");}
   T = (DN - DE) + (TN - TE);//83.848 ;          /* Elapsed T since epoch             */
   if (DEBUG) {
-    Serial.print("T: ");
-  Serial.println(T);
+    console->print("T: ");
+  console->println(T);
   }
   DT = DC * T / 2.0;                  /* Linear drag terms                 */
   KD = 1.0 + 4.0 * DT;
@@ -301,12 +302,12 @@ void Plan13::satvec(void)
   Sz = SATz;
   Az = ANTz;
   Vz = VELz;
-   if (DEBUG) {Serial.println("End satvec()");}
+   if (DEBUG) {console->println("End satvec()");}
 }
 
 void Plan13::rangevec(void)
 {
-   if (DEBUG) {Serial.println("Start rangevec()");}
+   if (DEBUG) {console->println("Start rangevec()");}
    /* Range vector = sat vector - observer vector */
   Rx = Sx - Ox;
   Ry = Sy - Oy;
@@ -340,7 +341,7 @@ rxOutLong = rxFrequencyLong - rxDoppler;
 txOutLong = txFrequencyLong + txDoppler;
 
 
-   if (DEBUG) {Serial.println("End rangevec()");}
+   if (DEBUG) {console->println("End rangevec()");}
 }
 
 void Plan13::sunvec(void)
@@ -373,20 +374,20 @@ int Plan13::getDoppler64(unsigned long freq) {
 
 void Plan13::printdata(void)
 {
-  Serial.print("AZ:");
-  Serial.print(AZ);
-  Serial.print(" EL: ");
-  Serial.print(EL);
-  Serial.print(" RX: ");
-  Serial.print(rxOutLong);
-  Serial.print(" TX: ");
-  Serial.print(txOutLong);
-Serial.print(" Sat Lat: ");
-Serial.print(SLAT);
-Serial.print(" Sat Lon.: ");
-Serial.print(SLON);
-Serial.print(" RR: ");
-Serial.print(RR);
+  console->print("AZ:");
+  console->print(AZ);
+  console->print(" EL: ");
+  console->print(EL);
+  console->print(" RX: ");
+  console->print(rxOutLong);
+  console->print(" TX: ");
+  console->print(txOutLong);
+console->print(" Sat Lat: ");
+console->print(SLAT);
+console->print(" Sat Lon.: ");
+console->print(SLON);
+console->print(" RR: ");
+console->print(RR);
 
 }
 void Plan13::setFrequency(unsigned long rxFrequency_in, unsigned long txFrequency_in) {
@@ -411,7 +412,7 @@ void Plan13::setLocation(double observer_lon_in, double observer_lat_in, int hei
 
 void Plan13::setTime(int yearIn, int monthIn, int mDayIn, int hourIn, int minIn, int secIn) {
   if (DEBUG) {
-    Serial.println("Start setTime()");
+    console->println("Start setTime()");
   }
      int aYear = yearIn;
      int aMonth = monthIn;
@@ -432,23 +433,23 @@ void Plan13::setTime(int yearIn, int monthIn, int mDayIn, int hourIn, int minIn,
      TN = ((float)aHour + ((float)aMin + ((float)aSec/60.0)) /60.0)/24.0;
      DN = (long)DN;
          if (DEBUG) {
-     Serial.print(aYear);
-     Serial.print("/");
-     Serial.print(aMonth);
-     Serial.print("/");
-     Serial.print(aMday);
-     Serial.print(" ");
-     Serial.print(aHour);
-     Serial.print(":");
-     Serial.print(aMin);
-     Serial.print(":");
-     Serial.print(aSec);
-     Serial.print(" ");
-     Serial.print("DN: ");
-     Serial.println(DN);
-     Serial.print("TN: ");
-     Serial.println(TN);
-     Serial.println("End setTime()");
+     console->print(aYear);
+     console->print("/");
+     console->print(aMonth);
+     console->print("/");
+     console->print(aMday);
+     console->print(" ");
+     console->print(aHour);
+     console->print(":");
+     console->print(aMin);
+     console->print(":");
+     console->print(aSec);
+     console->print(" ");
+     console->print("DN: ");
+     console->println(DN);
+     console->print("TN: ");
+     console->println(TN);
+     console->println("End setTime()");
  }
 }
 
@@ -468,17 +469,17 @@ void Plan13::setTime(int yearIn, int monthIn, int mDayIn, int hourIn, int minIn,
 			RV = RV_in;
 			ALON = ALON_in;
 	  if (DEBUG) {
-		  Serial.print("YE");Serial.println(YE);
-		  Serial.print("TE");Serial.println(TE);
-		  Serial.print("IN");Serial.println(IN);
-		  Serial.print("RA");Serial.println(RA);
-		  Serial.print("EC");Serial.println(EC);
-		  Serial.print("WP");Serial.println(WP);
-		  Serial.print("MA");Serial.println(MA);
-		  Serial.print("MM");Serial.println(MM);
-		  Serial.print("M2");Serial.println(M2);
-		  Serial.print("RV");Serial.println(RV);
-		  Serial.print("ALON");Serial.println(ALON);
+		  console->print("YE");console->println(YE);
+		  console->print("TE");console->println(TE);
+		  console->print("IN");console->println(IN);
+		  console->print("RA");console->println(RA);
+		  console->print("EC");console->println(EC);
+		  console->print("WP");console->println(WP);
+		  console->print("MA");console->println(MA);
+		  console->print("MM");console->println(MM);
+		  console->print("M2");console->println(M2);
+		  console->print("RV");console->println(RV);
+		  console->print("ALON");console->println(ALON);
 	  }
 	  if (TEST) {// sample elements for AO-51
 	    YE = 1997.0;
@@ -504,17 +505,17 @@ void Plan13::setTime(int yearIn, int monthIn, int mDayIn, int hourIn, int minIn,
 
  void Plan13::footprintOctagon(float *points, float SLATin, float SLONin, float REin, float RSin) {
 	//static float points[16];
-	Serial.print("SLAT: ");
-	Serial.print(SLATin);
-	Serial.print(", SLON: ");
-	Serial.print(SLONin);
-	Serial.print(", RE: ");
-	Serial.print(REin);
-	Serial.print(", RS: ");
-	Serial.println(RSin);
+	console->print("SLAT: ");
+	console->print(SLATin);
+	console->print(", SLON: ");
+	console->print(SLONin);
+	console->print(", RE: ");
+	console->print(REin);
+	console->print(", RS: ");
+	console->println(RSin);
 	float srad = acos(REin/RSin); // Beta in Davidoff diag. 13.2, this is in rad
-	Serial.print("srad: ");
-	Serial.println(srad);
+	console->print("srad: ");
+	console->println(srad);
 	float cla= cos(rad(SLATin));
 	float sla = sin(rad(SLATin));
 	float clo = cos(rad(SLONin));
@@ -523,35 +524,34 @@ void Plan13::setTime(int yearIn, int monthIn, int mDayIn, int hourIn, int minIn,
 	float cra = cos(srad);
 	for (int i = 0; i < 16; i = i +2) {
 		float a = 2 * M_PI * i / 16;
-		Serial.print("\ta: ");
-		Serial.println(a);
+		console->print("\ta: ");
+		console->println(a);
 		float X = cra;
-		Serial.print("\t first X: ");
-		Serial.println(X);
-		Serial.print("\t first Y: ");
+		console->print("\t first X: ");
+		console->println(X);
+		console->print("\t first Y: ");
 		float Y = sra*sin(a);
-		Serial.println(Y);
+		console->println(Y);
 		float Z = sra*cos(a);
-		Serial.print("\t first Z: ");
-		Serial.println(Z);
+		console->print("\t first Z: ");
+		console->println(Z);
 		float x = X*cla - Z*sla;
 		float y = Y;
 		float z = X*sla + Z*cla;
 		X = x*clo - y*slo;
-		Serial.print("\tX: ");
-		Serial.println(X);
+		console->print("\tX: ");
+		console->println(X);
 		Y = x*slo + y*clo;
-		Serial.print("\tY: ");
-		Serial.println(Y);
+		console->print("\tY: ");
+		console->println(Y);
 		Z = z; 
-		Serial.print("\tZ: ");
-		Serial.println(Z);
+		console->print("\tZ: ");
+		console->println(Z);
 		points[i] = deg(FNatn(Y,X));
-		Serial.print("\t Long: ");
-		Serial.print(points[i]);
+		console->print("\t Long: ");
+		console->print(points[i]);
 		points[i+1] = deg(asin(Z));
-		Serial.print("\t Lat: ");
-		Serial.println(points[i+1]);
+		console->print("\t Lat: ");
+		console->println(points[i+1]);
 	}
 }
-

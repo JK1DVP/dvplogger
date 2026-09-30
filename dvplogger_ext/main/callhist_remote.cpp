@@ -26,6 +26,7 @@
 #include "dupechk.h"
 #include "mux_transport.h"
 #ifdef DVPLOGGER_EXT
+#if JK1DVPLOG_HWVER != 1
 struct remote_callhist_entry { char call[LEN_CALLSIGN+1]; char exch[LEN_EXCH+1]; };
 static remote_callhist_entry *rch = NULL;
 static int rch_capacity = 0, rch_count = 0;
@@ -125,6 +126,18 @@ int append_callhist_partial_subcpu(const char *call, struct check_entry_list *li
 }
 int get_callhist_subcpu_count(){return rch_count;} size_t get_callhist_subcpu_bytes(){return rch_bytes;}
 bool get_callhist_subcpu_entry(int i,const char **c,const char **e){if(i<0||i>=rch_count)return false;*c=rch[i].call;*e=rch[i].exch;return true;}
+#else
+// HW1 SUBCPU intentionally has no CALLHIST database. MAIN uses SD-backed
+// CALLHIST lookup, leaving SUBCPU internal RAM available for the DUPE DB.
+void process_callhist_reset_subcpu(const char*) {}
+void process_callhist_entry_subcpu(char*) {}
+void process_callhist_end_subcpu() {}
+bool search_callhist_subcpu_local(const char*, char*, size_t) { return false; }
+int append_callhist_partial_subcpu(const char*, struct check_entry_list*, int) { return 0; }
+int get_callhist_subcpu_count() { return 0; }
+size_t get_callhist_subcpu_bytes() { return 0; }
+bool get_callhist_subcpu_entry(int, const char**, const char**) { return false; }
+#endif  // JK1DVPLOG_HWVER != 1
 #else
 #include "SD.h"
 static volatile bool ch_done = false;

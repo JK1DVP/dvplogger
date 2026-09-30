@@ -25,7 +25,7 @@
 #include "cty.h"
 
 int get_entity_info(char *callsign,char *entity, char *entity_desc,
-		    int *cqzone, int *ituzone, char *continent,
+		    char *cqzone, char *ituzone, char *continent,
 		    char *lat, char *lon, char *tz);
 void show_entity_info(char *callsign);
 float calc_azimuth(float to_longitude,float to_latitude,float from_longitude,float from_latitude);

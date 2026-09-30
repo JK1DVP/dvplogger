@@ -64,6 +64,8 @@ void print_qso_entry(union qso_union_tag *qso, Stream *out = nullptr);
 void sprint_qso_entry(char *buf,union qso_union_tag *qso);
 void sprint_qso_entry_hamlogcsv(char *buf,union qso_union_tag *qso);
 void sprint_qso_entry_adif(char *buf,union qso_union_tag *qso) ;
+void sprint_qso_entry_cabrillo(char *buf, union qso_union_tag *qso);
+bool qso_contest_name(const union qso_union_tag *qso, char *out, size_t out_size);
 void string_trim_right(char *s, char c);
 void print_qso_logfile() ;
 bool parse_strings(const char *remarks, const char *parse_str,

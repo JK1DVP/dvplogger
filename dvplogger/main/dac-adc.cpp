@@ -207,7 +207,7 @@ void adc_process(){
     uint32_t voltage;
     // ADC1_CH6の電圧値を取得
     esp_adc_cal_get_voltage(ADC_CHANNEL_0, &adcChar, &voltage);
-    Serial.println(String(voltage));
+    console->println(String(voltage));
 }
 
 

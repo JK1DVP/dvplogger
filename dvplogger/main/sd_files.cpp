@@ -101,8 +101,8 @@ void testFileIO(fs::FS &fs, const char *path) {
 void dateTime(uint16_t* date, uint16_t* time) {
  DateTime now = rtcclock.now();
  sprintf(timestamp, "%02d:%02d:%02d %2d/%2d/%2d \n", now.hour(),now.minute(),now.second(),now.month(),now.day(),now.year()-2000);
- Serial.println("yy");
- Serial.println(timestamp);
+ console->println("yy");
+ console->println(timestamp);
  // return date using FAT_DATE macro to format fields
  *date = FAT_DATE(now.year(), now.month(), now.day());
 

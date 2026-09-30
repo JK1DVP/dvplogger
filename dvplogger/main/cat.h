@@ -141,6 +141,9 @@ void send_identification_query_civ(struct radio *radio) ;
 void send_power_query_civ(struct radio *radio);
 void send_att_query_civ(struct radio *radio) ;
 void send_smeter_query_civ(struct radio *radio) ;
+void send_swr_query_civ(struct radio *radio);
+void autotuner_toggle(struct radio *radio);
+void autotuner_service(struct radio *radio);
 void set_frequency(int freq, struct radio *radio) ;
 void set_mode_nonfil(const char *opmode, struct radio *radio) ;
 void set_mode(const char *opmode, byte filt, struct radio *radio) ;
@@ -155,6 +158,7 @@ void smeter_postprocess(struct radio *radio);
 struct radio *search_civ_address(int civaddr);
 int check_and_set_frequency(struct radio *radio, unsigned long freq);
 void get_civ(struct radio *radio) ;
+extern int cat_rx_monitor;
 void print_civ(struct radio *radio) ;
 void print_cat(struct radio *radio) ;
 
@@ -198,6 +202,9 @@ void civ_process() ;
 int receive_civ(struct radio *radio) ;
 int unique_num_radio(int i) ;
 void Control_TX_process() ;
+bool radio_tx_meter_active(const struct radio *radio);
+void cat_periodic_polling_enable_changed(struct radio *radio);
+void request_yaesu_tx_meter_poll(struct radio *radio);
 void rotator_sweep_process();
 void set_sat_opmode(struct radio *radio, char *opmode) ;
 

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <inttypes.h>
 #include <sys/param.h>
 #include <assert.h>
@@ -37,6 +38,7 @@
 #include "esp_loader.h"
 #include "esp32_port.h"
 #include "example_common.h"
+#include "mbedtls/md5.h"
 
 
 //#include <SD.h>
@@ -64,13 +66,16 @@
 
 static const char *TAG = "serial_flasher";
 
-extern const uint8_t  bootloader_bootloader_bin[];
+extern const uint8_t  bootloader_bootloader_bin_lzss[];
+extern const uint32_t bootloader_bootloader_bin_lzss_size;
 extern const uint32_t bootloader_bootloader_bin_size;
 extern const uint8_t  bootloader_bootloader_bin_md5[];
-extern const uint8_t  jk1dvplog_ext_bin[];
+extern const uint8_t  jk1dvplog_ext_bin_lzss[];
+extern const uint32_t jk1dvplog_ext_bin_lzss_size;
 extern const uint32_t jk1dvplog_ext_bin_size;
 extern const uint8_t  jk1dvplog_ext_bin_md5[];
-extern const uint8_t  partition_table_partition_table_bin[];
+extern const uint8_t  partition_table_partition_table_bin_lzss[];
+extern const uint32_t partition_table_partition_table_bin_lzss_size;
 extern const uint32_t partition_table_partition_table_bin_size;
 extern const uint8_t  partition_table_partition_table_bin_md5[];
 const uint8_t gpio0_trigger_mcp_pin = 14;
@@ -92,6 +97,8 @@ const uint8_t reset_trigger_mcp_pin = 15;
 static uint8_t buf[BUF_LEN] = {0};
 
 static const char *get_error_string(const esp_loader_error_t error);
+esp_loader_error_t flash_binary_lzss(const uint8_t *src, size_t compressed_size, size_t output_size, size_t address,
+                                     const uint8_t *expected_md5, const char *label);
 
 void slave_monitor(void *arg)
 {
@@ -264,34 +271,44 @@ void esp_flasher(void)
     if (connect_to_target(HIGHER_BAUDRATE) == ESP_LOADER_SUCCESS) {
 
       //      get_example_binaries(esp_loader_get_target(), &bin);
-        bin.boot.data = bootloader_bootloader_bin;
+        bin.boot.data = bootloader_bootloader_bin_lzss;
         bin.boot.size = bootloader_bootloader_bin_size;
         bin.boot.md5 = bootloader_bootloader_bin_md5;
         bin.boot.addr = BOOTLOADER_ADDRESS_V0;
-        bin.part.data = partition_table_partition_table_bin;
+        bin.part.data = partition_table_partition_table_bin_lzss;
         bin.part.size = partition_table_partition_table_bin_size;
         bin.part.md5 = partition_table_partition_table_bin_md5;
         bin.part.addr = PARTITION_ADDRESS;
-        bin.app.data  = jk1dvplog_ext_bin;
+        bin.app.data  = jk1dvplog_ext_bin_lzss;
         bin.app.size  = jk1dvplog_ext_bin_size;
         bin.app.md5 = jk1dvplog_ext_bin_md5;
         bin.app.addr  = APPLICATION_ADDRESS;
       
 	printf("esp_flasher() 3\n");
         ESP_LOGI(TAG, "Loading bootloader...");
-        flash_binary(bin.boot.data, bin.boot.size, bin.boot.addr);
+        esp_loader_error_t err = flash_binary_lzss(bin.boot.data, bootloader_bootloader_bin_lzss_size,
+                                                   bin.boot.size, bin.boot.addr, bin.boot.md5, "bootloader");
+        if (err != ESP_LOADER_SUCCESS) goto flash_failed;
         ESP_LOGI(TAG, "Loading partition table...");
-        flash_binary(bin.part.data, bin.part.size, bin.part.addr);
+        err = flash_binary_lzss(bin.part.data, partition_table_partition_table_bin_lzss_size,
+                                bin.part.size, bin.part.addr, bin.part.md5, "partition");
+        if (err != ESP_LOADER_SUCCESS) goto flash_failed;
         ESP_LOGI(TAG, "Loading app...");
-        flash_binary(bin.app.data,  bin.app.size,  bin.app.addr);
-        ESP_LOGI(TAG, "Done!");
+        err = flash_binary_lzss(bin.app.data, jk1dvplog_ext_bin_lzss_size,
+                                bin.app.size, bin.app.addr, bin.app.md5, "app");
+        if (err != ESP_LOADER_SUCCESS) goto flash_failed;
+        ESP_LOGI(TAG, "Done! All images MD5 verified.");
 	
 	printf("esp_flasher() 4\n");
         esp_loader_reset_target(); // replace this with local custom version
 	printf("esp_flasher() 5\n");
         // Delay for skipping the boot message of the targets
         vTaskDelay(500 / portTICK_PERIOD_MS);
+        return;
 
+flash_failed:
+        ESP_LOGE(TAG, "Flash/MD5 verification FAILED: %s. Target left in bootloader.", get_error_string(err));
+        return;
     }
 }
 
@@ -396,62 +413,123 @@ esp_loader_error_t connect_to_target_with_stub(const uint32_t current_transmissi
     return ESP_LOADER_SUCCESS;
 }
 
-esp_loader_error_t flash_binary(const uint8_t *bin, size_t size, size_t address)
+/* Tiny streaming LZSS decoder for embedded flasher images.
+ * Format: 8-token control byte, bit=0 literal, bit=1 two-byte match.
+ * Match packs (offset-1) in 11 bits and (length-3) in 5 bits.
+ * The 2 KiB history buffer exists only while the flasher is running. */
+esp_loader_error_t flash_binary_lzss(const uint8_t *src, size_t compressed_size,
+                                     size_t output_size, size_t address,
+                                     const uint8_t *expected_md5, const char *label)
 {
     esp_loader_error_t err;
     static uint8_t payload[1024];
-    const uint8_t *bin_addr = bin;
+    mbedtls_md5_context md5ctx;
+    unsigned char decoded_md5[16];
+    char decoded_md5_hex[33];
+    uint8_t *history = (uint8_t *)malloc(2048);
+    if (!history) {
+        printf("LZSS: cannot allocate 2048-byte history buffer.\n");
+        return ESP_LOADER_ERROR_FAIL;
+    }
 
+    mbedtls_md5_init(&md5ctx);
+    if (mbedtls_md5_starts_ret(&md5ctx) != 0) {
+        printf("MD5 VERIFY %s: cannot initialize MD5\n", label);
+        free(history);
+        mbedtls_md5_free(&md5ctx);
+        return ESP_LOADER_ERROR_INVALID_MD5;
+    }
     printf("Erasing flash (this may take a while)...\n");
-    err = esp_loader_flash_start(address, size, sizeof(payload));
+    err = esp_loader_flash_start(address, output_size, sizeof(payload));
     if (err != ESP_LOADER_SUCCESS) {
-        printf("Erasing flash failed with error: %s.\n", get_error_string(err));
-
-        if (err == ESP_LOADER_ERROR_INVALID_PARAM) {
-            printf("If using Secure Download Mode, double check that the specified\
-                    target flash size is correct.\n");
-        }
+        mbedtls_md5_free(&md5ctx);
+        free(history);
         return err;
     }
-    printf("Start programming\n");
 
-    size_t binary_size = size;
-    size_t written = 0;
-
-    while (size > 0) {
-        size_t to_read = MIN(size, sizeof(payload));
-        memcpy(payload, bin_addr, to_read);
-
-        err = esp_loader_flash_write(payload, to_read);
-        if (err != ESP_LOADER_SUCCESS) {
-            printf("\nPacket could not be written! Error %s.\n", get_error_string(err));
-            return err;
+    size_t ip = 0, produced = 0, payload_len = 0, hist_pos = 0;
+    uint8_t ctrl = 0, mask = 0;
+    while (produced < output_size) {
+        if (!mask) {
+            if (ip >= compressed_size) { err = ESP_LOADER_ERROR_INVALID_PARAM; goto out; }
+            ctrl = src[ip++]; mask = 1;
         }
 
-        size -= to_read;
-        bin_addr += to_read;
-        written += to_read;
+        size_t count = 1;
+        size_t offset = 0;
+        uint8_t match = (ctrl & mask) != 0;
+        if (match) {
+            if (ip + 1 >= compressed_size) { err = ESP_LOADER_ERROR_INVALID_PARAM; goto out; }
+            uint16_t v = (uint16_t)src[ip] | ((uint16_t)src[ip + 1] << 8); ip += 2;
+            offset = (size_t)(v >> 5) + 1;
+            count = (size_t)(v & 31) + 3;
+            if (offset > 2048 || offset > produced) { err = ESP_LOADER_ERROR_INVALID_PARAM; goto out; }
+        }
 
-        int progress = (int)(((float)written / binary_size) * 100);
-        printf("\rProgress: %d %%", progress);
-    };
+        for (size_t n = 0; n < count && produced < output_size; ++n) {
+            uint8_t b;
+            if (match) b = history[(hist_pos + 2048 - offset) & 2047];
+            else {
+                if (ip >= compressed_size) { err = ESP_LOADER_ERROR_INVALID_PARAM; goto out; }
+                b = src[ip++];
+            }
+            history[hist_pos] = b;
+            hist_pos = (hist_pos + 1) & 2047;
+            payload[payload_len++] = b;
+            ++produced;
+            if (payload_len == sizeof(payload)) {
+                if (mbedtls_md5_update_ret(&md5ctx, payload, payload_len) != 0) {
+                    err = ESP_LOADER_ERROR_INVALID_MD5; goto out;
+                }
+                err = esp_loader_flash_write(payload, payload_len);
+                if (err != ESP_LOADER_SUCCESS) goto out;
+                payload_len = 0;
+            }
+        }
+        mask <<= 1;
+    }
 
-    printf("\nFinished programming\n");
+    if (payload_len) {
+        if (mbedtls_md5_update_ret(&md5ctx, payload, payload_len) != 0) {
+            err = ESP_LOADER_ERROR_INVALID_MD5; goto out;
+        }
+        err = esp_loader_flash_write(payload, payload_len);
+        if (err != ESP_LOADER_SUCCESS) goto out;
+    }
+    if (produced != output_size) { err = ESP_LOADER_ERROR_INVALID_PARAM; goto out; }
 
+    if (mbedtls_md5_finish_ret(&md5ctx, decoded_md5) != 0) {
+        err = ESP_LOADER_ERROR_INVALID_MD5; goto out;
+    }
+    for (size_t i = 0; i < sizeof(decoded_md5); ++i) {
+        snprintf(&decoded_md5_hex[i * 2], 3, "%02x", decoded_md5[i]);
+    }
+    decoded_md5_hex[32] = '\0';
+    if (!expected_md5 || strlen((const char *)expected_md5) != 32 ||
+        strcasecmp(decoded_md5_hex, (const char *)expected_md5) != 0) {
+        printf("MD5 VERIFY %s: DECODE FAILED expected=%s decoded=%s\n", label,
+               expected_md5 ? (const char *)expected_md5 : "(null)", decoded_md5_hex);
+        err = ESP_LOADER_ERROR_INVALID_MD5; goto out;
+    }
+    printf("MD5 VERIFY %s: decoded image OK %s\n", label, decoded_md5_hex);
+
+    err = ESP_LOADER_SUCCESS;
 #if MD5_ENABLED
     err = esp_loader_flash_verify();
-    if (err == ESP_LOADER_ERROR_UNSUPPORTED_FUNC) {
-        printf("ESP8266 does not support flash verify command.");
-        return err;
-    } else if (err != ESP_LOADER_SUCCESS) {
-        printf("MD5 does not match. Error: %s\n", get_error_string(err));
-        return err;
+    if (err == ESP_LOADER_SUCCESS) {
+        printf("MD5 VERIFY %s: target flash OK\n", label);
+    } else {
+        printf("MD5 VERIFY %s: TARGET FAILED error=%s\n", label, get_error_string(err));
     }
-    printf("Flash verified\n");
+#else
+    printf("MD5 VERIFY %s: target verify disabled at build time\n", label);
 #endif
-
-    return ESP_LOADER_SUCCESS;
+out:
+    mbedtls_md5_free(&md5ctx);
+    free(history);
+    return err;
 }
+
 #endif /* SERIAL_FLASHER_INTERFACE_UART || SERIAL_FLASHER_INTERFACE_USB */
 
 esp_loader_error_t load_ram_binary(const uint8_t *bin)

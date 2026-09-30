@@ -26,6 +26,7 @@
 #include "callhist.h"
 #include "dupechk.h"
 #include "mux_transport.h"
+#include "display.h"
 #ifdef DVPLOGGER_EXT
 struct remote_callhist_entry { char call[LEN_CALLSIGN+1]; char exch[LEN_EXCH+1]; };
 static remote_callhist_entry *rch = NULL;
@@ -165,8 +166,11 @@ void process_callhist_control_response_main(const char *b) {
 }
 
 static bool send_callhist_entry_with_ack(int seq, const char *packet) {
-  const int max_retries = 3;
-  const uint32_t ack_timeout_ms = 250;
+  // CALLHIST shares the MUX with keyboard/DUPE traffic.  Be deliberately
+  // tolerant of a busy link; a lost ACK is harmless because SUBCPU re-ACKs
+  // the most recently accepted sequence without inserting it twice.
+  const int max_retries = 5;
+  const uint32_t ack_timeout_ms = 500;
 
   for (int attempt = 0; attempt < max_retries; attempt++) {
     ch_ack_received = false;
@@ -218,13 +222,32 @@ bool load_callhist_subcpu(const char *fn) {
     if (line[0]) count++;
   f.close();
 
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+           "Call History\nLoading SUBCPU\n0 / %d", count);
+  upd_display_info_flash(dp->lcdbuf);
+
   char b[160];
   snprintf(b, sizeof(b), "chreset%d", count);
   ch_done = false;
   ch_ack_received = false;
-  mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
-                         (unsigned char *)b, strlen(b));
-  delay(10);
+
+  /* Do not start entry #1 merely after a fixed delay.  Wait until a ping
+     sent after chreset comes back; because the MUX control stream is ordered,
+     that proves SUBCPU has processed the reset/allocation first. */
+  bool reset_ready = false;
+  for (int attempt = 0; attempt < 3 && !reset_ready; attempt++) {
+    mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
+                           (unsigned char *)b, strlen(b));
+    reset_ready = callhist_subcpu_alive(750);
+    if (!reset_ready) delay(50);
+  }
+  if (!reset_ready) {
+    console->println("callhist transfer: SUBCPU not ready after reset");
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "Call History\nSUBCPU not ready\nLoad failed");
+    upd_display_info_flash(dp->lcdbuf);
+    return false;
+  }
 
   f = SD.open(fn, FILE_READ);
   if (!f) return false;
@@ -250,6 +273,11 @@ bool load_callhist_subcpu(const char *fn) {
       return false;
     }
     sent = seq;
+    if ((sent % 200) == 0 || sent == count) {
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "Call History\nLoading SUBCPU\n%d / %d", sent, count);
+      upd_display_info_flash(dp->lcdbuf);
+    }
   }
   f.close();
 
@@ -270,6 +298,7 @@ bool load_callhist_subcpu(const char *fn) {
 }
 
 int load_callhist_subcpu_or_main(const char *fn, bool *fell_back) {
+  (void)ensure_callhist_pkb(fn);
   if (fell_back) *fell_back = false;
 
   if (load_callhist_subcpu(fn)) {
@@ -279,6 +308,23 @@ int load_callhist_subcpu_or_main(const char *fn, bool *fell_back) {
   }
 
   console->println("CALLHIST: SUBCPU load failed; considering MAIN fallback");
+#if JK1DVPLOG_HWVER == 1
+  // HW1 MAIN can use the compact RAM-index + SD-resident PKB backend even
+  // without PSRAM.  read_callhist_list() selects MAIN-SD automatically.
+  callhist_at = 0;
+  {
+    int n = read_callhist_list((char *)fn);
+    if (n > 0) {
+      plogw->enable_callhist = 1;
+      if (fell_back) *fell_back = true;
+      console->printf("CALLHIST: fallback to %s entries=%d\n",
+                      f_spiram ? "MAIN-PSRAM" : "MAIN-SD", n);
+      return n;
+    }
+    console->printf("CALLHIST: %s load also failed\n",
+                    f_spiram ? "MAIN-PSRAM" : "MAIN-SD");
+  }
+#else
   if (f_spiram) {
     callhist_at = 0;
     int n = read_callhist_list((char *)fn);
@@ -292,6 +338,7 @@ int load_callhist_subcpu_or_main(const char *fn, bool *fell_back) {
   } else {
     console->println("CALLHIST: MAIN has no PSRAM; fallback not attempted");
   }
+#endif
 
   close_callhist();
   callhist_at = 1;             // preserve SUBCPU as the preferred placement

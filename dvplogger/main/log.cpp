@@ -33,7 +33,7 @@
 #include "zserver.h"
 #include "dupechk.h"
 #include "callhist_fd.h"
-//#include "callhist.h"
+#include "callhist.h"
 #include "callhist_remote.h"
 #include "callhist_mem.h"
 #include "misc.h"
@@ -117,9 +117,20 @@ const char *switch_rigmode() {
   for (i = 0; i < NMODEID; i++) {
     if (strcmp(radio->opmode, mode_str[i]) == 0) {
       imode = i;
-      imode++;  // next mode
-      if (imode >= NMODEID) imode = 0;
-      return mode_str[imode];
+      // Skip digital-voice modes which the selected rig cannot set.
+      // Icom CI-V: D-STAR (DV) only.  Yaesu FTX-1 / FT-991A: C4FM only.
+      // Other rigs keep the legacy mode cycle and skip both.
+      for (int n = 0; n < NMODEID; n++) {
+        imode++;
+        if (imode >= NMODEID) imode = 0;
+        if (strcmp(mode_str[imode], "DSTAR") == 0 &&
+            radio->rig_spec->cat_type != CAT_TYPE_CIV) continue;
+        if (strcmp(mode_str[imode], "C4FM") == 0 &&
+            !(radio->rig_spec->rig_type == RIG_TYPE_YAESU_FTX1 ||
+              strncmp(radio->rig_spec->rig_identification, "0670", 4) == 0)) continue;
+        return mode_str[imode];
+      }
+      return "CW";
     }
   }
 
@@ -210,6 +221,7 @@ void enable_radios(int idx_radio, int radio_cmd) {
     radio->enabled = 1;
     break;
   }
+  cat_periodic_polling_enable_changed(radio);
   print_radio_info(idx_radio);
   upd_disp_rig_info();
 }
@@ -386,6 +398,7 @@ void init_logwindow() {
   init_buf(plogw->cluster2_cmd, LEN_CLUSTER_CMD);
   init_buf(plogw->sent_exch, LEN_SENT_EXCH_WINDOW);
   init_buf(plogw->contest_name,LEN_CONTEST_NAME);
+  init_buf(plogw->contest_entry, LEN_CONTEST_NAME * 2 + 2);
 
   plogw->sent_exch_abbreviation_level=0; // control how abbreviate sent_exch 
   init_buf(plogw->jcc, LEN_JCC_WINDOW);
@@ -607,14 +620,14 @@ int exch_partial_check(struct radio *radio,char *exch,unsigned char bandmode,uns
     if (part!=NULL) { // substring exch found in target exchange in dupechk list
       strcpy(entry->callsign,dupechk->callsign[i]);
       strcpy(entry->exch,dupechk->exch[i]);
-      entry->bandmode=dupechk->bandmode[i];
+      entry->bandmode=dupechk_entry_display_bandmode(i, bandmode, mask);
       entry->flag|=CHECK_ENTRY_FLAG_DUPECHECK_LIST;
       entry_list->nentry++;
 
       if (strlen(dupechk->callsign[i]) == strlen(radio->callsign+2)) {
 	// exact match
 	entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
-	if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
+	if (dupechk_entry_matches_bandmode(i, bandmode, mask)) {
 	  // dupe = worked
 	  entry->flag|=CHECK_ENTRY_FLAG_DUPE;
 	  entry_list->dupe++;
@@ -637,63 +650,26 @@ int exch_partial_check(struct radio *radio,char *exch,unsigned char bandmode,uns
   // end of dupechk search
 
   if (callhist_check && callhist_at == 0) {
-    // callhist_list search
-    char *callsign;    
-    int i=0;
-    char callsign_exch[20];//,*exch;
-    while (1) {
+    struct callhist_iter it;
+    callhist_iter_begin(&it);
+    char ch_call[LEN_CALLSIGN + 1], ch_exch[LEN_EXCH + 1];
+    while (callhist_iter_next(&it, ch_call, sizeof(ch_call), ch_exch, sizeof(ch_exch))) {
       entry=&entry_list->entryl[entry_list->nentry];
-      //    entry=&check_entry_list[entry_list->nentry];
       entry->flag=0;
-    
-      strcpy(callsign_exch,callhist_list[i]); // process by strtok so need to copy
-      if (*callsign_exch=='\0') {
-	// end of the callhist_list to search
-	break;
+      part=strstr(ch_exch,exch);
+      if (part!=NULL) {
+        bool duplicate=false;
+        for (int j=0;j<entry_list->nentry;j++) {
+          if (strcmp(entry_list->entryl[j].callsign,ch_call)==0) { duplicate=true; break; }
+        }
+        if (duplicate) continue;
+        strcpy(entry->callsign,ch_call);
+        strcpy(entry->exch,ch_exch);
+        entry->flag|=CHECK_ENTRY_FLAG_CALLHIST_LIST;
+        entry_list->nentry++;
+        if (strlen(ch_call) == strlen(radio->callsign+2)) entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
+        if ((entry_list->nentry>=10)|| (entry_list->nentry>=entry_list->nmax_entry)) return entry_list->nentry;
       }
-      callsign=strtok(callsign_exch," ");
-      if (callsign!=NULL) {
-	exchange=strtok(NULL," ");
-	if (exchange!=NULL) {
-	  // check the exchange by strstr
-	  part=strstr(exchange,exch);
-	  if (part!=NULL) { // substring call found in target callsign in dupechk list
-	    // check if the same entry (s) already exists in the list
-	    for (int j=0;j<entry_list->nentry;j++) {
-	      if (strcmp(entry_list->entryl[j].callsign,callsign)==0) {
-		goto end_check_callhist1;
-	      }
-	    }
-	    // if check passed
-	    strcpy(entry->callsign,callsign);
-	    strcpy(entry->exch,exchange);
-	    entry->flag|=CHECK_ENTRY_FLAG_CALLHIST_LIST;
-	    entry_list->nentry++;
-	    if (strlen(callsign) == strlen(radio->callsign+2)) {
-	      // exact match with callsign window
-	      entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
-	      if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
-		// dupe = worked
-		entry->flag|=CHECK_ENTRY_FLAG_DUPE;
-		entry_list->dupe ++;
-	      } 
-	    }
-	    // number of found entry in range?
-	    if ((entry_list->nentry>=10)|| (entry_list->nentry>=entry_list->nmax_entry)) {
-	      if (entry_list->nentry<=entry_list->cursor) {
-		entry_list->cursor=entry_list->nentry-1;
-	      }
-	      if (entry_list->cursor<0) {
-		entry_list->cursor=0;
-	      }
-	      return entry_list->nentry; // end of search
-	    }
-	    
-	  }
-	}
-      }
-    end_check_callhist1:
-      i++; // callhist_list index i; to the next entry
     }
   }
   if (entry_list->nentry<=entry_list->cursor) {
@@ -724,12 +700,12 @@ static int dupe_partial_check_local(const char *call,
     entry->flag = CHECK_ENTRY_FLAG_DUPECHECK_LIST;
     strcpy(entry->callsign, callsign);
     strcpy(entry->exch, dupechk->exch[i]);
-    entry->bandmode = dupechk->bandmode[i];
+    entry->bandmode = dupechk_entry_display_bandmode(i, bandmode, mask);
 
     if (strchr(call, '-') == NULL && len == strlen(callsign) &&
         dupe_callsign_equal(callsign, call)) {
       entry->flag |= CHECK_ENTRY_FLAG_EXACT_MATCH;
-      if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
+      if (dupechk_entry_matches_bandmode(i, bandmode, mask)) {
         entry->flag |= CHECK_ENTRY_FLAG_DUPE;
         entry_list->dupe++;
       }
@@ -786,59 +762,27 @@ int dupe_partial_check(const char *call,unsigned char bandmode,unsigned char mas
   // end of dupechk search
 
   if (callhist_check && callhist_at == 0) {
-    // callhist_list search
-    int i=0;
-    char callsign_exch[20],*exch;
-    while (1) {
+    struct callhist_iter it;
+    callhist_iter_begin(&it);
+    char ch_call[LEN_CALLSIGN + 1], ch_exch[LEN_EXCH + 1];
+    while (callhist_iter_next(&it, ch_call, sizeof(ch_call), ch_exch, sizeof(ch_exch))) {
       entry=&entry_list->entryl[entry_list->nentry];
-      //    entry=&check_entry_list[entry_list->nentry];
       entry->flag=0;
-    
-      strcpy(callsign_exch,callhist_list[i]); // process by strtok so need to copy
-      if (*callsign_exch=='\0') {
-	// end of the callhist_list to search
-	break;
+      part = dupe_callsign_partial_match(ch_call, call) ? ch_call : NULL;
+      if (part!=NULL) {
+        bool duplicate=false;
+        for (int j=0;j<entry_list->nentry;j++) {
+          if (strcmp(entry_list->entryl[j].callsign,ch_call)==0) { duplicate=true; break; }
+        }
+        if (duplicate) continue;
+        strcpy(entry->callsign,ch_call);
+        strcpy(entry->exch,ch_exch);
+        entry->flag|=CHECK_ENTRY_FLAG_CALLHIST_LIST;
+        entry_list->nentry++;
+        if (strchr(call, '-') == NULL && len == strlen(ch_call) &&
+            dupe_callsign_equal(ch_call, call)) entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
+        if ((entry_list->nentry>=10)|| (entry_list->nentry>=entry_list->nmax_entry)) return entry_list->nentry;
       }
-      callsign=strtok(callsign_exch," ");
-      if (callsign!=NULL) {
-	exch=strtok(NULL," ");
-	if (exch!=NULL) {
-	  // Ordinary entry keeps substring matching; RTTY '-' is a one-character
-	  // wildcard over the complete callsign.
-	  part = dupe_callsign_partial_match(callsign, call) ? callsign : NULL;
-	  if (part!=NULL) { // partial/wildcard call found
-	    // check if the same entry (s) already exists in the list
-	    for (int j=0;j<entry_list->nentry;j++) {
-	      if (strcmp(entry_list->entryl[j].callsign,callsign)==0) {
-		goto end_check_callhist;
-	      }
-	    }
-	    // if check passed
-	    strcpy(entry->callsign,callsign);
-	    strcpy(entry->exch,exch);
-	    entry->flag|=CHECK_ENTRY_FLAG_CALLHIST_LIST;
-	    entry_list->nentry++;
-	    if (strchr(call, '-') == NULL && len == strlen(callsign) &&
-              dupe_callsign_equal(callsign, call)) {
-	      // exact match
-	      entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
-	    }
-	    // number of found entry in range?
-	    if ((entry_list->nentry>=10)|| (entry_list->nentry>=entry_list->nmax_entry)) {
-	      if (entry_list->nentry<=entry_list->cursor) {
-		entry_list->cursor=entry_list->nentry-1;
-	      }
-	      if (entry_list->cursor<0) {
-		entry_list->cursor=0;
-	      }
-	      return entry_list->nentry; // end of search
-	    }
-	    
-	  }
-	}
-      }
-    end_check_callhist:
-      i++; // callhist_list index i; to the next entry
     }
   }
   if (entry_list->nentry<=entry_list->cursor) {
@@ -898,7 +842,7 @@ int dupe_callhist_check(const char *call,unsigned char bandmode, unsigned char m
   ret = 0;
   for (i = 0; i < dupechk->ncallsign; i++) {
     if ((ret == 0) || (f_callhist == 1)) {
-      if ((dupechk->bandmode[i] & mask) == (bandmode & mask)) {
+      if (dupechk_entry_matches_bandmode(i, bandmode, mask)) {
         // current band and mode
         if (dupe_callsign_equal(dupechk->callsign[i], call)) {
           // dupe
@@ -920,8 +864,10 @@ int dupe_callhist_check(const char *call,unsigned char bandmode, unsigned char m
     // not dupe and not yet worked in other band
     // if enabled search for the history
     if (plogw->enable_callhist) {
-      // flash stored callhist_list search
-      search_callhist_list_exch((const char **)callhist_list,call,0,exch_history);
+      // packed CALLHIST runtime search (legacy PCK RAM is transparent fallback)
+      static char callhist_exch_buf[LEN_EXCH + 1];
+      if (callhist_lookup_exact(call, callhist_exch_buf, sizeof(callhist_exch_buf)))
+        *exch_history = callhist_exch_buf;
       //      search_callhist_list(callhist_list,call,0); // if 1, match callsign body (before /?) 0, full callsign match
     }
   }
@@ -929,4 +875,3 @@ int dupe_callhist_check(const char *call,unsigned char bandmode, unsigned char m
   
 }
   
-

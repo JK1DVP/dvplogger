@@ -51,7 +51,7 @@ char cluster2_startup_cmd[N_CLUSTER2_STARTUP_CMDS][LEN_CLUSTER_CMD + 3];
 
 static constexpr uint8_t N_CLUSTER_CONNECTIONS = 2;
 static constexpr size_t CLUSTER_RX_LINE_MAX = 192;
-static constexpr size_t CLUSTER_RX_QUEUE_LEN = 32;
+static constexpr size_t CLUSTER_RX_QUEUE_LEN = 128;
 
 struct ClusterRuntime {
   struct cluster *state;
@@ -101,10 +101,11 @@ static inline bool passed_timeout_cluster(ClusterRuntime *rt) {
 
 static const char* TAG = "cluster";
 
-struct ClusterRxLine {
+struct ClusterRxSpot {
   uint8_t source;
-  uint16_t len;
-  char data[CLUSTER_RX_LINE_MAX];
+  uint16_t raw_len;  // only for overload accounting
+  char freq[12];
+  char station[LEN_CALLSIGN + 1];
 };
 
 static QueueHandle_t s_cluster_rx_queue = nullptr;
@@ -136,26 +137,53 @@ static void note_cluster_rx_overload(ClusterRuntime *rt, size_t dropped_bytes,
   }
 }
 
+/*
+ * Keep the deep (128 entry) queue used for contest/skimmer bursts, but do not
+ * queue the complete 192-byte cluster line.  Only CW spots can reach
+ * upd_bandmap_cluster() in the existing code, and get_info_cluster() only
+ * needs frequency/callsign plus the already-resolved CW mode.  Remarks were
+ * only retained for verbose :F printing, not for bandmap/DUPE/multi logic.
+ */
+static bool parse_cluster_spot_for_queue(const char *raw, size_t len,
+                                         ClusterRxSpot *spot) {
+  if (!raw || !spot || len < 75) return false;
+  if (strncmp(raw, "DX de", 5) != 0) return false;
+  if (len > 42 && strncmp(raw + 39, "FT", 2) == 0) return false;
+  if (!(strncmp(raw + 39, "CW", 2) == 0 || strstr(raw + 39, "WPM") != NULL))
+    return false;
+
+  char freq[sizeof(spot->freq)] = {};
+  char station[sizeof(spot->station)] = {};
+  if (sscanf(raw, "DX de %*[^:]: %11s %16s", freq, station) != 2)
+    return false;
+
+  strlcpy(spot->freq, freq, sizeof(spot->freq));
+  strlcpy(spot->station, station, sizeof(spot->station));
+  return true;
+}
+
 static void enqueue_complete_cluster_line(ClusterRuntime *rt) {
   if (!rt || !s_cluster_rx_queue || rt->rx_line_len == 0) return;
 
-  ClusterRxLine line{};
-  line.source = rt->id;
-  line.len = rt->rx_line_len;
-  memcpy(line.data, rt->rx_line, line.len);
-  line.data[line.len] = '\0';
+  rt->rx_line[rt->rx_line_len] = '\0';
 
-  if (xQueueSend(s_cluster_rx_queue, &line, 0) != pdTRUE) {
-    // Preserve line boundaries: discard one complete old line, then keep the
-    // newest complete line.  Never discard only part of a line.
-    ClusterRxLine old_line;
-    if (xQueueReceive(s_cluster_rx_queue, &old_line, 0) == pdTRUE &&
-        xQueueSend(s_cluster_rx_queue, &line, 0) == pdTRUE) {
-      ClusterRuntime *old_rt = old_line.source < N_CLUSTER_CONNECTIONS
-          ? &cluster_rt[old_line.source] : rt;
-      note_cluster_rx_overload(old_rt, old_line.len, false);
+  ClusterRxSpot spot{};
+  spot.source = rt->id;
+  spot.raw_len = rt->rx_line_len;
+  if (!parse_cluster_spot_for_queue(rt->rx_line, rt->rx_line_len, &spot))
+    return;
+
+  if (xQueueSend(s_cluster_rx_queue, &spot, 0) != pdTRUE) {
+    // Preserve the newest useful spot under burst load.  Discard one complete
+    // parsed spot, never a partial TCP line.
+    ClusterRxSpot old_spot;
+    if (xQueueReceive(s_cluster_rx_queue, &old_spot, 0) == pdTRUE &&
+        xQueueSend(s_cluster_rx_queue, &spot, 0) == pdTRUE) {
+      ClusterRuntime *old_rt = old_spot.source < N_CLUSTER_CONNECTIONS
+          ? &cluster_rt[old_spot.source] : rt;
+      note_cluster_rx_overload(old_rt, old_spot.raw_len, false);
     } else {
-      note_cluster_rx_overload(rt, line.len, false);
+      note_cluster_rx_overload(rt, spot.raw_len, false);
     }
   }
 }
@@ -270,21 +298,27 @@ void upd_bandmap_cluster1(uint8_t source, const char *cmdbuf) {
 //extern void upd_bandmap_cluster(const char* line);
 
 static void cluster_worker_task(void* /*pv*/) {
-    ClusterRxLine line;
+    ClusterRxSpot spot;
+    char line[64];
     for (;;) {
-        if (xQueueReceive(s_cluster_rx_queue, &line, portMAX_DELAY) != pdTRUE)
+        if (xQueueReceive(s_cluster_rx_queue, &spot, portMAX_DELAY) != pdTRUE)
           continue;
-        if (line.source >= N_CLUSTER_CONNECTIONS || line.len == 0 ||
-            line.len >= CLUSTER_RX_LINE_MAX)
+        if (spot.source >= N_CLUSTER_CONNECTIONS || !spot.freq[0] ||
+            !spot.station[0])
           continue;
-        line.data[line.len] = '\0';
-        upd_bandmap_cluster1(line.source, line.data);
+
+        // Recreate only the fields consumed by get_info_cluster().  Keeping
+        // the existing parser here avoids moving DUPE/multi/bandmap work into
+        // the AsyncTCP callback.
+        snprintf(line, sizeof(line), "DX de Q: %s %s CW",
+                 spot.freq, spot.station);
+        get_info_cluster(line);
     }
 }
 
 void cluster_io_init() {
     if (!s_cluster_rx_queue) {
-        s_cluster_rx_queue = xQueueCreate(CLUSTER_RX_QUEUE_LEN, sizeof(ClusterRxLine));
+        s_cluster_rx_queue = xQueueCreate(CLUSTER_RX_QUEUE_LEN, sizeof(ClusterRxSpot));
         configASSERT(s_cluster_rx_queue != nullptr);
         xTaskCreatePinnedToCore(cluster_worker_task, "cluster_worker",
                                6144, nullptr, 4, nullptr, tskNO_AFFINITY);
@@ -364,11 +398,10 @@ AsyncClient *client_tcp = nullptr;
 
 void sprint_cluster_info(char *buf,struct bandmap_entry *entry, int bandid, int idx )
 {
-  sprintf(buf,":F %8d t %d mode %d Remarks: %s type %d bandid=%d station %s nentry %d idx %d \n",
+  sprintf(buf,":F %8d t %d mode %d type %d bandid=%d station %s nentry %d idx %d \n",
 	  entry->freq,
 	  entry->time,
 	  entry->mode,
-	  entry->remarks,
 	  entry->type,
 	  bandid,
 	  entry->station,
@@ -382,7 +415,7 @@ void print_cluster_info(struct bandmap_entry *entry, int bandid, int idx )
   if ((verbose & 16) == 0) return;
   char buf[256];
   sprint_cluster_info(buf, entry, bandid, idx);
-  Serial.print(buf);
+  console->print(buf);
 }
 
 
@@ -420,7 +453,6 @@ void get_info_cluster(const char *ssrc) {
   char *stn;
   char *s1;
   char *md;
-  char *remarks;
   int modeid;
   int modetype;
   struct bandmap_entry *entry;
@@ -510,18 +542,33 @@ void get_info_cluster(const char *ssrc) {
   modeid = modeid_string(md);  //
   modetype = modetype_string(md);
 
-  // remarks
-  //  s1 = strtok(NULL, ""); // s1 points to remarks
-  //  if (s1 == NULL) return;
-  //  remarks = trim(s1);
-  remarks=s1;
-
   adjust_callsign(stn);
 
 
   int bandmode = bandmode_param(bandid, modetype);
   char remote_exch[LEN_EXCH + 1] = "";
   bool dupe = false;
+
+  for (int i = 0; i < bandmap[bandid - 1].nentry; ++i) {
+    const struct bandmap_entry *worked_entry =
+        bandmap[bandid - 1].entry + i;
+    if (!(worked_entry->flag & BANDMAP_ENTRY_FLAG_WORKED) ||
+        strcasecmp(worked_entry->station, stn) != 0 ||
+        worked_entry->mode >= NMODEID)
+      continue;
+    const int worked_bandmode =
+        bandmode_param(bandid, ::modetype[worked_entry->mode]);
+    if ((worked_bandmode & plogw->mask) != (bandmode & plogw->mask))
+      continue;
+
+    // QSO completion marks every matching Bandmap entry WORKED.  When a new
+    // spot for that station arrives, do not clear the flag and briefly show
+    // it again; discard the refresh before touching the existing record.
+    if (verbose & 16)
+      console->printf("cluster spot discarded: already WORKED call=%s\n", stn);
+    return;
+  }
+
   /*
    * Do not synchronously query the SUBCPU for every incoming cluster line.
    * A busy skimmer feed can otherwise fill the RX queue while each request
@@ -536,6 +583,11 @@ void get_info_cluster(const char *ssrc) {
         console->printf("cluster spot discarded: DUPE result unavailable call=%s\n",
                         stn);
       }
+      return;
+    }
+    if (dupe) {
+      if (verbose & 16)
+        console->printf("cluster spot discarded: DUPE call=%s\n", stn);
       return;
     }
   }
@@ -600,6 +652,7 @@ void get_info_cluster(const char *ssrc) {
   if (dupe) {
     // Keep DUPE spots in the database.  The display layer may hide them in
     // the normal list, but an on-frequency lookup still needs this record.
+    entry->flag &= ~BANDMAP_ENTRY_FLAG_DUPE_PENDING;
     entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
     /*
     if (entry_allband!=NULL) {
@@ -611,7 +664,22 @@ void get_info_cluster(const char *ssrc) {
       console->println(stn);
     }
   } else {
-    entry->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+    if (dupechk->dupechk_at == 1) {
+      // Do not expose a new/updated cluster spot until the authoritative
+      // SUBCPU DUPE check has completed.  WORKED doubles as the existing
+      // display-hide bit while DUPE_PENDING tells the main loop to check it.
+      entry->flag |= BANDMAP_ENTRY_FLAG_DUPE_PENDING;
+      entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+      bandmap_dupe_pending_notify();
+      if (verbose & 16384)
+        console->printf("[BANDMAP-DUPE] ENQUEUE call=%s band=%d freq=%u bm=%d cid=%u mask=0x%02X flags=0x%02X\n",
+                        stn, bandid, ifreq, bandmode,
+                        (unsigned)current_contest_dupe_id(),
+                        (unsigned)plogw->mask, (unsigned)entry->flag);
+    } else {
+      entry->flag &= ~BANDMAP_ENTRY_FLAG_DUPE_PENDING;
+      entry->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+    }
   }
   // reset new multi flag
   entry->flag &= ~BANDMAP_ENTRY_FLAG_NEWMULTI;
@@ -662,9 +730,6 @@ void get_info_cluster(const char *ssrc) {
   //  entry->time = rtctime.unixtime();  // current time for removing the entry in clean_bandmap();
   stamp_bandmap_entry(entry);  // reception time and within-second order
   entry->mode = modeid;
-  entry->remarks[0] = '\0';
-  strncat(entry->remarks, remarks, 16);  // copy remarks
-  trim(entry->remarks);
   entry->type = 2;
 
 
@@ -1167,5 +1232,3 @@ const char *cluster_connection_state(uint8_t cluster_no) {
 
 void set_cluster() { set_cluster_id(0, plogw->cluster_name + 2); }
 void set_cluster2() { set_cluster_id(1, plogw->cluster2_name + 2); }
-
-

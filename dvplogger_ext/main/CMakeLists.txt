@@ -1,6 +1,20 @@
+set(DVP_EXT_SRCS
+    "main.cpp"
+    "keyboard.cpp"
+    "mux_transport.cpp"
+    "dupechk.cpp"
+    "callhist_mem.cpp"
+    "callhist_remote.cpp"
+)
+
+# Keep HW1 SUBCPU lean: keyboard/MUX/DUPE remain, audio playback is HW3-only.
+if(NOT JK1DVPLOG_HWVER EQUAL 1)
+    list(APPEND DVP_EXT_SRCS "AudioPlayer.cpp")
+endif()
+
 idf_component_register(
-SRCS "main.cpp" "keyboard.cpp" "mux_transport.cpp" "AudioPlayer.cpp" "dupechk.cpp" "callhist_mem.cpp" "callhist_remote.cpp"
-INCLUDE_DIRS ""
+    SRCS ${DVP_EXT_SRCS}
+    INCLUDE_DIRS ""
 )
 
 

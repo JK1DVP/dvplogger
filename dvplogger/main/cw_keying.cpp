@@ -70,6 +70,8 @@ int wptr_cw_onoff_buf = 0, rptr_cw_onoff_buf = 0;
 int f_transmission = 0;     // 0 nothing   1 force transmission on active trx 2 force stop transmission on active trx
 static volatile uint32_t cw_xit_start_hold_until_ms = 0;
 volatile bool f_rtty_usb_lead_pending = false; // start USB RTTY lead only after PTT ON is issued
+volatile bool f_rtty_message_end_pending = false;
+volatile int rtty_pending_lead_ms = 0;
 
 // Manual keyboard CW must not follow the automatic SO2R sequence TX radio.
 // -1 means normal/automatic operation: use so2r.radio_tx().
@@ -111,6 +113,22 @@ int cw_ratio_bunbo = 10;
 int cw_ratio_bunbo2 = 100;
 int cw_count_ms = 0;
 int rtty_figures = 0;  // rtty FIGS 1/LTRS 0 flag
+
+// Shift+key RTTY typing is grouped into one transmission.  This avoids a
+// PTT cycle for every character while still returning to receive promptly.
+enum ManualRttyTxState {
+  MANUAL_RTTY_IDLE,
+  MANUAL_RTTY_OPEN,
+  MANUAL_RTTY_CLOSING
+};
+static ManualRttyTxState manual_rtty_tx_state = MANUAL_RTTY_IDLE;
+static bool manual_rtty_stx_pending = false;
+static uint32_t manual_rtty_last_key_ms = 0;
+static int manual_rtty_radio_idx = -1;
+static char manual_rtty_pending[LEN_CW_SEND_BUF];
+static size_t manual_rtty_pending_len = 0;
+static const uint32_t MANUAL_RTTY_PTT_LEAD_MS = 200;
+static const uint32_t MANUAL_RTTY_RX_IDLE_MS = 500;
 
 //void send_baudot(byte ascii, int *figures);
 
@@ -201,8 +219,13 @@ static void keying_port(int port, int on)
   case 0: digitalWrite(LED, on); break;
   case 1: digitalWrite(CW_KEY1, on); break;
   case 2: digitalWrite(CW_KEY2, on); break;
-  case 3: case 4: usb_keying_request((uint8_t)port, on != 0); break;
+  case 3: case 4: usb_keying_request((uint8_t)port, on != 0, 1); break;
   }
+}
+
+void keying_port_direct(int port, int on)
+{
+  keying_port(port, on);
 }
 
 void keying(int on)
@@ -227,7 +250,7 @@ void keying(int on)
           break;
         case 3:  // USB CDC ACM DTR
         case 4:  // USB CDC ACM RTS
-          usb_keying_request(radio->rig_spec->cwport, on);
+          usb_keying_request(radio->rig_spec->cwport, on, 1);
           break;
       }
       // make sure all other hardware ports are off
@@ -260,7 +283,7 @@ void keying(int on)
             break;
           case 3:  // USB CDC ACM DTR
           case 4:  // USB CDC ACM RTS
-            usb_keying_request(radio->rig_spec->cwport, on);
+            usb_keying_request(radio->rig_spec->cwport, on, 1);
             break;
         }
       }
@@ -382,8 +405,13 @@ void interrupt_cw_send() {
 	// RTTY stx/etx
       case CW_MSCMD_RTTY_STX: {           // STX start transmission in active TX (in SO2R)
 	f_transmission = 1;  // request PTT ON in the main loop
-        if (rtty_ptt_lead_ms < 0) rtty_ptt_lead_ms = 0;
-        if (rtty_ptt_lead_ms > 2000) rtty_ptt_lead_ms = 2000;
+        int lead_ms = manual_rtty_stx_pending
+                          ? (int)MANUAL_RTTY_PTT_LEAD_MS
+                          : rtty_ptt_lead_ms;
+        manual_rtty_stx_pending = false;
+        if (lead_ms < 0) lead_ms = 0;
+        if (lead_ms > 2000) lead_ms = 2000;
+        rtty_pending_lead_ms = lead_ms;
         const uint8_t fskport = (uint8_t)rig_fsk_port(radio->rig_spec);
         if (!radio->f_tone_keying && (fskport == 3 || fskport == 4)) {
           // Do not start the MARK lead here.  PTT is only issued later by
@@ -397,7 +425,7 @@ void interrupt_cw_send() {
         } else {
           const bool line_asserted = true ^ rig_rtty_invert(radio->rig_spec);
           keying_port(fskport, line_asserted ? 1 : 0);
-          cw_count_ms = rtty_ptt_lead_ms;
+          cw_count_ms = lead_ms;
         }
 	break;
       }
@@ -737,14 +765,40 @@ void send_bits(byte code, int fig, int *figures) {
 }
 
 
+static bool rtty_usos_space_pending = false;
+
+static bool rtty_is_figures_ascii(byte ascii) {
+  switch (ascii) {
+    case '3': case '-': case '8': case '7': case '$': case '4':
+    case '\'': case ',': case '!': case ':': case '(': case '5':
+    case '\"': case ')': case '2': case '6': case '0': case '1':
+    case '9': case '?': case '&': case '.': case '/': case ';':
+      return true;
+    default:
+      return false;
+  }
+}
+
 void send_baudot(byte ascii, int *figures)
 // figures : state of letters 0 and figures 1
 {
+  // USOS (Unshift On Space) interoperability:
+  // Many RTTY decoders locally return to LTRS when they receive SPACE.
+  // Keep our real transmitter shift state unchanged for non-USOS receivers,
+  // but if the first printable character after SPACE is a FIGS character,
+  // explicitly send FIGS again before it.
+  if (rtty_usos_space_pending && rtty_is_figures_ascii(ascii)) {
+    send_bits(27, 1, figures);  // explicit FIGS, even if TX is already in FIGS
+    rtty_usos_space_pending = false;
+  } else if (ascii != ' ' && ascii != 0x0d && ascii != 0x0a) {
+    rtty_usos_space_pending = false;
+  }
 
   switch (ascii) {
     // Diagnostic-only explicit LTRS character.
     case 0x1f:
       *figures = 0;
+      rtty_usos_space_pending = false;
       send_bits(31, 0, figures);
       break;
     // followings are letters
@@ -752,7 +806,10 @@ void send_baudot(byte ascii, int *figures)
     case 'E': send_bits(1, 0, figures); break;
     case 0x0a: send_bits(2, *figures, figures); break;
     case 'A': send_bits(3, 0, figures); break;
-    case ' ': send_bits(4, *figures, figures); break;
+    case ' ':
+      send_bits(4, *figures, figures);
+      rtty_usos_space_pending = true;
+      break;
     case 'S': send_bits(5, 0, figures); break;
     case 'I': send_bits(6, 0, figures); break;
     case 'U': send_bits(7, 0, figures); break;
@@ -1157,6 +1214,71 @@ void append_rtty_test_text(const char *s) {
   append_cwbuf_raw((uint8_t)CW_MSCMD_RTTY_ETX_CHR);
 }
 
+static void begin_manual_rtty_burst(struct radio *radio) {
+  set_manual_cw_radio(radio->rig_idx);
+  manual_rtty_radio_idx = radio->rig_idx;
+  manual_rtty_stx_pending = true;
+  append_cwbuf_raw((uint8_t)CW_MSCMD_RTTY_STX_CHR);
+  // Establish a known receive state for every separately keyed burst.
+  // If the preceding transmission ended in FIGS, relying on the retained
+  // local state can turn a leading number such as 310101 into EQPQPQ.
+  append_cwbuf_raw(0x1f);  // explicit ITA2 LTRS
+  manual_rtty_tx_state = MANUAL_RTTY_OPEN;
+}
+
+void append_manual_rtty_char(struct radio *radio, char c) {
+  if (radio == NULL || radio->modetype != LOG_MODETYPE_DG) return;
+  c = append_cwbuf_convchar(c);
+  if (c == '\0') return;
+
+  if (manual_rtty_tx_state == MANUAL_RTTY_CLOSING) {
+    // ETX may already be in the symbol scheduler.  Do not put a new STX
+    // behind it: USB completion of the old burst could then turn PTT off in
+    // the middle of the new one.  Retain typing until TX is completely idle.
+    if (manual_rtty_pending_len < sizeof(manual_rtty_pending))
+      manual_rtty_pending[manual_rtty_pending_len++] = c;
+    return;
+  }
+
+  if (manual_rtty_tx_state == MANUAL_RTTY_IDLE)
+    begin_manual_rtty_burst(radio);
+  append_cwbuf_raw((uint8_t)c);
+  manual_rtty_last_key_ms = millis();
+}
+
+void process_manual_rtty_tx() {
+  if (manual_rtty_tx_state == MANUAL_RTTY_OPEN) {
+    if ((uint32_t)(millis() - manual_rtty_last_key_ms) <
+        MANUAL_RTTY_RX_IDLE_MS) return;
+
+    append_cwbuf_raw((uint8_t)CW_MSCMD_RTTY_ETX_CHR);
+    manual_rtty_tx_state = MANUAL_RTTY_CLOSING;
+    return;
+  }
+
+  if (manual_rtty_tx_state != MANUAL_RTTY_CLOSING) return;
+  if (rptr_cw_send_buf != wptr_cw_send_buf ||
+      rptr_cw_onoff_buf != wptr_cw_onoff_buf || cw_count_ms != 0 ||
+      f_transmission != 0 || f_rtty_usb_lead_pending ||
+      usb_rtty_fast_service_needed()) return;
+
+  manual_rtty_tx_state = MANUAL_RTTY_IDLE;
+  if (manual_rtty_pending_len == 0) {
+    clear_manual_cw_radio();
+    manual_rtty_radio_idx = -1;
+    return;
+  }
+
+  int idx = manual_rtty_radio_idx;
+  if (idx < 0 || idx >= N_RADIO) idx = so2r.focused_radio();
+  struct radio *radio = &radio_list[idx];
+  begin_manual_rtty_burst(radio);
+  for (size_t i = 0; i < manual_rtty_pending_len; ++i)
+    append_cwbuf_raw((uint8_t)manual_rtty_pending[i]);
+  manual_rtty_pending_len = 0;
+  manual_rtty_last_key_ms = millis();
+}
+
 void append_cwbuf(char c) {
   c=append_cwbuf_convchar(c);
   if (c=='\0') return ;
@@ -1237,6 +1359,7 @@ void set_rttymemory_string(struct radio *radio, int num, char *s)
   // If FSK is omitted, legacy rigs fall back to CW:0..4.
   // '[' and ']' are the existing local RTTY STX/ETX markers.
   append_cwbuf('[');  // start transmission
+  append_cwbuf_raw(0x1f);  // always establish ITA2 LTRS before message text
   sp = rtty_memory_string;
   while (1) {
     c = *sp++;
@@ -1250,6 +1373,10 @@ void set_rttymemory_string(struct radio *radio, int num, char *s)
       append_cwbuf(c);
   }
   append_cwbuf(']');  // end transmission
+  // Unlike CW, local RTTY has no '$' end-of-message token in the character
+  // stream.  Defer the SO2R message-finished notification until
+  // Control_TX_process() has actually dropped PTT after ETX/tail MARK.
+  f_rtty_message_end_pending = true;
 }
 
 void set_rttymemory_string_buf(char *s) {
@@ -1552,6 +1679,7 @@ void delete_cwbuf() {
 
 void cancel_keying(struct radio *radio) // here radio indicates currently transmitting radio
 {
+  f_rtty_message_end_pending = false;
   cw_xit_start_hold_until_ms = 0;
   request_finish_xit_cw_message(radio);
   clear_cwbuf();
@@ -1606,6 +1734,10 @@ void clear_cwbuf() {
   //
   rptr_cw_send_buf = wptr_cw_send_buf;
   cw_send_update = 1;
+  manual_rtty_tx_state = MANUAL_RTTY_IDLE;
+  manual_rtty_stx_pending = false;
+  manual_rtty_pending_len = 0;
+  manual_rtty_radio_idx = -1;
 }
 
 void display_cwbuf() {
@@ -1638,5 +1770,3 @@ void display_cwbuf() {
   buf[pbuf] = '\0';
   display_cw_buf_lcd(buf);
 }
-
-

@@ -46,12 +46,13 @@
 #include "mux_transport.h"
 #include "callhist_remote.h"
 
-enum QueryCIVType {Freq,Mode,Smeter,Ptt,Id,Preamp,Gps,Att,Power,RigAnt,ScopeLevel};
+enum QueryCIVType {Freq,Mode,Smeter,SWR,Ptt,Id,Preamp,Gps,Att,Power,RigAnt,ScopeLevel};
 void send_query_civ(enum QueryCIVType type,struct radio *radio) {
   switch(type) {
   case Freq:		send_freq_query_civ(radio);break;//0
   case Mode:		send_mode_query_civ(radio);break;//1
   case Smeter:	    send_smeter_query_civ(radio);break;//2
+  case SWR:          send_swr_query_civ(radio);break;
   case Ptt:		send_ptt_query_civ(radio);break;//3
   case Att:		send_att_query_civ(radio);break;//3    
   case Id:	      send_identification_query_civ(radio);break;  // 5
@@ -76,21 +77,28 @@ static void process_subcpu_late_recovery()
 
   if (!callhist_subcpu_alive(120)) return;
 
-  console->println(
-    "SUBCPU late recovery: response detected; DUPE rebuild scheduled");
-  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
-           "SUBCPU FOUND\nRebuilding DUPE...");
-  upd_display_info_flash(dp->lcdbuf);
-
   subcpu_online = true;
-  callhist_at = 1;
-  init_dupechk_maincpu();
+  const bool want_dupe_subcpu = dupechk_setting_wants_subcpu();
 
-  // Use the same deferred rebuild path as startup/contest changes.  This keeps
-  // all QSO.TXT -> DUPE reconstruction in one place.
-  request_makedupe_rebuild();
+  if (want_dupe_subcpu) {
+    console->println(
+      "SUBCPU late recovery: response detected; DUPE rebuild scheduled");
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "SUBCPU FOUND\nRebuilding DUPE...");
+    upd_display_info_flash(dp->lcdbuf);
 
-  if (plogw->enable_callhist) {
+    init_dupechk_maincpu();
+    // Use the same deferred rebuild path as startup/contest changes.
+    request_makedupe_rebuild();
+  } else {
+    console->printf(
+      "SUBCPU late recovery: response detected; DUPE remains MAIN (setting=%d)\n",
+      dupechk_at);
+  }
+
+  // SUBCPU recovery must not silently move CALLHIST.  callhist_at is the
+  // already-resolved CALLHIST placement and is independent of DUPE.
+  if (plogw->enable_callhist && callhist_at == 1) {
     bool fallback = false;
     int n = load_callhist_subcpu_or_main(callhistfn, &fallback);
     if (n > 0) {
@@ -99,13 +107,16 @@ static void process_subcpu_late_recovery()
     } else {
       console->println("SUBCPU RECOVERED: CALLHIST disabled (no usable memory)");
     }
+  } else if (plogw->enable_callhist) {
+    console->println("SUBCPU RECOVERED: CALLHIST remains MAIN");
   } else {
     console->println("SUBCPU RECOVERED: CALLHIST=OFF");
   }
 
   snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
-           "SUBCPU RECOVERED\nDUPE: rebuilding\nCALLHIST: %s",
-           plogw->enable_callhist ? "ON" : "OFF");
+           "SUBCPU RECOVERED\nDUPE: %s\nCALLHIST: %s",
+           want_dupe_subcpu ? "rebuilding" : "MAIN",
+           plogw->enable_callhist ? (callhist_at == 1 ? "SUBCPU" : "MAIN") : "OFF");
   upd_display_info_flash(dp->lcdbuf);
 }
 
@@ -146,7 +157,7 @@ static inline void interval_diag_finish(IntervalDiag *diag) {
   if (total >= INTERVAL_DIAG_THRESHOLD_US) {
     // Use the hardware serial port rather than console/telnet output so a
     // blocked network stream does not hide or amplify the diagnosis.
-    Serial.printf("INTERVAL SLOW total=%lu us max=%lu us stage=%s stat=%d wifi=%d core=%d\n",
+    console->printf("INTERVAL SLOW total=%lu us max=%lu us stage=%s stat=%d wifi=%d core=%d\n",
                   (unsigned long)total,
                   (unsigned long)diag->max_us,
                   diag->max_stage,
@@ -161,7 +172,6 @@ void interval_process() {
   interval_diag_begin(&interval_diag);
   struct radio *radio;
   int next_interval;
-  static int query_item = 0;
   next_interval = 100;
   service_icom_clock_sync();
   service_yaesu_scope();
@@ -188,91 +198,118 @@ void interval_process() {
     }
     if (!dupechk_remote_query_pending()) {
       if (f_mux_transport) mux_transport.recv_pkt();
+      interval_diag_mark(&interval_diag, "pre_display_mux");
+
+      const uint32_t display_info_started_us = micros();
       upd_display_info();// update info_display (when timer==0)
+      const uint32_t display_info_elapsed_us = micros() - display_info_started_us;
+      if (display_info_elapsed_us >= 80000U) {
+        console->printf(
+            "SLOWDETAIL display_info call=%lu us timer=%d show=%d stat=%d core=%d\n",
+            (unsigned long)display_info_elapsed_us,
+            info_disp.timer, info_disp.show_info, interval_process_stat,
+            xPortGetCoreID());
+      }
+      interval_diag_mark(&interval_diag, "display_info_call");
+
       if (f_mux_transport) mux_transport.recv_pkt();
+      interval_diag_mark(&interval_diag, "post_display_mux");
+    } else {
+      interval_diag_mark(&interval_diag, "display_skipped_remote_dupe");
     }
-    interval_diag_mark(&interval_diag, "display_info");
     
+    /*
+     * Unified weighted CAT/CI-V poll scheduler (100-ms slots).
+     *
+     * Yaesu ASCII uses a compact 4-slot cycle:
+     *   0 IF
+     *   1 TX -> response-driven SM0 (RX) / RM6 (TX)
+     *   2 IF
+     *   3 SLOW
+     *
+     * Thus IF runs at 5 Hz, TX+meter at 2.5 Hz, and slow/status requests
+     * are admitted at 2.5 Hz aggregate.  TX and meter are one logical poll:
+     * cat.cpp waits for the TX answer, parses it, then immediately queues the
+     * correct meter without waiting for the next 100-ms interval slot.
+     *
+     * Other CAT/CI-V protocols retain the conservative 10-slot schedule.
+     */
+    static const QueryCIVType slow_common[] = {
+      Id, Ptt, Mode, Smeter, Preamp, Ptt, Mode, Smeter, Att, Gps,
+      Power, RigAnt, ScopeLevel
+    };
+    static const QueryCIVType slow_yaesu[] = {
+      Id, Preamp, Att, Power, RigAnt, ScopeLevel
+    };
+    static uint8_t slow_common_pos[N_RADIO] = {0};
+    static uint8_t slow_yaesu_pos[N_RADIO] = {0};
+
+    // Satellite frequency monitoring has a tighter cadence than the normal
+    // weighted poller.  IC-9700 MAIN/SUB and two-radio RX/TX are alternated,
+    // giving each side a 200-ms observation period while Doppler calculation
+    // remains on the existing 500-ms satellite timer.
+    const bool sat_poll_used = sat_frequency_monitor_process();
+
     for (int i = 0; i < N_RADIO; i++) {
       if (!unique_num_radio(i)) continue;
       radio = &radio_list[i];
-      if (!radio->enabled) continue;
-      // Common 600-ms query sequence (100 ms per step):
-      //   normal:      Freq, Mode, Smeter, Freq, silence, slow query
-      //   show_signal: Freq, Smeter, Smeter, Freq, silence, slow query
-      // Freq is queried at stat 0 and 3: every 300 ms.
-      // GPS and other slow/status items are handled by query_item.
-      if (!radio->f_civ_response_expected) {
-	if (!plogw->f_show_signal) {
-	  // normal 
-	  switch (interval_process_stat) {  
-	  case 0:
-	    send_query_civ(Freq,radio); break;
-	  case 1:
-	    send_query_civ(Mode,radio); break;
-	  case 2:
-	    send_query_civ(Smeter,radio); break;	    
-	  case 3:
-	    send_query_civ(Freq,radio); break;
-	  case 4:  // silence period for rotator //4 
-	    break;
-	  case 5:  // slow/status query
-	    switch(query_item) {
-	    case 0:send_query_civ(Id,radio); break;	    	    
-	    case 1:send_query_civ(Ptt,radio); break;
-	    case 2:send_query_civ(Mode,radio); break;
-	    case 3:send_query_civ(Smeter,radio); break;	    
-	    case 4:send_query_civ(Preamp,radio); break;
-	    case 5:send_query_civ(Ptt,radio); break;
-	    case 6:send_query_civ(Mode,radio); break;
-	    case 7:send_query_civ(Smeter,radio); break;	    
-	    case 8:send_query_civ(Att,radio); break;
-	    case 9:send_query_civ(Gps,radio); break;
-	    case 10:send_query_civ(Power,radio); break;
-	    case 11:send_query_civ(RigAnt,radio); break;
-	    case 12:send_query_civ(ScopeLevel,radio); break;
-	    }
-	    query_item++;
-	    if (query_item >= 13) query_item = 0;
-	    break;
-	  }
-	} else {
-	  // show signal 
-	  switch (interval_process_stat) {  
-	  case 0:
-	    send_query_civ(Freq,radio); break;
-	  case 1:
-	  case 2:
-	    send_query_civ(Smeter,radio); break;
-	  case 3:
-	    send_query_civ(Freq,radio); break;
-	  case 4:  // silence period for rotator //4 
-	    break;
-	  case 5:  // slow/status query 
-	    switch(query_item) {
-	    case 0:send_query_civ(Id,radio); break;
-	    case 1:send_query_civ(Ptt,radio); break;
-	    case 2:send_query_civ(Mode,radio); break;
-	    case 3:send_query_civ(Smeter,radio); break;
-	    case 4:send_query_civ(Preamp,radio); break;
-	    case 5:send_query_civ(Ptt,radio); break;
-	    case 6:send_query_civ(Mode,radio); break;
-	    case 7:send_query_civ(Smeter,radio); break;
-	    case 8:send_query_civ(Att,radio); break;
-	    case 9:send_query_civ(Gps,radio); break;
-	    case 10:send_query_civ(Power,radio); break;
-	    case 11:send_query_civ(RigAnt,radio); break;
-	    case 12:send_query_civ(ScopeLevel,radio); break;
-	    }
-	    query_item++;
-	    if (query_item >= 13) query_item = 0;
-	    break;
-	  }
-	}
+      if (!radio->enabled || radio->rig_spec == NULL) continue;
+      autotuner_service(radio);
+      if (sat_poll_used) continue;
+
+      const bool yaesu_ascii =
+          radio->rig_spec->cat_type == CAT_TYPE_YAESU_NEW ||
+          radio->rig_spec->cat_type == CAT_TYPE_YAESU_OLD;
+
+      // Yaesu ASCII has its own one-query-at-a-time serializer.  Other
+      // protocols retain the legacy response gate.
+      if (!yaesu_ascii && radio->f_civ_response_expected) continue;
+
+      if (yaesu_ascii) {
+        switch (interval_process_stat & 3) {
+        case 0:
+        case 2:
+          send_query_civ(Freq, radio);       // IF;
+          break;
+        case 1:
+          request_yaesu_tx_meter_poll(radio); // TX; -> SM0;/RM6;
+          break;
+        case 3: {
+          const size_t n = sizeof(slow_yaesu) / sizeof(slow_yaesu[0]);
+          send_query_civ(slow_yaesu[slow_yaesu_pos[i]], radio);
+          slow_yaesu_pos[i] = (slow_yaesu_pos[i] + 1) % n;
+          break;
+        }
+        }
+      } else {
+        switch (interval_process_stat) {
+        case 0:
+        case 2:
+        case 5:
+        case 8:
+          send_query_civ(Freq, radio);
+          break;
+        case 1:
+        case 4:
+          send_query_civ(radio_tx_meter_active(radio) ? SWR : Smeter, radio);
+          break;
+        case 6:
+        case 9: {
+          const size_t n = sizeof(slow_common) / sizeof(slow_common[0]);
+          send_query_civ(slow_common[slow_common_pos[i]], radio);
+          slow_common_pos[i] = (slow_common_pos[i] + 1) % n;
+          break;
+        }
+        case 3:
+        case 7:
+        default:
+          break;
+        }
       }
-    }		
+    }
     interval_diag_mark(&interval_diag, "radio_queries");
     if (f_mux_transport) mux_transport.recv_pkt();
+    interval_diag_mark(&interval_diag, "post_radio_mux");
 
 
     if (interval_process_stat == 4) {
@@ -280,7 +317,7 @@ void interval_process() {
     }
 
     interval_process_stat++;
-    if (interval_process_stat > 5) interval_process_stat = 0;
+    if (interval_process_stat > 9) interval_process_stat = 0;
     timeout_interval = millis() + next_interval;
     //	plogw->ostream->print("PTT:");plogw->ostream->print(plogw->ptt_stat);plogw->ostream->print(" S_stat:");plogw->ostream->println(plogw->smeter_stat);
   }
@@ -309,8 +346,8 @@ void interval_process() {
   // second process
   if (timeout_second < millis()) {
     // interval job every second
-    //    Serial.print("receive_civport nmax in 1ms interrupt.:");
-    //    Serial.println(receive_civport_count);
+    //    console->print("receive_civport nmax in 1ms interrupt.:");
+    //    console->println(receive_civport_count);
 
     receive_civport_count=0;
     if (plogw->autopoweroff) {
@@ -360,6 +397,24 @@ void interval_process() {
       }
       plogw->ostream->print(" revs=");
       plogw->ostream->println(main_loop_revs);
+
+      // max/total/calls for each bank.  The existing max-only line is kept
+      // for easy comparison with older logs.  total is accumulated CPU time
+      // in us during this reporting window.
+      plogw->ostream->print(" profile_tc:");
+      for (int i = 0; i < PROF_BANK_COUNT; ++i) {
+        const char *name = time_measure_get_name(i);
+        if (name[0] == '\0') continue;
+        plogw->ostream->print(' ');
+        plogw->ostream->print(name);
+        plogw->ostream->print('=');
+        plogw->ostream->print(time_measure_get(i));
+        plogw->ostream->print('/');
+        plogw->ostream->print((unsigned long long)time_measure_get_total(i));
+        plogw->ostream->print('/');
+        plogw->ostream->print(time_measure_get_calls(i));
+      }
+      plogw->ostream->println();
       interval_diag_mark(&interval_diag, "profile_print");
     }
     for (int i = 0; i < PROF_BANK_COUNT; ++i) time_measure_clear(i);
@@ -462,4 +517,3 @@ void interval_process() {
 //  after timer expired, message send with the repeat_func_key in the repeat_func_radio(?)
 
 // may better define SO2R class to hold all these status and functions (so2r_tx, rx, stereo, msg_tx_radio f_sequence_stat and focused_radio, ui_send_cq
-

@@ -63,9 +63,9 @@ int f_printkey=0;
 int f_show_clock = 0;
 DateTime rtctime, ntptime;
 
-const char *mode_str[NMODEID] = { "CW", "CW-R", "LSB", "USB", "FM", "AM", "RTTY", "RTTY-R" };
+const char *mode_str[NMODEID] = { "CW", "CW-R", "LSB", "USB", "FM", "AM", "RTTY", "RTTY-R", "DSTAR", "C4FM" };
 // mode code given from rig ci-v
-int modetype[NMODEID] = { LOG_MODETYPE_CW, LOG_MODETYPE_CW, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_DG, LOG_MODETYPE_DG };  // RTTY and RTTY-R are both digital/FSK
+int modetype[NMODEID] = { LOG_MODETYPE_CW, LOG_MODETYPE_CW, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_PH, LOG_MODETYPE_DG, LOG_MODETYPE_DG, LOG_MODETYPE_PH, LOG_MODETYPE_PH };  // D-STAR/C4FM are digital voice, but contest-operation type is PHONE
 const char *modetype_str[4] = { "*", "CW", "PH", "DG" };
 /// call buffer
 struct logwindow logw;
@@ -132,6 +132,11 @@ int rig_clock_sync = 1;     // 1: sync supported Icom rig clock on CI-V connect/
 //int callhistf_stat = 0;  // 0 not open 1 open for reading 2 open for writing
 char qsologfn[20];    // qso log filename (append)
 char callhistfn[20];  // call history file to read
-int callhist_at=1; // 0: MAIN, 1: SUBCPU (default: SUBCPU)
-int dupechk_at=1; // 0: MAIN, 1: SUBCPU 2:this is SUBCPU (default: SUBCPU)
+#if JK1DVPLOG_HWVER == 1
+int callhist_at=0; // HW1 default: MAIN when PSRAM is available; no-PSRAM is forced to SUBCPU
+#else
+int callhist_at=1; // HW3 default: SUBCPU; settings.txt may select MAIN-PSRAM with callhist_at 0
+#endif
+int dupechk_at=0; // placement setting: 0=AUTO, 1=SUBCPU, 2=MAIN
+int dupechk_max=2500; // requested DUPE database capacity; persisted in settings.txt
 

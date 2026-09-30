@@ -49,6 +49,7 @@
 #include "esp_heap_caps.h"
 #include "bandmap.h"
 #include "dupechk.h"
+#include "callhist.h"
 #include "antenna.h"
 #include "satellite.h"
 #include "ui.h"
@@ -65,7 +66,6 @@
 #endif
 #include <stdarg.h>
 #include <stdio.h>
-#include <errno.h>
 
 // ui.cpp currently does not expose this display helper in ui.h.
 // Declare it here so the Web WPM command can reuse the LCD speed display.
@@ -205,7 +205,10 @@ static bool enqueue_web_ui(const WebUiCommand &cmd) {
 }
 }
 
+namespace { static void web_trace_poll(); }
+
 void process_web_ui_queue() {
+  web_trace_poll();
   if (!s_web_ui_queue) return;
   WebUiCommand cmd;
   int budget=8;
@@ -343,7 +346,7 @@ void process_web_ui_queue() {
       upd_display_info_flash(dp->lcdbuf);
       upd_display();
     } else if (cmd.type == WEB_UI_RADIO_MODE) {
-      if (cmd.value < SO2R::RADIO_MODE_SO1R || cmd.value > SO2R::RADIO_MODE_SO2R) continue;
+      if (cmd.value != SO2R::RADIO_MODE_SO1R && cmd.value != SO2R::RADIO_MODE_SO2R) continue;
       bool transmitting = (so2r.sequence_stat() != SO2R::Default);
       for (int i = 0; i < N_RADIO && !transmitting; ++i) transmitting = radio_list[i].ptt_stat != 0;
       if (transmitting) { upd_display_info_flash("RADIO MODE BUSY\nTX/sequence active"); continue; }
@@ -359,8 +362,7 @@ void process_web_ui_queue() {
       so2r.set_status();
       save_settings("");
       snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "RADIO MODE\n%s\nSaved",
-               so2r.radio_mode == SO2R::RADIO_MODE_SO1R ? "SO1R" :
-               so2r.radio_mode == SO2R::RADIO_MODE_SAT ? "SAT" : "SO2R");
+               so2r.radio_mode == SO2R::RADIO_MODE_SO2R ? "SO2R" : "SO1R");
       request_display_update_on_demand();
       request_bandmap_update_on_demand();
       upd_display_info_flash(dp->lcdbuf);
@@ -419,6 +421,238 @@ void process_web_terminal_log_queue() {
 
 AsyncWebServer web_server(80);
 
+// Low-memory Web lifetime diagnostics.  This deliberately avoids Arduino
+// String allocation and does not hook AsyncClient callbacks (which belong to
+// ESPAsyncWebServer).  BEGIN/QUEUED/CHUNK/EOF identify response lifetime;
+// delayed SNAP records show whether heap/AsyncTCP resources recover after it.
+namespace {
+static portMUX_TYPE web_trace_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t web_trace_next_id = 0;
+struct WebTraceSlot {
+  uint32_t id = 0;
+  uint32_t t0 = 0;
+  uint32_t last = 0;
+  uint8_t snap_mask = 0;
+  char path[24] = {0};
+};
+static WebTraceSlot web_trace_slots[6];
+
+static void web_trace_heap(uint32_t id, const char *event, const char *path,
+                           size_t total = 0) {
+  if (!f_low_memory_mode || !lowmem_trace || !console) return;
+  multi_heap_info_t info;
+  heap_caps_get_info(&info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t awm = asyncTCPStackHighWaterMark();
+  const uint32_t astack = asyncTCPStackConfiguredSize();
+  const uint32_t aused = (awm && awm <= astack) ? astack - awm : 0;
+  console->printf("[WEBTRACE] #%lu %-6s %-20s free=%u largest=%u min=%u async_used~=%u q=%u total=%u\\n",
+                  (unsigned long)id, event ? event : "?", path ? path : "?",
+                  (unsigned)info.total_free_bytes, (unsigned)info.largest_free_block,
+                  (unsigned)info.minimum_free_bytes, (unsigned)aused,
+                  (unsigned)asyncTCPQueueMessagesWaiting(), (unsigned)total);
+}
+
+static uint32_t web_trace_begin(const char *path) {
+  if (!f_low_memory_mode || !lowmem_trace) return 0;
+  uint32_t id;
+  portENTER_CRITICAL(&web_trace_mux);
+  id = ++web_trace_next_id;
+  WebTraceSlot &slot = web_trace_slots[id % 6];
+  slot.id = id;
+  slot.t0 = slot.last = millis();
+  slot.snap_mask = 0;
+  strlcpy(slot.path, path ? path : "?", sizeof(slot.path));
+  portEXIT_CRITICAL(&web_trace_mux);
+  web_trace_heap(id, "BEGIN", path);
+  return id;
+}
+
+static void web_trace_touch(uint32_t id, const char *path, const char *event,
+                            size_t total = 0) {
+  if (!id) return;
+  portENTER_CRITICAL(&web_trace_mux);
+  WebTraceSlot &slot = web_trace_slots[id % 6];
+  if (slot.id == id) slot.last = millis();
+  portEXIT_CRITICAL(&web_trace_mux);
+  web_trace_heap(id, event, path, total);
+}
+
+static void web_trace_poll() {
+  if (!f_low_memory_mode || !lowmem_trace) return;
+  const uint32_t now = millis();
+  static const uint32_t delay_ms[3] = {250, 1000, 3000};
+  for (auto &slot : web_trace_slots) {
+    if (!slot.id) continue;
+    for (uint8_t n = 0; n < 3; ++n) {
+      if (!(slot.snap_mask & (1U << n)) && now - slot.last >= delay_ms[n]) {
+        slot.snap_mask |= (1U << n);
+        char event[8];
+        snprintf(event, sizeof(event), "S%ums", (unsigned)delay_ms[n]);
+        web_trace_heap(slot.id, event, slot.path);
+      }
+    }
+  }
+}
+} // namespace
+
+// HW1 protection against slow-client / weak-WiFi response pile-up.
+// Refuse only memory-heavy streamed responses when internal RAM is already
+// tight; small control/API requests remain available.  The browser can retry.
+static bool web_lowmem_admit_heavy(AsyncWebServerRequest *request,
+                                   const char *path) {
+  if (!f_low_memory_mode) return true;
+  const size_t free_internal =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t largest_internal =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const unsigned q = (unsigned)asyncTCPQueueMessagesWaiting();
+  // Base admission on the *current* heap/AsyncTCP state.  A completed earlier
+  // request may have driven the historical minimum very low; that is not a
+  // reason to reject a new request after the heap has recovered.
+  if (free_internal >= 14000 && largest_internal >= 7000 && q < 10) return true;
+
+  if (lowmem_trace && console) {
+    console->printf("[WEBGUARD] reject %-20s free=%u largest=%u q=%u\n",
+                    path ? path : "?", (unsigned)free_internal,
+                    (unsigned)largest_internal, q);
+  }
+  AsyncWebServerResponse *response =
+      request->beginResponse(503, "text/plain",
+                             "Web busy / low memory; retry shortly");
+  response->addHeader("Retry-After", "1");
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+  return false;
+}
+
+// HW1 POTA/SOTA nearest-search admission control.  These handlers scan SD
+// files and then keep an AsyncTCP response alive; on a weak link repeated
+// searches can otherwise accumulate faster than TCP can drain them.
+static bool web_lowmem_admit_near(AsyncWebServerRequest *request,
+                                  const char *path) {
+  if (!f_low_memory_mode) return true;
+  const size_t free_internal =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t largest_internal =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const unsigned q = (unsigned)asyncTCPQueueMessagesWaiting();
+  // Nearest searches only scan the SD file and return a small JSON object.
+  // Do not require the old 22 KiB reserve or an arbitrary time cooldown.
+  // The shared scratch lock already serializes the formatting phase.
+  if (free_internal >= 14000 && largest_internal >= 7000 && q < 8) return true;
+
+  if (lowmem_trace && console) {
+    console->printf("[WEBGUARD] reject %-20s free=%u largest=%u q=%u\\n",
+                    path ? path : "?", (unsigned)free_internal,
+                    (unsigned)largest_internal, q);
+  }
+  AsyncWebServerResponse *response =
+      request->beginResponse(503, "text/plain", "Search busy; retry shortly");
+  response->addHeader("Retry-After", "2");
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+  return false;
+}
+
+// Shared Web formatting workspace.  6144 bytes is the experimentally chosen
+// bounded-buffer size used by the Web paths on both HW1 and HW3.  Keep it
+// static so large response formatting never fragments the Arduino heap.
+static constexpr size_t WEB_SHARED_SCRATCH_SIZE = 6144;
+static constexpr uint32_t WEB_SHARED_SCRATCH_STALE_MS = 30000U;
+static char web_shared_scratch[WEB_SHARED_SCRATCH_SIZE];
+static portMUX_TYPE web_shared_scratch_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool web_shared_scratch_busy = false;
+static uint32_t web_shared_scratch_lease_seq = 0;
+static uint32_t web_shared_scratch_active_lease = 0;
+static uint32_t web_shared_scratch_acquired_ms = 0;
+static const char *web_shared_scratch_owner = nullptr;
+
+static bool web_shared_scratch_acquire(AsyncWebServerRequest *request,
+                                       const char *path,
+                                       uint32_t *lease_out) {
+  const uint32_t now = millis();
+  bool acquired = false;
+  bool stale_reclaimed = false;
+  const char *old_owner = nullptr;
+  uint32_t old_age = 0;
+  uint32_t lease = 0;
+
+  portENTER_CRITICAL(&web_shared_scratch_mux);
+  if (web_shared_scratch_busy) {
+    old_age = (uint32_t)(now - web_shared_scratch_acquired_ms);
+    if (old_age >= WEB_SHARED_SCRATCH_STALE_MS) {
+      old_owner = web_shared_scratch_owner;
+      web_shared_scratch_busy = false;
+      web_shared_scratch_active_lease = 0;
+      web_shared_scratch_owner = nullptr;
+      stale_reclaimed = true;
+    }
+  }
+  if (!web_shared_scratch_busy) {
+    web_shared_scratch_busy = true;
+    if (++web_shared_scratch_lease_seq == 0) ++web_shared_scratch_lease_seq;
+    lease = web_shared_scratch_lease_seq;
+    web_shared_scratch_active_lease = lease;
+    web_shared_scratch_acquired_ms = now;
+    web_shared_scratch_owner = path;
+    acquired = true;
+  }
+  const char *busy_owner = web_shared_scratch_owner;
+  const uint32_t busy_age = web_shared_scratch_busy ?
+      (uint32_t)(now - web_shared_scratch_acquired_ms) : 0;
+  portEXIT_CRITICAL(&web_shared_scratch_mux);
+
+  if (stale_reclaimed && console) {
+    console->printf("[WEBSCRATCH] STALE release owner=%s age=%u ms\n",
+                    old_owner ? old_owner : "?", (unsigned)old_age);
+  }
+  if (acquired) {
+    if (lease_out) *lease_out = lease;
+    if (lowmem_trace && console)
+      console->printf("[WEBSCRATCH] acquire %-20s lease=%u\n",
+                      path ? path : "?", (unsigned)lease);
+    return true;
+  }
+  if (lowmem_trace && console)
+    console->printf("[WEBSCRATCH] busy %-20s owner=%s age=%u ms lease=%u\n",
+                    path ? path : "?", busy_owner ? busy_owner : "?",
+                    (unsigned)busy_age, (unsigned)web_shared_scratch_active_lease);
+  AsyncWebServerResponse *response =
+      request->beginResponse(503, "text/plain", "Web formatter busy; retry shortly");
+  response->addHeader("Retry-After", "1");
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+  return false;
+}
+
+static void web_shared_scratch_release(uint32_t lease) {
+  if (!lease) return;
+  const uint32_t now = millis();
+  bool released = false;
+  const char *owner = nullptr;
+  uint32_t age = 0;
+  portENTER_CRITICAL(&web_shared_scratch_mux);
+  if (web_shared_scratch_busy && web_shared_scratch_active_lease == lease) {
+    owner = web_shared_scratch_owner;
+    age = (uint32_t)(now - web_shared_scratch_acquired_ms);
+    web_shared_scratch_busy = false;
+    web_shared_scratch_active_lease = 0;
+    web_shared_scratch_owner = nullptr;
+    released = true;
+  }
+  portEXIT_CRITICAL(&web_shared_scratch_mux);
+  if (released && lowmem_trace && console)
+    console->printf("[WEBSCRATCH] release %-20s lease=%u age=%u ms\n",
+                    owner ? owner : "?", (unsigned)lease, (unsigned)age);
+}
+
+static size_t web_stream_chunk_limit(size_t maxLen) {
+  // Do not impose the old HW1=512/HW3=1024 producer cap.  AsyncWebServer's
+  // maxLen already provides bounded back-pressure; the common 6144-byte
+  // formatter is used only as transient/static workspace.
+  return std::min(maxLen, WEB_SHARED_SCRATCH_SIZE);
+}
+
 const char* PARAM_MESSAGE = "message";
 
 void notFound(AsyncWebServerRequest *request) {
@@ -451,6 +685,7 @@ static void humanReadableSizeToBuffer(size_t bytes, char *out, size_t out_size) 
 // RAM, rather than constructing the complete file list in a String.
 static void setupSdFileListHandler() {
   web_server.on("/filelist", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!web_lowmem_admit_heavy(request, "/filelist")) return;
     struct FileListState {
       enum Stage : uint8_t { Header, OpenEntry, Row, Footer, Done } stage = Header;
       File root;
@@ -458,6 +693,10 @@ static void setupSdFileListHandler() {
       size_t offset = 0;
       size_t length = 0;
       char text[320];
+      uint32_t trace_id = 0;
+      size_t trace_total = 0;
+      size_t trace_next = 4096;
+      bool trace_eof = false;
     };
 
     std::shared_ptr<FileListState> state = std::make_shared<FileListState>();
@@ -466,6 +705,7 @@ static void setupSdFileListHandler() {
       return;
     }
 
+    state->trace_id = web_trace_begin("/filelist");
     state->root = SD.open("/");
     if (!state->root) {
       request->send(500, "text/plain", "Failed to open SD card root");
@@ -479,11 +719,12 @@ static void setupSdFileListHandler() {
       [state](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
         (void)index;
         size_t written = 0;
+        const size_t chunkLimit = web_stream_chunk_limit(maxLen);
 
         auto copy_pending = [&]() -> bool {
           if (state->offset >= state->length) return true;
           const size_t remain = state->length - state->offset;
-          const size_t available = maxLen - written;
+          const size_t available = chunkLimit - written;
           const size_t ncopy = remain < available ? remain : available;
           if (ncopy) {
             memcpy(buffer + written, state->text + state->offset, ncopy);
@@ -499,7 +740,7 @@ static void setupSdFileListHandler() {
           state->offset = 0;
         };
 
-        while (written < maxLen && state->stage != FileListState::Done) {
+        while (written < chunkLimit && state->stage != FileListState::Done) {
           switch (state->stage) {
           case FileListState::Header:
             if (state->length == 0) {
@@ -563,11 +804,21 @@ static void setupSdFileListHandler() {
             break;
           }
         }
+        state->trace_total += written;
+        if (state->trace_total >= state->trace_next) {
+          web_trace_touch(state->trace_id, "/filelist", "CHUNK", state->trace_total);
+          state->trace_next += 4096;
+        }
+        if (state->stage == FileListState::Done && !state->trace_eof) {
+          state->trace_eof = true;
+          web_trace_touch(state->trace_id, "/filelist", "EOF", state->trace_total);
+        }
         return written;
       });
 
     response->addHeader("Cache-Control", "no-store");
     request->send(response);
+    web_trace_touch(state->trace_id, "/filelist", "QUEUED");
   });
 }
 
@@ -813,6 +1064,8 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     SD.remove(backupPath);
   }
 
+  callhist_source_updated(targetPath.c_str());
+
   webLog.print("Upload Complete: ");
   webLog.print(filename);
   webLog.print(" received=");
@@ -903,203 +1156,261 @@ double calculateBearing(double lat1, double lon1, double lat2, double lon2) {
 
 
 struct ParkInfo {
-  double dist;   // km
-  String code;   // JA-0001 …
-  String name;
+  double dist;
+  char code[20];
+  char name[96];
   double bearing;
-  /* デフォルト (必須) */
-  ParkInfo() : dist(1e9), code(""), name(""),bearing(0.0) {}
-
-  /* 値付きコンストラクタ */
-  ParkInfo(double d, const String& c, const String& n, double b)
-    : dist(d), code(c), name(n),bearing(b) {}
 };
 
+struct SummitInfo {
+  double dist;
+  char code[24];
+  char name[96];
+  int alt;
+  double bearing;
+};
 
+static bool read_csv_line(File &f, char *buf, size_t buflen) {
+  if (!buf || buflen < 2 || !f.available()) return false;
+  size_t n = f.readBytesUntil('\n', buf, buflen - 1);
+  buf[n] = '\0';
+  if (n && buf[n - 1] == '\r') buf[--n] = '\0';
+  // If a malformed/oversize line did not fit, discard the remainder so the
+  // next call always starts at a record boundary.
+  if (n == buflen - 1 && f.available()) {
+    int c;
+    while ((c = f.read()) >= 0 && c != '\n') yield();
+  }
+  return true;
+}
+
+static bool split_csv5(char *line, char **field) {
+  if (!line || !field) return false;
+  field[0] = line;
+  for (int i = 1; i < 5; ++i) {
+    char *comma = strchr(field[i - 1], ',');
+    if (!comma) return false;
+    *comma = '\0';
+    field[i] = comma + 1;
+  }
+  return true;
+}
+
+static size_t json_append_escaped(char *dst, size_t cap, size_t pos,
+                                  const char *src) {
+  if (!dst || !cap) return pos;
+  for (const unsigned char *p = (const unsigned char *)(src ? src : ""); *p; ++p) {
+    const char *esc = nullptr;
+    char one[2] = {(char)*p, '\0'};
+    if (*p == '"') esc = "\\\"";
+    else if (*p == '\\') esc = "\\\\";
+    else if (*p == '\n') esc = "\\n";
+    else if (*p == '\r') esc = "\\r";
+    else if (*p == '\t') esc = "\\t";
+    else esc = one;
+    const size_t n = strlen(esc);
+    if (pos + n + 1 >= cap) break;
+    memcpy(dst + pos, esc, n); pos += n;
+  }
+  dst[pos < cap ? pos : cap - 1] = '\0';
+  return pos;
+}
+
+static size_t json_appendf(char *dst, size_t cap, size_t pos,
+                           const char *fmt, ...) {
+  if (!dst || pos >= cap) return pos;
+  va_list ap; va_start(ap, fmt);
+  int n = vsnprintf(dst + pos, cap - pos, fmt, ap);
+  va_end(ap);
+  if (n < 0) return pos;
+  if ((size_t)n >= cap - pos) return cap - 1;
+  return pos + (size_t)n;
+}
+
+static bool json_appendf_checked(char *dst, size_t cap, size_t &pos,
+                                 const char *fmt, ...) {
+  if (!dst || pos >= cap) return false;
+  va_list ap; va_start(ap, fmt);
+  const int n = vsnprintf(dst + pos, cap - pos, fmt, ap);
+  va_end(ap);
+  if (n < 0 || (size_t)n >= cap - pos) { if (cap) dst[cap - 1] = '\0'; return false; }
+  pos += (size_t)n;
+  return true;
+}
+
+struct FixedJsonState {
+  char *data = web_shared_scratch;
+  size_t len = 0;
+  bool owns_scratch = false;
+  uint32_t scratch_lease = 0;
+  ~FixedJsonState() { if (owns_scratch) web_shared_scratch_release(scratch_lease); }
+};
+
+static void send_fixed_json_state(AsyncWebServerRequest *request,
+                                  const std::shared_ptr<FixedJsonState> &state) {
+  AsyncWebServerResponse *response = request->beginChunkedResponse(
+    "application/json",
+    [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      if (index >= state->len) return 0;
+      const size_t n = std::min(state->len - index, web_stream_chunk_limit(maxLen));
+      memcpy(buffer, state->data + index, n);
+      return n;
+    });
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+}
+
+static bool web_grid_to_latlon(AsyncWebServerRequest *request,
+                               float &lat, float &lon) {
+  if (!request->hasParam("grid")) return false;
+  char grid[10] = {0};
+  // Copy directly into a bounded buffer; avoid retaining another Arduino
+  // String while the SD scan and response are active.
+  snprintf(grid, sizeof(grid), "%s", request->getParam("grid")->value().c_str());
+  size_t begin = 0, end = strlen(grid);
+  while (begin < end && isspace((unsigned char)grid[begin])) ++begin;
+  while (end > begin && isspace((unsigned char)grid[end - 1])) --end;
+  if (begin) memmove(grid, grid + begin, end - begin);
+  grid[end - begin] = '\0';
+  const size_t grid_len = strlen(grid);
+  if (grid_len < 4 || grid_len > 8) return false;
+  for (size_t i = 0; i < grid_len; ++i)
+    grid[i] = (char)toupper((unsigned char)grid[i]);
+  lat = mh2lat(grid); lon = mh2lon(grid);
+  webLog.print("grid="); webLog.print(grid);
+  webLog.print(" lat,lon="); webLog.print(lat); webLog.print(" "); webLog.println(lon);
+  return isfinite(lat) && isfinite(lon);
+}
+
+static void build_park_json(const ParkInfo *best, int found,
+                            char *json, size_t json_size) {
+  size_t pos = 0; json[0] = '\0';
+  pos = json_appendf(json, json_size, pos, "[");
+  for (int i = 0; i < found; ++i) {
+    pos = json_appendf(json, json_size, pos, "%s{\"code\":\"", i ? "," : "");
+    pos = json_append_escaped(json, json_size, pos, best[i].code);
+    pos = json_appendf(json, json_size, pos, "\",\"name\":\"");
+    pos = json_append_escaped(json, json_size, pos, best[i].name);
+    pos = json_appendf(json, json_size, pos,
+                       "\",\"distance_km\":%.2f,\"bearing_deg\":%.1f}",
+                       best[i].dist, best[i].bearing);
+  }
+  json_appendf(json, json_size, pos, "]");
+}
+
+static void build_summit_json(const SummitInfo *best, int found,
+                              char *json, size_t json_size) {
+  size_t pos = 0; json[0] = '\0';
+  pos = json_appendf(json, json_size, pos, "[");
+  for (int i = 0; i < found; ++i) {
+    pos = json_appendf(json, json_size, pos, "%s{\"code\":\"", i ? "," : "");
+    pos = json_append_escaped(json, json_size, pos, best[i].code);
+    pos = json_appendf(json, json_size, pos, "\",\"name\":\"");
+    pos = json_append_escaped(json, json_size, pos, best[i].name);
+    pos = json_appendf(json, json_size, pos,
+                       "\",\"alt\":%d,\"distance_km\":%.2f,\"bearing_deg\":%.1f}",
+                       best[i].alt, best[i].dist, best[i].bearing);
+  }
+  json_appendf(json, json_size, pos, "]");
+}
 
 // `/nearest?grid=PM95ru`
 void setupNearestHandler(AsyncWebServer &server) {
   server.on("/nearest", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!request->hasParam("grid")) {
-      request->send(400, "text/plain", "Missing grid param");
-      return;
-    }
-
-    String grid = request->getParam("grid")->value();
-    grid.toUpperCase();  // 必須
+    if (!web_lowmem_admit_near(request, "/nearest")) return;
     float myLat = 0, myLon = 0;
-    //    gridToLatLon(grid.c_str(), myLat, myLon);
-
-    char gridstr[10];
-    strcpy(gridstr,grid.c_str());
-    webLog.print("grid=");webLog.print(gridstr);
-    webLog.print("<-");webLog.println(grid.c_str());
-	      
-    myLat=mh2lat(gridstr);
-    myLon=mh2lon(gridstr);
-
-    webLog.print("lat,lon=");webLog.print(myLat);webLog.print(" ");webLog.println(myLon);
-
-    File f = SD.open("/pota-jp.csv", "r");
-    if (!f) {
-      request->send(500, "text/plain", "File open error");
-      return;
+    if (!web_grid_to_latlon(request, myLat, myLon)) {
+      request->send(400, "text/plain", "Invalid or missing grid param"); return;
     }
+    File f = SD.open("/pota-jp.csv", "r");
+    if (!f) { request->send(500, "text/plain", "File open error"); return; }
 
-    ParkInfo top3[3];
+    ParkInfo top3[3] = {};
     int found = 0;
-
-    while (f.available()) {
-      String line = f.readStringUntil('\n');
-
-      if (line.startsWith("reference")) continue;
-
-      int c1 = line.indexOf(',');
-      int c2 = line.indexOf(',', c1 + 1);
-      int c3 = line.indexOf(',', c2 + 1);
-      int c4 = line.indexOf(',', c3 + 1);
-      String code = line.substring(0, c1);
-      String name = line.substring(c1 + 1, c2);
-      double lat = line.substring(c2 + 1, c3).toFloat();
-      double lon = line.substring(c3 + 1, c4).toFloat();
-      /*      webLog.print("code:");webLog.print(code);
-      webLog.print("name:");webLog.print(name);      
-      webLog.print(" lat:");webLog.print(lat);
-      webLog.print(" lon:");webLog.println(lon);
-      */
-      
-
+    char line[256];
+    while (read_csv_line(f, line, sizeof(line))) {
+      if (!strncmp(line, "reference", 9)) continue;
+      char *v[5]; if (!split_csv5(line, v)) continue;
+      const double lat = atof(v[2]), lon = atof(v[3]);
       if (lat == 0 || lon == 0) continue;
-
-      double dist = haversine(myLat, myLon, lat, lon);
-      double bearing = calculateBearing(myLat, myLon, lat, lon);
-
-      yield();
-      // 上位3件に追加または更新
-      if (found < 3) {
-        top3[found++] = {dist, code, name, bearing };
-      } else {
-        // 一番遠いのを探して置き換え
-        int maxIndex = 0;
-        for (int i = 1; i < 3; ++i) {
-          if (top3[i].dist > top3[maxIndex].dist) maxIndex = i;
-        }
-        if (dist < top3[maxIndex].dist) {
-          top3[maxIndex] = {dist, code, name, bearing};
-        }
+      const double dist = haversine(myLat, myLon, lat, lon);
+      const double bearing = calculateBearing(myLat, myLon, lat, lon);
+      int slot = -1;
+      if (found < 3) slot = found++;
+      else {
+        int far = 0;
+        for (int i = 1; i < 3; ++i) if (top3[i].dist > top3[far].dist) far = i;
+        if (dist < top3[far].dist) slot = far;
       }
+      if (slot >= 0) {
+        top3[slot].dist = dist; top3[slot].bearing = bearing;
+        strlcpy(top3[slot].code, v[0], sizeof(top3[slot].code));
+        strlcpy(top3[slot].name, v[1], sizeof(top3[slot].name));
+      }
+      yield();
     }
     f.close();
-
-    // ソート（昇順）
-    for (int i = 0; i < found - 1; ++i) {
-      for (int j = i + 1; j < found; ++j) {
-        if (top3[i].dist > top3[j].dist) {
-          ParkInfo temp = top3[i];
-          top3[i] = top3[j];
-          top3[j] = temp;
-        }
-      }
-    }
-
-    // JSON出力
-    String result = "[";
-    for (int i = 0; i < found; ++i) {
-      if (i > 0) result += ",";
-      result += "{\"code\":\"" + top3[i].code + "\",";
-      result += "\"name\":\"" + top3[i].name + "\",";
-      result += "\"distance_km\":" + String(top3[i].dist, 2) +",";
-      result += "\"bearing_deg\":" + String(top3[i].bearing, 1) + "}";
-    }
-    result += "]";
-    request->send(200, "application/json", result);
+    for (int i = 0; i < found - 1; ++i) for (int j = i + 1; j < found; ++j)
+      if (top3[i].dist > top3[j].dist) std::swap(top3[i], top3[j]);
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/nearest", &scratch_lease)) return;
+    std::shared_ptr<FixedJsonState> json = std::make_shared<FixedJsonState>();
+    if (!json) { web_shared_scratch_release(scratch_lease); request->send(503, "text/plain", "Not enough memory"); return; }
+    json->owns_scratch = true;
+    json->scratch_lease = scratch_lease;
+    build_park_json(top3, found, json->data, WEB_SHARED_SCRATCH_SIZE);
+    json->len = strlen(json->data);
+    send_fixed_json_state(request, json);
   });
 }
 
-
-struct SummitInfo {
-  double dist;
-  String code;   // JA/KN-001 …
-  String name;
-  int    alt;    // 標高 m
-  double bearing;
-
-  SummitInfo() : dist(1e9), code(""), name(""),  alt(0), bearing(0) {}
-  SummitInfo(double d, const String& c, const String& n, int a,double b)
-    : dist(d), code(c), name(n), alt(a),bearing(b) {}
-};
-
 void setupNearestSummit(AsyncWebServer &server) {
-  server.on("/nearest_summit", HTTP_GET, [](AsyncWebServerRequest *req){
-    if (!req->hasParam("grid")) { req->send(400,"text/plain","grid?"); return; }
-    String grid = req->getParam("grid")->value();
-    grid.toUpperCase();  // 必須
-    float myLat=0,myLon=0;
-    //gridToLatLon(grid.c_str(), myLat, myLon);
-    char gridstr[10];
-    strcpy(gridstr,grid.c_str());
-    webLog.print("grid=");webLog.print(gridstr);
-    webLog.print("<-");webLog.println(grid.c_str());
-	      
-    myLat=mh2lat(gridstr);
-    myLon=mh2lon(gridstr);
-    webLog.print("lat,lon=");webLog.print(myLat);webLog.print(" ");webLog.println(myLon);
-
-    File f = SD.open("/ja_sota.csv","r");
-    if (!f){ req->send(500,"text/plain","SOTA CSV open err"); return; }
+  server.on("/nearest_summit", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!web_lowmem_admit_near(request, "/nearest_summit")) return;
+    float myLat = 0, myLon = 0;
+    if (!web_grid_to_latlon(request, myLat, myLon)) {
+      request->send(400, "text/plain", "Invalid or missing grid param"); return;
+    }
+    File f = SD.open("/ja_sota.csv", "r");
+    if (!f) { request->send(500, "text/plain", "SOTA CSV open err"); return; }
     webLog.println("open ja_sota.csv");
 
-    SummitInfo best[3]; int filled=0;
-    while(f.available()){
-      String line=f.readStringUntil('\n');
-      if(line.startsWith("summitCode")) continue;
-      //      webLog.println(line);
-      int c1=line.indexOf(',');
-      int c2=line.indexOf(',',c1+1);
-      int c3=line.indexOf(',',c2+1);
-      int c4=line.indexOf(',',c3+1);
-      int c5=line.indexOf(',',c4+1);
-      //JA/YN-082,Oomuroyama,35.44090,138.65359,1468
-      String code=line.substring(0,c1);
-      String name=line.substring(c1+1,c2);
-      double lat= line.substring(c2+1,c3).toFloat();
-      double lon= line.substring(c3+1,c4).toFloat();
-      int alt   = line.substring(c4+1,c5).toInt();      
-      if(lat==0||lon==0) continue;
-      //      webLog.print("lat:");webLog.print(lat);
-      //      webLog.print("lon:");webLog.println(lon);      
-      yield();
-      double d = haversine(myLat,myLon,lat,lon);
-      double bearing = calculateBearing(myLat, myLon, lat, lon);
-
-      if(filled<3){ best[filled++]={d,code,name,alt,bearing }; }
-      else{
-        int far=0;
-	for(int i=1;i<3;i++) {
-	  if(best[i].dist>best[far].dist) far=i;
-	}
-        if(d<best[far].dist) {
-	  best[far]={d,code,name,alt,bearing };
-	}
+    SummitInfo best[3] = {};
+    int found = 0;
+    char line[256];
+    while (read_csv_line(f, line, sizeof(line))) {
+      if (!strncmp(line, "summitCode", 10)) continue;
+      char *v[5]; if (!split_csv5(line, v)) continue;
+      const double lat = atof(v[2]), lon = atof(v[3]);
+      if (lat == 0 || lon == 0) continue;
+      const double dist = haversine(myLat, myLon, lat, lon);
+      const double bearing = calculateBearing(myLat, myLon, lat, lon);
+      int slot = -1;
+      if (found < 3) slot = found++;
+      else {
+        int far = 0;
+        for (int i = 1; i < 3; ++i) if (best[i].dist > best[far].dist) far = i;
+        if (dist < best[far].dist) slot = far;
       }
+      if (slot >= 0) {
+        best[slot].dist = dist; best[slot].bearing = bearing; best[slot].alt = atoi(v[4]);
+        strlcpy(best[slot].code, v[0], sizeof(best[slot].code));
+        strlcpy(best[slot].name, v[1], sizeof(best[slot].name));
+      }
+      yield();
     }
     f.close();
-    // 距離で昇順ソート
-    for(int i=0;i<filled-1;i++) for(int j=i+1;j<filled;j++)
-      if(best[i].dist>best[j].dist){ SummitInfo t=best[i]; best[i]=best[j]; best[j]=t; }
-
-    String json="[";
-    for(int i=0;i<filled;i++){
-      if(i) json+=",";
-      json+="{\"code\":\""+best[i].code+"\",\"name\":\""+best[i].name+
-            "\",\"alt\":"+String(best[i].alt)+
-            ",\"distance_km\":"+String(best[i].dist,2)+
-            ",\"bearing_deg\":"+String(best[i].bearing,1)+	
-	"}";
-    }
-    json+="]";
-    webLog.println(json);
-    req->send(200,"application/json",json);
+    for (int i = 0; i < found - 1; ++i) for (int j = i + 1; j < found; ++j)
+      if (best[i].dist > best[j].dist) std::swap(best[i], best[j]);
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/nearest_summit", &scratch_lease)) return;
+    std::shared_ptr<FixedJsonState> json = std::make_shared<FixedJsonState>();
+    if (!json) { web_shared_scratch_release(scratch_lease); request->send(503, "text/plain", "Not enough memory"); return; }
+    json->owns_scratch = true;
+    json->scratch_lease = scratch_lease;
+    build_summit_json(best, found, json->data, WEB_SHARED_SCRATCH_SIZE);
+    json->len = strlen(json->data);
+    send_fixed_json_state(request, json);
   });
 }
 
@@ -1191,7 +1502,7 @@ char *pwin_index(int i) {
   switch (i) {
   case 0:return plogw->my_callsign;
   case 1:return plogw->sent_exch;
-  case 2:return plogw->contest_name;   // "Contest Name";
+  case 2:return plogw->contest_entry;  // normalized Main[,Sub] definition
   case 3:return plogw->power_code;// "Power Code";    
   case 4:return plogw->jcc;  // "JCC/JCG POTA/ SOTA/";
   case 5:return plogw->wifi_ssid; //"Wifi_SSID";
@@ -1257,6 +1568,11 @@ const char *settings_page_html = R"rawliteral(
   </div>
 
   <div class="setting">
+    <label><input id="call_stack_mode" type="checkbox"> Call Stack Mode</label>
+    <div>CALL欄でカンマ区切りの局を保持し、カーソル位置の局をEnterで選択します。</div>
+  </div>
+
+  <div class="setting">
     <label for="bandmap_lifetime">Bandmap spot lifetime (minutes)</label>
     <input id="bandmap_lifetime" type="number" min="1" max="1440"
            value="%BANDMAP_LIFETIME%" style="width:10em">
@@ -1292,6 +1608,16 @@ function updateSetting(index) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  fetch('/call_stack_mode')
+    .then(res => res.text())
+    .then(value => {
+      document.getElementById('call_stack_mode').checked = value.trim() === '1';
+    });
+  document.getElementById('call_stack_mode').addEventListener('change', function() {
+    fetch(`/set_call_stack_mode?enabled=${this.checked ? 1 : 0}`)
+      .then(res => res.text())
+      .then(msg => { document.getElementById('status').innerText = msg; });
+  });
   fetch('/clock_display_mode')
     .then(res => res.text())
     .then(mode => {
@@ -1354,6 +1680,13 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
     Hardware MIC/PTT is independent of this setting:
     Radio0&rarr;PTT1, Radio1&rarr;PTT2, Radio2&rarr;PTT3.
     Therefore <code>PTT:2</code> means hardware PTT plus CAT/CI-V PTT.</li>
+  <li><strong>T:<em>0..5</em></strong> antenna tuner control:
+    0=disabled/legacy Alt-T, 1=KEY1, 2=KEY2, 3=USB DTR, 4=USB RTS,
+    5=rig internal tuner by CAT/CI-V.</li>
+  <li><strong>SWR:<em>ratio x 100</em></strong> automatic tune threshold.
+    For example <code>SWR:200</code> means 2.00:1. Omit or use 0 to disable automatic action.</li>
+  <li><strong>TH:<em>milliseconds</em></strong> external tuner contact hold time
+    (500..3000, default 1500).</li>
   <li><strong>B:<em>baudrate</em></strong></li>
   <li><strong>P:<em>catport_number</em></strong> ((-2:Manual) ‑1:USB, 1:Bluetooth, 2:CI‑V, 3:CAT, 4:CAT2)</li>
   <li><strong>ADR:<em>CI‑V_address</em></strong></li>
@@ -1675,12 +2008,20 @@ struct ContestWebPreset {
   bool dupe_separate;
 };
 
+// Cache CONTEST.TXT itself rather than materializing every preset into RAM.
+// The file is small (currently about 562 bytes), so a fixed buffer is both
+// cheaper and more deterministic than N_CONTEST ContestWebPreset objects.
+// Lookups scan this RAM snapshot and parse only the requested preset.  Thus a
+// MAKEDUPE rebuild reads the SD card once, but does not allocate a preset table.
+static constexpr size_t CONTEST_PRESET_CACHE_BYTES = 2048;
+static char contest_web_file_cache[CONTEST_PRESET_CACHE_BYTES];
+static size_t contest_web_file_cache_len = 0;
 static ContestWebPreset contest_web_scratch;
+static ContestWebPreset *contest_web_pending_save = NULL;
 static bool contest_web_presets_loaded = false;
 static constexpr int N_USER_CONTEST_SLOTS = 2;
 static char contest_web_user_slot[N_USER_CONTEST_SLOTS][9];
 static const char *CONTEST_PRESET_FILE = "/CONTEST.TXT";
-static const char *CONTEST_PRESET_VFS_FILE = "/sd/CONTEST.TXT";
 static String contest_web_last_status = "No contest action has been received since boot.";
 static bool contest_web_file_loaded = false;
 static size_t contest_web_file_size = 0;
@@ -1690,7 +2031,6 @@ static bool valid_web_user_md_basename(const String &filename);
 static void set_contest_web_status(const String &message) {
   contest_web_last_status = message;
   if (console) console->printf("WEB CONTEST: %s\n", message.c_str());
-  Serial.printf("WEB CONTEST: %s\n", message.c_str());
 }
 
 static String contest_web_sd_status() {
@@ -1725,91 +2065,92 @@ static void copy_web_value(char *dst, size_t dst_size, const String &src) {
   dst[n] = '\0';
 }
 
-static String html_attr_escape(const char *src) {
-  String out;
-  if (!src) return out;
-  while (*src) {
-    switch (*src) {
-      case '&': out += F("&amp;"); break;
-      case '"': out += F("&quot;"); break;
-      case '<': out += F("&lt;"); break;
-      case '>': out += F("&gt;"); break;
-      default: out += *src; break;
-    }
-    ++src;
+static void copy_web_span(char *dst, size_t dst_size,
+                          const char *src, size_t src_len) {
+  if (!dst || dst_size == 0) return;
+  size_t n = 0;
+  while (n + 1 < dst_size && n < src_len) {
+    const char c = src[n];
+    dst[n] = (c == '\r' || c == '\n' || c == '\t') ? ' ' : c;
+    ++n;
   }
-  return out;
+  dst[n] = '\0';
 }
 
-static String json_string_escape(const char *src) {
-  String out;
-  if (!src) return out;
-  while (*src) {
-    switch (*src) {
-      case '\\': out += F("\\\\"); break;
-      case '"': out += F("\\\""); break;
-      case '\r': out += F("\\r"); break;
-      case '\n': out += F("\\n"); break;
-      case '\t': out += F("\\t"); break;
-      default: out += *src; break;
-    }
-    ++src;
-  }
-  return out;
-}
-
-static bool parse_contest_preset_line(const String &line, const char *wanted_name,
-                                      ContestWebPreset *out) {
-  int p1 = line.indexOf('\t');
-  int p2 = p1 < 0 ? -1 : line.indexOf('\t', p1 + 1);
-  int p3 = p2 < 0 ? -1 : line.indexOf('\t', p2 + 1);
-  int p4 = p3 < 0 ? -1 : line.indexOf('\t', p3 + 1);
-  int p5 = p4 < 0 ? -1 : line.indexOf('\t', p4 + 1);
-  int p6 = p5 < 0 ? -1 : line.indexOf('\t', p5 + 1);
-  if (p1 < 1 || p2 < 0 || p3 < 0) return false;
-  String name = line.substring(0, p1);
-  if (!name.equalsIgnoreCase(wanted_name)) return false;
-
-  memset(out, 0, sizeof(*out));
-  out->used = true;
-  strlcpy(out->name, name.c_str(), sizeof(out->name));
-  copy_web_value(out->f1, sizeof(out->f1), line.substring(p1 + 1, p2));
-  if (p4 >= 0 && p5 >= 0) {
-    copy_web_value(out->f2, sizeof(out->f2), line.substring(p2 + 1, p3));
-    copy_web_value(out->f3, sizeof(out->f3), line.substring(p3 + 1, p4));
-    copy_web_value(out->f5, sizeof(out->f5), line.substring(p4 + 1, p5));
-    if (p6 >= 0) {
-      copy_web_value(out->exch, sizeof(out->exch), line.substring(p5 + 1, p6));
-      out->dupe_separate = line.substring(p6 + 1).toInt() != 0;
-    } else {
-      copy_web_value(out->exch, sizeof(out->exch), line.substring(p5 + 1));
-    }
-  } else {
-    copy_web_value(out->f3, sizeof(out->f3), line.substring(p2 + 1, p3));
-    copy_web_value(out->exch, sizeof(out->exch), line.substring(p3 + 1));
+static bool web_span_equals_ignore_case(const char *src, size_t len,
+                                        const char *wanted) {
+  if (!src || !wanted) return false;
+  const size_t wanted_len = strlen(wanted);
+  if (len != wanted_len) return false;
+  for (size_t i = 0; i < len; ++i) {
+    char a = src[i];
+    char b = wanted[i];
+    if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+    if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
+    if (a != b) return false;
   }
   return true;
 }
 
-static ContestWebPreset *find_contest_web_preset(const char *name, bool create) {
-  if (!name || !*name) return NULL;
-  bool found = false;
-  File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
-  if (f) {
-    while (f.available()) {
-      String line = f.readStringUntil('\n');
-      if (line.endsWith("\r")) line.remove(line.length() - 1);
-      // Keep scanning: the last occurrence is the newest appended value.
-      if (parse_contest_preset_line(line, name, &contest_web_scratch)) found = true;
-    }
-    f.close();
+static int web_span_to_int(const char *src, size_t len) {
+  size_t i = 0;
+  while (i < len && (src[i] == ' ' || src[i] == '\t')) ++i;
+  int sign = 1;
+  if (i < len && (src[i] == '+' || src[i] == '-')) {
+    if (src[i++] == '-') sign = -1;
   }
-  if (found) return &contest_web_scratch;
-  if (!create) return NULL;
-  memset(&contest_web_scratch, 0, sizeof(contest_web_scratch));
-  contest_web_scratch.used = true;
-  strlcpy(contest_web_scratch.name, name, sizeof(contest_web_scratch.name));
-  return &contest_web_scratch;
+  int value = 0;
+  bool have_digit = false;
+  while (i < len && src[i] >= '0' && src[i] <= '9') {
+    have_digit = true;
+    value = value * 10 + (src[i++] - '0');
+  }
+  return have_digit ? sign * value : 0;
+}
+
+static bool parse_contest_preset_line(const char *line, size_t line_len,
+                                      const char *wanted_name,
+                                      ContestWebPreset *out) {
+  if (!line || !wanted_name || !out) return false;
+  if (line_len && line[line_len - 1] == '\r') --line_len;
+
+  size_t tab[6];
+  size_t ntabs = 0;
+  for (size_t i = 0; i < line_len && ntabs < 6; ++i) {
+    if (line[i] == '\t') tab[ntabs++] = i;
+  }
+  if (ntabs < 3 || tab[0] < 1) return false;
+  if (!web_span_equals_ignore_case(line, tab[0], wanted_name)) return false;
+
+  memset(out, 0, sizeof(*out));
+  out->used = true;
+  copy_web_span(out->name, sizeof(out->name), line, tab[0]);
+  copy_web_span(out->f1, sizeof(out->f1),
+                line + tab[0] + 1, tab[1] - tab[0] - 1);
+
+  if (ntabs >= 5) {
+    copy_web_span(out->f2, sizeof(out->f2),
+                  line + tab[1] + 1, tab[2] - tab[1] - 1);
+    copy_web_span(out->f3, sizeof(out->f3),
+                  line + tab[2] + 1, tab[3] - tab[2] - 1);
+    copy_web_span(out->f5, sizeof(out->f5),
+                  line + tab[3] + 1, tab[4] - tab[3] - 1);
+    if (ntabs >= 6) {
+      copy_web_span(out->exch, sizeof(out->exch),
+                    line + tab[4] + 1, tab[5] - tab[4] - 1);
+      out->dupe_separate =
+          web_span_to_int(line + tab[5] + 1, line_len - tab[5] - 1) != 0;
+    } else {
+      copy_web_span(out->exch, sizeof(out->exch),
+                    line + tab[4] + 1, line_len - tab[4] - 1);
+    }
+  } else {
+    copy_web_span(out->f3, sizeof(out->f3),
+                  line + tab[1] + 1, tab[2] - tab[1] - 1);
+    copy_web_span(out->exch, sizeof(out->exch),
+                  line + tab[2] + 1, line_len - tab[2] - 1);
+  }
+  return true;
 }
 
 static void initialize_user_contest_slot_defaults() {
@@ -1824,35 +2165,122 @@ static void initialize_user_contest_slot_defaults() {
   }
 }
 
-static void load_contest_web_presets() {
-  if (contest_web_presets_loaded) return;
-  contest_web_presets_loaded = true;
+static void parse_user_slots_from_cache() {
   memset(contest_web_user_slot, 0, sizeof(contest_web_user_slot));
+  size_t pos = 0;
+  while (pos < contest_web_file_cache_len) {
+    size_t end = pos;
+    while (end < contest_web_file_cache_len && contest_web_file_cache[end] != '\n') ++end;
+    size_t line_len = end - pos;
+    if (line_len && contest_web_file_cache[pos + line_len - 1] == '\r') --line_len;
+    for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
+      char prefix[16];
+      const int prefix_len = snprintf(prefix, sizeof(prefix), "#USER_SLOT%d=", i + 1);
+      if (prefix_len <= 0 || (size_t)prefix_len > line_len ||
+          memcmp(contest_web_file_cache + pos, prefix, (size_t)prefix_len) != 0)
+        continue;
+      const char *value = contest_web_file_cache + pos + prefix_len;
+      size_t value_len = line_len - (size_t)prefix_len;
+      while (value_len && (*value == ' ' || *value == '\t')) { ++value; --value_len; }
+      while (value_len && (value[value_len - 1] == ' ' || value[value_len - 1] == '\t')) --value_len;
+      if (value_len < 1 || value_len > 8) continue;
+      bool valid = true;
+      for (size_t j = 0; j < value_len; ++j) {
+        char c = value[j];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+          valid = false;
+          break;
+        }
+        contest_web_user_slot[i][j] = c;
+      }
+      if (valid) contest_web_user_slot[i][value_len] = '\0';
+      else contest_web_user_slot[i][0] = '\0';
+    }
+    pos = end < contest_web_file_cache_len ? end + 1 : end;
+  }
+  initialize_user_contest_slot_defaults();
+}
+
+static bool read_contest_file_into_cache() {
+  contest_web_file_cache[0] = '\0';
+  contest_web_file_cache_len = 0;
   File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
   if (!f) {
     contest_web_file_loaded = false;
     contest_web_file_size = 0;
-    initialize_user_contest_slot_defaults();
-    set_contest_web_status(String("preset file not found at ") + CONTEST_PRESET_FILE + "; using default User presets");
+    parse_user_slots_from_cache();
+    return false;
+  }
+  contest_web_file_size = f.size();
+  if (contest_web_file_size >= sizeof(contest_web_file_cache)) {
+    f.close();
+    contest_web_file_loaded = false;
+    set_contest_web_status(String("preset file too large for RAM cache: ") +
+                           String(contest_web_file_size) + " bytes");
+    parse_user_slots_from_cache();
+    return false;
+  }
+  contest_web_file_cache_len = f.readBytes(
+      contest_web_file_cache, contest_web_file_size);
+  f.close();
+  contest_web_file_cache[contest_web_file_cache_len] = '\0';
+  contest_web_file_loaded = true;
+  parse_user_slots_from_cache();
+  return true;
+}
+
+static void load_contest_web_presets() {
+  if (contest_web_presets_loaded) return;
+  contest_web_presets_loaded = true;
+  if (!read_contest_file_into_cache()) {
+    if (!contest_web_file_size)
+      set_contest_web_status(String("preset file not found at ") +
+                             CONTEST_PRESET_FILE + "; using default User presets");
     return;
   }
-  contest_web_file_loaded = true;
-  contest_web_file_size = f.size();
-  set_contest_web_status(String("loaded ") + CONTEST_PRESET_FILE + " (" + String(contest_web_file_size) + " bytes)");
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    if (line.endsWith("\r")) line.remove(line.length() - 1);
-    for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
-      String prefix = String("#USER_SLOT") + String(i + 1) + "=";
-      if (!line.startsWith(prefix)) continue;
-      String filename = line.substring(prefix.length());
-      filename.trim(); filename.toUpperCase();
-      if (valid_web_user_md_basename(filename))
-        strlcpy(contest_web_user_slot[i], filename.c_str(), sizeof(contest_web_user_slot[i]));
+  set_contest_web_status(String("cached ") + CONTEST_PRESET_FILE + " (" +
+                         String(contest_web_file_cache_len) + " bytes)");
+}
+
+// Return the last matching line, preserving the historical last-value-wins
+// semantics without keeping a parsed object for every contest.
+static ContestWebPreset *find_contest_web_preset(const char *name, bool create) {
+  if (!name || !*name) return NULL;
+  load_contest_web_presets();
+  ContestWebPreset found;
+  bool have = false;
+  size_t pos = 0;
+  while (pos < contest_web_file_cache_len) {
+    size_t end = pos;
+    while (end < contest_web_file_cache_len && contest_web_file_cache[end] != '\n') ++end;
+    size_t line_len = end - pos;
+    ContestWebPreset candidate;
+    if (parse_contest_preset_line(contest_web_file_cache + pos, line_len,
+                                  name, &candidate)) {
+      found = candidate;
+      have = true;
     }
+    pos = end < contest_web_file_cache_len ? end + 1 : end;
   }
-  f.close();
-  initialize_user_contest_slot_defaults();
+  if (have) {
+    contest_web_scratch = found;
+    return &contest_web_scratch;
+  }
+  if (!create) return NULL;
+  memset(&contest_web_scratch, 0, sizeof(contest_web_scratch));
+  contest_web_scratch.used = true;
+  strlcpy(contest_web_scratch.name, name, sizeof(contest_web_scratch.name));
+  return &contest_web_scratch;
+}
+
+void reload_contest_runtime_presets() {
+  contest_web_presets_loaded = false;
+  contest_web_pending_save = NULL;
+  load_contest_web_presets();
+  if (console)
+    console->printf("MAKEDUPE CONTEST file cache refreshed: %u bytes\n",
+                    (unsigned int)contest_web_file_cache_len);
 }
 
 static bool save_contest_web_presets() {
@@ -1860,51 +2288,89 @@ static bool save_contest_web_presets() {
     set_contest_web_status("save failed: microSD is not mounted");
     return false;
   }
-  FILE *fp = fopen(CONTEST_PRESET_VFS_FILE, "a");
-  if (!fp) {
-    set_contest_web_status(String("save failed: fopen(") + CONTEST_PRESET_VFS_FILE + ",a) failed, errno=" + String(errno));
+  load_contest_web_presets();
+  const char *tmp_name = "/CONTEST.NEW";
+  const char *bak_name = "/CONTEST.BAK";
+  if (SD.exists(tmp_name)) SD.remove(tmp_name);
+  File out = SD.open(tmp_name, FILE_WRITE);
+  if (!out) {
+    set_contest_web_status("save failed: cannot create /CONTEST.NEW");
     return false;
   }
-  int n = fprintf(fp, "#USER_SLOT1=%s\n#USER_SLOT2=%s\n",
-                  contest_web_user_slot[0], contest_web_user_slot[1]);
-  if (n >= 0 && contest_web_scratch.used) {
-    n = fprintf(fp, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
-                contest_web_scratch.name, contest_web_scratch.f1,
-                contest_web_scratch.f2, contest_web_scratch.f3,
-                contest_web_scratch.f5, contest_web_scratch.exch,
-                contest_web_scratch.dupe_separate ? 1 : 0);
+
+  // Rewrite from the cached file image.  Preserve comments, history and all
+  // unrelated presets; replace only the pending preset and the two slot lines.
+  size_t pos = 0;
+  while (pos < contest_web_file_cache_len) {
+    size_t end = pos;
+    while (end < contest_web_file_cache_len && contest_web_file_cache[end] != '\n') ++end;
+    size_t line_len = end - pos;
+    if (line_len && contest_web_file_cache[pos + line_len - 1] == '\r') --line_len;
+    const char *line = contest_web_file_cache + pos;
+    bool skip =
+        (line_len >= 12 && memcmp(line, "#USER_SLOT1=", 12) == 0) ||
+        (line_len >= 12 && memcmp(line, "#USER_SLOT2=", 12) == 0);
+    if (!skip && contest_web_pending_save) {
+      size_t tab = 0;
+      while (tab < line_len && line[tab] != '\t') ++tab;
+      if (tab > 0 && tab < line_len &&
+          web_span_equals_ignore_case(line, tab, contest_web_pending_save->name))
+        skip = true;
+    }
+    if (!skip) {
+      out.write((const uint8_t *)line, line_len);
+      out.write((uint8_t)'\n');
+    }
+    pos = end < contest_web_file_cache_len ? end + 1 : end;
   }
-  const bool write_failed = n < 0;
-  const bool flush_failed = fflush(fp) != 0;
-  const bool close_failed = fclose(fp) != 0;
-  if (write_failed || flush_failed || close_failed) {
-    set_contest_web_status(String("save failed while appending ") + CONTEST_PRESET_FILE + ", errno=" + String(errno));
+  out.printf("#USER_SLOT1=%s\n#USER_SLOT2=%s\n",
+             contest_web_user_slot[0], contest_web_user_slot[1]);
+  if (contest_web_pending_save) {
+    const ContestWebPreset &p = *contest_web_pending_save;
+    out.printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+               p.name, p.f1, p.f2, p.f3, p.f5, p.exch,
+               p.dupe_separate ? 1 : 0);
+  }
+  out.flush();
+  out.close();
+
+  if (SD.exists(bak_name)) SD.remove(bak_name);
+  if (SD.exists(CONTEST_PRESET_FILE) &&
+      !SD.rename(CONTEST_PRESET_FILE, bak_name)) {
+    if (SD.exists(tmp_name)) SD.remove(tmp_name);
+    set_contest_web_status("save failed: cannot preserve CONTEST.TXT");
     return false;
   }
-  File verify = SD.open(CONTEST_PRESET_FILE, FILE_READ);
-  if (!verify) {
-    set_contest_web_status(String("save failed: cannot reopen ") + CONTEST_PRESET_FILE);
+  if (!SD.rename(tmp_name, CONTEST_PRESET_FILE)) {
+    if (SD.exists(bak_name)) SD.rename(bak_name, CONTEST_PRESET_FILE);
+    set_contest_web_status("save failed: cannot install CONTEST.TXT");
     return false;
   }
-  contest_web_file_size = verify.size();
-  verify.close();
-  contest_web_file_loaded = true;
-  set_contest_web_status(String("saved ") + CONTEST_PRESET_FILE + " (" + String(contest_web_file_size) + " bytes)");
+  if (SD.exists(bak_name)) SD.remove(bak_name);
+
+  // Refresh the raw snapshot immediately so subsequent lookups see the save.
+  if (!read_contest_file_into_cache()) {
+    set_contest_web_status(String("save succeeded, but cannot cache ") + CONTEST_PRESET_FILE);
+    return false;
+  }
+  contest_web_pending_save = NULL;
+  set_contest_web_status(String("saved and cached ") + CONTEST_PRESET_FILE + " (" +
+                         String(contest_web_file_cache_len) + " bytes)");
   return true;
 }
 
 bool save_contest_runtime_preset(const char *contest_name) {
   if (!contest_name || !*contest_name || !plogw) return false;
-  load_contest_web_presets();
   ContestWebPreset *p = find_contest_web_preset(contest_name, true);
   if (!p) return false;
 
-  copy_web_value(p->f1, sizeof(p->f1), String(plogw->cw_msg[0] + 2));
-  copy_web_value(p->f2, sizeof(p->f2), String(plogw->cw_msg[1] + 2));
-  copy_web_value(p->f3, sizeof(p->f3), String(plogw->cw_msg[2] + 2));
-  copy_web_value(p->f5, sizeof(p->f5), String(plogw->cw_msg[4] + 2));
-  copy_web_value(p->exch, sizeof(p->exch), String(plogw->sent_exch + 2));
+  copy_web_span(p->f1, sizeof(p->f1), plogw->cw_msg[0] + 2, strlen(plogw->cw_msg[0] + 2));
+  copy_web_span(p->f2, sizeof(p->f2), plogw->cw_msg[1] + 2, strlen(plogw->cw_msg[1] + 2));
+  copy_web_span(p->f3, sizeof(p->f3), plogw->cw_msg[2] + 2, strlen(plogw->cw_msg[2] + 2));
+  copy_web_span(p->f5, sizeof(p->f5), plogw->cw_msg[4] + 2, strlen(plogw->cw_msg[4] + 2));
+  copy_web_span(p->exch, sizeof(p->exch), plogw->sent_exch + 2, strlen(plogw->sent_exch + 2));
   p->dupe_separate = plogw->mask == CW_PH_DUPE_OK;
+  contest_web_pending_save = p;
   return save_contest_web_presets();
 }
 
@@ -1923,7 +2389,6 @@ static void set_current_contest_messages(const ContestWebPreset &p) {
 
 bool apply_contest_runtime_preset(const char *contest_name) {
   if (!contest_name || !*contest_name || !plogw) return false;
-  load_contest_web_presets();
   ContestWebPreset *p = find_contest_web_preset(contest_name, false);
   if (!p) return false;
   set_current_contest_messages(*p);
@@ -1934,10 +2399,17 @@ bool get_contest_runtime_sent_exch(const char *contest_name,
                                    char *out, size_t out_size) {
   if (out && out_size) out[0] = '\0';
   if (!contest_name || !*contest_name || !out || out_size == 0) return false;
-  load_contest_web_presets();
   ContestWebPreset *p = find_contest_web_preset(contest_name, false);
   if (!p) return false;
   strlcpy(out, p->exch, out_size);
+  return true;
+}
+
+bool get_contest_runtime_dupe_mask(const char *contest_name, int *mask) {
+  if (!contest_name || !*contest_name || !mask) return false;
+  ContestWebPreset *p = find_contest_web_preset(contest_name, false);
+  if (!p) return false;
+  *mask = p->dupe_separate ? CW_PH_DUPE_OK : CW_PH_DUPE_NG;
   return true;
 }
 
@@ -1963,6 +2435,7 @@ static bool update_preset_from_request(AsyncWebServerRequest *request, const cha
   copy_web_value(p->f5, sizeof(p->f5), f5->value());
   copy_web_value(p->exch, sizeof(p->exch), exch->value());
   p->dupe_separate = dupe_separate && dupe_separate->value() == "1";
+  contest_web_pending_save = p;
   if (result) *result = p;
   return true;
 }
@@ -1980,134 +2453,216 @@ static void setupContestPageHandler() {
   load_contest_web_presets();
 
   web_server.on("/contests", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!web_lowmem_admit_heavy(request, "/contests")) return;
     const bool japanese = request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja");
-    struct State { enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header; size_t offset=0,length=0; int index=0; bool japanese=false; char text[6144]; };
+    struct State {
+      enum Stage:uint8_t {Header,Entry,Footer,Done} stage=Header;
+      size_t source_pos=0, repl_pos=0, repl_len=0, row_pos=0, row_len=0;
+      int index=0;
+      bool japanese=false;
+      uint32_t trace_id=0;
+      size_t trace_total=0;
+      bool trace_eof=false;
+      bool owns_scratch=false;
+      uint32_t scratch_lease=0;
+      char *row=web_shared_scratch;
+      char *repl=web_shared_scratch + 1024;
+      ~State(){ if(owns_scratch) web_shared_scratch_release(scratch_lease); }
+    };
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/contests", &scratch_lease)) return;
     std::shared_ptr<State> state = std::make_shared<State>();
-    if (state) state->japanese = japanese;
-    if (!state) {
-      request->send(503, "text/plain", "Not enough memory to build contest page");
-      return;
-    }
+    if (!state) { web_shared_scratch_release(scratch_lease); request->send(503, "text/plain", "Not enough memory to build contest page"); return; }
+    state->owns_scratch=true;
+    state->scratch_lease=scratch_lease;
+    state->japanese = japanese;
+    state->trace_id = web_trace_begin("/contests");
+
     AsyncWebServerResponse *response=request->beginChunkedResponse("text/html",
       [state](uint8_t *buffer,size_t maxLen,size_t chunkIndex) mutable -> size_t {
         (void)chunkIndex; size_t written=0;
-        auto prepare=[&](const char *source,bool footer){
-          String text=FPSTR(source);
-          if (!footer) {
-            text.replace("%CURRENT_CONTEST%",html_attr_escape(plogw->contest_name+2));
-            text.replace("%SD_STATUS%", html_attr_escape(contest_web_sd_status().c_str()));
-            text.replace("%LAST_STATUS%", html_attr_escape(contest_web_last_status.c_str()));
-          }
-          else {
-            text.replace("%LANG%", state->japanese ? "ja" : "en");
-            for (int i = 0; i < N_USER_CONTEST_SLOTS; ++i) {
-              String filename = contest_web_user_slot[i];
-              if (!filename.length() && i == 0 && !contest_web_user_slot[1][0] &&
-                  is_user_md_contest_name(plogw->contest_name + 2)) {
-                filename = plogw->contest_name + 6;
-              }
-
-              String contest_name;
-              if (filename.length()) contest_name = String("User") + filename;
-              bool current = contest_name.length() &&
-                             strcasecmp(plogw->contest_name + 2, contest_name.c_str()) == 0;
-              ContestWebPreset *p = contest_name.length()
-                                      ? find_contest_web_preset(contest_name.c_str(), false)
-                                      : NULL;
-              const char *f1 = p ? p->f1 : (current ? plogw->cw_msg[0] + 2 : "");
-              const char *f2 = p ? p->f2 : (current ? plogw->cw_msg[1] + 2 : "");
-              const char *f3 = p ? p->f3 : (current ? plogw->cw_msg[2] + 2 : "");
-              const char *f5 = p ? p->f5 : (current ? plogw->cw_msg[4] + 2 : "");
-              const char *ex = p ? p->exch : (current ? plogw->sent_exch + 2 : "");
-              String tag = String("%USER") + String(i + 1);
-
-              text.replace(tag + "_CLASS%", current ? " class=\"current\"" : "");
-              text.replace(tag + "_FILENAME%", html_attr_escape(filename.c_str()));
-              text.replace(tag + "_F1%", html_attr_escape(f1));
-              text.replace(tag + "_F2%", html_attr_escape(f2));
-              text.replace(tag + "_F3%", html_attr_escape(f3));
-              text.replace(tag + "_F5%", html_attr_escape(f5));
-              text.replace(tag + "_EXCH%", html_attr_escape(ex));
-              text.replace(tag + "_DUPE_CHECKED%", (p && p->dupe_separate) ? "checked" : "");
-              text.replace(tag + "_ACTION%", state->japanese ? (current ? "保存して再選択" : "選択して保存") : (current ? "Save & re-select" : "Select & save"));
-            }
-          }
-          text.toCharArray(state->text,sizeof(state->text)); state->length=strnlen(state->text,sizeof(state->text)); state->offset=0;
+        auto put_escaped=[](char *dst,size_t cap,const char *src)->size_t {
+          if (!dst || !cap) return 0;
+          size_t n = 0;
+          if (!src) src = "";
+          while(*src && n+1<cap){
+            const char *e=nullptr;
+            switch(*src){case '&':e="&amp;";break;case '"':e="&quot;";break;case '<':e="&lt;";break;case '>':e="&gt;";break;}
+            if(e){while(*e && n+1<cap) dst[n++]=*e++;} else dst[n++]=*src;
+            ++src;
+          } dst[n]='\0'; return n;
         };
-        auto copy=[&]()->bool { size_t remain=state->length-state->offset,room=maxLen-written,n=remain<room?remain:room; if(n){memcpy(buffer+written,state->text+state->offset,n);written+=n;state->offset+=n;} if(state->offset==state->length){state->offset=0;state->length=0;return true;} return false; };
-        while(written<maxLen && state->stage!=State::Done){
-          switch(state->stage){
-          case State::Header:
-            if (!state->length) prepare(state->japanese ? contests_page_header : contests_page_header_en, false);
-            if (copy()) state->stage = State::Entry;
-            break;
-          case State::Entry:
-            if(state->index>=contest_definition_count()){state->stage=State::Footer;break;}
-            if(!state->length){
-              int id=contest_definition_id(state->index); const char *name=contest_definition_name(state->index);
-              bool current=plogw->contest_id==id && strcasecmp(plogw->contest_name+2,name)==0;
-              ContestWebPreset *p=find_contest_web_preset(name,false);
-              const char *f1=p?p->f1:(current?plogw->cw_msg[0]+2:plogw->cw_msg[0]+2);
-              const char *f2=p?p->f2:(current?plogw->cw_msg[1]+2:plogw->cw_msg[1]+2);
-              const char *f3=p?p->f3:(current?plogw->cw_msg[2]+2:plogw->cw_msg[2]+2);
-              const char *f5=p?p->f5:(current?plogw->cw_msg[4]+2:plogw->cw_msg[4]+2);
-              const char *ex=p?p->exch:(current?plogw->sent_exch+2:plogw->sent_exch+2);
-              bool dupe_ok=contest_definition_mask(state->index)==CW_PH_DUPE_OK;
-              String form_id = String("contest_form_") + String(state->index);
-              String action_label = state->japanese ? (current ? "保存して再選択" : "選択して保存") : (current ? "Save & re-select" : "Select & save");
-              String row=String("<tr")+(current?" class=\"current\"":"")+"><td><form id=\""+form_id+"\" method=\"GET\" action=\"/select_contest\"><input type=\"hidden\" name=\"lang\" value=\""+(state->japanese?"ja":"en")+"\"><input type=\"hidden\" name=\"id\" value=\""+String(id)+"\"></form>"+String(id)+"</td><td class=\"name\"><div class=\"contest-name-field\"><span class=\"name-text\">"+html_attr_escape(name)+"</span><button form=\""+form_id+"\" type=\"submit\">"+action_label+"</button></div></td><td class=\""+(dupe_ok?"dupe-ok":"dupe-ng")+"\">"+(state->japanese ? (dupe_ok?"CW/Phone別":"モード共通") : (dupe_ok?"CW/Phone separate":"All modes"))+"</td>";
-              row += "<td><input form=\""+form_id+"\" name=\"f1\" maxlength=\"30\" value=\""+html_attr_escape(f1)+"\"></td>";
-              row += "<td><input form=\""+form_id+"\" name=\"f2\" maxlength=\"30\" value=\""+html_attr_escape(f2)+"\"></td>";
-              row += "<td><input form=\""+form_id+"\" name=\"f3\" maxlength=\"30\" value=\""+html_attr_escape(f3)+"\"></td>";
-              row += "<td><input form=\""+form_id+"\" name=\"f5\" maxlength=\"30\" value=\""+html_attr_escape(f5)+"\"></td>";
-              row += "<td><input form=\""+form_id+"\" name=\"exch\" maxlength=\"17\" value=\""+html_attr_escape(ex)+"\"></td>";
-              row += "</tr>\n";
-              row.toCharArray(state->text,sizeof(state->text)); state->length=strnlen(state->text,sizeof(state->text)); state->offset=0;
-            }
-            if (copy()) ++state->index;
-            break;
-          case State::Footer:
-            if (!state->length) prepare(state->japanese ? contests_page_footer : contests_page_footer_en, true);
-            if (copy()) state->stage = State::Done;
-            break;
-          case State::Done: break;
+        auto resolve=[&](const char *tok)->void {
+          state->repl[0]='\0'; state->repl_len=0; state->repl_pos=0;
+          const char *v=""; char tmp[96]; tmp[0]='\0';
+          if(!strcmp(tok,"CURRENT_CONTEST")) v=plogw->contest_name+2;
+          else if(!strcmp(tok,"LAST_STATUS")) v=contest_web_last_status.c_str();
+          else if(!strcmp(tok,"SD_STATUS")) {
+            if(SD.cardType()==CARD_NONE) snprintf(tmp,sizeof(tmp),"microSD: not mounted / no card");
+            else if(SD.exists(CONTEST_PRESET_FILE)) snprintf(tmp,sizeof(tmp),"microSD: mounted, preset=%s (%u bytes)",CONTEST_PRESET_FILE,(unsigned)contest_web_file_size);
+            else snprintf(tmp,sizeof(tmp),"microSD: mounted, preset=not created yet");
+            v=tmp;
+          } else if(!strcmp(tok,"LANG")) v=state->japanese?"ja":"en";
+          else if(!strncmp(tok,"USER",4) && tok[4]>='1' && tok[4]<='2' && tok[5]=='_') {
+            int i=tok[4]-'1'; const char *field=tok+6;
+            char filename[9]; strlcpy(filename,contest_web_user_slot[i],sizeof(filename));
+            if(!filename[0] && i==0 && !contest_web_user_slot[1][0] && is_user_md_contest_name(plogw->contest_name+2)) strlcpy(filename,plogw->contest_name+6,sizeof(filename));
+            char cname[16]; cname[0]='\0'; if(filename[0]) snprintf(cname,sizeof(cname),"User%s",filename);
+            bool current=cname[0] && strcasecmp(plogw->contest_name+2,cname)==0;
+            ContestWebPreset *p=cname[0]?find_contest_web_preset(cname,false):NULL;
+            if(!strcmp(field,"CLASS")) v=current?" class=\"current\"":"";
+            else if(!strcmp(field,"FILENAME")) v=filename;
+            else if(!strcmp(field,"F1")) v=p?p->f1:(current?plogw->cw_msg[0]+2:"");
+            else if(!strcmp(field,"F2")) v=p?p->f2:(current?plogw->cw_msg[1]+2:"");
+            else if(!strcmp(field,"F3")) v=p?p->f3:(current?plogw->cw_msg[2]+2:"");
+            else if(!strcmp(field,"F5")) v=p?p->f5:(current?plogw->cw_msg[4]+2:"");
+            else if(!strcmp(field,"EXCH")) v=p?p->exch:(current?plogw->sent_exch+2:"");
+            else if(!strcmp(field,"DUPE_CHECKED")) v=(p&&p->dupe_separate)?"checked":"";
+            else if(!strcmp(field,"ACTION")) v=state->japanese?(current?"保存して再選択":"選択して保存"):(current?"Save & re-select":"Select & save");
           }
+          state->repl_len=put_escaped(state->repl,256,v);
+          // CLASS and DUPE_CHECKED are markup, not attribute values.
+          if(!strcmp(tok,"USER1_CLASS")||!strcmp(tok,"USER2_CLASS")||!strcmp(tok,"USER1_DUPE_CHECKED")||!strcmp(tok,"USER2_DUPE_CHECKED")) {
+            strlcpy(state->repl,v,256); state->repl_len=strlen(state->repl);
+          }
+        };
+        auto stream_template=[&](const char *src)->bool {
+          while(written<maxLen){
+            if(state->repl_pos<state->repl_len){buffer[written++]=state->repl[state->repl_pos++];continue;}
+            char c=pgm_read_byte(src+state->source_pos);
+            if(!c){state->source_pos=0;return true;}
+            if(c!='%'){buffer[written++]=c;++state->source_pos;continue;}
+            char tok[40];
+            size_t n = 0;
+            size_t p = state->source_pos + 1;
+            char t = '\0';
+            while (n + 1 < sizeof(tok) && (t = pgm_read_byte(src + p)) && t != '%') {
+              tok[n++] = t;
+              ++p;
+            }
+            if (t != '%') {
+              buffer[written++] = c;
+              ++state->source_pos;
+              continue;
+            }
+            tok[n]='\0'; state->source_pos=p+1; resolve(tok);
+          }
+          return false;
+        };
+        auto append=[&](size_t &n,const char *x,bool esc){
+          if (!x) x = "";
+          if (esc) {
+            char e[192];
+            put_escaped(e, sizeof(e), x);
+            size_t l = strlen(e);
+            if (n + l < 1024) {
+              memcpy(state->row + n, e, l);
+              n += l;
+              state->row[n] = 0;
+            }
+          } else {
+            size_t l = strlen(x);
+            if (n + l < 1024) {
+              memcpy(state->row + n, x, l);
+              n += l;
+              state->row[n] = 0;
+            }
+          }
+        };
+        auto build_row=[&](){
+          int id=contest_definition_id(state->index); const char *name=contest_definition_name(state->index);
+          bool current=plogw->contest_id==id && strcasecmp(plogw->contest_name+2,name)==0;
+          ContestWebPreset *p=find_contest_web_preset(name,false);
+          const char *f1=p?p->f1:plogw->cw_msg[0]+2,*f2=p?p->f2:plogw->cw_msg[1]+2,*f3=p?p->f3:plogw->cw_msg[2]+2,*f5=p?p->f5:plogw->cw_msg[4]+2,*ex=p?p->exch:plogw->sent_exch+2;
+          bool dupe=contest_definition_mask(state->index)==CW_PH_DUPE_OK; size_t n=0; state->row[0]=0;
+          char a[160];
+          append(n, current ? "<tr class=\"current\"><td>" : "<tr><td>", false);
+          snprintf(a, sizeof(a), "<form id=\"contest_form_%d\" method=\"GET\" action=\"/select_contest\">", state->index);
+          append(n, a, false);
+          snprintf(a, sizeof(a), "<input type=\"hidden\" name=\"lang\" value=\"%s\"><input type=\"hidden\" name=\"id\" value=\"%d\"></form>%d", state->japanese ? "ja" : "en", id, id);
+          append(n, a, false);
+          append(n, "</td><td class=\"name\"><div class=\"contest-name-field\"><span class=\"name-text\">", false);
+          append(n, name, true);
+          append(n, "</span><button form=\"contest_form_", false);
+          snprintf(a, sizeof(a), "%d\" type=\"submit\">", state->index);
+          append(n, a, false);
+          append(n, state->japanese ? (current ? "保存して再選択" : "選択して保存") : (current ? "Save & re-select" : "Select & save"), false);
+          append(n, "</button></div></td><td class=\"", false);
+          append(n, dupe ? "dupe-ok" : "dupe-ng", false);
+          append(n, "\">", false);
+          append(n, state->japanese ? (dupe ? "CW/Phone別" : "モード共通") : (dupe ? "CW/Phone separate" : "All modes"), false);
+          append(n, "</td>", false);
+          const char *keys[]={"f1","f2","f3","f5","exch"}; const char *vals[]={f1,f2,f3,f5,ex}; const int ml[]={30,30,30,30,17};
+          for(int k=0;k<5;k++){snprintf(a,sizeof(a),"<td><input form=\"contest_form_%d\" name=\"%s\" maxlength=\"%d\" value=\"",state->index,keys[k],ml[k]);append(n,a,false);append(n,vals[k],true);append(n,"\"></td>",false);} append(n,"</tr>\n",false);
+          state->row_len=n; state->row_pos=0;
+        };
+        while(written<maxLen && state->stage!=State::Done){
+          if(state->stage==State::Header){if(stream_template(state->japanese?contests_page_header:contests_page_header_en))state->stage=State::Entry;continue;}
+          if(state->stage==State::Entry){
+            if(state->index>=contest_definition_count()){state->stage=State::Footer;continue;}
+            if (!state->row_len) build_row();
+            size_t r = state->row_len - state->row_pos;
+            size_t room = maxLen - written;
+            size_t n = r < room ? r : room;
+            if (n) {
+              memcpy(buffer + written, state->row + state->row_pos, n);
+              written += n;
+              state->row_pos += n;
+            }
+            if (state->row_pos == state->row_len) {
+              state->row_len = 0;
+              state->row_pos = 0;
+              ++state->index;
+            }
+            continue;
+          }
+          if(state->stage==State::Footer){if(stream_template(state->japanese?contests_page_footer:contests_page_footer_en))state->stage=State::Done;continue;}
+        }
+        state->trace_total += written;
+        if (state->stage == State::Done && written == 0 && !state->trace_eof) {
+          state->trace_eof = true;
+          web_trace_touch(state->trace_id, "/contests", "EOF", state->trace_total);
         }
         return written;
       });
-    response->addHeader("Cache-Control","no-store"); request->send(response);
+    response->addHeader("Cache-Control","no-store");
+    request->send(response);
+    web_trace_touch(state->trace_id, "/contests", "QUEUED");
   });
 
   web_server.on("/contest_preset", HTTP_GET, [](AsyncWebServerRequest *request) {
     if(!request->hasParam("name")){request->send(400,"text/plain","Missing name");return;}
     ContestWebPreset *p=find_contest_web_preset(request->getParam("name")->value().c_str(),false);
-    String json="{\"f1\":\""; json += json_string_escape(p ? p->f1 : ""); json += "\",\"f2\":\""; json += json_string_escape(p ? p->f2 : "");
-    json += "\",\"f3\":\""; json += json_string_escape(p ? p->f3 : ""); json += "\",\"f5\":\""; json += json_string_escape(p ? p->f5 : "");
-    json += "\",\"exch\":\""; json += json_string_escape(p ? p->exch : ""); json += "\"}";
+    char json[512];
+    auto esc=[](char *dst,size_t cap,const char *src)->size_t{size_t n=0;if(!src)src="";while(*src&&n+2<cap){char c=*src++;const char *e=nullptr;switch(c){case '\\':e="\\\\";break;case '"':e="\\\"";break;case '\r':e="\\r";break;case '\n':e="\\n";break;case '\t':e="\\t";break;}if(e){while(*e&&n+1<cap)dst[n++]=*e++;}else dst[n++]=c;}dst[n]=0;return n;};
+    char e1[80],e2[80],e3[80],e5[80],ex[64]; esc(e1,sizeof(e1),p?p->f1:"");esc(e2,sizeof(e2),p?p->f2:"");esc(e3,sizeof(e3),p?p->f3:"");esc(e5,sizeof(e5),p?p->f5:"");esc(ex,sizeof(ex),p?p->exch:"");
+    snprintf(json,sizeof(json),"{\"f1\":\"%s\",\"f2\":\"%s\",\"f3\":\"%s\",\"f5\":\"%s\",\"exch\":\"%s\"}",e1,e2,e3,e5,ex);
     request->send(200,"application/json",json);
   });
 
   web_server.on("/select_contest", HTTP_GET, [](AsyncWebServerRequest *request) {
-    Serial.printf("WEB CONTEST: request /select_contest params=%u\n", (unsigned)request->params());
+    console->printf("WEB CONTEST: request /select_contest params=%u\n", (unsigned)request->params());
     AsyncWebParameter *id_param=contest_request_param(request,"id");
     if(!id_param){set_contest_web_status("request rejected: missing contest id");request->send(400,"text/plain",contest_web_last_status);return;}
     int id=id_param->value().toInt(); int index=-1;
     for(int i=0;i<contest_definition_count();++i) if(contest_definition_id(i)==id){index=i;break;}
     if(index<0){set_contest_web_status(String("request rejected: invalid contest id ")+String(id));request->send(400,"text/plain",contest_web_last_status);return;}
-    Serial.printf("WEB CONTEST: built-in id=%d name=%s\n", id, contest_definition_name(index));
+    console->printf("WEB CONTEST: built-in id=%d name=%s\n", id, contest_definition_name(index));
     ContestWebPreset *p=NULL;
     if(!update_preset_from_request(request,contest_definition_name(index),&p)){set_contest_web_status(String("request rejected: missing preset values for ")+contest_definition_name(index));request->send(400,"text/plain",contest_web_last_status);return;}
-    Serial.println("WEB CONTEST: preset values received; saving");
+    console->println("WEB CONTEST: preset values received; saving");
     if(!save_contest_web_presets()){request->send(500,"text/plain",contest_web_last_status);return;}
-    Serial.println("WEB CONTEST: preset saved; applying contest");
-    plogw->contest_id=id; set_contest_id(); set_current_contest_messages(*p);
+    console->println("WEB CONTEST: preset saved; applying contest");
+    plogw->contest_id=id; set_contest_id();
+    contest_entry_set_single(plogw->contest_name + 2);
+    set_current_contest_messages(*p);
     upd_display_info_contest_settings(so2r.radio_selected());
     set_contest_web_status(String("selected ") + (plogw->contest_name+2) + ", F2=\"" + (plogw->cw_msg[1]+2) + "\", EXCH=\"" + (plogw->sent_exch+2) + "\"");
     request->redirect(request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja") ? "/contests?lang=ja" : "/contests?lang=en");
   });
 
   web_server.on("/select_user_contest", HTTP_GET, [](AsyncWebServerRequest *request) {
-    Serial.printf("WEB CONTEST: request /select_user_contest params=%u\n", (unsigned)request->params());
+    console->printf("WEB CONTEST: request /select_user_contest params=%u\n", (unsigned)request->params());
     AsyncWebParameter *filename_param=contest_request_param(request,"filename");
     AsyncWebParameter *slot_param=contest_request_param(request,"slot");
     if(!filename_param){set_contest_web_status("User request rejected: missing filename");request->send(400,"text/plain",contest_web_last_status);return;}
@@ -2123,6 +2678,7 @@ static void setupContestPageHandler() {
     strlcpy(contest_web_user_slot[slot],filename.c_str(),sizeof(contest_web_user_slot[slot]));
     if(!save_contest_web_presets()){request->send(500,"text/plain",contest_web_last_status);return;}
     strncpy(plogw->contest_name+2,contestName.c_str(),LEN_CONTEST_NAME); plogw->contest_name[2+LEN_CONTEST_NAME]='\0';
+    contest_entry_set_single(plogw->contest_name + 2);
     set_current_contest_messages(*p);
     upd_display_info_contest_settings(so2r.radio_selected());
     set_user_md_fallback_dupe_mask(p->dupe_separate ? CW_PH_DUPE_OK : CW_PH_DUPE_NG);
@@ -2136,6 +2692,7 @@ static void setupContestPageHandler() {
 
 void setupSettingsPageHandler() {
   web_server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!web_lowmem_admit_heavy(request, "/settings")) return;
     // The old implementation built two large Arduino Strings (the complete
     // HTML page plus a separately concatenated input-list) before send().
     // On HWVER=1 this can require several large contiguous INTERNAL-RAM
@@ -2150,6 +2707,10 @@ void setupSettingsPageHandler() {
       size_t display_pos = 0;
       char line[384];
       char lifetime[16];
+      uint32_t trace_id = 0;
+      size_t trace_total = 0;
+      size_t trace_next = 4096;
+      bool trace_eof = false;
     };
 
     std::shared_ptr<SettingsPageState> state =
@@ -2158,6 +2719,7 @@ void setupSettingsPageHandler() {
       request->send(503, "text/plain", "Not enough memory for Settings page");
       return;
     }
+    state->trace_id = web_trace_begin("/settings");
     snprintf(state->lifetime, sizeof(state->lifetime), "%d",
              bandmap_lifetime_minutes);
 
@@ -2176,6 +2738,7 @@ void setupSettingsPageHandler() {
       [state](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
         (void)index;
         size_t written = 0;
+        const size_t chunkLimit = web_stream_chunk_limit(maxLen);
 
         static const uint8_t display_order[] = {
           0, 1, 2, 3, 4, 5, 6, 27,
@@ -2196,7 +2759,7 @@ void setupSettingsPageHandler() {
         auto copy_range = [&](const char *src, size_t len) -> bool {
           if (state->offset > len) state->offset = len;
           const size_t remain = len - state->offset;
-          const size_t room = maxLen - written;
+          const size_t room = chunkLimit - written;
           const size_t n = remain < room ? remain : room;
           if (n) {
             memcpy(buffer + written, src + state->offset, n);
@@ -2214,7 +2777,7 @@ void setupSettingsPageHandler() {
           return copy_range(src, strlen(src));
         };
 
-        while (written < maxLen && state->stage != SettingsPageState::Done) {
+        while (written < chunkLimit && state->stage != SettingsPageState::Done) {
           switch (state->stage) {
           case SettingsPageState::Prefix:
             if (copy_range(settings_page_html,
@@ -2280,15 +2843,26 @@ void setupSettingsPageHandler() {
             break;
           }
         }
+        state->trace_total += written;
+        if (state->trace_total >= state->trace_next) {
+          web_trace_touch(state->trace_id, "/settings", "CHUNK", state->trace_total);
+          state->trace_next += 4096;
+        }
+        if (state->stage == SettingsPageState::Done && !state->trace_eof) {
+          state->trace_eof = true;
+          web_trace_touch(state->trace_id, "/settings", "EOF", state->trace_total);
+        }
         return written;
       });
 
     response->addHeader("Cache-Control", "no-store");
     request->send(response);
+    web_trace_touch(state->trace_id, "/settings", "QUEUED");
   });
 
 
   web_server.on("/rigs", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!web_lowmem_admit_heavy(request, "/rigs")) return;
     struct RigsPageState {
       enum Stage : uint8_t { Header, RigEntry, Footer, Done } stage = Header;
       size_t offset = 0;
@@ -2461,6 +3035,27 @@ void setupSettingsPageHandler() {
     request->send(200, "text/plain", mode == 1 ? "Clock display: UTC (saved)" : "Clock display: JST (saved)");
   });
 
+  web_server.on("/call_stack_mode", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", String(plogw->call_stack_mode ? 1 : 0));
+  });
+
+  web_server.on("/set_call_stack_mode", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->hasParam("enabled")) {
+      request->send(400, "text/plain", "Missing enabled");
+      return;
+    }
+    const int enabled = request->getParam("enabled")->value().toInt();
+    if (enabled != 0 && enabled != 1) {
+      request->send(400, "text/plain", "Invalid enabled");
+      return;
+    }
+    set_call_stack_mode(enabled != 0);
+    save_settings("");
+    request->send(200, "text/plain",
+                  enabled ? "Call Stack Mode: ON (saved)"
+                          : "Call Stack Mode: OFF (saved)");
+  });
+
 
   web_server.on("/save_rigs", HTTP_GET, [](AsyncWebServerRequest *request){
     save_rigs("RIGS"); 
@@ -2548,15 +3143,23 @@ struct QsoDumpState {
   File file;
   size_t pos = 0;
   bool isCurrent = false;
-  String fname;
+  char fname[20] = {0};
   bool finished = false;
   union qso_union_tag qso;
-  int type = 0; // 0: dump 1:txt 2;adif 3:csv
-  String pendingLine ="";
-  char dumpbuf[1024];
+  int type = 0; // 0:dump 1:txt 2:adif 3:csv 4:jarllog 5:cabrillo
+  char *pendingLine = web_shared_scratch;
+  size_t pendingLen = 0;
+  size_t pendingOff = 0;
+  char *dumpbuf = web_shared_scratch + 1024;
+  bool owns_scratch = false;
+  uint32_t scratch_lease = 0;
   bool headerWritten = false;  // added
-  String park;
-  String summit;
+  ~QsoDumpState() { if (file) file.close(); if (owns_scratch) web_shared_scratch_release(scratch_lease); }
+  char park[24] = {0};
+  char summit[24] = {0};
+  char cabrilloContest[40] = {0};
+  char cabrilloCall[LEN_QSO_CALLSIGN + 1] = {0};
+  char cabrilloSourceContest[40] = {0};
   
 };
 
@@ -2564,65 +3167,78 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
 
 #define RECORD_SIZE sizeof(state.qso.all)
   size_t bytesWritten = 0;
+  // Keep each AsyncWebServer producer callback small on low-memory ESP32.
+  // This provides back-pressure instead of filling AsyncTCP buffers eagerly.
+  const size_t chunkLimit = web_stream_chunk_limit(maxLen);
   //  char raw[RECORD_SIZE + 1];  // 1レコード分
   //  raw[RECORD_SIZE] = '\0';
 
   //  char linebuf[2048];
 
-  // 1. ヘッダー未出力なら先に出す
+  // 1. Header: format directly into the shared fixed workspace.
   if (!state.headerWritten) {
-    String header;
+    char *header = web_shared_scratch + 2048;
+    size_t headerLen = 0;
     if (state.type == 4) {
-      // show the leading part of html      
-      header += "<body onload=\"document.getElementById('form').submit()\"><form id=\"form\" method=\"POST\" action=\"https://contest.jarl.org/cgi-bin/logsheetform.cgi\"> <input type=\"hidden\" name=\"command\" value=\"load\" />    <textarea name=\"logsheet_file\" cols=\"80\" rows=\"10\">\r\nDVPlogger text log follows; time:";
-      header +=plogw->tm;
-      header +="\r\n";
-    } else if (state.type==2) {
-      // adif header
-      header+="<eoh>\n";
-    } else {
-      header = "";
+      int n = snprintf(header, 1024,
+        "<body onload=\"document.getElementById('form').submit()\"><form id=\"form\" method=\"POST\" action=\"https://contest.jarl.org/cgi-bin/logsheetform.cgi\"> <input type=\"hidden\" name=\"command\" value=\"load\" />    <textarea name=\"logsheet_file\" cols=\"80\" rows=\"10\">\r\nDVPlogger text log follows; time:%s\r\n",
+        plogw->tm);
+      headerLen = n > 0 ? std::min((size_t)n, (size_t)1023) : 0;
+    } else if (state.type == 2) {
+      strlcpy(header, "<eoh>\n", 1024);
+      headerLen = 6;
+    } else if (state.type == 5) {
+      int n = snprintf(header, 1024,
+        "START-OF-LOG: 3.0\r\nCALLSIGN: %s\r\nCONTEST: %s\r\nCREATED-BY: DVPlogger\r\n",
+        state.cabrilloCall[0] ? state.cabrilloCall : plogw->my_callsign + 2,
+        state.cabrilloContest[0] ? state.cabrilloContest : "UNKNOWN");
+      headerLen = n > 0 ? std::min((size_t)n, (size_t)1023) : 0;
+      const char *email = plogw->email_addr + 2;
+      if (email[0] && strcasecmp(email, "email@address") != 0 && headerLen < 1023) {
+        n = snprintf(header + headerLen, 1024 - headerLen, "EMAIL: %s\r\n", email);
+        if (n > 0) headerLen += std::min((size_t)n, (size_t)(1023 - headerLen));
+      }
+      const char *name = plogw->my_name + 2;
+      if (name[0] && strcasecmp(name, "NoName") != 0 && headerLen < 1023) {
+        n = snprintf(header + headerLen, 1024 - headerLen, "NAME: %.75s\r\n", name);
+        if (n > 0) headerLen += std::min((size_t)n, (size_t)(1023 - headerLen));
+      }
     }
-
-    if (header.length() <= maxLen) {
-      memcpy(buffer, header.c_str(), header.length());
-      bytesWritten += header.length();
-      state.headerWritten = true;
-      //      webLog.println("header written");
-    } else {
-      // ヘッダーすら入らない → ダミー送信
-      memcpy(buffer, "\n", 1);
-      return 1;
-    }
+    const size_t ncopy = std::min(headerLen, chunkLimit);
+    if (ncopy) memcpy(buffer, header, ncopy);
+    bytesWritten = ncopy;
+    state.headerWritten = true;
   }
 
   // 2. pendingLine の処理（前回入らなかった行）
-  if (!state.pendingLine.isEmpty()) {
-    size_t len = state.pendingLine.length();
-    if (bytesWritten + len <= maxLen) {
-      memcpy(buffer + bytesWritten, state.pendingLine.c_str(), len);
-      bytesWritten += len;
-      state.pendingLine = "";
-      webLog.println("pending line write");      
+  if (state.pendingLen > state.pendingOff) {
+    const size_t remain = state.pendingLen - state.pendingOff;
+    const size_t room = chunkLimit - bytesWritten;
+    const size_t ncopy = std::min(remain, room);
+    if (ncopy) {
+      memcpy(buffer + bytesWritten, state.pendingLine + state.pendingOff, ncopy);
+      bytesWritten += ncopy;
+      state.pendingOff += ncopy;
+    }
+    if (state.pendingOff == state.pendingLen) {
+      state.pendingLen = 0;
+      state.pendingOff = 0;
+      state.pendingLine[0] = '\0';
     } else {
-      // まだ入らない → 1バイトだけ送る
-      memcpy(buffer + bytesWritten, "\n", 1);
-      webLog.println("dummy write +");
-      return bytesWritten + 1;
+      // The pending line itself fills this 1 KiB chunk.  Return it directly;
+      // no dummy byte and no temporary String allocation are needed.
+      return bytesWritten;
     }
   }
 
   // 2. ファイル終端チェック
   if (!state.file || state.finished || state.pos >= state.file.size()) {
     state.finished = true;
-    webLog.print("state.file:");    webLog.print(state.file);
-    webLog.print(" state.finished:");    webLog.println(state.finished);    
     return 0;
   }
 
   // main qso read & dump loop
-  webLog.print("maxLen:");      webLog.println(maxLen);
-  while ((bytesWritten < maxLen) && (bytesWritten < 2048) ) {
+  while (bytesWritten < chunkLimit) {
     //  while ((bytesWritten < maxLen)) {
     if (state.pos >= state.file.size()) {
       state.finished = true;
@@ -2647,16 +3263,24 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
       strcat(state.dumpbuf,(char *)state.qso.all1);
     } else {
       reformat_qso_entry(&state.qso);
+      if (state.type == 5) {
+        if (state.qso.entry.type[0] != 'Q') continue;
+        char qcontest[40];
+        if (state.cabrilloSourceContest[0]) {
+          if (!qso_contest_name(&state.qso, qcontest, sizeof(qcontest)) ||
+              strcasecmp(qcontest, state.cabrilloSourceContest) != 0) continue;
+        }
+      }
 
       // check park number
       char *p1;
-      if (!state.park.isEmpty()) {
+      if (state.park[0] != '\0') {
 	if ((p1=strstr(state.qso.entry.remarks,"POTA_MY:"))!=NULL) { // my park information in POTA activation
 	  char tmpbuf1[100];
 	  strcpy(tmpbuf1,p1+8);
 	  p1=strtok(tmpbuf1," ");
 	  if (p1!=NULL) {
-	    if (!state.park.equals(p1)) {
+	    if (strcmp(state.park, p1) != 0) {
 	      // match
 	      continue;
 	    }
@@ -2668,13 +3292,13 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
 	}
       }
 
-      if (!state.summit.isEmpty()) {
+      if (state.summit[0] != '\0') {
 	if ((p1=strstr(state.qso.entry.remarks,"SOTA_MY:"))!=NULL) { // my park information in SOTA activation
 	  char tmpbuf1[100];
 	  strcpy(tmpbuf1,p1+8);
 	  p1=strtok(tmpbuf1," ");
 	  if (p1!=NULL) {
-	    if (!state.park.equals(p1)) {
+	    if (strcmp(state.summit, p1) != 0) {
 	      // match
 	      continue;
 	    }
@@ -2698,6 +3322,9 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
       } else if (state.type==4) {
 	// jarllog
 	sprint_qso_entry(state.dumpbuf,&state.qso);	
+      } else if (state.type==5) {
+        // Cabrillo 3.0 QSO line; sent/received exchanges come from the QSO record.
+        sprint_qso_entry_cabrillo(state.dumpbuf, &state.qso);
       } else {
 	// error
 	webLog.print("errortic state.type=");webLog.println(state.type);
@@ -2705,48 +3332,65 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
 	break;
       }
     }
-    String line;
-    line = String(state.dumpbuf) ;
-
-    /*    size_t lineLen = line.length();
-    if (bytesWritten + lineLen > maxLen) {
-      // 次回にまわす
-      state.pos -= RECORD_SIZE;  // 読み戻す
-      break;
-    }
-    */
-    
-    size_t lineLen = line.length();
-    if (bytesWritten+lineLen <= maxLen) {
-      memcpy(buffer + bytesWritten, line.c_str(), lineLen);
+    const size_t lineLen = strnlen(state.dumpbuf, 1024);
+    if (bytesWritten + lineLen <= chunkLimit) {
+      memcpy(buffer + bytesWritten, state.dumpbuf, lineLen);
       bytesWritten += lineLen;
-      webLog.print("bytesWritten:");webLog.print(bytesWritten);
-      webLog.print(" pos:");webLog.println(state.pos);    
     } else {
-      // 5. 今回は出力できない → キャッシュに入れて、最小限の出力
-      state.pendingLine = line;
-      memcpy(buffer+bytesWritten, "\n", 1);  // ダミーでも返す
-      webLog.println("pending line  +cache + dummy write");      
-      return bytesWritten+1;
+      // Cache the formatted line in fixed storage.  This avoids String heap
+      // allocation/fragmentation and lets the next callback drain it in pieces.
+      const size_t cacheLen = std::min(lineLen, (size_t)(1024 - 1));
+      memcpy(state.pendingLine, state.dumpbuf, cacheLen);
+      state.pendingLine[cacheLen] = '\0';
+      state.pendingLen = cacheLen;
+      state.pendingOff = 0;
+
+      // Use any room left in this chunk immediately; do not enqueue a dummy byte.
+      const size_t room = chunkLimit - bytesWritten;
+      const size_t ncopy = std::min(state.pendingLen, room);
+      if (ncopy) {
+        memcpy(buffer + bytesWritten, state.pendingLine, ncopy);
+        bytesWritten += ncopy;
+        state.pendingOff = ncopy;
+      }
+      return bytesWritten;
     }
   }
 
   // 終了処理
   if (state.finished) {
     webLog.println("state.finished reached");
-    String footer = "";
-    if (state.type!=2 && state.type!=3) { // not adif
-      footer += "---- end of file ";
-      footer += state.isCurrent ? "(current)" : state.fname;
-      footer += " -----\n";
+    char *footer = web_shared_scratch + 2048;
+    size_t footerTotal = 0;
+    if (state.type == 5) {
+      strlcpy(footer, "END-OF-LOG:\r\n", 1024);
+      footerTotal = strlen(footer);
+    } else if (state.type != 2 && state.type != 3) {
+      int n = snprintf(footer, 1024, "---- end of file %s -----\n",
+                       state.isCurrent ? "(current)" : state.fname);
+      footerTotal = n > 0 ? std::min((size_t)n, (size_t)1023) : 0;
+    } else {
+      footer[0] = '\0';
     }
-    if (state.type==4) { // jarllog
-      footer+="</textarea> <br /><input type=\"submit\" value=\"send to logsheetform\" /></form></body>";
+    if (state.type == 4 && footerTotal < 1023) {
+      const char *tail = "</textarea> <br /><input type=\"submit\" value=\"send to logsheetform\" /></form></body>";
+      strlcpy(footer + footerTotal, tail, 1024 - footerTotal);
+      footerTotal = strlen(footer);
     }
-    size_t footerLen = std::min(maxLen - bytesWritten, (size_t)footer.length());
-    memcpy(buffer + bytesWritten, footer.c_str(), footerLen);
-    bytesWritten += footerLen;
-    
+    const size_t room = chunkLimit - bytesWritten;
+    const size_t footerLen = std::min(room, footerTotal);
+    if (footerLen) {
+      memcpy(buffer + bytesWritten, footer, footerLen);
+      bytesWritten += footerLen;
+    }
+    if (footerLen < footerTotal) {
+      const size_t remain = std::min(footerTotal - footerLen, (size_t)1023);
+      memcpy(state.pendingLine, footer + footerLen, remain);
+      state.pendingLine[remain] = '\0';
+      state.pendingLen = remain;
+      state.pendingOff = 0;
+    }
+
     if (!state.isCurrent) state.file.close();
   } else {
     if (bytesWritten==0) {
@@ -2756,42 +3400,118 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
       return 1;
     }
   }
-  webLog.print("returning bytesWritten:");webLog.println(bytesWritten);
   return bytesWritten;
 }
 
 void handleQsoLogDump(AsyncWebServerRequest* request, const String& numstr, int type) {
-    struct QsoDumpState state;
-    state.type = type;
-    state.qso.all1[sizeof(state.qso.all)]='\0';
-    state.park = request->hasParam("park") ? request->getParam("park")->value() : "";
-    state.summit = request->hasParam("summit") ? request->getParam("summit")->value() : "";    
-    
-    if (numstr.isEmpty()) {
-      // 現在ログ (共通ファイル)
-      state.file = qsologf;
-      state.isCurrent = true;
-      state.fname = "";
-    } else {
-      state.fname = "/qsobak." + numstr;
-      if (!SD.exists(state.fname)) {
-	request->send(404, "text/plain", "Log file not found.");
-	return;
-      }
-      state.file = SD.open(state.fname, "r");
+    if (!web_lowmem_admit_heavy(request, "/qso-export")) return;
+    // Keep the large QSO streaming state off the AsyncTCP task stack and avoid
+    // copying File/String objects into the chunked-response lambda.
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/qso-export", &scratch_lease)) return;
+    std::shared_ptr<QsoDumpState> state = std::make_shared<QsoDumpState>();
+    if (!state) {
+      web_shared_scratch_release(scratch_lease);
+      request->send(503, "text/plain", "Not enough memory for QSO export");
+      return;
+    }
+    state->owns_scratch = true;
+    state->scratch_lease = scratch_lease;
+    state->type = type;
+    state->qso.all1[sizeof(state->qso.all)]='\0';
+
+    if (request->hasParam("park")) {
+      strlcpy(state->park, request->getParam("park")->value().c_str(), sizeof(state->park));
+    }
+    if (request->hasParam("summit")) {
+      strlcpy(state->summit, request->getParam("summit")->value().c_str(), sizeof(state->summit));
     }
 
-    if (!state.file) {
+    if (numstr.isEmpty()) {
+      // Open a dedicated read-only handle for web export.  Do not copy the
+      // logger's long-lived append handle (qsologf) into QsoDumpState: its
+      // destructor closes state->file when the async response finishes.
+      state->file = SD.open(qsologfn, FILE_READ);
+      state->isCurrent = true;
+      strlcpy(state->fname, qsologfn, sizeof(state->fname));
+    } else {
+      snprintf(state->fname, sizeof(state->fname), "/qsobak.%s", numstr.c_str());
+      if (!SD.exists(state->fname)) {
+        request->send(404, "text/plain", "Log file not found.");
+        return;
+      }
+      state->file = SD.open(state->fname, "r");
+    }
+
+    if (!state->file) {
       request->send(500, "text/plain", "Failed to open log file.");
       return;
     }
 
-    AsyncWebServerResponse* response = request->beginChunkedResponse(type == 4 ? "text/html" : "text/plain",
-								     [state](uint8_t* buffer, size_t maxLen, size_t index) mutable -> size_t {
-								       return readQsoChunk(state, buffer, maxLen);
-								     });
+    if (type == 5) {
+      // Cabrillo is a contest log, unlike /readqso.  Export only QSOs tagged
+      // with the currently selected contest.  If no contest is selected, use
+      // the first C: tag found in the file as a fallback.
+      if (plogw->contest_name[2])
+        strlcpy(state->cabrilloSourceContest, plogw->contest_name + 2,
+                sizeof(state->cabrilloSourceContest));
+      size_t save_pos = state->file.position();
+      union qso_union_tag probe;
+      probe.all1[sizeof(probe.all)] = '\0';
+      for (size_t p = 0; p + sizeof(probe.all) <= state->file.size(); p += sizeof(probe.all)) {
+        state->file.seek(p);
+        if (state->file.read((uint8_t*)probe.all, sizeof(probe.all)) < sizeof(probe.all)) break;
+        reformat_qso_entry(&probe);
+        if (probe.entry.type[0] != 'Q') continue;
+        if (!state->cabrilloCall[0] && probe.entry.mycall[0])
+          strlcpy(state->cabrilloCall, probe.entry.mycall, sizeof(state->cabrilloCall));
+        char contest[40];
+        if (qso_contest_name(&probe, contest, sizeof(contest))) {
+          if (!state->cabrilloSourceContest[0])
+            strlcpy(state->cabrilloSourceContest, contest, sizeof(state->cabrilloSourceContest));
+          if (strcasecmp(contest, state->cabrilloSourceContest) != 0) continue;
+          if (strcasecmp(contest, "ARRL10m") == 0 || strcasecmp(contest, "ARRL10") == 0)
+            strlcpy(state->cabrilloContest, "ARRL-10", sizeof(state->cabrilloContest));
+          else if (strcasecmp(contest, "CQWWRTTY") == 0)
+            strlcpy(state->cabrilloContest, "CQ-WW-RTTY", sizeof(state->cabrilloContest));
+          else if (strcasecmp(contest, "ARRLDX") == 0)
+            strlcpy(state->cabrilloContest,
+                    (strncmp(probe.entry.mode, "CW", 2) == 0) ? "ARRL-DX-CW" : "ARRL-DX-SSB",
+                    sizeof(state->cabrilloContest));
+          else {
+            size_t j = 0;
+            for (size_t i = 0; contest[i] && j + 1 < sizeof(state->cabrilloContest); ++i) {
+              unsigned char c = (unsigned char)contest[i];
+              if (isalnum(c)) state->cabrilloContest[j++] = toupper(c);
+              else if (c == '-' || c == '_') state->cabrilloContest[j++] = '-';
+            }
+            state->cabrilloContest[j] = '\0';
+          }
+          break;
+        }
+      }
+      state->file.seek(save_pos);
+    }
 
+    const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    char qso_diag[112];
+    snprintf(qso_diag, sizeof(qso_diag),
+             "QSO export begin type=%d size=%u free=%u largest=%u",
+             type, (unsigned)state->file.size(), (unsigned)free_internal,
+             (unsigned)largest_internal);
+    webLog.println(qso_diag);
+
+    AsyncWebServerResponse* response = request->beginChunkedResponse(
+      type == 4 ? "text/html" : (type == 3 ? "text/csv; charset=utf-8" : "text/plain; charset=utf-8"),
+      [state](uint8_t* buffer, size_t maxLen, size_t index) mutable -> size_t {
+        (void)index;
+        return readQsoChunk(*state, buffer, web_stream_chunk_limit(maxLen));
+      });
+
+    if (type == 5) response->addHeader("Content-Disposition", "attachment; filename=contest.log");
     response->addHeader("Server", "ESP Async Web Server");
+    response->addHeader("Cache-Control", "no-store");
     request->send(response);
   }
 
@@ -2808,10 +3528,11 @@ const char index_html[] PROGMEM = R"rawliteral(
   <p><h1>DVPlogger Usage</h1></p>
 <p><a href="/jarllog">/jarllog</a> to send log to JARL Log Maker.</p>
 <p><a href="/readqso">/readqso</a> to read QSO data in text.</p>
+<p><a href="/cabrillo">/cabrillo</a> to download Cabrillo 3.0 contest log.</p>
 <p><a href="/csv">/csv</a> to read QSO data in HAMLOG csv.</p>
 <p><a href="/adif">/adif</a> to read QSO data in ADIF format.</p>
 <p><a href="/dumpqso">/dumpqso</a> to dump backup qso data\n(*) </p>
-<p>jarllog,readqso,dumpqso,csv,adif?num=QSOFILENUM(001,...) to process backup QSO files.</p>
+<p>jarllog,readqso,cabrillo,dumpqso,csv,adif?num=QSOFILENUM(001,...) to process backup QSO files.</p>
 <p>?park=PARK# でPARK#からQRVしたログ(Remarks にPOTA_MY:PARK#)のみ出力します。</p>
 <p>?summit=SUMMIT# でSOTA SUMMIT#からQRVしたログ(Remarks にSOTA_MY:SUMMIT#)のみ出力します。</p>
 <p><a href="/potahelp?lang=ja">POTA helper (jp)</a> <a href="/potahelp?lang=en">(en)</a> Nearest-park search / ADIF export</p>
@@ -2824,9 +3545,10 @@ const char index_html[] PROGMEM = R"rawliteral(
 <p><a href="https://github.com/JK1DVP/dvplogger/blob/main/DVPlogger_manual_260827.pdf">Manual DVPlogger_manual_260827.pdf</a></p>
 <p><a href="/op">/op</a> Web Opeartion Window</p>
 <p><a href="/sat">/sat</a> Satellite Operation Helper</p>
+<p><a href="/location">/location</a> Smartphone / map location setup</p>
 
   <p><h1>File Upload</h1></p>
-  <p>SD Free: %FREESPIFFS% | SD Used: %USEDSPIFFS% | SD Total: %TOTALSPIFFS%</p>
+  <p>SD Free: <span id="sdFree">...</span> | SD Used: <span id="sdUsed">...</span> | SD Total: <span id="sdTotal">...</span></p>
   <form method="POST" action="/upload" enctype="multipart/form-data"><input type="file" name="data"/><input type="submit" name="upload" value="Upload" title="Upload File"></form>
 <p>パーシャルチェックのファイルはname.pck (8.3形式)でアップロードしてください。</p>
 <p>CALLHISTnameとコマンドを入力すると、name.pckを読み込みます。</p>
@@ -2837,10 +3559,22 @@ const char index_html[] PROGMEM = R"rawliteral(
   <p>You can see the progress of the upload by watching the serial output.</p>
   <div id="filelist">Loading SD file list...</div>
 <script>
-fetch('/filelist', {cache:'no-store'})
+// Fetch small dynamic values only after the static root page has completed.
+// Do these sequentially on low-memory hardware so two AsyncTCP responses do
+// not compete for the same small internal-RAM send window.
+new Promise(function(resolve){ setTimeout(resolve, 500); })
+  .then(function(){ return fetch('/api/storage', {cache:'no-store'}); })
+  .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+  .then(function(j){
+    document.getElementById('sdFree').textContent=j.free;
+    document.getElementById('sdUsed').textContent=j.used;
+    document.getElementById('sdTotal').textContent=j.total;
+    return new Promise(function(resolve){ setTimeout(resolve, 350); });
+  })
+  .then(function(){ return fetch('/filelist', {cache:'no-store'}); })
   .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
   .then(function(html){ document.getElementById('filelist').innerHTML=html; })
-  .catch(function(e){ document.getElementById('filelist').textContent='SD file list error: '+e; });
+  .catch(function(e){ document.getElementById('filelist').textContent='SD info error: '+e; });
 </script>
 </body>
 </html>
@@ -2971,6 +3705,76 @@ loadConfig();
 )rawliteral";
 
 
+const char location_page_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DVPlogger Location</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+body{font-family:sans-serif;margin:14px;max-width:900px}nav a{margin-right:12px}
+.card{border:1px solid #aaa;border-radius:8px;padding:12px;margin-top:12px}
+.fields{display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:center}
+input,button{font-size:1.05rem;padding:8px;box-sizing:border-box}input{width:100%}
+button{margin:4px 4px 4px 0}.primary{font-weight:bold}#map{height:52vh;min-height:320px;border:1px solid #888}
+#msg{white-space:pre-wrap}.ok{color:#075;font-weight:bold}.err{color:#b00;font-weight:bold}
+@media(max-width:520px){body{margin:8px}.fields{grid-template-columns:1fr}.fields label{margin-top:4px}#map{height:48vh}}
+</style></head><body>
+<nav><a href="/">ホーム</a><a href="/op">運用画面</a><a href="/sat">衛星</a><a href="/location">位置設定</a></nav>
+<h1>現在位置の設定</h1>
+<div class="card"><div class="fields">
+<label for="lat">緯度</label><input id="lat" type="number" min="-90" max="90" step="0.000001" inputmode="decimal">
+<label for="lon">経度</label><input id="lon" type="number" min="-180" max="180" step="0.000001" inputmode="decimal">
+<label for="grid">Grid Locator</label><input id="grid" maxlength="6" autocapitalize="characters">
+</div>
+<p><button class="primary" onclick="saveLatLon()">緯度・経度を設定・保存</button>
+<button onclick="saveGrid()">Gridを設定・保存</button>
+<button onclick="phoneLocation()">スマホの現在位置</button></p>
+<div id="msg">読み込み中...</div></div>
+<div class="card"><h2>地図から指定</h2><p><small>地図をタップするとマーカーと入力値が移動します。地図表示にはインターネット接続が必要です。</small></p>
+<div id="map"></div></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const latEl=document.getElementById('lat'),lonEl=document.getElementById('lon'),gridEl=document.getElementById('grid'),msgEl=document.getElementById('msg');
+let map=null,marker=null;
+function maidenhead(lat,lon){
+  lat=Math.max(-89.999999,Math.min(89.999999,Number(lat)));lon=Math.max(-179.999999,Math.min(179.999999,Number(lon)));
+  let x=lon+180,y=lat+90;
+  return String.fromCharCode(65+Math.floor(x/20))+String.fromCharCode(65+Math.floor(y/10))+
+    Math.floor((x%20)/2)+Math.floor(y%10)+
+    String.fromCharCode(65+Math.floor((x%2)*12))+String.fromCharCode(65+Math.floor((y%1)*24));
+}
+function gridCenter(g){
+  g=String(g).trim().toUpperCase();if(!/^[A-R]{2}[0-9]{2}([A-X]{2})?$/.test(g))return null;
+  let lon=(g.charCodeAt(0)-65)*20-180,lat=(g.charCodeAt(1)-65)*10-90;
+  lon+=Number(g[2])*2;lat+=Number(g[3]);
+  if(g.length===6){lon+=(g.charCodeAt(4)-65)/12+1/24;lat+=(g.charCodeAt(5)-65)/24+1/48;}
+  else{lon+=1;lat+=0.5;}return {lat,lon};
+}
+function setPoint(lat,lon,move=true){
+  lat=Number(lat);lon=Number(lon);if(!Number.isFinite(lat)||!Number.isFinite(lon))return;
+  latEl.value=lat.toFixed(6);lonEl.value=lon.toFixed(6);gridEl.value=maidenhead(lat,lon);
+  if(map){if(!marker)marker=L.marker([lat,lon]).addTo(map);else marker.setLatLng([lat,lon]);if(move)map.setView([lat,lon],Math.max(map.getZoom(),11));}
+}
+function initMap(lat,lon){
+  if(typeof L==='undefined'){msgEl.className='err';msgEl.textContent+='\n地図ライブラリを取得できません。数値またはGrid入力は使用できます。';return;}
+  map=L.map('map').setView([lat,lon],11);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+  marker=L.marker([lat,lon]).addTo(map);map.on('click',e=>setPoint(e.latlng.lat,e.latlng.lng,false));
+}
+async function loadLocation(){try{const r=await fetch('/api/location',{cache:'no-store'});if(!r.ok)throw new Error(await r.text());const d=await r.json();setPoint(d.lat,d.lon,false);gridEl.value=d.grid;msgEl.className='';msgEl.textContent=`現在: ${d.grid}  ${Number(d.lat).toFixed(6)}, ${Number(d.lon).toFixed(6)}`;initMap(Number(d.lat),Number(d.lon));}catch(e){msgEl.className='err';msgEl.textContent='現在位置の取得失敗: '+e;initMap(35.681236,139.767125);}}
+async function post(q){const r=await fetch('/api/location?'+q,{method:'POST'});const t=await r.text();if(!r.ok)throw new Error(t);const d=JSON.parse(t);setPoint(d.lat,d.lon);gridEl.value=d.grid;msgEl.className='ok';msgEl.textContent=`保存しました: ${d.grid}  ${Number(d.lat).toFixed(6)}, ${Number(d.lon).toFixed(6)}`;}
+async function saveLatLon(){try{await post(new URLSearchParams({lat:latEl.value,lon:lonEl.value}));}catch(e){msgEl.className='err';msgEl.textContent='保存失敗: '+e.message;}}
+async function saveGrid(){try{const g=gridEl.value.trim().toUpperCase(),p=gridCenter(g);if(!p)throw new Error('Gridは4文字または6文字で入力してください');await post(new URLSearchParams({grid:g}));}catch(e){msgEl.className='err';msgEl.textContent='保存失敗: '+e.message;}}
+function phoneLocation(){
+  if(!navigator.geolocation){msgEl.className='err';msgEl.textContent='このブラウザでは位置情報を利用できません';return;}
+  msgEl.className='';msgEl.textContent='スマホの位置を取得中...';
+  navigator.geolocation.getCurrentPosition(p=>{setPoint(p.coords.latitude,p.coords.longitude);msgEl.textContent=`取得精度: 約${Math.round(p.coords.accuracy)} m（確認後「設定・保存」を押してください）`;},e=>{msgEl.className='err';msgEl.textContent='位置取得失敗: '+e.message+'\nHTTP接続ではブラウザに拒否される場合があります。';},{enableHighAccuracy:true,timeout:15000,maximumAge:30000});
+}
+latEl.addEventListener('change',()=>setPoint(latEl.value,lonEl.value));lonEl.addEventListener('change',()=>setPoint(latEl.value,lonEl.value));
+gridEl.addEventListener('change',()=>{const p=gridCenter(gridEl.value);if(p)setPoint(p.lat,p.lon);});loadLocation();
+</script></body></html>
+)rawliteral";
+
+
 const char sat_page_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DVPlogger Satellite Helper</title>
@@ -2983,10 +3787,10 @@ const char sat_page_html[] PROGMEM = R"rawliteral(
 .pass-grid>div:nth-child(2) .mono{font-size:1em;line-height:1.55}
 #passcanvas{width:100%;max-width:360px;height:auto;background:#111;border:1px solid #666}
 @media(max-width:700px){.pass-grid{grid-template-columns:1fr}}</style>
-</head><body><nav><a href="/">ホーム</a><a href="/op">運用画面</a><a href="/sat">衛星</a></nav>
+</head><body><nav><a href="/">ホーム</a><a href="/op">運用画面</a><a href="/sat">衛星</a><a href="/location">位置設定</a></nav>
 <h1>衛星運用ヘルパー</h1>
 <p><small>衛星位置・Doppler追尾計算はDVPlogger本体で約500 ms周期で更新されます。</small></p>
-<div class="cards"><section class="card"><h2>衛星選択</h2><p>現在: <span id="satmode" class="sat-off">SAT OFF</span></p><select id="sat"></select> <button onclick="selectSat()">選択・開始</button> <button onclick="satOn()">Satellite mode ON</button> <button onclick="satOff()">OFF</button><p id="selectmsg"></p></section>
+<div class="cards"><section class="card"><h2>衛星選択</h2><p>現在: <span id="satmode" class="sat-off">SAT OFF</span></p><select id="sat"></select> <button onclick="selectSat()">選択</button> <button onclick="satOn()">Satellite mode ON</button> <button onclick="satOff()">OFF</button><p id="selectmsg"></p></section>
 <section class="card"><h2>現在の追尾状態</h2><div id="status" class="status-large">読み込み中...</div></section>
 </div>
 <section class="card"><h2>次回パス</h2><p><button onclick="recalcAos()">AOS再計算</button> <span id="aosstate"></span></p>
@@ -3000,7 +3804,7 @@ const char sat_page_html[] PROGMEM = R"rawliteral(
 <div class="cards">
 <section class="card"><h2>運用制御</h2>
 <p>追尾: <select id="tracking"><option value="0">RX FIX</option><option value="1">TX FIX</option><option value="2">SAT FIX</option><option value="3">NO TRACK</option></select> <button onclick="setTracking()">設定</button></p>
-<p>VFO: <select id="vfomode"><option value="0">Single: TX=A</option><option value="1">Single: RX=A</option><option value="2">TX=Radio0 / RX=Radio1</option><option value="3">TX=Radio1 / RX=Radio0</option></select> <button onclick="setVfo()">設定</button> <button onclick="autoVfo()">Auto VFO</button></p><p id="autovfomsg" class="mono"></p>
+<p>VFO: <select id="vfomode"><option value="0">R_B_T_A / Single: TX=A (IC-9700 DUAL: RX=SUB, TX=MAIN)</option><option value="1">R_A_T_B / Single: RX=A (IC-9700 SAT: RX=MAIN, TX=SUB)</option><option value="2">TX=Radio0 / RX=Radio1</option><option value="3">TX=Radio1 / RX=Radio0</option></select> <button onclick="setVfo()">設定</button> <button onclick="autoVfo()">Auto VFO</button></p><p id="autovfomsg" class="mono"></p>
 <p><button onclick="action('center')">Center</button> <button onclick="action('beacon')">Beacon</button></p>
 <p>Offset: <button onclick="offset(-100)">-100</button> <button onclick="offset(-10)">-10</button> <button onclick="offset(10)">+10</button> <button onclick="offset(100)">+100</button> Hz</p>
 <p id="opmsg"></p></section>
@@ -3012,7 +3816,7 @@ const char sat_page_html[] PROGMEM = R"rawliteral(
 </section></div>
 <section class="card"><h2>衛星データ管理</h2>
 <p><small>Name はTLE内の衛星名と一致させてください。周波数は MHz、Offset は Hz です。最大26エントリ。</small></p>
-<div style="overflow-x:auto"><table><thead><tr><th>Name</th><th>Up MHz</th><th>Mode</th><th>Down MHz</th><th>Mode</th><th>Beacon MHz</th><th>Offset Hz</th><th>TLE</th><th></th></tr></thead><tbody id="satdbbody"></tbody></table></div>
+<div style="overflow-x:auto"><table><thead><tr><th></th><th>Name</th><th>Up MHz</th><th>Mode</th><th>Down MHz</th><th>Mode</th><th>Beacon MHz</th><th>Offset Hz</th><th>TLE</th><th></th></tr></thead><tbody id="satdbbody"></tbody></table></div>
 <h3 id="satdbtitle">新規追加</h3>
 <input type="hidden" id="satdbindex" value="-1">
 <p>Name <input id="satdbname" size="16" maxlength="19">
@@ -3100,7 +3904,7 @@ async function updateExpandedNow(){
     drawSky(expandedPassData.points,d);
   }catch(e){}
 }
-async function selectSat(){const q=new URLSearchParams({index:satEl.value});const r=await fetch('/api/sat/select?'+q,{method:'POST'});selectMsgEl.textContent=await r.text();trackingDirty=false;vfoDirty=false;await loadStatus();await loadList();}
+async function selectSat(){const q=new URLSearchParams({index:satEl.value});const r=await fetch('/api/sat/select?'+q,{method:'POST'});selectMsgEl.textContent=await r.text();trackingDirty=false;vfoDirty=false;await loadStatus();await loadList();await loadSatDb();}
 async function satOn(){const r=await fetch('/api/sat/enable?enabled=1',{method:'POST'});const msg=await r.text();selectMsgEl.textContent=r.ok?msg:`SAT ON失敗 (HTTP ${r.status}): ${msg}`;trackingDirty=false;vfoDirty=false;if(r.ok){await loadList();await loadSatDb();await loadAos();}await loadStatus();}
 async function satOff(){const r=await fetch('/api/sat/enable?enabled=0',{method:'POST'});selectMsgEl.textContent=await r.text();await loadStatus();}
 async function setTracking(){const r=await fetch('/api/sat/tracking?mode='+trackingEl.value,{method:'POST'});opMsgEl.textContent=await r.text();if(r.ok)trackingDirty=false;await loadStatus();}
@@ -3112,7 +3916,8 @@ async function saveLocation(){const q=new URLSearchParams({grid:gridLocEl.value.
 async function recalcAos(){await fetch('/api/sat/aos/recalculate',{method:'POST'});loadAos();}
 let satDbRows=[];
 function mhz(v){return (Number(v)/1000000).toFixed(6);}
-async function loadSatDb(){try{const d=await (await fetch('/api/sat/db',{cache:'no-store'})).json();satDbRows=d.satellites;satdbbody.innerHTML=d.satellites.map(x=>`<tr><td>${esc(x.name)}</td><td>${mhz(x.up0)}-${mhz(x.up1)}</td><td>${esc(x.upmode)}</td><td>${mhz(x.dn0)}-${mhz(x.dn1)}</td><td>${esc(x.dnmode)}</td><td>${mhz(x.beacon)}</td><td>${x.offset}</td><td>${x.tle?'OK':'--'}</td><td><button onclick="editSatDb(${x.index})">編集</button> <button onclick="deleteSatDb(${x.index})">削除</button></td></tr>`).join('');}catch(e){satdbmsg.textContent='一覧取得失敗: '+e.message;}}
+async function loadSatDb(){try{const [db,status]=await Promise.all([(await fetch('/api/sat/db',{cache:'no-store'})).json(),(await fetch('/api/sat/status',{cache:'no-store'})).json()]);satDbRows=db.satellites;satdbbody.innerHTML=db.satellites.map(x=>`<tr><td><button onclick="selectSatDb(${x.index})" ${x.index===status.index?'disabled':''}>${x.index===status.index?'選択中':'選択'}</button></td><td>${esc(x.name)}</td><td>${mhz(x.up0)}-${mhz(x.up1)}</td><td>${esc(x.upmode)}</td><td>${mhz(x.dn0)}-${mhz(x.dn1)}</td><td>${esc(x.dnmode)}</td><td>${mhz(x.beacon)}</td><td>${x.offset}</td><td>${x.tle?'OK':'--'}</td><td><button onclick="editSatDb(${x.index})">編集</button> <button onclick="deleteSatDb(${x.index})">削除</button></td></tr>`).join('');}catch(e){satdbmsg.textContent='一覧取得失敗: '+e.message;}}
+async function selectSatDb(idx){const r=await fetch('/api/sat/select?index='+idx,{method:'POST'});satdbmsg.textContent=await r.text();if(!r.ok)return;trackingDirty=false;vfoDirty=false;await Promise.all([loadStatus(),loadList(),loadSatDb()]);}
 function newSatDb(){satdbindex.value='-1';satdbtitle.textContent='新規追加';satdbname.value='';satup0.value='0';satup1.value='0';satupmode.value='';satdn0.value='0';satdn1.value='0';satdnmode.value='';satbeacon.value='0';satoffset.value='0';}
 function editSatDb(idx){const x=satDbRows.find(v=>v.index===idx);if(!x)return;satdbindex.value=String(idx);satdbtitle.textContent='編集: '+x.name;satdbname.value=x.name;satup0.value=mhz(x.up0);satup1.value=mhz(x.up1);satupmode.value=x.upmode;satdn0.value=mhz(x.dn0);satdn1.value=mhz(x.dn1);satdnmode.value=x.dnmode;satbeacon.value=mhz(x.beacon);satoffset.value=String(x.offset);}
 async function saveSatDb(){const q=new URLSearchParams({index:satdbindex.value,name:satdbname.value.trim(),up0:satup0.value,up1:satup1.value,upmode:satupmode.value.trim().toUpperCase(),dn0:satdn0.value,dn1:satdn1.value,dnmode:satdnmode.value.trim().toUpperCase(),beacon:satbeacon.value,offset:satoffset.value});const r=await fetch('/api/sat/db/save?'+q,{method:'POST'});satdbmsg.textContent=await r.text();if(r.ok){newSatDb();await loadSatDb();await loadList();}}
@@ -3252,7 +4057,6 @@ const char oppage_html[] PROGMEM =R"rawliteral(
 <div class="button-container">
   <label>Operation:</label>
   <button id="b_radio_mode_0" type="button" onclick="selectRadioMode(0)" style="background-color:gray">SO1R</button>
-  <button id="b_radio_mode_1" type="button" onclick="selectRadioMode(1)" style="background-color:gray">SAT</button>
   <button id="b_radio_mode_2" type="button" onclick="selectRadioMode(2)" style="background-color:gray">SO2R</button>
   <button id="b_cqsp" type="button" onclick="toggleCqSp()" title="Toggle CQ / S&amp;P" style="background-color:gray">CQ/S&amp;P</button>
   <span id="radioModeMessage"></span>
@@ -4112,7 +4916,6 @@ enum WebBandmapJobState : uint8_t {
   WEB_BANDMAP_JOB_IDLE = 0,
   WEB_BANDMAP_JOB_PREPARE,
   WEB_BANDMAP_JOB_SCAN,
-  WEB_BANDMAP_JOB_WAIT_DUPE,
   WEB_BANDMAP_JOB_FINISH_BAND,
   WEB_BANDMAP_JOB_PUBLISH
 };
@@ -4124,43 +4927,9 @@ struct WebBandmapBuildJob {
   uint16_t source_index = 0;
   uint16_t output_count = 0;
   uint32_t hash = 2166136261UL;
-  WebBandmapEntry pending{};
-  uint16_t pending_source_index = 0;
 };
 
 static WebBandmapBuildJob web_bandmap_job;
-
-static bool web_bandmap_source_still_matches(int band_index, int source_index,
-                                              const WebBandmapEntry &entry) {
-  if (band_index < 0 || band_index >= WEB_BANDMAP_BANDS) return false;
-  if (source_index < 0 || source_index >= bandmap[band_index].nentry)
-    return false;
-  const struct bandmap_entry *source = bandmap[band_index].entry + source_index;
-  return source->freq == entry.freq && source->time == entry.time &&
-         source->mode == entry.mode &&
-         strcasecmp(source->station, entry.station) == 0;
-}
-
-static void web_bandmap_store_pending(bool worked) {
-  WebBandmapSnapshot *snapshot =
-      web_bandmap_snapshots[web_bandmap_job.snapshot_index];
-  if (web_bandmap_source_still_matches(web_bandmap_job.band_index,
-                                        web_bandmap_job.pending_source_index,
-                                        web_bandmap_job.pending)) {
-    struct bandmap_entry *source =
-        bandmap[web_bandmap_job.band_index].entry +
-        web_bandmap_job.pending_source_index;
-    if (worked) source->flag |= BANDMAP_ENTRY_FLAG_WORKED;
-    else source->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
-  }
-  if (worked || web_bandmap_job.output_count >= snapshot->capacity_per_band)
-    return;
-
-  web_bandmap_job.pending.flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
-  *web_bandmap_entry_at(snapshot, web_bandmap_job.band_index,
-                        web_bandmap_job.output_count++) =
-      web_bandmap_job.pending;
-}
 
 static void web_bandmap_finish_current_band() {
   WebBandmapSnapshot *snapshot =
@@ -4203,15 +4972,14 @@ static bool start_web_bandmap_snapshot_job() {
   web_bandmap_heap_trace("job start");
   if (!ensure_web_bandmap_snapshots()) return false;
 
-  // Time-sliced asynchronous DUPE checking requires an inactive snapshot.
-  // The normal PSRAM configuration has two snapshots.  Retain the old
-  // synchronous rebuild as a fallback would defeat the loop-time guarantee,
-  // so low-memory/single-snapshot configurations simply defer the refresh.
+  // Time-sliced snapshot construction requires an inactive snapshot.
+  // The normal PSRAM configuration has two snapshots; low-memory/single-
+  // snapshot configurations defer refresh rather than blocking the loop.
   if (web_bandmap_snapshot_count < 2) {
     static uint32_t last_warning_ms = 0;
     if (millis() - last_warning_ms >= 5000U) {
       last_warning_ms = millis();
-      webLog.println("bandmap: time-sliced rebuild requires two snapshots");
+      webLog.println("bandmap: time-sliced snapshot requires two snapshots");
     }
     return false;
   }
@@ -4258,46 +5026,26 @@ static void process_web_bandmap_snapshot_job() {
       }
 
       const uint16_t source_index = web_bandmap_job.source_index++;
-      struct bandmap_entry *source =
+      const struct bandmap_entry *source =
           bandmap[web_bandmap_job.band_index].entry + source_index;
       ++entries_processed;
       if (source->station[0] == '\0' || source->mode >= NMODEID) break;
 
-      web_bandmap_job.pending = WebBandmapEntry{};
-      web_bandmap_job.pending.freq = source->freq;
-      web_bandmap_job.pending.time = source->time;
-      strlcpy(web_bandmap_job.pending.station, source->station,
-              sizeof(web_bandmap_job.pending.station));
-      web_bandmap_job.pending.mode = source->mode;
-      web_bandmap_job.pending.flag = source->flag;
-      web_bandmap_job.pending_source_index = source_index;
+      // bandmap[] is the single authoritative DUPE state for both LCD and
+      // Web.  Pending entries are hidden until the background Bandmap DUPE
+      // worker resolves them; WORKED entries remain hidden.
+      if (source->flag & (BANDMAP_ENTRY_FLAG_DUPE_PENDING |
+                          BANDMAP_ENTRY_FLAG_WORKED))
+        break;
 
-      const int bandid = web_bandmap_job.band_index + 1;
-      const byte bm = bandmode_param(bandid, modetype[source->mode]);
-      if (dupechk->dupechk_at == 1) {
-        if (!dupechk_background_exact_start(source->station, bm, plogw->mask)) {
-          // The single query slot belongs to operator work.  Retry this same
-          // entry on a later loop rather than skipping its DUPE result.
-          --web_bandmap_job.source_index;
-          return;
-        }
-        web_bandmap_job.state = WEB_BANDMAP_JOB_WAIT_DUPE;
-        return;
-      }
-
-      web_bandmap_store_pending(
-          dupe_check_nocallhist(source->station, bm, plogw->mask));
-      break;
-    }
-
-    case WEB_BANDMAP_JOB_WAIT_DUPE: {
-      bool confirmed = false;
-      bool worked = false;
-      if (!dupechk_background_exact_poll(&confirmed, &worked)) return;
-      // On timeout or operator preemption, retry the same entry in the next
-      // refresh.  Keep it visible now instead of stalling the current build.
-      web_bandmap_store_pending(confirmed && worked);
-      web_bandmap_job.state = WEB_BANDMAP_JOB_SCAN;
+      WebBandmapEntry entry{};
+      entry.freq = source->freq;
+      entry.time = source->time;
+      strlcpy(entry.station, source->station, sizeof(entry.station));
+      entry.mode = source->mode;
+      entry.flag = source->flag;
+      *web_bandmap_entry_at(snapshot, web_bandmap_job.band_index,
+                            web_bandmap_job.output_count++) = entry;
       break;
     }
 
@@ -4452,8 +5200,10 @@ static void process_web_bandmap_command_queue() {
     }
 
     struct radio *radio = so2r.radio_selected();
+    // Web selection needs DUPE/CALLHIST state, but partial-check results
+    // belong to the operator LCD workflow and must not cover the bandmap.
     set_station_entry(radio, entry->station, entry->freq,
-                      mode_str[entry->mode]);
+                      mode_str[entry->mode], false);
     webLog.printf("bandmap: selected %s %lu\n", entry->station,
                   static_cast<unsigned long>(entry->freq));
   }
@@ -4600,6 +5350,133 @@ static void web_bandmap_json_safe_copy(char *dest, size_t dest_size,
   dest[out] = '\0';
 }
 
+// Stream large static PROGMEM bodies in bounded chunks on every hardware
+// revision.  This avoids AsyncWebServer staging a multi-kilobyte response in
+// internal RAM before TCP can drain it.  Keep the chunk deliberately small so
+// HW1 and HW3 exercise the same low-peak-memory path.
+static void send_progmem_stream(AsyncWebServerRequest *request,
+                                const char *content_type,
+                                const char *body,
+                                size_t body_len,
+                                const char *trace_path = nullptr) {
+  if (!web_lowmem_admit_heavy(request, trace_path ? trace_path : "/stream")) return;
+  struct ProgmemStreamState {
+    const char *body = nullptr;
+    size_t length = 0;
+    uint32_t trace_id = 0;
+    const char *trace_path = nullptr;
+    bool eof_logged = false;
+  };
+  std::shared_ptr<ProgmemStreamState> state = std::make_shared<ProgmemStreamState>();
+  if (!state) {
+    request->send(503, "text/plain", "Not enough memory for streamed page");
+    return;
+  }
+  state->body = body;
+  state->length = body_len;
+  state->trace_path = trace_path;
+  if (trace_path) state->trace_id = web_trace_begin(trace_path);
+
+  AsyncWebServerResponse *response = request->beginChunkedResponse(
+    content_type,
+    [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      if (index >= state->length) {
+        if (state->trace_id && !state->eof_logged) {
+          state->eof_logged = true;
+          web_trace_touch(state->trace_id, state->trace_path, "EOF", state->length);
+        }
+        return 0;
+      }
+      const size_t remain = state->length - index;
+      const size_t ncopy = std::min(remain, web_stream_chunk_limit(maxLen));
+      memcpy_P(buffer, state->body + index, ncopy);
+      return ncopy;
+    });
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+  if (state->trace_id) web_trace_touch(state->trace_id, trace_path, "QUEUED");
+}
+
+template <size_t N>
+static void send_progmem_stream(AsyncWebServerRequest *request,
+                                const char *content_type,
+                                const char (&body)[N],
+                                const char *trace_path = nullptr) {
+  send_progmem_stream(request, content_type, body, N ? N - 1 : 0, trace_path);
+}
+
+
+// Stream a large HTML template without first materialising it as a String.
+// The two replacement values are deliberately copied into fixed-size storage;
+// the response callback can therefore render directly from flash + small RAM.
+static void send_progmem_template2_stream(AsyncWebServerRequest *request,
+                                          const char *body,
+                                          const char *token1, const char *value1,
+                                          const char *token2, const char *value2) {
+  if (!web_lowmem_admit_heavy(request, "/template")) return;
+  struct Template2State {
+    const char *seg[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    size_t len[5] = {0, 0, 0, 0, 0};
+    char value1[96] = {0};
+    char value2[96] = {0};
+    size_t total = 0;
+  };
+  std::shared_ptr<Template2State> state = std::make_shared<Template2State>();
+  if (!state) {
+    request->send(503, "text/plain", "Not enough memory for streamed template");
+    return;
+  }
+  strlcpy(state->value1, value1 ? value1 : "", sizeof(state->value1));
+  strlcpy(state->value2, value2 ? value2 : "", sizeof(state->value2));
+  const char *p1 = strstr(body, token1);
+  const char *p2 = strstr(body, token2);
+  if (!p1 || !p2 || p1 == p2) {
+    request->send(500, "text/plain", "HTML template token missing");
+    return;
+  }
+
+  // Render tokens in their actual HTML order.  Callers need not know which
+  // placeholder appears first in the template.
+  const char *first_p = p1;
+  const char *first_token = token1;
+  const char *first_value = state->value1;
+  const char *second_p = p2;
+  const char *second_token = token2;
+  const char *second_value = state->value2;
+  if (p2 < p1) {
+    first_p = p2; first_token = token2; first_value = state->value2;
+    second_p = p1; second_token = token1; second_value = state->value1;
+  }
+  const char *after_first = first_p + strlen(first_token);
+  const char *after_second = second_p + strlen(second_token);
+  state->seg[0] = body;          state->len[0] = (size_t)(first_p - body);
+  state->seg[1] = first_value;   state->len[1] = strlen(first_value);
+  state->seg[2] = after_first;   state->len[2] = (size_t)(second_p - after_first);
+  state->seg[3] = second_value;  state->len[3] = strlen(second_value);
+  state->seg[4] = after_second;  state->len[4] = strlen(state->seg[4]);
+  for (int i = 0; i < 5; ++i) state->total += state->len[i];
+  AsyncWebServerResponse *response = request->beginChunkedResponse(
+    "text/html; charset=utf-8",
+    [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      if (index >= state->total) return 0;
+      size_t want = web_stream_chunk_limit(maxLen);
+      size_t out = 0, base = 0;
+      for (int i = 0; i < 5 && out < want; ++i) {
+        const size_t end = base + state->len[i];
+        if (index + out < end) {
+          const size_t off = (index + out > base) ? (index + out - base) : 0;
+          const size_t n = std::min(want - out, state->len[i] - off);
+          memcpy(buffer + out, state->seg[i] + off, n);
+          out += n;
+        }
+        base = end;
+      }
+      return out;
+    });
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+}
+
 static void add_bandmap_api_headers(AsyncWebServerResponse *response) {
   if (!response) return;
   response->addHeader("Cache-Control", "no-store");
@@ -4615,41 +5492,39 @@ static void send_bandmap_api_text(AsyncWebServerRequest *request, int code,
   request->send(response);
 }
 
+static void send_web_band_list_json(AsyncWebServerRequest *request) {
+  char json[768];
+  size_t pos = 0;
+  bool ok = json_appendf_checked(json, sizeof(json), pos, "{\"bands\":[");
+  for (int bandid = 1; ok && bandid < N_BAND; ++bandid) {
+    char label[24];
+    snprintf(label, sizeof(label), "%s", bandid_str[bandid - 1]);
+    size_t n = strlen(label);
+    while (n && isspace((unsigned char)label[n - 1])) label[--n] = '\0';
+    ok = json_appendf_checked(json, sizeof(json), pos,
+                              "%s{\"id\":%d,\"label\":\"%s\"}",
+                              bandid > 1 ? "," : "", bandid, label);
+  }
+  if (ok) ok = json_appendf_checked(json, sizeof(json), pos, "]}");
+  if (!ok) { request->send(507, "text/plain", "Band list JSON too large"); return; }
+  AsyncWebServerResponse *response = request->beginResponse(200, "application/json", json);
+  add_bandmap_api_headers(response);
+  request->send(response);
+}
+
 static void setup_web_bandmap_handlers() {
   web_server.on("/bandmap", HTTP_GET, [](AsyncWebServerRequest *request) {
-    AsyncWebServerResponse *response = request->beginResponse_P(
-      200, "text/html; charset=utf-8", web_bandmap_page);
-    response->addHeader("Cache-Control", "no-store");
-    request->send(response);
+    send_progmem_stream(request, "text/html; charset=utf-8",
+                        web_bandmap_page, "/bandmap");
   });
 
   web_server.on("/api/bandmap/bands", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String json = "{\"bands\":[";
-    for (int bandid = 1; bandid < N_BAND; ++bandid) {
-      if (bandid > 1) json += ',';
-      json += "{\"id\":" + String(bandid) + ",\"label\":\"";
-      String label = bandid_str[bandid - 1];
-      label.trim();
-      json += label;
-      json += "\"}";
-    }
-    json += "]}";
-    send_bandmap_api_text(request, 200, "application/json", json);
+    send_web_band_list_json(request);
   });
 
   // Even Hub applications use the same compact band list.
   web_server.on("/api/g2/bands", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String json = "{\"bands\":[";
-    for (int bandid = 1; bandid < N_BAND; ++bandid) {
-      if (bandid > 1) json += ',';
-      json += "{\"id\":" + String(bandid) + ",\"label\":\"";
-      String label = bandid_str[bandid - 1];
-      label.trim();
-      json += label;
-      json += "\"}";
-    }
-    json += "]}";
-    send_bandmap_api_text(request, 200, "application/json", json);
+    send_web_band_list_json(request);
   });
 
   web_server.on("/api/bandmap/version", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -4683,71 +5558,39 @@ static void setup_web_bandmap_handlers() {
       return;
     }
 
-    // A single band is limited to WEB_BANDMAP_MAX_DISPLAY_ENTRIES (20), so
-    // build a complete JSON document and send it with Content-Length.  This
-    // avoids truncated HTTP-200 JSON caused by the chunk generator state
-    // machine while keeping peak memory bounded to a few kilobytes.
-    String json;
-    size_t reserve_size = 160U +
-      static_cast<size_t>(state->band[0].count) * 144U;
-    if (reserve_size < 1024U) reserve_size = 1024U;
-    if (!json.reserve(reserve_size)) {
-      delete state;
-      request->send(503, "text/plain", "bandmap JSON allocation failed");
-      return;
-    }
-
-    json += F("{\"bandGeneration\":");
-    json += static_cast<unsigned long>(state->generation);
-    json += F(",\"bands\":[{");
-    json += F("\"id\":");
-    json += state->band[0].bandid;
-    json += F(",\"label\":\"");
-
-    String label = bandid_str[state->band[0].bandid - 1];
-    label.trim();
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/api/bandmap/data", &scratch_lease)) { delete state; return; }
+    auto json = std::make_shared<FixedJsonState>();
+    if (!json) { delete state; web_shared_scratch_release(scratch_lease); request->send(503, "text/plain", "Not enough memory"); return; }
+    json->owns_scratch = true;
+    json->scratch_lease = scratch_lease;
+    size_t &pos = json->len;
+    char label[24];
+    snprintf(label, sizeof(label), "%s", bandid_str[state->band[0].bandid - 1]);
+    size_t label_len = strlen(label);
+    while (label_len && isspace((unsigned char)label[label_len - 1])) label[--label_len] = '\0';
     char safe_label[32];
-    web_bandmap_json_safe_copy(safe_label, sizeof(safe_label), label.c_str());
-    json += safe_label;
-    json += F("\",\"spots\":[");
-
+    web_bandmap_json_safe_copy(safe_label, sizeof(safe_label), label);
+    bool ok = json_appendf_checked(json->data, WEB_SHARED_SCRATCH_SIZE, pos,
+        "{\"bandGeneration\":%lu,\"bands\":[{\"id\":%d,\"label\":\"%s\",\"spots\":[",
+        (unsigned long)state->generation, state->band[0].bandid, safe_label);
     const int now = my_rtc.unixtime();
-    for (uint16_t i = 0; i < state->band[0].count; ++i) {
-      const WebBandmapEntry &entry = state->band[0].entries[i];
-      const int age = max(0, (now - entry.time) / 60);
-      const unsigned long hz =
-        static_cast<unsigned long>(entry.freq) * FREQ_UNIT;
-      char freq_text[24];
-      snprintf(freq_text, sizeof(freq_text), "%lu.%01lu",
-               hz / 1000UL, (hz % 1000UL) / 100UL);
-      char safe_station[sizeof(entry.station)];
-      web_bandmap_json_safe_copy(safe_station, sizeof(safe_station),
-                                 entry.station);
-
-      if (i) json += ',';
-      json += F("{\"freq\":");
-      json += static_cast<unsigned long>(entry.freq);
-      json += F(",\"freqText\":\"");
-      json += freq_text;
-      json += F("\",\"call\":\"");
-      json += safe_station;
-      json += F("\",\"mode\":");
-      json += entry.mode;
-      json += F(",\"time\":");
-      json += static_cast<long>(entry.time);
-      json += F(",\"age\":");
-      json += age;
-      json += F(",\"multi\":");
-      json += (entry.flag & BANDMAP_ENTRY_FLAG_NEWMULTI) ? F("true") : F("false");
-      json += '}';
+    for (uint16_t i=0; ok && i<state->band[0].count; ++i) {
+      const WebBandmapEntry &entry=state->band[0].entries[i];
+      const int age=max(0,(now-entry.time)/60);
+      const unsigned long hz=(unsigned long)entry.freq*FREQ_UNIT;
+      char freq_text[24], safe_station[sizeof(entry.station)];
+      snprintf(freq_text,sizeof(freq_text),"%lu.%01lu",hz/1000UL,(hz%1000UL)/100UL);
+      web_bandmap_json_safe_copy(safe_station,sizeof(safe_station),entry.station);
+      ok=json_appendf_checked(json->data,WEB_SHARED_SCRATCH_SIZE,pos,
+          "%s{\"freq\":%lu,\"freqText\":\"%s\",\"call\":\"%s\",\"mode\":%d,\"time\":%ld,\"age\":%d,\"multi\":%s}",
+          i?",":"",(unsigned long)entry.freq,freq_text,safe_station,entry.mode,(long)entry.time,age,
+          (entry.flag&BANDMAP_ENTRY_FLAG_NEWMULTI)?"true":"false");
     }
-    json += F("]}]}" );
-
+    if(ok) ok=json_appendf_checked(json->data,WEB_SHARED_SCRATCH_SIZE,pos,"]}]}");
     delete state;
-    AsyncWebServerResponse *response =
-      request->beginResponse(200, "application/json", json);
-    add_bandmap_api_headers(response);
-    request->send(response);
+    if(!ok){ request->send(507,"text/plain","Bandmap JSON exceeds shared Web buffer"); return; }
+    send_fixed_json_state(request,json);
   });
 
   // /api/g2/bandmap is a lightweight alias intended for Even Hub clients.
@@ -4894,16 +5737,23 @@ void process_web_bandmap() {
 
   // User commands are handled first.  Snapshot rebuilding then advances only
   // within its per-loop time/entry budget.
+  time_measure_start_name(PROF_WEB_BAND_CMD, "web_cmd");
   process_web_bandmap_command_queue();
+  time_measure_stop(PROF_WEB_BAND_CMD);
+
+  time_measure_start_name(PROF_WEB_BAND_SNAPSHOT, "web_snap");
   process_web_bandmap_snapshot_job();
+  time_measure_stop(PROF_WEB_BAND_SNAPSHOT);
 
   const uint32_t now = millis();
   if (web_bandmap_job.state == WEB_BANDMAP_JOB_IDLE &&
       (int32_t)(now - web_bandmap_next_refresh_ms) >= 0) {
+    time_measure_start_name(PROF_WEB_BAND_START, "web_start");
     if (start_web_bandmap_snapshot_job())
       web_bandmap_next_refresh_ms = now + WEB_BANDMAP_REFRESH_MS;
     else
       web_bandmap_next_refresh_ms = now + 1000U;
+    time_measure_stop(PROF_WEB_BAND_START);
   }
 }
 
@@ -4940,21 +5790,123 @@ static void web_sat_format_datetime(const DateTime &t, char *buf, size_t n) {
            t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
 }
 
+static bool valid_web_grid(const String &grid) {
+  if (!(grid.length() == 4 || grid.length() == 6)) return false;
+  if (grid[0] < 'A' || grid[0] > 'R' || grid[1] < 'A' || grid[1] > 'R' ||
+      !isdigit((unsigned char)grid[2]) || !isdigit((unsigned char)grid[3]))
+    return false;
+  return grid.length() == 4 ||
+         (grid[4] >= 'A' && grid[4] <= 'X' &&
+          grid[5] >= 'A' && grid[5] <= 'X');
+}
+
+static void apply_web_location(double latitude, double longitude,
+                               const char *grid) {
+  strlcpy(plogw->grid_locator + 2, grid, LEN_GL + 1);
+  strlcpy(plogw->grid_locator_set, grid, LEN_GL + 1);
+  plogw->lat = latitude;
+  plogw->lon = longitude;
+  plogw->latitude = latitude;
+  plogw->longitude = longitude;
+  p13.setLocation(longitude, latitude, 50);
+  save_settings("");
+  if (plogw->sat) {
+    set_sat_info_calc();
+    set_sat_freq_calc();
+  }
+}
+
+static void send_web_location_json(AsyncWebServerRequest *request) {
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"grid\":\"%s\",\"lat\":%.6f,\"lon\":%.6f}",
+           plogw->grid_locator_set, plogw->latitude, plogw->longitude);
+  request->send(200, "application/json", payload);
+}
+
 void init_webserver() {
   web_heap_point("before web handlers");
 
   setupSdFileListHandler();
 
+  web_server.on("/api/storage", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const uint32_t trace_id = web_trace_begin("/api/storage");
+    char free_text[24], used_text[24], total_text[24], payload[128];
+    humanReadableSizeToBuffer(SD.totalBytes() - SD.usedBytes(), free_text, sizeof(free_text));
+    humanReadableSizeToBuffer(SD.usedBytes(), used_text, sizeof(used_text));
+    humanReadableSizeToBuffer(SD.totalBytes(), total_text, sizeof(total_text));
+    snprintf(payload, sizeof(payload),
+             "{\"free\":\"%s\",\"used\":\"%s\",\"total\":\"%s\"}",
+             free_text, used_text, total_text);
+    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", payload);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+    web_trace_touch(trace_id, "/api/storage", "QUEUED");
+  });
+
   web_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    String logmessage = "Client:" + request->client()->remoteIP().toString() + + " " + request->url();
-    webLog.println(logmessage);
-    request->send_P(200, "text/html", index_html, processor);
-    logmessage="";
+    webLog.println("Client:/");
+    // Static top page: use the same bounded streaming path on HW1 and HW3.
+    // Dynamic SD values are fetched separately by the page.
+    send_progmem_stream(request, "text/html; charset=utf-8", index_html, "/");
   });
 
 
   web_server.on("/sat", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", sat_page_html);
+    send_progmem_stream(request, "text/html; charset=utf-8", sat_page_html, "/sat");
+  });
+
+  web_server.on("/location", HTTP_GET, [](AsyncWebServerRequest *request) {
+    send_progmem_stream(request, "text/html; charset=utf-8", location_page_html, "/location");
+  });
+
+  web_server.on("/api/location", HTTP_GET,
+                [](AsyncWebServerRequest *request) {
+    send_web_location_json(request);
+  });
+
+  web_server.on("/api/location", HTTP_POST,
+                [](AsyncWebServerRequest *request) {
+    if (request->hasParam("lat") && request->hasParam("lon")) {
+      const String lat_text = request->getParam("lat")->value();
+      const String lon_text = request->getParam("lon")->value();
+      char *lat_end = nullptr;
+      char *lon_end = nullptr;
+      const double latitude = strtod(lat_text.c_str(), &lat_end);
+      const double longitude = strtod(lon_text.c_str(), &lon_end);
+      if (lat_end == lat_text.c_str() || *lat_end != '\0' ||
+          lon_end == lon_text.c_str() || *lon_end != '\0' ||
+          !isfinite(latitude) || !isfinite(longitude) ||
+          latitude < -90.0 || latitude > 90.0 ||
+          longitude < -180.0 || longitude > 180.0) {
+        request->send(400, "text/plain", "Invalid latitude or longitude");
+        return;
+      }
+      char grid[LEN_GL + 1];
+      strlcpy(grid, get_mh(latitude, longitude, 6), sizeof(grid));
+      apply_web_location(latitude, longitude, grid);
+      send_web_location_json(request);
+      return;
+    }
+
+    if (request->hasParam("grid")) {
+      String grid = request->getParam("grid")->value();
+      grid.trim();
+      grid.toUpperCase();
+      if (!valid_web_grid(grid)) {
+        request->send(400, "text/plain",
+                      "Grid must be a valid 4 or 6 character locator");
+        return;
+      }
+      // maidenhead.h predates const-correct interfaces and requires char *.
+      // Keep String's const buffer untouched and parse a writable copy.
+      char grid_buf[LEN_GL + 1];
+      strlcpy(grid_buf, grid.c_str(), sizeof(grid_buf));
+      apply_web_location(mh2lat(grid_buf), mh2lon(grid_buf), grid_buf);
+      send_web_location_json(request);
+      return;
+    }
+    request->send(400, "text/plain", "Missing lat/lon or grid");
   });
 
   web_server.on("/api/sat/status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -4964,10 +5916,8 @@ void init_webserver() {
     const char *tracking_name = plogw->sat_freq_tracking_mode == SAT_RX_FIX ? "RX FIX" :
                                 plogw->sat_freq_tracking_mode == SAT_TX_FIX ? "TX FIX" :
                                 plogw->sat_freq_tracking_mode == SAT_SAT_FIX ? "SAT FIX" : "NO TRACK";
-    const char *vfo_name = plogw->sat_vfo_mode == SAT_VFO_SINGLE_A_TX ? "Single: TX=A" :
-                           plogw->sat_vfo_mode == SAT_VFO_SINGLE_A_RX ? "Single: RX=A" :
-                           plogw->sat_vfo_mode == SAT_VFO_MULTI_TX_0 ? "TX=Radio0 / RX=Radio1" :
-                           "TX=Radio1 / RX=Radio0";
+    char vfo_name[80];
+    sat_vfo_mode_label(vfo_name, sizeof(vfo_name));
     const int offset_hz = (idx >= 0 && idx < N_SATELLITES) ? sat_info[idx].offset_freq : 0;
     DateTime utc_time((uint32_t)(my_rtc.unixtime() - 9UL * 3600UL));
     char jst[80], utc[80];
@@ -4989,22 +5939,24 @@ void init_webserver() {
   });
 
   web_server.on("/api/sat/db", HTTP_GET, [](AsyncWebServerRequest *request) {
-    AsyncResponseStream *res = request->beginResponseStream("application/json");
-    res->print("{\"satellites\":[");
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/api/sat/db", &scratch_lease)) return;
+    auto state = std::make_shared<FixedJsonState>();
+    if (!state) { web_shared_scratch_release(scratch_lease); request->send(503, "text/plain", "Not enough memory"); return; }
+    state->owns_scratch = true; state->scratch_lease = scratch_lease; size_t &pos = state->len;
+    bool ok = json_appendf_checked(state->data, WEB_SHARED_SCRATCH_SIZE, pos, "{\"satellites\":[");
     bool first = true;
-    for (int i = 0; i < N_SATELLITES; ++i) {
-      if (sat_info[i].name[0] == '\0') continue;
-      if (!first) res->print(',');
-      first = false;
-      res->printf("{\"index\":%d,\"name\":\"%s\",\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\","
-                  "\"dn0\":%d,\"dn1\":%d,\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"tle\":%s}",
-                  i, sat_info[i].name, sat_info[i].up_f0, sat_info[i].up_f1, sat_info[i].up_mode,
-                  sat_info[i].dn_f0, sat_info[i].dn_f1, sat_info[i].dn_mode,
-                  sat_info[i].bc_f0, sat_info[i].offset_freq,
-                  sat_info[i].YEAR ? "true" : "false");
+    for (int i=0; ok && i<N_SATELLITES; ++i) {
+      if (!sat_info[i].name[0]) continue;
+      ok = json_appendf_checked(state->data, WEB_SHARED_SCRATCH_SIZE, pos,
+        "%s{\"index\":%d,\"name\":\"%s\",\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\",\"dn0\":%d,\"dn1\":%d,\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"tle\":%s}",
+        first?"":",", i,sat_info[i].name,sat_info[i].up_f0,sat_info[i].up_f1,sat_info[i].up_mode,
+        sat_info[i].dn_f0,sat_info[i].dn_f1,sat_info[i].dn_mode,sat_info[i].bc_f0,sat_info[i].offset_freq,sat_info[i].YEAR?"true":"false");
+      first=false;
     }
-    res->print("]}");
-    request->send(res);
+    if (ok) ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"]}");
+    if (!ok) { request->send(507,"text/plain","Satellite database JSON exceeds shared Web buffer"); return; }
+    send_fixed_json_state(request,state);
   });
 
   web_server.on("/api/sat/db/save", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -5075,7 +6027,7 @@ void init_webserver() {
       sat_info[idx].maxel = 0;
     }
     save_satinfo();
-    readtlefile();
+    request_sat_tle_parse();
     start_calc_nextaos();
     request->send(200, "text/plain", sat_info[idx].YEAR ? "Saved; TLE matched" : "Saved; no matching TLE yet");
   });
@@ -5108,21 +6060,20 @@ void init_webserver() {
     }
     if (!have_valid_sat) {
       load_satinfo();
-      readtlefile();
+      request_sat_tle_parse();
     }
 
-    AsyncResponseStream *res = request->beginResponseStream("application/json");
-    res->print("{\"satellites\":[");
-    bool first = true;
-    for (int i = 0; i < N_SATELLITES; ++i) {
-      if (sat_info[i].name[0] == '\0' || sat_info[i].YEAR == 0) continue;
-      if (!first) res->print(',');
-      first = false;
-      res->printf("{\"index\":%d,\"name\":\"%s\",\"selected\":%s}",
-                  i, sat_info[i].name, i == plogw->sat_idx_selected ? "true" : "false");
-    }
-    res->print("]}");
-    request->send(res);
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/api/sat/list", &scratch_lease)) return;
+    auto state=std::make_shared<FixedJsonState>();
+    if (!state) { web_shared_scratch_release(scratch_lease); request->send(503,"text/plain","Not enough memory"); return; }
+    state->owns_scratch=true; state->scratch_lease=scratch_lease; size_t &pos=state->len;
+    bool ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"satellites\":["); bool first=true;
+    for(int i=0; ok && i<N_SATELLITES; ++i){ if(!sat_info[i].name[0]||!sat_info[i].YEAR) continue;
+      ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"%s{\"index\":%d,\"name\":\"%s\",\"selected\":%s}",first?"":",",i,sat_info[i].name,i==plogw->sat_idx_selected?"true":"false"); first=false; }
+    if(ok) ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"]}");
+    if(!ok){ request->send(507,"text/plain","Satellite list JSON exceeds shared Web buffer"); return; }
+    send_fixed_json_state(request,state);
   });
 
   web_server.on("/api/sat/select", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -5136,31 +6087,18 @@ void init_webserver() {
     sat_name_entered();
     set_sat_info_calc();
     set_sat_freq_calc();
-    request->send(200, "text/plain", "Selected and satellite operation started");
+    request->send(200, "text/plain", "Satellite selected");
   });
 
   web_server.on("/api/sat/enable", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("enabled")) { request->send(400, "text/plain", "Missing enabled"); return; }
-    if (request->getParam("enabled")->value().toInt()) {
-      bool tle_loaded_now = false;
-      if (plogw->tle_unixtime == 0) {
-        readtlefile();
-        tle_loaded_now = (plogw->tle_unixtime != 0);
-      }
-      if (plogw->sat_idx_selected < 0 || plogw->sat_idx_selected >= N_SATELLITES ||
-          sat_info[plogw->sat_idx_selected].name[0] == '\0') {
-        request->send(409, "text/plain", "Select a satellite first");
-        return;
-      }
-      strlcpy(plogw->sat_name + 2, sat_info[plogw->sat_idx_selected].name, LEN_SATNAME_WINDOW + 1);
-      sat_name_entered(); set_sat_info_calc(); set_sat_freq_calc();
-      request->send(200, "text/plain",
-                    tle_loaded_now ? "Satellite operation ON (TLE loaded from SD)"
-                                   : "Satellite operation ON");
-    } else {
-      plogw->sat = 0;
-      request->send(200, "text/plain", "Satellite operation OFF");
+    const bool enabled = request->getParam("enabled")->value().toInt() != 0;
+    if (!set_satellite_operation(enabled)) {
+      request->send(409, "text/plain", "Select a satellite first");
+      return;
     }
+    request->send(200, "text/plain",
+                  enabled ? "Satellite operation ON" : "Satellite operation OFF");
   });
 
   web_server.on("/api/sat/tracking", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -5175,7 +6113,9 @@ void init_webserver() {
     char reason[192];
     const int mode = auto_select_sat_vfo_mode(reason, sizeof(reason));
     if (mode >= 0) {
+      sat_apply_vfo_mode_to_rig();
       set_sat_freq_calc();
+      sat_apply_default_opmode();
       request->send(200, "text/plain", String("Auto VFO: ") + reason);
     } else {
       request->send(409, "text/plain", String("Auto VFO: ") + reason);
@@ -5186,7 +6126,10 @@ void init_webserver() {
     if (!request->hasParam("mode")) { request->send(400, "text/plain", "Missing mode"); return; }
     const int mode = request->getParam("mode")->value().toInt();
     if (mode < SAT_VFO_SINGLE_A_TX || mode > SAT_VFO_MULTI_TX_1) { request->send(400, "text/plain", "Invalid VFO mode"); return; }
-    plogw->sat_vfo_mode = mode; set_sat_freq_calc();
+    plogw->sat_vfo_mode = mode;
+    sat_apply_vfo_mode_to_rig();
+    set_sat_freq_calc();
+    sat_apply_default_opmode();
     request->send(200, "text/plain", "VFO mode changed");
   });
 
@@ -5249,8 +6192,12 @@ void init_webserver() {
     web_sat_format_datetime(aos, aos_text, sizeof(aos_text));
     web_sat_format_datetime(los, los_text, sizeof(los_text));
 
-    AsyncResponseStream *res = request->beginResponseStream("application/json");
-    res->printf("{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\","
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/api/sat/pass", &scratch_lease)) return;
+    auto state=std::make_shared<FixedJsonState>();
+    if(!state){ web_shared_scratch_release(scratch_lease); request->send(503,"text/plain","Not enough memory"); return; }
+    state->owns_scratch=true; state->scratch_lease=scratch_lease; size_t &pos=state->len;
+    bool ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\","
                 "\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\",\"dn0\":%d,\"dn1\":%d,"
                 "\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"points\":[",
                 idx, sat_info[idx].name, aos_text, los_text,
@@ -5268,17 +6215,17 @@ void init_webserver() {
       if (!web_sat_calc_point(idx, t, &az, &el, &rr)) continue;
       if (off == 0) aos_az = az;
       if (el > max_el) { max_el = el; mel_az = az; mel_time = t; }
-      if (!first) res->print(',');
+      if (!first) ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,",");
       first = false;
-      res->printf("{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)t.unixtime(), az, el);
+      ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)t.unixtime(), az, el);
       last_off = off;
       if (duration - off < step) break;
     }
     if (last_off != duration) {
       double az = 0, el = 0, rr = 0;
       if (web_sat_calc_point(idx, los, &az, &el, &rr)) {
-        if (!first) res->print(',');
-        res->printf("{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)los.unixtime(), az, el);
+        if (!first) ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,",");
+        ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)los.unixtime(), az, el);
         los_az = az;
         if (el > max_el) { max_el = el; mel_az = az; mel_time = los; }
       }
@@ -5287,9 +6234,10 @@ void init_webserver() {
       web_sat_calc_point(idx, los, &los_az, &el, &rr);
     }
     web_sat_format_datetime(mel_time, mel_text, sizeof(mel_text));
-    res->printf("],\"aos_az\":%.3f,\"mel\":\"%s\",\"mel_az\":%.3f,\"mel_el\":%.3f,\"los_az\":%.3f}",
+    ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"],\"aos_az\":%.3f,\"mel\":\"%s\",\"mel_az\":%.3f,\"mel_el\":%.3f,\"los_az\":%.3f}",
                 aos_az, mel_text, mel_az, max_el, los_az);
-    request->send(res);
+    if(!ok){ request->send(507,"text/plain","Satellite pass JSON exceeds shared Web buffer"); return; }
+    send_fixed_json_state(request,state);
   });
 
   web_server.on("/api/sat/nowpos", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -5318,7 +6266,11 @@ void init_webserver() {
   });
 
   web_server.on("/api/sat/aos", HTTP_GET, [](AsyncWebServerRequest *request) {
-    AsyncResponseStream *res = request->beginResponseStream("application/json");
+    uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/api/sat/aos", &scratch_lease)) return;
+    auto state=std::make_shared<FixedJsonState>();
+    if(!state){ web_shared_scratch_release(scratch_lease); request->send(503,"text/plain","Not enough memory"); return; }
+    state->owns_scratch=true; state->scratch_lease=scratch_lease; size_t &pos=state->len; bool ok=true;
     int total = 0;
     int completed = 0;
     for (int i=0;i<N_SATELLITES;i++) {
@@ -5333,7 +6285,7 @@ void init_webserver() {
                              plogw->f_nextaos == 3 ? "LOS search" :
                              plogw->f_nextaos == 4 ? "finalize" :
                              plogw->f_nextaos == 5 ? "next satellite" : "idle";
-    res->printf("{\"calculating\":%s,\"completed\":%d,\"total\":%d,\"current_index\":%d,\"current_name\":\"%s\",\"state\":%d,\"state_name\":\"%s\",\"passes\":[",
+    ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"calculating\":%s,\"completed\":%d,\"total\":%d,\"current_index\":%d,\"current_name\":\"%s\",\"state\":%d,\"state_name\":\"%s\",\"passes\":[",
                 plogw->f_nextaos ? "true" : "false", completed, total, current_idx,
                 current_name, plogw->f_nextaos, state_name);
     int aos_idx[N_SATELLITES];
@@ -5363,14 +6315,16 @@ void init_webserver() {
     const int shown_count = aos_count < max_show ? aos_count : max_show;
     for (int n = 0; n < shown_count; ++n) {
       const int i = aos_idx[n];
-      if (!first) res->print(',');
+      if (!first) ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,",");
       first = false;
       char aos[24], los[24];
       snprintf(aos,sizeof(aos),"%04d-%02d-%02d %02d:%02d",sat_info[i].nextaos.year(),sat_info[i].nextaos.month(),sat_info[i].nextaos.day(),sat_info[i].nextaos.hour(),sat_info[i].nextaos.minute());
       snprintf(los,sizeof(los),"%04d-%02d-%02d %02d:%02d",sat_info[i].nextlos.year(),sat_info[i].nextlos.month(),sat_info[i].nextlos.day(),sat_info[i].nextlos.hour(),sat_info[i].nextlos.minute());
-      res->printf("{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\",\"max_el\":%.2f}",i,sat_info[i].name,aos,los,sat_info[i].maxel);
+      ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\",\"max_el\":%.2f}",i,sat_info[i].name,aos,los,sat_info[i].maxel);
     }
-    res->print("]}"); request->send(res);
+    ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"]}");
+    if(!ok){ request->send(507,"text/plain","Satellite AOS JSON exceeds shared Web buffer"); return; }
+    send_fixed_json_state(request,state);
   });
 
 
@@ -5411,7 +6365,7 @@ void init_webserver() {
 body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}
 </style></head>
 <body onload="updateDownloadLink()">
-<p><a href="/potahelp?lang=en">English</a> | <a href="/">ホーム</a></p>
+<p><a href="/potahelp?lang=en">English</a> | <a href="/">ホーム</a> | <a href="/location">地図で現在位置を設定</a></p>
 <h1>POTA運用・ログ作成ヘルパー</h1>
 <p>このページでは、現在運用しているPOTA公園をDVPloggerへ設定し、その公園で記録したQSOだけをADIFで取り出してPOTAへアップロードできます。</p>
 <div class="warn"><strong>重要：</strong>公園番号を入力しただけではログへ反映されません。必ず「この公園をDVPloggerへ設定」を押してください。設定後のQSOにはRemarksへ <code>POTA_MY:公園番号</code> が自動記録されます。</div>
@@ -5429,7 +6383,7 @@ body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#2
 <h2>公園番号が分からない場合</h2>
 <div class="step">
 <p>現在地のグリッドロケーターから、近い公園を検索できます。検索結果をクリックすると、その公園を本体へ設定し、公園情報ページも開きます。</p>
-<div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid例: PM95ru"><button onclick="findNearest()">近いPOTA公園を検索</button></div>
+<div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid例: PM95ru"><button id="nearBtn" onclick="findNearest()">近いPOTA公園を検索</button></div>
 <p id="searchStatus" class="status"></p><ul id="results"></ul>
 </div>
 
@@ -5452,10 +6406,12 @@ body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#2
 <p><a href="/">ホームへ戻る</a>　<a href="/sotahelp?lang=ja">SOTAヘルパーへ</a></p>
 <script>
 function normPark(){return document.getElementById('park').value.trim().toUpperCase();}
-function findNearest(){
- const grid=document.getElementById('grid').value.trim(); const st=document.getElementById('searchStatus');
- if(!grid){st.textContent='グリッドロケーターを入力してください。';return;} st.textContent='検索中…';
- fetch(`/nearest?grid=${encodeURIComponent(grid)}`).then(r=>{if(!r.ok)throw new Error('検索に失敗しました');return r.json();}).then(showResults).catch(e=>st.textContent=e.message);
+let nearBusy=false;
+async function findNearest(){
+ const grid=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');
+ if(!grid){st.textContent='グリッドロケーターを入力してください。';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='検索中…';
+ try{const r=await fetch(`/nearest?grid=${encodeURIComponent(grid)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'本体が通信処理中です。少し待って再検索してください。':'検索に失敗しました');showResults(await r.json());}
+ catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}
 }
 function showResults(list){
  const ul=document.getElementById('results');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length}件の候補を表示しました。公園名をクリックすると本体へ設定します。`:'候補が見つかりませんでした。';
@@ -5475,38 +6431,29 @@ function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}
 
   
   const char *pota_page_en = R"rawliteral(
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>POTA Operation and Log Helper</title><style>body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}</style></head><body onload="updateDownloadLink()"><p><a href="/potahelp?lang=ja">日本語</a> | <a href="/">Home</a></p><h1>POTA Operation and Log Helper</h1><p>Set the POTA park currently being activated, export only QSOs made from that park as ADIF, and upload the file to POTA.</p><div class="warn"><strong>Important:</strong> Typing a park reference alone does not change the logger. Press “Set this park in DVPlogger”. Subsequent QSOs receive <code>POTA_MY:park-reference</code> in Remarks.</div>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>POTA Operation and Log Helper</title><style>body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}</style></head><body onload="updateDownloadLink()"><p><a href="/potahelp?lang=ja">日本語</a> | <a href="/">Home</a> | <a href="/location">Set location on map</a></p><h1>POTA Operation and Log Helper</h1><p>Set the POTA park currently being activated, export only QSOs made from that park as ADIF, and upload the file to POTA.</p><div class="warn"><strong>Important:</strong> Typing a park reference alone does not change the logger. Press “Set this park in DVPlogger”. Subsequent QSOs receive <code>POTA_MY:park-reference</code> in Remarks.</div>
 <h2>1. Set the park being activated</h2><div class="step"><label for="park"><strong>POTA park reference</strong></label><div class="row"><input type="text" id="park" %PARK_ID% placeholder="Example: JP-1001" oninput="updateDownloadLink()"><button class="primary" onclick="setCurrentPark()">Set this park in DVPlogger</button><button onclick="openParkPage()">Open park information</button></div><p id="setStatus" class="status"></p><p class="small">DVPlogger stores <code>POTA/JP-xxxx</code> in the JCC/JCG field. QSOs logged afterward are identified as activation QSOs from this park.</p></div>
-<h2>Find a nearby park</h2><div class="step"><p>Search for nearby parks using the current grid locator. Clicking a result sets the park in DVPlogger and opens its POTA page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button onclick="findNearest()">Find nearby POTA parks</button></div><p id="searchStatus" class="status"></p><ul id="results"></ul></div>
+<h2>Find a nearby park</h2><div class="step"><p>Search for nearby parks using the current grid locator. Clicking a result sets the park in DVPlogger and opens its POTA page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button id="nearBtn" onclick="findNearest()">Find nearby POTA parks</button></div><p id="searchStatus" class="status"></p><ul id="results"></ul></div>
 <h2>2. Log QSOs normally</h2><div class="step"><p>Enter callsign, RST and exchange normally. Each QSO logged after setting the park is tagged with the current park reference.</p><p class="note">After moving to another park, set the new park before logging more QSOs. Logs can be exported separately for each park.</p></div>
 <h2>3. Export this park's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current park reference.</p><a id="dl" class="button primary" href="/adif" download="pota_log.adi">Download ADIF for this park</a><p id="status" class="status"></p><p class="small">The filename is <code>pota_log_JP-xxxx.adi</code>. Verify the park reference before downloading.</p></div>
 <h2>4. Upload to POTA</h2><div class="step"><ol><li>Save the ADIF file above.</li><li>Open POTA Log Manager and sign in.</li><li>Select or drag the saved ADIF file into the upload page.</li><li>Confirm the park, date/time and callsign before submitting.</li></ol><button onclick="openPOTA()">Open POTA Log Manager</button></div>
 <h2>Button reference</h2><ul><li><strong>Set this park in DVPlogger:</strong> tags subsequently logged QSOs with the park reference.</li><li><strong>Open park information:</strong> opens the official POTA park page without changing DVPlogger.</li><li><strong>Find nearby POTA parks:</strong> lists candidates from the park file on the SD card.</li><li><strong>Download ADIF for this park:</strong> exports only QSOs made from the selected park.</li><li><strong>Open POTA Log Manager:</strong> opens the official log page; upload is not automatic.</li></ul><p><a href="/sotahelp?lang=en">SOTA helper</a></p>
-<script>function normPark(){return document.getElementById('park').value.trim().toUpperCase();}function findNearest(){const grid=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus');if(!grid){st.textContent='Enter a grid locator.';return;}st.textContent='Searching...';fetch(`/nearest?grid=${encodeURIComponent(grid)}`).then(r=>{if(!r.ok)throw new Error('Search failed');return r.json();}).then(showResults).catch(e=>st.textContent=e.message);}function showResults(list){const ul=document.getElementById('results');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a park name to set it.`:'No candidates found.';list.forEach(p=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${p.code}: ${p.name} (${p.distance_km} km, bearing ${p.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectPark(p.code,p.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifyPark(code,name,grid){return fetch(`/select?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentPark(){const code=normPark(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a park reference.';return;}notifyPark(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('park').value=code;updateDownloadLink();st.textContent=`${code} is now the active park. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectPark(code,name,grid){notifyPark(code,name,grid).then(()=>{document.getElementById('park').value=code;updateDownloadLink();document.getElementById('setStatus').textContent=`${code} ${name} is now the active park.`;window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openParkPage(){const code=normPark();if(!code){document.getElementById('setStatus').textContent='Enter a park reference.';return;}window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';link.download='pota_log.adi';st.textContent='Enter a park reference and set it in DVPlogger.';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;link.download=`pota_log_${park}.adi`;st.textContent=`Ready to extract QSOs for ${park}.`;}}function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}</script></body></html>
+<script>function normPark(){return document.getElementById('park').value.trim().toUpperCase();}let nearBusy=false;async function findNearest(){const grid=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');if(!grid){st.textContent='Enter a grid locator.';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='Searching...';try{const r=await fetch(`/nearest?grid=${encodeURIComponent(grid)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'DVPlogger is busy. Please retry shortly.':'Search failed');showResults(await r.json());}catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}}function showResults(list){const ul=document.getElementById('results');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a park name to set it.`:'No candidates found.';list.forEach(p=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${p.code}: ${p.name} (${p.distance_km} km, bearing ${p.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectPark(p.code,p.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifyPark(code,name,grid){return fetch(`/select?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentPark(){const code=normPark(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a park reference.';return;}notifyPark(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('park').value=code;updateDownloadLink();st.textContent=`${code} is now the active park. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectPark(code,name,grid){notifyPark(code,name,grid).then(()=>{document.getElementById('park').value=code;updateDownloadLink();document.getElementById('setStatus').textContent=`${code} ${name} is now the active park.`;window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openParkPage(){const code=normPark();if(!code){document.getElementById('setStatus').textContent='Enter a park reference.';return;}window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';link.download='pota_log.adi';st.textContent='Enter a park reference and set it in DVPlogger.';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;link.download=`pota_log_${park}.adi`;st.textContent=`Ready to extract QSOs for ${park}.`;}}function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}</script></body></html>
 )rawliteral";
 
   web_server.on("/potahelp", HTTP_GET, [pota_page,pota_page_en](AsyncWebServerRequest* request){
     const bool japanese = request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja");
-    String html(japanese ? pota_page : pota_page_en);
-    String gl = String(plogw->grid_locator_set);
-    html.replace("%GRID_LOCATOR%", gl);
-    // replace park
-    char *p1;
-    if ((p1=strstr(plogw->jcc+2,"POTA/"))!=NULL) {
-	char tmpbuf1[100];
-	strcpy(tmpbuf1,p1+5);
-	p1=strtok(tmpbuf1," ");
-	if (p1!=NULL) {
-	  String park = String("value=\"")+String(p1)+String("\"");
-	  html.replace("%PARK_ID%",park);
-	  park="";
-	}
-    } else {
-      html.replace("%PARK_ID%",String(""));
+    char park_attr[96] = {0};
+    const char *p1 = strstr(plogw->jcc + 2, "POTA/");
+    if (p1) {
+      char tmpbuf1[100];
+      strlcpy(tmpbuf1, p1 + 5, sizeof(tmpbuf1));
+      char *park = strtok(tmpbuf1, " ");
+      if (park) snprintf(park_attr, sizeof(park_attr), "value=\"%s\"", park);
     }
-
-    //    request->send_P(200, "text/html", pota_page, processor);
-    request->send(200, "text/html", html);
+    send_progmem_template2_stream(request, japanese ? pota_page : pota_page_en,
+                                  "%GRID_LOCATOR%", plogw->grid_locator_set,
+                                  "%PARK_ID%", park_attr);
   });
 
 
@@ -5541,7 +6488,7 @@ function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}
 body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}
 </style></head>
 <body onload="updateDownloadLinkSOTA()">
-<p><a href="/sotahelp?lang=en">English</a> | <a href="/">ホーム</a></p>
+<p><a href="/sotahelp?lang=en">English</a> | <a href="/">ホーム</a> | <a href="/location">地図で現在位置を設定</a></p>
 <h1>SOTA運用・ログ作成ヘルパー</h1>
 <p>このページでは、現在運用しているSOTA山頂をDVPloggerへ設定し、その山頂で記録したQSOだけをADIFで取り出してSOTA Databaseへアップロードできます。</p>
 <div class="warn"><strong>重要：</strong>山頂IDを入力しただけではログへ反映されません。必ず「この山頂をDVPloggerへ設定」を押してください。設定後のQSOにはRemarksへ <code>SOTA_MY:山頂ID</code> が自動記録されます。</div>
@@ -5555,7 +6502,7 @@ body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#2
 
 <h2>山頂IDが分からない場合</h2>
 <div class="step"><p>現在地のグリッドロケーターから近い山頂を検索できます。検索結果をクリックすると、その山頂を本体へ設定し、山頂情報ページも開きます。</p>
-<div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid例: PM95ru"><button onclick="findSota()">近いSOTA山頂を検索</button></div>
+<div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid例: PM95ru"><button id="nearBtn" onclick="findSota()">近いSOTA山頂を検索</button></div>
 <p id="searchStatus" class="status"></p><ul id="sotaResults"></ul></div>
 
 <h2>2. DVPloggerで通常どおり交信を記録</h2>
@@ -5574,7 +6521,7 @@ body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#2
 <p><a href="/">ホームへ戻る</a>　<a href="/potahelp?lang=ja">POTAヘルパーへ</a></p>
 <script>
 function normSummit(){return document.getElementById('summit').value.trim().toUpperCase();}
-function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus');if(!g){st.textContent='グリッドロケーターを入力してください。';return;}st.textContent='検索中…';fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`).then(r=>{if(!r.ok)throw new Error('検索に失敗しました');return r.json();}).then(showSota).catch(e=>st.textContent=e.message);}
+let nearBusy=false;async function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');if(!g){st.textContent='グリッドロケーターを入力してください。';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='検索中…';try{const r=await fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'本体が通信処理中です。少し待って再検索してください。':'検索に失敗しました');showSota(await r.json());}catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}}
 function showSota(list){const ul=document.getElementById('sotaResults');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length}件の候補を表示しました。山頂名をクリックすると本体へ設定します。`:'候補が見つかりませんでした。';list.forEach(s=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${s.code}: ${s.name}（${s.distance_km} km、標高 ${s.alt} m、方位 ${s.bearing_deg}°）`;a.onclick=(ev)=>{ev.preventDefault();selectSota(s.code,s.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}
 function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('DVPloggerへの設定に失敗しました');return r.text();});}
 function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='山頂IDを入力してください。';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} を現在の運用山頂として設定しました。これ以後のQSOへ記録されます。`;}).catch(e=>st.textContent=e.message);}
@@ -5586,40 +6533,29 @@ function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank'
 )rawliteral";  
   
   const char *sota_page_en = R"rawliteral(
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SOTA Operation and Log Helper</title><style>body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}</style></head><body onload="updateDownloadLinkSOTA()"><p><a href="/sotahelp?lang=ja">日本語</a> | <a href="/">Home</a></p><h1>SOTA Operation and Log Helper</h1><p>Set the SOTA summit currently being activated, export only QSOs made from that summit as ADIF, and upload the file to SOTA Database.</p><div class="warn"><strong>Important:</strong> Typing a summit reference alone does not change the logger. Press “Set this summit in DVPlogger”. Subsequent QSOs receive <code>SOTA_MY:summit-reference</code> in Remarks.</div>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SOTA Operation and Log Helper</title><style>body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#222}h1{font-size:1.55rem}h2{font-size:1.2rem;margin-top:1.8rem;border-left:5px solid #555;padding-left:.6rem}.step{border:1px solid #bbb;border-radius:8px;padding:12px 14px;margin:12px 0}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}input{font-size:1rem;padding:7px;min-width:14em}button,.button{font-size:1rem;padding:7px 12px;cursor:pointer}.primary{font-weight:bold}.note{background:#f3f3f3;padding:9px 12px;border-radius:6px}.warn{background:#fff4d6;padding:9px 12px;border-radius:6px}.status{font-weight:bold;min-height:1.5em}.small{font-size:.92em;color:#444}code{background:#eee;padding:1px 4px}ul{padding-left:1.4em}a{color:#0645ad}</style></head><body onload="updateDownloadLinkSOTA()"><p><a href="/sotahelp?lang=ja">日本語</a> | <a href="/">Home</a> | <a href="/location">Set location on map</a></p><h1>SOTA Operation and Log Helper</h1><p>Set the SOTA summit currently being activated, export only QSOs made from that summit as ADIF, and upload the file to SOTA Database.</p><div class="warn"><strong>Important:</strong> Typing a summit reference alone does not change the logger. Press “Set this summit in DVPlogger”. Subsequent QSOs receive <code>SOTA_MY:summit-reference</code> in Remarks.</div>
 <h2>1. Set the summit being activated</h2><div class="step"><label for="summit"><strong>SOTA summit reference</strong></label><div class="row"><input type="text" id="summit" %SUMMIT_ID% placeholder="Example: JA/KN-006" oninput="updateDownloadLinkSOTA()"><button class="primary" onclick="setCurrentSummit()">Set this summit in DVPlogger</button><button onclick="openSummitPage()">Open summit information</button></div><p id="setStatus" class="status"></p><p class="small">DVPlogger stores <code>SOTA/JA/xx-xxx</code> in the JCC/JCG field. QSOs logged afterward are identified as activation QSOs from this summit.</p></div>
-<h2>Find a nearby summit</h2><div class="step"><p>Search for nearby summits using the current grid locator. Clicking a result sets the summit in DVPlogger and opens its information page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button onclick="findSota()">Find nearby SOTA summits</button></div><p id="searchStatus" class="status"></p><ul id="sotaResults"></ul></div>
+<h2>Find a nearby summit</h2><div class="step"><p>Search for nearby summits using the current grid locator. Clicking a result sets the summit in DVPlogger and opens its information page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button id="nearBtn" onclick="findSota()">Find nearby SOTA summits</button></div><p id="searchStatus" class="status"></p><ul id="sotaResults"></ul></div>
 <h2>2. Log QSOs normally</h2><div class="step"><p>Enter callsign, RST and exchange normally. Each QSO logged after setting the summit is tagged with the current summit reference.</p><p class="note">After moving to another summit, set the new reference before logging more QSOs. Logs can be exported separately for each summit.</p></div>
 <h2>3. Export this summit's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current summit reference.</p><a id="dl" class="button primary" href="/adif" download="sota_log.adi">Download ADIF for this summit</a><p id="status" class="status"></p><p class="small">The filename is <code>sota_log_JA_xx-xxx.adi</code>. A browser may replace “/” in the summit reference with “_”.</p></div>
 <h2>4. Upload to SOTA Database</h2><div class="step"><ol><li>Save the ADIF file above.</li><li>Open SOTA log upload and sign in.</li><li>Select Activator log upload and choose the saved ADIF file.</li><li>Confirm the summit, date/time and callsign before submitting.</li></ol><button onclick="openSOTA()">Open SOTA log upload</button></div>
 <h2>Button reference</h2><ul><li><strong>Set this summit in DVPlogger:</strong> tags subsequently logged QSOs with the summit reference.</li><li><strong>Open summit information:</strong> opens the SOTLAS summit page without changing DVPlogger.</li><li><strong>Find nearby SOTA summits:</strong> lists candidates from the summit file on the SD card.</li><li><strong>Download ADIF for this summit:</strong> exports only QSOs made from the selected summit.</li><li><strong>Open SOTA log upload:</strong> opens the SOTA Database upload page; upload is not automatic.</li></ul><p><a href="/potahelp?lang=en">POTA helper</a></p>
-<script>function normSummit(){return document.getElementById('summit').value.trim().toUpperCase();}function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus');if(!g){st.textContent='Enter a grid locator.';return;}st.textContent='Searching...';fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`).then(r=>{if(!r.ok)throw new Error('Search failed');return r.json();}).then(showSota).catch(e=>st.textContent=e.message);}function showSota(list){const ul=document.getElementById('sotaResults');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a summit name to set it.`:'No candidates found.';list.forEach(x=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${x.code}: ${x.name} (${x.distance_km} km, altitude ${x.alt} m, bearing ${x.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectSota(x.code,x.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a summit reference.';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} is now the active summit. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectSota(code,name,grid){notifySummit(code,name,grid).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();document.getElementById('setStatus').textContent=`${code} ${name} is now the active summit.`;window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openSummitPage(){const code=normSummit();if(!code){document.getElementById('setStatus').textContent='Enter a summit reference.';return;}window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';link.download='sota_log.adi';st.textContent='Enter a summit reference and set it in DVPlogger.';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;link.download=`sota_log_${summit.replaceAll('/','_')}.adi`;st.textContent=`Ready to extract QSOs for ${summit}.`;}}function openSOTA(){window.open('https://www.sotadata.org.uk/en/upload','_blank');}</script></body></html>
+<script>function normSummit(){return document.getElementById('summit').value.trim().toUpperCase();}let nearBusy=false;async function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');if(!g){st.textContent='Enter a grid locator.';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='Searching...';try{const r=await fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'DVPlogger is busy. Please retry shortly.':'Search failed');showSota(await r.json());}catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}}function showSota(list){const ul=document.getElementById('sotaResults');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a summit name to set it.`:'No candidates found.';list.forEach(x=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${x.code}: ${x.name} (${x.distance_km} km, altitude ${x.alt} m, bearing ${x.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectSota(x.code,x.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a summit reference.';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} is now the active summit. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectSota(code,name,grid){notifySummit(code,name,grid).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();document.getElementById('setStatus').textContent=`${code} ${name} is now the active summit.`;window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openSummitPage(){const code=normSummit();if(!code){document.getElementById('setStatus').textContent='Enter a summit reference.';return;}window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';link.download='sota_log.adi';st.textContent='Enter a summit reference and set it in DVPlogger.';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;link.download=`sota_log_${summit.replaceAll('/','_')}.adi`;st.textContent=`Ready to extract QSOs for ${summit}.`;}}function openSOTA(){window.open('https://www.sotadata.org.uk/en/upload','_blank');}</script></body></html>
 )rawliteral";
 
   web_server.on("/sotahelp", HTTP_GET, [sota_page,sota_page_en](AsyncWebServerRequest* request){
     const bool japanese = request->hasParam("lang") && request->getParam("lang")->value().equalsIgnoreCase("ja");
-    String html(japanese ? sota_page : sota_page_en);
-    String gl = String(plogw->grid_locator_set);
-    html.replace("%GRID_LOCATOR%", gl);
-    gl="";
-    // replace summit
-    char *p1;
-    if ((p1=strstr(plogw->jcc+2,"SOTA/"))!=NULL) {
+    char summit_attr[96] = {0};
+    const char *p1 = strstr(plogw->jcc + 2, "SOTA/");
+    if (p1) {
       char tmpbuf1[100];
-      strcpy(tmpbuf1,p1+5);
-      p1=strtok(tmpbuf1," ");
-      if (p1!=NULL) {
-	String summit = String("value=\"")+String(p1)+String("\"");
-	html.replace("%SUMMIT_ID%",summit);
-	summit="";
-      }
-    } else {
-      html.replace("%SUMMIT_ID%",String(""));
+      strlcpy(tmpbuf1, p1 + 5, sizeof(tmpbuf1));
+      char *summit = strtok(tmpbuf1, " ");
+      if (summit) snprintf(summit_attr, sizeof(summit_attr), "value=\"%s\"", summit);
     }
-
-    //    request->send_P(200, "text/html", pota_page, processor);
-    request->send(200, "text/html", html);
-    html="";
+    send_progmem_template2_stream(request, japanese ? sota_page : sota_page_en,
+                                  "%GRID_LOCATOR%", plogw->grid_locator_set,
+                                  "%SUMMIT_ID%", summit_attr);
   });
 
 
@@ -5667,6 +6603,12 @@ function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank'
     handleQsoLogDump(request, numstr,1);  // type 0:dump 1:txt 2:adif 3:csv 4:jarlog
   });
 
+  // /cabrillo
+  web_server.on("/cabrillo", HTTP_GET, [](AsyncWebServerRequest* request) {
+    String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
+    handleQsoLogDump(request, numstr,5);  // Cabrillo 3.0
+  });
+
   // /dumpqso
   web_server.on("/dumpqso", HTTP_GET, [](AsyncWebServerRequest* request) {
     String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
@@ -5689,245 +6631,229 @@ function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank'
 // static変数としてShiftキーの状態を保持
 // DVPlogger status page.  Use ?lang=en for English; Japanese is default.
 web_server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+  if (!web_lowmem_admit_heavy(request, "/status")) return;
   struct StatusChunkState {
     bool english = false;
     uint8_t stage = 0;
     size_t offset = 0;
-    String pending;
+    size_t length = 0;
+    bool owns_scratch = false;
+    uint32_t scratch_lease = 0;
+    char *pending = web_shared_scratch;
+    ~StatusChunkState(){ if(owns_scratch) web_shared_scratch_release(scratch_lease); }
   };
 
+  uint32_t scratch_lease = 0;
+    if (!web_shared_scratch_acquire(request, "/status", &scratch_lease)) return;
   auto state = std::make_shared<StatusChunkState>();
+  if (!state) { web_shared_scratch_release(scratch_lease); request->send(503, "text/plain", "Not enough memory"); return; }
+  state->owns_scratch = true;
+  state->scratch_lease = scratch_lease;
   state->english = request->hasParam("lang") &&
                    request->getParam("lang")->value().equalsIgnoreCase("en");
-  // Keep only one status-page section in RAM at a time.  The old handler
-  // reserved 6000+ bytes and built the complete page before sending it.
-  state->pending.reserve(1536);
 
   AsyncWebServerResponse *response = request->beginChunkedResponse(
     "text/html; charset=utf-8",
     [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
       (void)index;
 
-      auto esc = [](const String &src) {
-        String dst;
-        dst.reserve(src.length() + 12);
-        for (size_t i = 0; i < src.length(); ++i) {
-          switch (src[i]) {
-          case '&': dst += F("&amp;"); break;
-          case '<': dst += F("&lt;"); break;
-          case '>': dst += F("&gt;"); break;
-          case '"': dst += F("&quot;"); break;
-          default: dst += src[i]; break;
-          }
-        }
-        return dst;
-      };
-
-      auto input_name = [state](int ptr) -> String {
-        const bool english = state->english;
-        if (ptr >= 10 && ptr < 10 + N_CWMSG)
-          return String(english ? "CW message F" : "CWメッセージ F") + String(ptr - 9);
-        if (ptr >= 30 && ptr < 30 + N_CWMSG)
-          return String(english ? "RTTY message F" : "RTTYメッセージ F") + String(ptr - 29);
-        switch (ptr) {
-        case 0: return english ? String("Callsign") : String("相手局コールサイン");
-        case 1: return english ? String("Received exchange") : String("受信ナンバー");
-        case 2: return english ? String("Sent RST") : String("送信RST");
-        case 3: return english ? String("Received RST") : String("受信RST");
-        case 4: return english ? String("My callsign") : String("自局コールサイン");
-        case 5: return english ? String("Sent exchange") : String("送出ナンバー");
-        case 6: return String("Remarks");
-        case 7: return english ? String("Satellite") : String("衛星名");
-        case 8: return english ? String("Grid locator") : String("グリッドロケータ");
-        case 9: return String("JCC/JCG");
-        case 20: return english ? String("Rig name") : String("リグ名");
-        case 21: return english ? String("Cluster name") : String("Cluster名");
-        case 22: return english ? String("Email address") : String("メールアドレス");
-        case 23: return english ? String("Cluster command") : String("Clusterコマンド");
-        case 24: return english ? String("Power code") : String("電力コード");
-        case 25: return String("Wi-Fi SSID");
-        case 26: return english ? String("Wi-Fi password") : String("Wi-Fiパスワード");
-        case 27: return english ? String("Rig specification") : String("リグ仕様");
-        case 28: return String("Z-server");
-        case 29: return english ? String("Operator name") : String("オペレータ名");
-        case 40: return english ? String("Contest") : String("コンテスト");
-        case 41: return english ? String("Cluster2 name") : String("Cluster2名");
-        case 42: return english ? String("Cluster2 command") : String("Cluster2コマンド");
-        default: return String("#") + String(ptr);
-        }
-      };
-
-      auto input_value = [](struct radio *radio) -> String {
-        const int ptr = radio->ptr_curr;
-        if (ptr >= 10 && ptr < 10 + N_CWMSG) return String(plogw->cw_msg[ptr - 10] + 2);
-        if (ptr >= 30 && ptr < 30 + N_CWMSG) return String(plogw->rtty_msg[ptr - 30] + 2);
-        switch (ptr) {
-        case 0: return String(radio->callsign + 2);
-        case 1: return String(radio->recv_exch + 2);
-        case 2: return String(radio->sent_rst + 2);
-        case 3: return String(radio->recv_rst + 2);
-        case 4: return String(plogw->my_callsign + 2);
-        case 5: return String(plogw->sent_exch + 2);
-        case 6: return String(radio->remarks + 2);
-        case 7: return String(plogw->sat_name + 2);
-        case 8: return String(plogw->grid_locator + 2);
-        case 9: return String(plogw->jcc + 2);
-        case 20: return String(radio->rig_name + 2);
-        case 21: return String(plogw->cluster_name + 2);
-        case 22: return String(plogw->email_addr + 2);
-        case 23: return String(plogw->cluster_cmd + 2);
-        case 24: return String(plogw->power_code + 2);
-        case 25: return String(plogw->wifi_ssid + 2);
-        case 26: return String("********");
-        case 27: return String(radio->rig_spec_str + 2);
-        case 28: return String(plogw->zserver_name + 2);
-        case 29: return String(plogw->my_name + 2);
-        case 40: return String(plogw->contest_name + 2);
-        case 41: return String(plogw->cluster2_name + 2);
-        case 42: return String(plogw->cluster2_cmd + 2);
-        default: return String("-");
-        }
-      };
-
-      auto add_row = [&](const __FlashStringHelper *ja,
-                         const __FlashStringHelper *en,
-                         const String &value) {
-        state->pending += F("<tr><th>");
-        state->pending += state->english ? en : ja;
-        state->pending += F("</th><td>");
-        state->pending += esc(value);
-        state->pending += F("</td></tr>");
-      };
-
-      while (state->offset >= state->pending.length()) {
-        state->pending = "";
+      auto reset_pending = [&]() {
         state->offset = 0;
+        state->length = 0;
+        state->pending[0] = '\0';
+      };
+      auto append_n = [&](const char *src, size_t n) {
+        if (!src || !n || state->length >= 1536 - 1) return;
+        size_t room = 1536 - 1 - state->length;
+        if (n > room) n = room;
+        memcpy(state->pending + state->length, src, n);
+        state->length += n;
+        state->pending[state->length] = '\0';
+      };
+      auto append = [&](const char *src) {
+        if (src) append_n(src, strlen(src));
+      };
+      auto append_flash = [&](const __FlashStringHelper *src) {
+        if (!src) return;
+        const char *p = reinterpret_cast<const char *>(src);
+        while (state->length < 1536 - 1) {
+          char c = (char)pgm_read_byte(p++);
+          if (!c) break;
+          state->pending[state->length++] = c;
+        }
+        state->pending[state->length] = '\0';
+      };
+      auto append_escaped = [&](const char *src) {
+        if (!src) return;
+        while (*src && state->length < 1536 - 1) {
+          const char *e = nullptr;
+          switch (*src) {
+          case '&': e = "&amp;"; break;
+          case '<': e = "&lt;"; break;
+          case '>': e = "&gt;"; break;
+          case '"': e = "&quot;"; break;
+          default:
+            state->pending[state->length++] = *src++;
+            state->pending[state->length] = '\0';
+            continue;
+          }
+          append(e);
+          ++src;
+        }
+      };
+      auto append_uint = [&](uint32_t value) {
+        char tmp[16];
+        snprintf(tmp, sizeof(tmp), "%u", (unsigned)value);
+        append(tmp);
+      };
+      auto input_name = [&](int ptr, char *dst, size_t dst_size) {
         const bool english = state->english;
+        if (!dst_size) return;
+        if (ptr >= 10 && ptr < 10 + N_CWMSG) {
+          snprintf(dst, dst_size, english ? "CW message F%d" : "CWメッセージ F%d", ptr - 9); return;
+        }
+        if (ptr >= 30 && ptr < 30 + N_CWMSG) {
+          snprintf(dst, dst_size, english ? "RTTY message F%d" : "RTTYメッセージ F%d", ptr - 29); return;
+        }
+        const char *v = nullptr;
+        switch (ptr) {
+        case 0: v = english ? "Callsign" : "相手局コールサイン"; break;
+        case 1: v = english ? "Received exchange" : "受信ナンバー"; break;
+        case 2: v = english ? "Sent RST" : "送信RST"; break;
+        case 3: v = english ? "Received RST" : "受信RST"; break;
+        case 4: v = english ? "My callsign" : "自局コールサイン"; break;
+        case 5: v = english ? "Sent exchange" : "送出ナンバー"; break;
+        case 6: v = "Remarks"; break;
+        case 7: v = english ? "Satellite" : "衛星名"; break;
+        case 8: v = english ? "Grid locator" : "グリッドロケータ"; break;
+        case 9: v = "JCC/JCG"; break;
+        case 20: v = english ? "Rig name" : "リグ名"; break;
+        case 21: v = english ? "Cluster name" : "Cluster名"; break;
+        case 22: v = english ? "Email address" : "メールアドレス"; break;
+        case 23: v = english ? "Cluster command" : "Clusterコマンド"; break;
+        case 24: v = english ? "Power code" : "電力コード"; break;
+        case 25: v = "Wi-Fi SSID"; break;
+        case 26: v = english ? "Wi-Fi password" : "Wi-Fiパスワード"; break;
+        case 27: v = english ? "Rig specification" : "リグ仕様"; break;
+        case 28: v = "Z-server"; break;
+        case 29: v = english ? "Operator name" : "オペレータ名"; break;
+        case 40: v = english ? "Contest" : "コンテスト"; break;
+        case 41: v = english ? "Cluster2 name" : "Cluster2名"; break;
+        case 42: v = english ? "Cluster2 command" : "Cluster2コマンド"; break;
+        default: snprintf(dst, dst_size, "#%d", ptr); return;
+        }
+        strlcpy(dst, v, dst_size);
+      };
+      auto input_value = [](struct radio *radio) -> const char * {
+        const int ptr = radio->ptr_curr;
+        if (ptr >= 10 && ptr < 10 + N_CWMSG) return plogw->cw_msg[ptr - 10] + 2;
+        if (ptr >= 30 && ptr < 30 + N_CWMSG) return plogw->rtty_msg[ptr - 30] + 2;
+        switch (ptr) {
+        case 0: return radio->callsign + 2; case 1: return radio->recv_exch + 2;
+        case 2: return radio->sent_rst + 2; case 3: return radio->recv_rst + 2;
+        case 4: return plogw->my_callsign + 2; case 5: return plogw->sent_exch + 2;
+        case 6: return radio->remarks + 2; case 7: return plogw->sat_name + 2;
+        case 8: return plogw->grid_locator + 2; case 9: return plogw->jcc + 2;
+        case 20: return radio->rig_name + 2; case 21: return plogw->cluster_name + 2;
+        case 22: return plogw->email_addr + 2; case 23: return plogw->cluster_cmd + 2;
+        case 24: return plogw->power_code + 2; case 25: return plogw->wifi_ssid + 2;
+        case 26: return "********"; case 27: return radio->rig_spec_str + 2;
+        case 28: return plogw->zserver_name + 2; case 29: return plogw->my_name + 2;
+        case 40: return plogw->contest_name + 2; case 41: return plogw->cluster2_name + 2;
+        case 42: return plogw->cluster2_cmd + 2; default: return "-";
+        }
+      };
+      auto add_row = [&](const __FlashStringHelper *ja, const __FlashStringHelper *en,
+                         const char *value) {
+        append("<tr><th>"); append_flash(state->english ? en : ja);
+        append("</th><td>"); append_escaped(value); append("</td></tr>");
+      };
+
+      while (state->offset >= state->length) {
+        reset_pending();
+        const bool english = state->english;
+        char tmp[96];
+        char namebuf[64];
 
         switch (state->stage++) {
         case 0:
-          state->pending += F("<!doctype html><html lang=\"");
-          state->pending += english ? F("en") : F("ja");
-          state->pending += F("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-          state->pending += F("<title>DVPlogger Status</title><style>body{font-family:sans-serif;margin:20px;max-width:1050px}table{border-collapse:collapse;width:100%;margin-bottom:18px}th,td{border:1px solid #bbb;padding:7px;text-align:left}th{background:#eee}.summary th{width:32%}.radio th,.radio td{white-space:nowrap}.radio td:last-child{white-space:normal}.nav a{margin-right:14px}h2{margin-bottom:6px}</style></head><body>");
-          state->pending += F("<div class=\"nav\"><a href=\"/\">");
-          state->pending += english ? F("Home") : F("ホーム");
-          state->pending += F("</a><a href=\"/settings\">");
-          state->pending += english ? F("Settings") : F("設定");
-          state->pending += F("</a><a href=\"/status?lang=");
-          state->pending += english ? F("ja\">日本語") : F("en\">English");
-          state->pending += F("</a></div><h1>DVPlogger Status</h1><h2>");
-          state->pending += english ? F("Logger") : F("ロガー");
-          state->pending += F("</h2><table class=\"summary\">");
+          append("<!doctype html><html lang=\""); append(english ? "en" : "ja");
+          append("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>DVPlogger Status</title><style>body{font-family:sans-serif;margin:20px;max-width:1050px}table{border-collapse:collapse;width:100%;margin-bottom:18px}th,td{border:1px solid #bbb;padding:7px;text-align:left}th{background:#eee}.summary th{width:32%}.radio th,.radio td{white-space:nowrap}.radio td:last-child{white-space:normal}.nav a{margin-right:14px}h2{margin-bottom:6px}</style></head><body><div class=\"nav\"><a href=\"/\">");
+          append(english ? "Home" : "ホーム"); append("</a><a href=\"/settings\">");
+          append(english ? "Settings" : "設定"); append("</a><a href=\"/status?lang=");
+          append(english ? "ja\">日本語" : "en\">English");
+          append("</a></div><h1>DVPlogger Status</h1><h2>"); append(english ? "Logger" : "ロガー");
+          append("</h2><table class=\"summary\">");
           break;
-
         case 1: {
           const bool connected = (WiFi.status() == WL_CONNECTED);
-          add_row(F("IPアドレス"), F("IP address"), connected ? WiFi.localIP().toString() : String("-"));
-          add_row(F("自局コールサイン"), F("My callsign"), String(plogw->my_callsign + 2));
-          add_row(F("現在のコンテスト"), F("Current contest"), String(plogw->contest_name + 2));
-          add_row(F("コンテスト運用"), F("Contest logging"),
-                  plogw->f_off_contest ? (english ? String("OFF (OFFCONTEST)") : String("OFF（OFFCONTEST）"))
-                                      : (english ? String("ON (ONCONTEST)") : String("ON（ONCONTEST）")));
-          add_row(F("フォーカスRadio"), F("Focused radio"), String(so2r.focused_radio() + 1));
-          add_row(F("RX Radio"), F("RX radio"), String(so2r.rx() + 1));
-          add_row(F("TX Radio"), F("TX radio"), String(so2r.tx() + 1));
+          if (connected) snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
+          else strlcpy(tmp, "-", sizeof(tmp));
+          add_row(F("IPアドレス"), F("IP address"), tmp);
+          add_row(F("自局コールサイン"), F("My callsign"), plogw->my_callsign + 2);
+          add_row(F("現在のコンテスト"), F("Current contest"), plogw->contest_name + 2);
+          add_row(F("コンテスト運用"), F("Contest logging"), plogw->f_off_contest ? (english ? "OFF (OFFCONTEST)" : "OFF（OFFCONTEST）") : (english ? "ON (ONCONTEST)" : "ON（ONCONTEST）"));
+          snprintf(tmp, sizeof(tmp), "%d", so2r.focused_radio() + 1); add_row(F("フォーカスRadio"), F("Focused radio"), tmp);
+          snprintf(tmp, sizeof(tmp), "%d", so2r.rx() + 1); add_row(F("RX Radio"), F("RX radio"), tmp);
+          snprintf(tmp, sizeof(tmp), "%d", so2r.tx() + 1); add_row(F("TX Radio"), F("TX radio"), tmp);
           struct radio *selected = so2r.radio_selected();
-          add_row(F("LCD入力欄"), F("LCD input field"), input_name(selected->ptr_curr));
+          input_name(selected->ptr_curr, namebuf, sizeof(namebuf)); add_row(F("LCD入力欄"), F("LCD input field"), namebuf);
           add_row(F("入力中の内容"), F("Current input"), input_value(selected));
-          state->pending += F("</table><h2>Radio</h2><table class=\"radio\"><tr><th>#</th><th>");
-          state->pending += english ? F("State") : F("状態");
-          state->pending += F("</th><th>Rig</th><th>");
-          state->pending += english ? F("Frequency") : F("周波数");
-          state->pending += F("</th><th>Mode</th><th>S</th><th>CQ/S&amp;P</th><th>");
-          state->pending += english ? F("LCD input field") : F("LCD入力欄");
-          state->pending += F("</th></tr>");
+          append("</table><h2>Radio</h2><table class=\"radio\"><tr><th>#</th><th>"); append(english ? "State" : "状態");
+          append("</th><th>Rig</th><th>"); append(english ? "Frequency" : "周波数");
+          append("</th><th>Mode</th><th>S</th><th>CQ/S&amp;P</th><th>"); append(english ? "LCD input field" : "LCD入力欄"); append("</th></tr>");
           break;
         }
-
         case 2:
           for (int i = 0; i < N_RADIO; ++i) {
             struct radio *radio = &radio_list[i];
-            String radio_state = radio->enabled
-              ? (english ? String("Enabled") : String("有効"))
-              : (english ? String("Disabled") : String("無効"));
-            if (so2r.focused_radio() == i) radio_state += F(" / Focus");
-            if (so2r.rx() == i) radio_state += F(" / RX");
-            if (so2r.tx() == i) radio_state += F(" / TX");
-            char fbuf[24];
-            snprintf(fbuf, sizeof(fbuf), "%u.%05u MHz", radio->freq / 100000U,
-                     radio->freq % 100000U);
-            const char *rig_name = (radio->rig_spec && radio->rig_spec->name)
-                                   ? radio->rig_spec->name : "-";
-            state->pending += F("<tr><td>"); state->pending += String(i + 1);
-            state->pending += F("</td><td>"); state->pending += esc(radio_state);
-            state->pending += F("</td><td>"); state->pending += esc(String(rig_name));
-            state->pending += F("</td><td>"); state->pending += fbuf;
-            state->pending += F("</td><td>"); state->pending += esc(String(radio->opmode));
-            state->pending += F("</td><td>");
-            state->pending += radio->enabled ? String(radio->smeter / SMETER_UNIT_DBM) : String("-");
-            state->pending += F("</td><td>");
-            state->pending += radio->cq[radio->modetype] ? F("CQ") : F("S&P");
-            state->pending += F("</td><td>"); state->pending += esc(input_name(radio->ptr_curr));
-            state->pending += F("</td></tr>");
+            char statebuf[64];
+            strlcpy(statebuf, radio->enabled ? (english ? "Enabled" : "有効") : (english ? "Disabled" : "無効"), sizeof(statebuf));
+            if (so2r.focused_radio() == i) strlcat(statebuf, " / Focus", sizeof(statebuf));
+            if (so2r.rx() == i) strlcat(statebuf, " / RX", sizeof(statebuf));
+            if (so2r.tx() == i) strlcat(statebuf, " / TX", sizeof(statebuf));
+            char fbuf[24]; snprintf(fbuf, sizeof(fbuf), "%u.%05u MHz", radio->freq / 100000U, radio->freq % 100000U);
+            const char *rig_name = (radio->rig_spec && radio->rig_spec->name) ? radio->rig_spec->name : "-";
+            append("<tr><td>"); append_uint(i + 1); append("</td><td>"); append_escaped(statebuf);
+            append("</td><td>"); append_escaped(rig_name); append("</td><td>"); append(fbuf);
+            append("</td><td>"); append_escaped(radio->opmode); append("</td><td>");
+            if (radio->enabled) { snprintf(tmp, sizeof(tmp), "%d", radio->smeter / SMETER_UNIT_DBM); append(tmp); } else append("-");
+            append("</td><td>"); append(radio->cq[radio->modetype] ? "CQ" : "S&P"); append("</td><td>");
+            input_name(radio->ptr_curr, namebuf, sizeof(namebuf)); append_escaped(namebuf); append("</td></tr>");
           }
-          state->pending += F("</table><h2>Wi-Fi</h2><table class=\"summary\">");
+          append("</table><h2>Wi-Fi</h2><table class=\"summary\">");
           break;
-
         case 3: {
           const bool connected = (WiFi.status() == WL_CONNECTED);
-          add_row(F("Wi-Fi状態"), F("Wi-Fi status"),
-                  connected ? (english ? String("Connected") : String("接続中"))
-                            : (english ? String("Disconnected") : String("未接続")));
-          add_row(F("SSID"), F("SSID"), connected ? WiFi.SSID() : String("-"));
-          add_row(F("受信強度"), F("Wi-Fi RSSI"), connected ? String(WiFi.RSSI()) + " dBm" : String("-"));
-          add_row(F("サブネットマスク"), F("Subnet mask"), connected ? WiFi.subnetMask().toString() : String("-"));
-          add_row(F("ゲートウェイ"), F("Gateway"), connected ? WiFi.gatewayIP().toString() : String("-"));
-          add_row(F("MACアドレス"), F("MAC address"), WiFi.macAddress());
-          state->pending += F("</table><h2>");
-          state->pending += english ? F("System") : F("システム");
-          state->pending += F("</h2><table class=\"summary\">");
+          add_row(F("Wi-Fi状態"), F("Wi-Fi status"), connected ? (english ? "Connected" : "接続中") : (english ? "Disconnected" : "未接続"));
+          add_row(F("SSID"), F("SSID"), connected ? WiFi.SSID().c_str() : "-");
+          if (connected) snprintf(tmp, sizeof(tmp), "%d dBm", WiFi.RSSI()); else strlcpy(tmp, "-", sizeof(tmp)); add_row(F("受信強度"), F("Wi-Fi RSSI"), tmp);
+          if (connected) snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", WiFi.subnetMask()[0], WiFi.subnetMask()[1], WiFi.subnetMask()[2], WiFi.subnetMask()[3]); else strlcpy(tmp, "-", sizeof(tmp)); add_row(F("サブネットマスク"), F("Subnet mask"), tmp);
+          if (connected) snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", WiFi.gatewayIP()[0], WiFi.gatewayIP()[1], WiFi.gatewayIP()[2], WiFi.gatewayIP()[3]); else strlcpy(tmp, "-", sizeof(tmp)); add_row(F("ゲートウェイ"), F("Gateway"), tmp);
+          strlcpy(tmp, WiFi.macAddress().c_str(), sizeof(tmp)); add_row(F("MACアドレス"), F("MAC address"), tmp);
+          append("</table><h2>"); append(english ? "System" : "システム"); append("</h2><table class=\"summary\">");
           break;
         }
-
         case 4: {
           const uint32_t seconds = millis() / 1000UL;
-          const uint32_t days = seconds / 86400UL;
-          const uint32_t hours = (seconds / 3600UL) % 24UL;
-          const uint32_t minutes = (seconds / 60UL) % 60UL;
-          const uint32_t secs = seconds % 60UL;
-          add_row(F("稼働時間"), F("Uptime"),
-                  String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(secs) + "s");
-          add_row(F("空きヒープ"), F("Free heap"), String(ESP.getFreeHeap()) + " bytes");
-          add_row(F("最小空きヒープ"), F("Minimum free heap"), String(ESP.getMinFreeHeap()) + " bytes");
-          const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-          const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-          const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-          const size_t psram_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
-          add_row(F("PSRAM総容量"), F("PSRAM total"), String(psram_total) + " bytes");
-          add_row(F("メモリ動作モード"), F("Memory mode"),
-                  String(psram_total == 0 ? "LOW (no PSRAM)" : "NORMAL (PSRAM)"));
-          add_row(F("PSRAM空き"), F("Free PSRAM"), String(psram_free) + " bytes");
-          add_row(F("PSRAM最大連続領域"), F("Largest PSRAM block"), String(psram_largest) + " bytes");
-          add_row(F("PSRAM最小空き"), F("Minimum free PSRAM"), String(psram_min_free) + " bytes");
-          state->pending += F("</table><p>");
-          state->pending += english ? F("Reload this page to refresh the values.")
-                                    : F("表示を更新するにはページを再読み込みしてください。");
-          state->pending += F("</p></body></html>");
+          snprintf(tmp, sizeof(tmp), "%ud %uh %um %us", (unsigned)(seconds / 86400UL), (unsigned)((seconds / 3600UL) % 24UL), (unsigned)((seconds / 60UL) % 60UL), (unsigned)(seconds % 60UL)); add_row(F("稼働時間"), F("Uptime"), tmp);
+          snprintf(tmp, sizeof(tmp), "%u bytes", (unsigned)ESP.getFreeHeap()); add_row(F("空きヒープ"), F("Free heap"), tmp);
+          snprintf(tmp, sizeof(tmp), "%u bytes", (unsigned)ESP.getMinFreeHeap()); add_row(F("最小空きヒープ"), F("Minimum free heap"), tmp);
+          const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM), psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM), psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM), psram_min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+          snprintf(tmp, sizeof(tmp), "%u bytes", (unsigned)psram_total); add_row(F("PSRAM総容量"), F("PSRAM total"), tmp);
+          add_row(F("メモリ動作モード"), F("Memory mode"), psram_total == 0 ? "LOW (no PSRAM)" : "NORMAL (PSRAM)");
+          snprintf(tmp, sizeof(tmp), "%u bytes", (unsigned)psram_free); add_row(F("PSRAM空き"), F("Free PSRAM"), tmp);
+          snprintf(tmp, sizeof(tmp), "%u bytes", (unsigned)psram_largest); add_row(F("PSRAM最大連続領域"), F("Largest PSRAM block"), tmp);
+          snprintf(tmp, sizeof(tmp), "%u bytes", (unsigned)psram_min_free); add_row(F("PSRAM最小空き"), F("Minimum free PSRAM"), tmp);
+          append("</table><p>"); append(english ? "Reload this page to refresh the values." : "表示を更新するにはページを再読み込みしてください。"); append("</p></body></html>");
           break;
         }
-
-        default:
-          return 0;
+        default: return 0;
         }
       }
-
-      const size_t remain = state->pending.length() - state->offset;
+      const size_t remain = state->length - state->offset;
       const size_t ncopy = std::min(remain, maxLen);
-      if (ncopy) {
-        memcpy(buffer, state->pending.c_str() + state->offset, ncopy);
-        state->offset += ncopy;
-      }
+      if (ncopy) { memcpy(buffer, state->pending + state->offset, ncopy); state->offset += ncopy; }
       return ncopy;
     });
   response->addHeader("Cache-Control", "no-store");
@@ -5939,7 +6865,7 @@ web_server.on("/antenna_status", HTTP_GET, [](AsyncWebServerRequest *request) {
 });
 
 web_server.on("/antenna", HTTP_GET, [](AsyncWebServerRequest *request) {
-  request->send_P(200, "text/html", antenna_page_html);
+  send_progmem_stream(request, "text/html; charset=utf-8", antenna_page_html, "/antenna");
 });
 
 web_server.on("/antenna_config", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -6011,7 +6937,7 @@ web_server.on("/network_service_mode", HTTP_GET, [](AsyncWebServerRequest *reque
 
 // /op ページ配信
 web_server.on("/op", HTTP_GET, [](AsyncWebServerRequest *request) {
-  request->send_P(200, "text/html", oppage_html);
+  send_progmem_stream(request, "text/html; charset=utf-8", oppage_html, "/op");
 });
 
 web_server.on("/rig_key", HTTP_GET, [](AsyncWebServerRequest *req) {
@@ -6167,7 +7093,7 @@ web_server.on("/control", HTTP_GET, [](AsyncWebServerRequest *request) {
 web_server.on("/radio_mode", HTTP_GET, [](AsyncWebServerRequest *req) {
   if (!req->hasParam("mode")) { req->send(400, "text/plain", "Missing mode"); return; }
   const int mode = req->getParam("mode")->value().toInt();
-  if (mode < SO2R::RADIO_MODE_SO1R || mode > SO2R::RADIO_MODE_SO2R) {
+  if (mode != SO2R::RADIO_MODE_SO1R && mode != SO2R::RADIO_MODE_SO2R) {
     req->send(400, "text/plain", "Invalid radio mode"); return;
   }
   if (so2r.sequence_stat() != SO2R::Default) {
@@ -6410,6 +7336,3 @@ void resume_webserver_after_flash() {
   web_server.begin();
   webserver_suspended_for_flash = false;
 }
-
-
-

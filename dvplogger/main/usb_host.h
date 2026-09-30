@@ -97,6 +97,8 @@ class KbdRptParser : public KeyboardReportParser {
   bool send_keyrpt_queue() ;
   uint32_t key_queue_drop_count = 0;
   uint32_t key_queue_drop_last_report_ms = 0;
+  bool caps_shift_2_down = false;
+  bool ext_caps_shift_2_down = false;
   
   public:
   void process_keyrpt_queue(const char *profile_name = NULL) ;  
@@ -148,7 +150,9 @@ bool usb_cat_ready_for_rig_type(uint8_t cat_type);
 // Deferred CDC ACM DTR/RTS keying.  cwport 3=DTR, 4=RTS.
 // usb_keying_request() is safe to call from the 1-ms CW ticker callback;
 // the actual USB control transfer is performed later by loop_usb().
-void usb_keying_request(uint8_t cwport, bool on);
+void usb_keying_request(uint8_t cwport, bool on, uint8_t source = 0);
+void USBKeyTraceSet(bool enable, Print *out = nullptr);
+bool USBKeyTraceGet();
 void usb_keying_process();
 // USB RTTY scheduler.  The 1-ms CW ticker only enqueues symbol states;
 // loop_usb() applies them at measured 45.45-baud symbol boundaries so USB
@@ -157,6 +161,7 @@ bool usb_rtty_begin(uint8_t cwport, uint32_t lead_ms, bool invert);
 bool usb_rtty_symbol_request(uint8_t cwport, bool mark, uint32_t duration_us);
 bool usb_rtty_end_request(uint8_t cwport);
 bool usb_rtty_take_tx_done();
+bool CP2105fskPhysicalTestStart(Stream *out = nullptr);
 void USBRTTYsetInvert(bool invert, Print *out = nullptr);
 bool USBRTTYgetInvert();
 // True while the USB RTTY scheduler needs sub-symbol polling latency.
@@ -171,6 +176,8 @@ void CP2105status(Stream *out = nullptr);
 bool CP2105selectPort(uint8_t port);
 bool CP2105setBaud(uint8_t port, uint32_t baudrate);
 bool CP2105controlTest(uint8_t port, char line, bool on, Stream *out = nullptr);
+bool CP2105lineStateTest(uint8_t port, uint8_t state, Stream *out = nullptr);
+bool CP2105diag(uint8_t port, Stream *out = nullptr);
 bool CP2105flowStatus(uint8_t port, Stream *out = nullptr);
 bool CP2105setManualFlow(uint8_t port, Stream *out = nullptr);
 void CP2105toggleDebug();

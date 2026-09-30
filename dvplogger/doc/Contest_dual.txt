@@ -1,0 +1,19 @@
+User Contest名は、大文字・小文字を区別せず受け付けます。例えばuserakintやUSERakintも、表示・ログではUserAKINTに統一されます。
+2つのUser Contestを同時に使用した場合、両方のMDファイルに基づいて交換ナンバーを検査します。secondary側が共通のUser Contest定義を参照してM2:NGになる問題を修正しています。
+現在のcontestと直前のcontestの組合せを記憶します。再起動後も、設定されているcontestを起点として、もう一方のcontestが復元されます。
+User Contestには永続的なIDが割り当てられます。IDはMDファイルが実在する場合だけ登録されるため、タイプミスによる不要なcontest登録を防ぎます。
+1300件のDUPE領域を複数contestで共有します。DUPE判定ではコールサイン、バンド・モードに加えてcontest IDも区別します。
+同じ局とのQSOでも、異なるcontestであれば別々にDUPE判定されます。
+1回のQSOを2つのcontestへ記録した場合は、それぞれ異なる交換ナンバーを持つ2件のDUPE entryとして登録されます。
+active／paired contestの両方について、QSOログからDUPEデータを再構築します。
+contest切替時にはDUPEデータを作り直さず、選択するcontest IDを切り替えます。そのため、キャッシュ済みcontest間の切替が速くなります。
+2つのUser ContestのMDテーブルがメモリに保持された後は、Ctrl-Shift-2で即時に往復できます。再起動後の未読込User Contestへ最初に切り替える際のみ、MD読込みとMAKEDUPEが発生します。
+CWとPhoneを別QSOとして扱うか、同一DUPEとして扱うかはcontestごとに判定されます。activeとpairedで設定が異なっていても、それぞれの規則が適用されます。
+MULTI画面の先頭に、現在のcontestとpaired contestを常時表示します。
+A>FUKOUT P:AKINT
+A>は現在入力・DUPE判定に使用しているactive contest、P:は切替対象のpaired contestを表します。
+LCDではUser ContestのUser接頭辞を省略し、contest名を最大7文字で表示します。
+二重交換ナンバーによるQSOが成立すると、対応関係を約1.5秒表示します。
+M1:FUKOUT
+M2:AKINT
+MULTI画面のmult:行は維持されます。バンド別MULTI一覧は、表示領域確保のため4件から3件になります。

@@ -466,7 +466,8 @@ int select_appropriate_radio(int bandid) {
 // cq ?    force s&p (done in set_frequency)
 // filt -> after set_frequency() and set_mode() then refer to radio->filtbank to set filt set_frequency_rig_radio() and send_mode_set_civ()
 
-int set_station_entry(struct radio *radio, char *station, unsigned int freq, const char *opmode)
+int set_station_entry(struct radio *radio, char *station, unsigned int freq,
+                      const char *opmode, bool show_partial_result)
 {
   if (!radio || !radio->enabled) return 0;
 
@@ -527,7 +528,10 @@ int set_station_entry(struct radio *radio, char *station, unsigned int freq, con
   radio->filtbank[target_bandid][LOG_SandP][target_modetype] = filt;
   radio->last_filtbank[target_bandid] = filt;
 
-  set_callsign_and_request_dupe(radio, station, true);
+  set_callsign_and_request_dupe_for_bandmode(
+      radio, station, true,
+      (unsigned char)bandmode_param(target_bandid, target_modetype),
+      show_partial_result);
 
   /*
    * A bandmap spot is a target selection.  Do not fabricate actual radio
@@ -556,9 +560,180 @@ void mark_bandmap_call_worked(const char *station, int bandid, int qso_bandmode)
     const int spot_bandmode = bandmode_param(bandid, modetype[entry->mode]);
     if ((spot_bandmode & plogw->mask) == (qso_bandmode & plogw->mask)) {
       entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+      // A completed QSO is authoritative.  Cancel the pending-display state
+      // so an older background NOT-DUPE reply can never expose this spot.
+      entry->flag &= ~BANDMAP_ENTRY_FLAG_DUPE_PENDING;
     }
   }
   bandmap_disp.f_update = 1;
+}
+
+struct BandmapDupePendingQuery {
+  bool active = false;
+  int bandid = 0;
+  unsigned int freq = 0;
+  int time = 0;
+  byte mode = 0;
+  char station[LEN_CALLSIGN + 1] = "";
+};
+
+static BandmapDupePendingQuery bandmap_dupe_pending_query;
+static bool bandmap_dupe_rebuild_hold = false;
+// Avoid rescanning every bandmap on every main-loop pass when there is no
+// background DUPE work.  This flag is raised only when DUPE_PENDING entries
+// are actually created (cluster input or a full MAKEDUPE recheck).
+static bool bandmap_dupe_work_pending = false;
+
+void bandmap_dupe_pending_notify() {
+  bandmap_dupe_work_pending = true;
+}
+
+static unsigned int count_bandmap_dupe_pending() {
+  unsigned int count = 0;
+  for (int b = 0; b < N_BAND - 1; ++b) {
+    struct bandmap *bm = &bandmap[b];
+    for (int i = 0; i < bm->nentry; ++i) {
+      const struct bandmap_entry *entry = bm->entry + i;
+      if (entry->station[0] && entry->mode < NMODEID &&
+          (entry->flag & BANDMAP_ENTRY_FLAG_DUPE_PENDING))
+        ++count;
+    }
+  }
+  return count;
+}
+
+void bandmap_dupe_rebuild_begin() {
+  // A MAKEDUPE rebuild changes the authoritative contest context.  Hide all
+  // existing spots until the rebuilt database can evaluate them again.
+  dupechk_background_exact_cancel();
+  bandmap_dupe_pending_query = BandmapDupePendingQuery{};
+  bandmap_dupe_rebuild_hold = true;
+  bandmap_dupe_pending_notify();
+
+  unsigned int queued = 0;
+  for (int b = 0; b < N_BAND - 1; ++b) {
+    struct bandmap *bm = &bandmap[b];
+    for (int i = 0; i < bm->nentry; ++i) {
+      struct bandmap_entry *entry = bm->entry + i;
+      if (!entry->station[0] || entry->mode >= NMODEID) continue;
+      entry->flag |= BANDMAP_ENTRY_FLAG_DUPE_PENDING;
+      entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+      ++queued;
+    }
+  }
+  bandmap_disp.f_update = 1;
+  if (verbose & 16384)
+    console->printf("[BANDMAP-DUPE] RECHECK-BEGIN cid=%u mask=0x%02X pending=%u hold=1\n",
+                    (unsigned)current_contest_dupe_id(),
+                    (unsigned)plogw->mask, queued);
+}
+
+void bandmap_dupe_rebuild_end() {
+  bandmap_dupe_rebuild_hold = false;
+  if (verbose & 16384)
+    console->printf("[BANDMAP-DUPE] RECHECK-READY cid=%u mask=0x%02X pending=%u hold=0\n",
+                    (unsigned)current_contest_dupe_id(),
+                    (unsigned)plogw->mask, count_bandmap_dupe_pending());
+}
+
+static struct bandmap_entry *find_bandmap_dupe_pending_snapshot() {
+  if (!bandmap_dupe_pending_query.active ||
+      bandmap_dupe_pending_query.bandid < 1 ||
+      bandmap_dupe_pending_query.bandid >= N_BAND)
+    return NULL;
+  struct bandmap *bm = &bandmap[bandmap_dupe_pending_query.bandid - 1];
+  for (int i = 0; i < bm->nentry; ++i) {
+    struct bandmap_entry *entry = bm->entry + i;
+    if (entry->freq == bandmap_dupe_pending_query.freq &&
+        entry->time == bandmap_dupe_pending_query.time &&
+        entry->mode == bandmap_dupe_pending_query.mode &&
+        strcasecmp(entry->station, bandmap_dupe_pending_query.station) == 0)
+      return entry;
+  }
+  return NULL;
+}
+
+void process_bandmap_dupe_pending() {
+  if (dupechk == NULL || dupechk->dupechk_at != 1) return;
+  if (bandmap_dupe_rebuild_hold) return;
+  if (!bandmap_dupe_work_pending && !bandmap_dupe_pending_query.active) return;
+
+  if (bandmap_dupe_pending_query.active) {
+    bool confirmed = false;
+    bool worked = false;
+    if (!dupechk_background_exact_poll(&confirmed, &worked)) return;
+
+    if (verbose & 16384)
+      console->printf("[BANDMAP-DUPE] POLL call=%s band=%d freq=%u confirmed=%u dupe=%u cid=%u mask=0x%02X\n",
+                      bandmap_dupe_pending_query.station,
+                      bandmap_dupe_pending_query.bandid,
+                      bandmap_dupe_pending_query.freq,
+                      confirmed ? 1U : 0U, worked ? 1U : 0U,
+                      (unsigned)current_contest_dupe_id(),
+                      (unsigned)plogw->mask);
+
+    struct bandmap_entry *entry = find_bandmap_dupe_pending_snapshot();
+    if (entry != NULL && (entry->flag & BANDMAP_ENTRY_FLAG_DUPE_PENDING)) {
+      if (confirmed) {
+        entry->flag &= ~BANDMAP_ENTRY_FLAG_DUPE_PENDING;
+        if (worked) entry->flag |= BANDMAP_ENTRY_FLAG_WORKED;
+        else entry->flag &= ~BANDMAP_ENTRY_FLAG_WORKED;
+        bandmap_disp.f_update = 1;
+        if (verbose & 16384)
+          console->printf("[BANDMAP-DUPE] RESOLVE call=%s result=%s flags=0x%02X\n",
+                          entry->station, worked ? "DUPE" : "VISIBLE",
+                          (unsigned)entry->flag);
+      } else if (verbose & 16384) {
+        console->printf("[BANDMAP-DUPE] RETRY call=%s reason=unconfirmed flags=0x%02X\n",
+                        entry->station, (unsigned)entry->flag);
+      }
+      // If the query was preempted/timed out, leave PENDING+WORKED intact.
+      // The next main-loop pass will retry it without ever exposing the spot.
+    }
+    bandmap_dupe_pending_query.active = false;
+    return;
+  }
+
+  // One query per main-loop opportunity.  Operator DUPE queries own the
+  // single SUBCPU slot and dupechk_background_exact_start() simply refuses
+  // while that slot is busy.
+  for (int b = 1; b < N_BAND; ++b) {
+    struct bandmap *bm = &bandmap[b - 1];
+    for (int i = 0; i < bm->nentry; ++i) {
+      struct bandmap_entry *entry = bm->entry + i;
+      if (!(entry->flag & BANDMAP_ENTRY_FLAG_DUPE_PENDING) ||
+          !entry->station[0] || entry->mode >= NMODEID)
+        continue;
+      const byte query_bandmode = bandmode_param(b, modetype[entry->mode]);
+      if (!dupechk_background_exact_start(entry->station, query_bandmode,
+                                           plogw->mask)) {
+        if (verbose & 16384)
+          console->printf("[BANDMAP-DUPE] WAIT call=%s band=%d freq=%u cid=%u mask=0x%02X reason=query-slot-busy/backoff\n",
+                          entry->station, b, entry->freq,
+                          (unsigned)current_contest_dupe_id(),
+                          (unsigned)plogw->mask);
+        return;
+      }
+      if (verbose & 16384)
+        console->printf("[BANDMAP-DUPE] START call=%s band=%d freq=%u bm=%u cid=%u mask=0x%02X flags=0x%02X\n",
+                        entry->station, b, entry->freq,
+                        (unsigned)query_bandmode,
+                        (unsigned)current_contest_dupe_id(),
+                        (unsigned)plogw->mask, (unsigned)entry->flag);
+      bandmap_dupe_pending_query.active = true;
+      bandmap_dupe_pending_query.bandid = b;
+      bandmap_dupe_pending_query.freq = entry->freq;
+      bandmap_dupe_pending_query.time = entry->time;
+      bandmap_dupe_pending_query.mode = entry->mode;
+      strlcpy(bandmap_dupe_pending_query.station, entry->station,
+              sizeof(bandmap_dupe_pending_query.station));
+      return;
+    }
+  }
+
+  // A complete scan found no remaining DUPE_PENDING entry.  Stay idle until
+  // cluster input or a MAKEDUPE rebuild explicitly creates new work.
+  bandmap_dupe_work_pending = false;
 }
 
 void pick_entry_bandmap() {
@@ -639,7 +814,6 @@ void pick_onfreq_station() {
 void init_bandmap_entry(struct bandmap_entry *p) {
   p->station[0] = '\0';
   p->mode = 0;
-  p->remarks[0] = '\0';
   p->time = 0;
   p->receive_order = 0;
   p->type = 0;
@@ -768,6 +942,11 @@ int new_entry_bandmap(int bandid,int nmax) {
   bandmap[idx].nentry += grow;
   // bandmap[idx].nentry += 5; // make it smaller increment to debug
   struct bandmap_entry *p;
+#if JK1DVPLOG_HWVER == 1
+  const size_t bm_free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t bm_largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  const size_t bm_bytes = sizeof(struct bandmap_entry) * (size_t)bandmap[idx].nentry;
+#endif
   //  p = (struct bandmap_entry *)realloc(bandmap[idx].entry, sizeof(struct bandmap_entry) * bandmap[idx].nentry); // original
   //#ifdef PSRAM_EXISTS
   if (f_spiram) {
@@ -781,6 +960,14 @@ int new_entry_bandmap(int bandid,int nmax) {
   //  }
     //#endif
   }
+#if JK1DVPLOG_HWVER == 1
+  const size_t bm_free_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t bm_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  console->printf("BANDMAP-ALLOC idx=%d entry=%d->%d esz=%u bytes=%u free=%u->%u largest=%u->%u %s\n",
+                  idx,nentry_prev,bandmap[idx].nentry,(unsigned)sizeof(struct bandmap_entry),
+                  (unsigned)bm_bytes,(unsigned)bm_free_before,(unsigned)bm_free_after,
+                  (unsigned)bm_largest_before,(unsigned)bm_largest_after,p ? "OK" : "FAIL");
+#endif
   if (p != NULL) {
     // success reallocation
     if (verbose & 16) plogw->ostream->println(" realloc ok ");
@@ -896,10 +1083,7 @@ void set_info_bandmap(int bandid, char *stn, int modeid, unsigned int ifreq, cha
   //  entry->time = rtctime.unixtime();  // current time for removing the entry in clean_bandmap();
   stamp_bandmap_entry(entry);  // reception time and within-second order
   entry->mode = modeid;
-  entry->remarks[0] = '\0';
   // temporally commented out
-  //  strncat(entry->remarks, remarks, 16); // copy remarks
-  //  trim(entry->remarks);
   entry->type = 2;
   if (!plogw->f_console_emu) {
     plogw->ostream->print("setting info bandmap  idx= ");
@@ -912,10 +1096,7 @@ void set_info_bandmap(int bandid, char *stn, int modeid, unsigned int ifreq, cha
     //  entry->time = rtctime.unixtime();  // current time for removing the entry in clean_bandmap();
     entry_allband->time = my_rtc.unixtime();  // current time for removing the entry in clean_bandmap();
     entry_allband->mode = modeid;
-    entry_allband->remarks[0] = '\0';
     // temporally commented out
-    //  strncat(entry->remarks, remarks, 16); // copy remarks
-    //  trim(entry->remarks);
     entry_allband->type = 2;
     if (!plogw->f_console_emu) {
       plogw->ostream->print("setting info bandmap allband idx= ");

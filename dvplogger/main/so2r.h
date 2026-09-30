@@ -185,6 +185,17 @@ public:
   int send_exch(struct radio *radio) 
   {
     if (verbose&4)     console->print("so2r send_exch()");
+
+    // PHONE VoiceMemory=0/1 does not actually transmit F2 here.  Do not
+    // enter Sending_Msg or move RX/focus to the partner radio when there is
+    // no automatic voice message on the air.
+    if (radio->modetype == LOG_MODETYPE_PH &&
+        plogw->voice_memory_enable < 2) {
+      if (verbose & 4)
+        console->println(" PHONE no auto exchange; keep RX/focus");
+      return 1;
+    }
+
     cancel_msg_tx();
     set_msg_tx_to_focused();
     set_tx_to_msg_tx();
@@ -198,9 +209,7 @@ public:
       append_cwbuf_string(plogw->cw_msg[1] + 2);  // F2 exchange
       append_cwbuf('$');  // control command
     } else if (radio->modetype== LOG_MODETYPE_PH) {
-      if (plogw->voice_memory_enable>=2) {
-	send_voice_memory(radio, 2);  // F2 exchange
-      }
+      send_voice_memory(radio, 2);  // F2 exchange (VoiceMemory >= 2)
     } else if (radio->modetype== LOG_MODETYPE_DG) {  // RTTY
       // send call and exchange , then move to my exch entry
       set_rttymemory_string(radio, 2, plogw->rtty_msg[1] + 2);  // set rtty memory on rig
@@ -849,10 +858,27 @@ public:
 
 
   // watch transmit status
-  void onTx_stat_update()
+  void onTx_stat_update(struct radio *radio)
   {
-    struct radio *radio;
-    radio = radio_msg_tx();
+    if (!radio) return;
+
+    // Manual PHONE CQ detection for SO2R.  When the operator keys the MIC
+    // while the cursor is in an empty CALLSIGN field, this is a Run/CQ
+    // transmission: an S&P transmission necessarily has a station to call.
+    // A subsequent dial-frequency change still returns the radio to S&P in
+    // set_frequency(), exactly as before.
+    if (radio_mode == RADIO_MODE_SO2R &&
+        radio->modetype == LOG_MODETYPE_PH &&
+        radio->rig_idx == focused_radio() &&
+        radio->ptt_stat_prev == 0 && radio->ptt_stat >= 1 &&
+        radio->ptr_curr == 0 && radio->callsign[2] == '\0') {
+      if (radio->cq[radio->modetype] != LOG_CQ) {
+        radio->cq[radio->modetype] = LOG_CQ;
+        if (verbose & 4)
+          console->println("PHONE empty CALL + PTT: S&P -> CQ");
+        upd_display();
+      }
+    }
 
     if (verbose & VERBOSE_SEQUENCE) {
       if (verbose&4)     console->println("onTx_stat_update()");

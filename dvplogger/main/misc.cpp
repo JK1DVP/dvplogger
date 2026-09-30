@@ -28,6 +28,7 @@
 #include "callhist.h"
 #include "variables.h"
 #include "misc.h"
+#include "AsyncTCP.h"
 
 // copy idx'th token in src to dest with separator character in sep
 void copy_token(char *dest,char *src,int idx,const char *sep) {
@@ -65,12 +66,16 @@ void copy_token(char *dest,char *src,int idx,const char *sep) {
 
 int time_measure_bank[N_TIME_MEASURE_BANK];
 int time_measure_bank_tmp[N_TIME_MEASURE_BANK];
+uint64_t time_measure_bank_total[N_TIME_MEASURE_BANK];
+uint32_t time_measure_bank_calls[N_TIME_MEASURE_BANK];
 char time_measure_bank_name[N_TIME_MEASURE_BANK][16]; // name of the measurement
 
 void time_measure_clear(int bank)
 {
   if (bank<0|| bank >=N_TIME_MEASURE_BANK) return;
   time_measure_bank[bank]=0;
+  time_measure_bank_total[bank]=0;
+  time_measure_bank_calls[bank]=0;
 }
 
 void time_measure_start(int bank)
@@ -91,6 +96,11 @@ void time_measure_stop(int bank)
 {
   if (bank<0|| bank >=N_TIME_MEASURE_BANK) return;
   time_measure_bank_tmp[bank]=micros()-time_measure_bank_tmp[bank];
+  // Accumulate total CPU time and invocation count in the same one-second
+  // window as the existing maximum profiler.  This exposes small but
+  // frequent per-loop costs which are invisible in max-only reports.
+  time_measure_bank_total[bank] += (uint32_t)time_measure_bank_tmp[bank];
+  time_measure_bank_calls[bank]++;
   // maximum update
   if (time_measure_bank[bank]< time_measure_bank_tmp[bank]) {
     // update time_measure_bank
@@ -105,7 +115,7 @@ void time_measure_stop(int bank)
     const uint32_t now_ms = millis();
     if ((int32_t)(now_ms - next_report_ms[bank]) >= 0) {
       next_report_ms[bank] = now_ms + 1000;
-      Serial.printf("PROFILE SLOW section=%s dt=%d us max=%d us wifi=%d core=%d\n",
+      console->printf("PROFILE SLOW section=%s dt=%d us max=%d us wifi=%d core=%d\n",
                     time_measure_bank_name[bank][0] ? time_measure_bank_name[bank] : "?",
                     time_measure_bank_tmp[bank],
                     time_measure_bank[bank],
@@ -119,6 +129,18 @@ int time_measure_get(int bank)
 {
   if (bank<0|| bank >=N_TIME_MEASURE_BANK) return 0;
   return time_measure_bank[bank];
+}
+
+uint64_t time_measure_get_total(int bank)
+{
+  if (bank < 0 || bank >= N_TIME_MEASURE_BANK) return 0;
+  return time_measure_bank_total[bank];
+}
+
+uint32_t time_measure_get_calls(int bank)
+{
+  if (bank < 0 || bank >= N_TIME_MEASURE_BANK) return 0;
+  return time_measure_bank_calls[bank];
 }
 
 const char *time_measure_get_name(int bank)
@@ -290,14 +312,21 @@ void memtrace_event(const char *tag)
   const size_t largest = info.largest_free_block;
   const size_t minimum = info.minimum_free_bytes;
 
-  Serial.printf("[MEMTRACE] %-24s free=%u largest=%u min=%u alloc=%u blocks=%u freeblk=%u\n",
+  const uint32_t async_wm = asyncTCPStackHighWaterMark();
+  const uint32_t async_stack = asyncTCPStackConfiguredSize();
+  const uint32_t async_used = (async_wm && async_wm <= async_stack) ? async_stack - async_wm : 0;
+
+  console->printf("[MEMTRACE] %-24s free=%u largest=%u min=%u alloc=%u blocks=%u freeblk=%u async_wm=%u async_used~=%u async_q=%u\n",
                 tag ? tag : "(null)",
                 (unsigned)free_now,
                 (unsigned)largest,
                 (unsigned)minimum,
                 (unsigned)info.total_allocated_bytes,
                 (unsigned)info.allocated_blocks,
-                (unsigned)info.free_blocks);
+                (unsigned)info.free_blocks,
+                (unsigned)async_wm,
+                (unsigned)async_used,
+                (unsigned)asyncTCPQueueMessagesWaiting());
 }
 
 void memtrace_poll()
@@ -326,10 +355,16 @@ void memtrace_poll()
 
   if ((free_drop || largest_drop || critical) &&
       (critical ? (now - last_report_ms >= 5000) : true)) {
-    Serial.printf("[MEMTRACE] runtime change           free=%u (%+d) largest=%u (%+d) min=%u\n",
+    const uint32_t async_wm = asyncTCPStackHighWaterMark();
+    const uint32_t async_stack = asyncTCPStackConfiguredSize();
+    const uint32_t async_used = (async_wm && async_wm <= async_stack) ? async_stack - async_wm : 0;
+    console->printf("[MEMTRACE] runtime change           free=%u (%+d) largest=%u (%+d) min=%u async_wm=%u async_used~=%u async_q=%u\n",
                   (unsigned)free_now, (int)free_now - (int)previous_free,
                   (unsigned)largest, (int)largest - (int)previous_largest,
-                  (unsigned)info.minimum_free_bytes);
+                  (unsigned)info.minimum_free_bytes,
+                  (unsigned)async_wm,
+                  (unsigned)async_used,
+                  (unsigned)asyncTCPQueueMessagesWaiting());
     last_report_ms = now;
   }
 

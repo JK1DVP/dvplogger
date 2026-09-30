@@ -80,6 +80,8 @@
 #include "mux_transport.h"
 #include "timekeep.h"
 
+static bool call_stack_select_at_cursor(struct radio *radio);
+
 // User-initiated focus changes should refresh the bandmap immediately.
 // SO2R sequencing continues to call so2r.change_focused_radio() directly,
 // so temporary TX/RX focus changes do not switch the displayed bandmap.
@@ -105,25 +107,32 @@ struct HelpPage {
 // Pages 0..6 preserve the existing HELP order and wording.
 // Later pages contain only CALLSIGN commands or only shortcut keys.
 static const HelpPage help_pages[] = {
-  {{"A-Home:SW_RIG", "A-End:Tgl_Rig", "A-x:Tgl_Xvtr", "A-m:SW_Mode", "A-t:Xmit,-b:BMapSrt", "\\:Focus Radio"}},
-  {{"SATELLITE", "NEW/READ/MAIL/", "DUMPQSOLOG", "MAKEDUPE,MEMSTAT", "LISTDIR,SAVE/LOAD", "HELP/HELPR"}},
-  {{"C-r,c,s:Rem,Cl,RST", "C-f:Rem->Mul,-v:Tgl_Voice", "C-j,p,n,o:Cur,Prev,Next,Last", "C-1,2:C/PDupe,Contest", "C-3,t,y:MaskBandmap,MultiShow", "C-S-2:Prev Contest"}},
-  {{"C-'-':editQSO", "C-4:callhist", "C-5:SO1R/SAT/SO2R", "C-u:Score", "PGUP/DN:CW SPD", "C-v:Voice"}},
+  {{"A-Home:SW_RIG", "A-End:Tgl_Rig", "A-x:Tgl_Xvtr", "A-m:SW_Mode", "A-t:Tune,-b:BMapSrt", "\\:Focus Radio"}},
+  {{"SATELLITE:SAT ON/OFF", "NEW/READ/MAIL/", "DUMPQSOLOG", "MAKEDUPE,MEMSTAT", "LISTDIR,SAVE/LOAD", "HELP/HELPR"}},
+  {{"C-r,c,s:Rem,Cl,RST", "C-f:Rem->Mul,-v:Tgl_Voice", "C-j,p,n,o:Cur,Prev,Next,Last", "C-1,2:C/PDupe,Contest", "C-3,t,y:MaskBandmap,MultiShow", "A-S-c:Prev Contest"}},
+  {{"C-'-':editQSO", "C-4:callhist", "C-5:SO1R/SO2R", "C-u:Score", "PGUP/DN:CW SPD", "C-v:Voice"}},
   {{"A-'-':Scope", "A-q:CW/S&P", "A-a:nextAOS", "A-p:pick sat AOS", "A-b:beacon ", "A-c:CW/RTTY edit"}},
   {{"A-d,n:bandmap del/add.", "A-g:tone key", "A-Spc:pick spot", "A-DEL:show rig info", "A-f:set center freq.", "A-r:vfo mode sw"}},
   {{"A-w:wipe QSO", "C-w:clear field", "A-<=>:bandmap sel.", "A-m:mode", "A-<>:band", "C-l:QSLcard"}},
 
   // CALLSIGN command index. Common prefixes/suffixes are compacted.
-  {{"NEW/READ/MAIL-QSOLOG", "DUMPQSOLOG/LISTQSOFILE", "SWITCHLOG/ZMERGE", "MAKEDUPE/DUPERESET", "RESTARTLOG/EXITEMU", "SAVE/LOAD"}},
+  {{"NEW/READ/MAIL-QSOLOG", "DUMPQSOLOG/LISTQSOFILE", "SWITCHLOG/ZMERGE", "MAKEDUPE/DUPERESET", "DUPEMAXnnn", "SAVE/LOAD"}},
   {{"LOAD/SAVE/RESETRIGS", "NEXTRIG/PREVRIG", "ENABLE/DISABLE-RIG", "BAND/RADIO", "BANDEN/BANDMASK/BANDMAP", "AUTOOFFnn/NATTO"}},
   {{"DISPTYPE0/1/2", "RESETDISP", "DISPCLOCKJST/UTC", "OLDESTnn", "ANTENNA[STATUS]", "ANTENNAON/OFF"}},
   {{"ESM/ALTCQ/2BSIQ", "OFF/ONCONTEST", "CONTEST", "KEY/STRAIGHT", "TOGGLEPTT", "CWJQF/CWNORMAL"}},
   {{"KBDJP/US", "PADDLENOR/REV", "IAMBICA/B", "MUX/NOMUXTRANS", "CALLHIST<file>", "CALLHISTMAIN/SUB"}},
-  {{"WIFI", "SUBCPURESET", "VERBOSEnn/DEBUG", "LISTDIR/MEMSTAT/ADCSTAT", "HELP/HELPR", "SATELLITE"}},
+  {{"WIFI", "SUBCPURESET", "VERBOSEnn/DEBUG", "LISTDIR/MEMSTAT/ADCSTAT", "HELP/HELPR", "SATELLITE:SAT ON/OFF"}},
   {{"XITON", "XITOFF", "XITRESET", "UP/DN:+/-20Hz S&P", "Yaesu:TX-only CLAR", "SAVE stores offset"}},
 
-  // Shortcut supplement only; no CALLSIGN commands on this page.
-  {{"A-s:track mode", "\\:Focus Radio", "C-S-2:Prev Contest", "C-S-t/y:Multi prev/next", "C-S-c/r:Contest/RIG", "ESC:Cancel TX"}},
+  // Recently added / useful CALLSIGN commands.
+  {{"CALLSTACK[/ON/OFF]", "WIPEKEYSWAP", "CLOCKSYNC (Icom)", "SMETER/INTERVAL/SEQNR", "DISPCLOCKJST/UTC", "HELP/HELPR"}},
+  {{"CLUSTER1ON/OFF", "CLUSTER2ON/OFF", "ZSERVERON/OFF", "POWER[?]/0..100", "RIGANT[?]/1/2", "NEXTAOS"}},
+  {{"CURSOR (Yaesu scope)", "DLEVEL[?]/-30..+30", "IPO/AMP1/AMP2", "XITON/OFF/RESET", "ANTENNAON/OFF", "SATELLITE"}},
+
+  // Shortcut supplements only; no CALLSIGN commands on these pages.
+  {{"A-s:track mode", "\\:Focus Radio", "A-S-c:Prev Contest", "C-S-t/y:Multi prev/next", "C-S-c/r:Contest/RIG", "ESC:Cancel TX"}},
+  {{"A-i:Rig off 10s", "A-t:Tune/ATU", "A-z:CW/PH mem bank", "A-e:USB keying hint", "C-Ent:SO2R pair next", "C-S-Ent:pair prev"}},
+  {{"S-char:CW/RTTY key", "A-w:wipe QSO", "C-w:clear field", "A-=:ant relay", "A-/:rot sweep susp", "C-k:keyer mode"}},
 };
 
 static constexpr int HELP_PAGE_COUNT =
@@ -300,6 +309,18 @@ int ui_perform_partial_check(struct radio *radio)
 
 int ui_response_call_and_move_to_exch(struct radio *radio)
 {
+  // In the CALLSIGN field, ';' is the quick equivalent of accepting the
+  // station and sending F5.  When Call Stack contains several stations,
+  // accept only the token under the cursor before transmitting.  Keep the
+  // existing ';' behavior in the Rcv field unchanged.
+  if (radio->ptr_curr == 0 && plogw->call_stack_mode &&
+      strchr(radio->callsign + 2, ',') != NULL) {
+    if (!call_stack_select_at_cursor(radio)) {
+      upd_display_info_flash("CALL STACK NG\nEmpty item");
+      info_disp.timer = 1800;
+      return 0;
+    }
+  }
   so2r.send_call_exch();
   return 0;
 }  
@@ -408,6 +429,8 @@ void send_single_char_radio(struct radio *radio,char c)
     if (c=='\"') c='/';
     sprintf(buf,"%c",tolower(c));
     play_string_cmd(buf);
+  } else if (radio->modetype == LOG_MODETYPE_DG) {
+    append_manual_rtty_char(radio, c);
   }
 }
 
@@ -514,12 +537,10 @@ if (key == 0x1f) {
   struct radio *radio;
   radio = so2r.radio_selected();
 
-  // Handle Ctrl-Shift-2 before the general Shift-key dispatcher.
-  // This also covers CapsLock-as-Ctrl through modkey_ctrl().
-  // Use the HID usage code (0x1f) rather than the translated character,
-  // because Shift+2 produces different characters on different keyboards.
-  if (modkey_shift(modkey) && modkey_ctrl(modkey) &&
-      !modkey_alt(modkey) && key == 0x1f) {
+  // Alternate contests with Alt-Shift-C.  Handle this before the general
+  // Shift and Alt dispatchers so neither consumes the chord first.
+  if (modkey_shift(modkey) && modkey_alt(modkey) &&
+      !modkey_ctrl(modkey) && key == 0x06) {
     alternate_contest();
     return;
   }
@@ -630,7 +651,13 @@ if (key == 0x1f) {
 	  }
 	  so2r.cancel_msg_tx();	
 	  so2r.set_msg_tx_to_focused(); // start sending in the currently focued radio
-	  so2r.set_rx_in_sending_msg();
+          // With PHONE VoiceMemory=0 there is no automatic transmission at all.
+          // F1 still changes CQ/S&P state, but must not move RX/focus to the
+          // partner radio merely because a function key was pressed.
+          if (!(so2r.radio_msg_tx()->modetype == LOG_MODETYPE_PH &&
+                plogw->voice_memory_enable == 0)) {
+            so2r.set_rx_in_sending_msg();
+          }
 	  function_keys(key, c); 
 	  break;
 	}
@@ -778,19 +805,7 @@ if (key == 0x1f) {
 	}
     */
     if (key == 0x17) {  // Alt-T tx/rx toggle ptt --> tune command
-      if (radio->ptt==0) {
-	if (radio->power >0) {
-	  radio->power_bak = radio->power;
-	}
-	set_power(radio, 8);
-      }
-      radio->ptt = 1 - radio->ptt;
-      set_ptt_rig(radio, radio->ptt);
-      if (radio->ptt==0) {
-	if (radio->power_bak >0) {
-	  set_power(radio, radio->power_bak);
-	}
-      }
+      autotuner_toggle(radio);
       return;
     }
     if (key == 0x1b) {  // Alt-X transverter toggle
@@ -1026,25 +1041,38 @@ if (key == 0x1f) {
 
     if (key == 0x15) {  // alt-r  switch sat_vfo_mode
       if (plogw->sat) {
+        if (radio_list[0].enabled && !radio_list[1].enabled &&
+            radio_list[0].rig_spec &&
+            radio_list[0].rig_spec->rig_type == RIG_TYPE_ICOM_IC9700) {
+          // Single IC-9700: Alt-R is exactly the same RATB/RBTA toggle as Web.
+          plogw->sat_vfo_mode =
+              (plogw->sat_vfo_mode == SAT_VFO_SINGLE_A_RX)
+                  ? SAT_VFO_SINGLE_A_TX : SAT_VFO_SINGLE_A_RX;
+        } else {
 	switch (plogw->sat_vfo_mode) {
-	case SAT_VFO_SINGLE_A_TX:  //SAT_VFO_SINGLE_A_TX
+	case SAT_VFO_SINGLE_A_TX:
 	  plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_RX;
 	  break;
 	case SAT_VFO_SINGLE_A_RX:
-	  plogw->sat_vfo_mode =
-	    SAT_VFO_MULTI_TX_0;
+	  plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_0;
 	  break;
 	case SAT_VFO_MULTI_TX_0:
 	  plogw->sat_vfo_mode = SAT_VFO_MULTI_TX_1;
-	  // may need to force transmit on radio #0 using so2r_tx function
 	  break;
 	case SAT_VFO_MULTI_TX_1:
 	  plogw->sat_vfo_mode = SAT_VFO_SINGLE_A_TX;
 	  break;
 	}
+        }
+        sat_apply_vfo_mode_to_rig();
+        set_sat_freq_calc();
+        // RATB/RBTA swaps the physical MAIN/SUB roles; rewrite both modes too.
+        sat_apply_default_opmode();
 	if (!plogw->f_console_emu) {
-	  plogw->ostream->print("Switched sat_vfo_mode ");
-	  plogw->ostream->println(plogw->sat_vfo_mode);
+          char vfo_label[80];
+          sat_vfo_mode_label(vfo_label, sizeof(vfo_label));
+	  plogw->ostream->print("Switched sat_vfo_mode: ");
+	  plogw->ostream->println(vfo_label);
 	}
 	upd_display_sat();
       }
@@ -1135,11 +1163,17 @@ if (key == 0x1f) {
       //      plogw->ostream->print("before radio->modetype=");
       //      plogw->ostream->println(radio->modetype);      
       
-      // alt-m to manually switch modes
+      // In satellite operation Alt-M is constrained by transponder type:
+      // linear = TX USB/CW only with RX fixed USB; FM = RX/TX fixed FM.
+      if (sat_alt_m_opmode()) {
+        upd_display();
+        return;
+      }
+
+      // Normal (or unclassified satellite) Alt-M mode cycle.
       const char *mode;
-      
       mode = switch_rigmode();
-      
+
       int filt;
       int target_modetype = modetype_string(mode);
       if (target_modetype <= 0) target_modetype = radio->modetype;
@@ -1462,11 +1496,8 @@ if (key == 0x1f) {
 	sync_dupechk_mask_subcpu(plogw->mask);
 	upd_display_info_contest_settings(radio);
 	break;
-      case 0x1f:  // Ctrl-2 / Ctrl-Shift-2: switch contest
-        if (modkey_shift(modkey)) {
-          // Alternate between the current and previous contest.
-          alternate_contest();
-        } else {
+      case 0x1f:  // Ctrl-2: advance contest
+        if (!modkey_shift(modkey)) {
           // Advance to the next registered contest.
           plogw->contest_id++;
           if (plogw->contest_id >= N_CONTEST) plogw->contest_id = 0;
@@ -1508,7 +1539,6 @@ if (key == 0x1f) {
 	    }
 	  } else {
 	    n = read_callhist_list(callhistfn);
-	    print_callhist_list((const char **)callhist_list, n);
 	  }
 	} else {
 	  if (!plogw->f_console_emu) plogw->ostream->println("close callhist");
@@ -1519,29 +1549,17 @@ if (key == 0x1f) {
 	break;
       }
 
-      case 0x22:  // ctrl-5 radio_mode switch
-	switch (so2r.radio_mode) {
-	case 0:  // current so1r
-	  {
-	  so2r.radio_mode = SO2R::RADIO_MODE_SAT;
-	  }
-	  break;
-
-	case 1:  // sat wro radio
-	  {
-	  so2r.radio_mode = SO2R::RADIO_MODE_SO2R;
-	  }
-	  break;
-	case 2:  // so2r
-	  {
-	  so2r.radio_mode = SO2R::RADIO_MODE_SO1R;
-	  }
-	  break;
-	}
-	sprintf(dp->lcdbuf, "radio_mode =%d\n%s\n", so2r.radio_mode, (so2r.radio_mode == SO2R::RADIO_MODE_SO1R) ? "SO1R" : (so2r.radio_mode == SO2R::RADIO_MODE_SAT) ? "SAT 0 TX 1 RX "
-		: "SO2R");
-	upd_display_info_flash(dp->lcdbuf);
-	break;
+      case 0x22:  // ctrl-5: SO1R/SO2R only; satellite operation is independent
+        if (so2r.radio_mode == SO2R::RADIO_MODE_SO1R) {
+          so2r.radio_mode = SO2R::RADIO_MODE_SO2R;
+        } else {
+          // SO2R -> SO1R.  Also normalize the legacy RADIO_MODE_SAT value.
+          so2r.radio_mode = SO2R::RADIO_MODE_SO1R;
+        }
+        sprintf(dp->lcdbuf, "radio_mode =%d\n%s\n", so2r.radio_mode,
+                so2r.radio_mode == SO2R::RADIO_MODE_SO2R ? "SO2R" : "SO1R");
+        upd_display_info_flash(dp->lcdbuf);
+        break;
 
 	// multi display
       case 0x17:  // ctrl-t: selected multiplier worked status on each band
@@ -1849,7 +1867,12 @@ if (key == 0x1f) {
       if ((key >= 0x3a) && (key <= 0x45)) {
 	so2r.cancel_msg_tx();	
 	so2r.set_msg_tx_to_focused(); // start sending in the currently focued radio
-	so2r.set_rx_in_sending_msg();	
+        // PHONE VoiceMemory=0 means the function key is state/control only;
+        // do not perform the SO2R receive switch used while a message is sent.
+        if (!(so2r.radio_msg_tx()->modetype == LOG_MODETYPE_PH &&
+              plogw->voice_memory_enable == 0)) {
+          so2r.set_rx_in_sending_msg();
+        }
 	function_keys(key, c);
       } else {
 	// key input in the repeat function radio window will stop repeating until concluding interrupted qso 
@@ -1957,7 +1980,12 @@ void function_keys(uint8_t key, uint8_t c) {
     //    plogw->repeat_func_timer = 0;
     so2r.cancel_repeat_timer();
 
-    so2r.sequence_stat(SO2R::Sending_Msg);
+    // Enter Sending_Msg only when this function key can actually transmit.
+    // In PHONE with VoiceMemory=0, F1 is still useful to select CQ mode, but
+    // there is no voice message and therefore no SO2R message sequence.
+    if (!(radio->modetype == LOG_MODETYPE_PH && plogw->voice_memory_enable == 0)) {
+      so2r.sequence_stat(SO2R::Sending_Msg);
+    }
     // send corresponding memory
     if ((radio->modetype==LOG_MODETYPE_CW) || (radio->f_tone_keying)) {
       append_cwbuf_string(plogw->cw_msg[key - 0x3a] + 2);  // send CW msg
@@ -2000,6 +2028,26 @@ void print_off_contest()
 
 void set_contest_from_name()
 {
+    char entered[sizeof(plogw->contest_entry) - 2];
+    strlcpy(entered, plogw->contest_entry + 2, sizeof(entered));
+    char *comma = strchr(entered, ',');
+    if (comma != NULL) {
+      *comma = '\0';
+      const char *sub = comma + 1;
+      if (!entered[0] || !sub[0] || !select_contest_pair(entered, sub)) {
+        upd_display_info_flash("Dual contest NG\nUse MAIN,SUB");
+        info_disp.timer = 2000;
+      } else {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "Dual contest\nMAIN:%s\nSUB:%s", entered, sub);
+        upd_display_info_flash(dp->lcdbuf);
+        info_disp.timer = 2000;
+      }
+      return;
+    }
+    // A single contest replaces any previous explicit Main/Sub definition.
+    strlcpy(plogw->contest_name + 2, entered,
+            sizeof(plogw->contest_name) - 2);
     if (is_user_md_contest_name(plogw->contest_name + 2)) {
       // Route User MD contests through the same contest-selection path as
       // built-in contests.  set_contest_id() records the current contest as
@@ -2007,9 +2055,11 @@ void set_contest_from_name()
       // current/previous pair used by contest alternate and dual-contest QSO.
       plogw->contest_id = USER_MD_CONTEST_ID;
       set_contest_id();
+      contest_commit_single_mode();
       return;
     }
     search_contest_id_from_name() ;
+    contest_commit_single_mode();
     switch(plogw->multi_type) {
     case MULTI_TYPE_NORMAL:      sprintf(buf,"NORMAL"); break;
     case MULTI_TYPE_CQWW:        sprintf(buf,"NORMAL/CQWW"); break;      
@@ -2040,7 +2090,7 @@ int check_multi_contest()
 }
 
 // Split the editable receive exchange into primary/secondary parts.
-// The first ',' or '/' is the dual-contest separator.  The edit buffer itself
+// A comma is the dual-contest separator.  Slash is reserved for CQWWRTTY Zone/QTH.  The edit buffer itself
 // is never modified here.
 static bool split_dual_recv_exch(const char *raw,
                                  char *primary, size_t primary_size,
@@ -2052,7 +2102,7 @@ static bool split_dual_recv_exch(const char *raw,
   if (separator_char) *separator_char = '\0';
   if (!raw) return false;
 
-  const char *sep = strpbrk(raw, ",/");
+  const char *sep = strchr(raw, ',');
   if (!sep) {
     if (primary && primary_size) strlcpy(primary, raw, primary_size);
     return false;
@@ -2095,6 +2145,115 @@ static void report_hostname_setting(const char *prefix)
                          prefix, plogw->hostname + 2, plogw->hostname + 2);
 }
 
+// Keep one three-call pending list per radio.  The selected item is copied to
+// the ordinary single-call QSO path; the remainder returns only after the QSO
+// is committed.
+static char call_stack_pending[N_RADIO][LEN_CALL_STACK_WINDOW + 1] = {{0}};
+static char call_stack_original[N_RADIO][LEN_CALL_STACK_WINDOW + 1] = {{0}};
+static uint8_t call_stack_original_cursor[N_RADIO] = {0};
+
+void set_call_stack_mode(bool enabled) {
+  plogw->call_stack_mode = enabled ? 1 : 0;
+  if (!enabled) {
+    memset(call_stack_pending, 0, sizeof(call_stack_pending));
+    memset(call_stack_original, 0, sizeof(call_stack_original));
+    memset(call_stack_original_cursor, 0, sizeof(call_stack_original_cursor));
+  }
+}
+
+static int call_stack_radio_index(const struct radio *radio) {
+  if (radio >= &radio_list[0] && radio < &radio_list[N_RADIO])
+    return (int)(radio - &radio_list[0]);
+  return 0;
+}
+
+const char *call_stack_display_callsign(const struct radio *radio,
+                                        int *cursor) {
+  const int idx = call_stack_radio_index(radio);
+  if (call_stack_original[idx][0]) {
+    if (cursor) *cursor = call_stack_original_cursor[idx];
+    return call_stack_original[idx];
+  }
+  if (cursor) *cursor = (uint8_t)radio->callsign[1];
+  return radio->callsign + 2;
+}
+
+static bool call_stack_restore_if_pending(struct radio *radio) {
+  const int idx = call_stack_radio_index(radio);
+  if (!plogw->call_stack_mode || call_stack_original[idx][0] == '\0')
+    return false;
+  // No QSO was committed: restore the complete list, including the selected
+  // item.  Removing an item is reserved for successful QSO completion.
+  strlcpy(radio->callsign + 2, call_stack_original[idx],
+          LEN_CALL_STACK_WINDOW + 1);
+  radio->callsign[1] = call_stack_original_cursor[idx];
+  call_stack_pending[idx][0] = '\0';
+  call_stack_original[idx][0] = '\0';
+  return true;
+}
+
+static void call_stack_restore_after_qso(struct radio *radio) {
+  const int idx = call_stack_radio_index(radio);
+  if (!plogw->call_stack_mode || call_stack_original[idx][0] == '\0') return;
+  strlcpy(radio->callsign + 2, call_stack_pending[idx],
+          LEN_CALL_STACK_WINDOW + 1);
+  radio->callsign[1] = 0;
+  call_stack_pending[idx][0] = '\0';
+  call_stack_original[idx][0] = '\0';
+  radio->ptr_curr = 0;
+}
+
+static bool call_stack_select_at_cursor(struct radio *radio) {
+  char original[LEN_CALL_STACK_WINDOW + 1];
+  char selected[LEN_CALL_WINDOW + 1];
+  char remaining[LEN_CALL_STACK_WINDOW + 1];
+  strlcpy(original, radio->callsign + 2, sizeof(original));
+
+  const size_t len = strlen(original);
+  size_t cursor = (uint8_t)radio->callsign[1];
+  if (cursor > len) cursor = len;
+  // A cursor sitting exactly on a comma selects the item to its right.
+  if (cursor < len && original[cursor] == ',') ++cursor;
+  size_t first = cursor;
+  while (first > 0 && original[first - 1] != ',') --first;
+  while (first < len && original[first] == ',') ++first;
+  size_t item_end = first;
+  while (item_end < len && original[item_end] != ',') ++item_end;
+  if (item_end <= first) return false;
+
+  const size_t item_len = item_end - first;
+  if (item_len >= sizeof(selected)) return false;
+  memcpy(selected, original + first, item_len);
+  selected[item_len] = '\0';
+
+  remaining[0] = '\0';
+  if (first > 0) {
+    const size_t prefix_len = first - 1; // omit comma before selected item
+    memcpy(remaining, original, prefix_len);
+    remaining[prefix_len] = '\0';
+  }
+  const char *suffix = original + item_end;
+  if (*suffix == ',') ++suffix;
+  if (*suffix) {
+    if (remaining[0]) strlcat(remaining, ",", sizeof(remaining));
+    strlcat(remaining, suffix, sizeof(remaining));
+  }
+
+  const int idx = call_stack_radio_index(radio);
+  strlcpy(call_stack_original[idx], original,
+          sizeof(call_stack_original[idx]));
+  call_stack_original_cursor[idx] = (uint8_t)radio->callsign[1];
+  strlcpy(call_stack_pending[idx], remaining, sizeof(call_stack_pending[idx]));
+  strlcpy(radio->callsign + 2, selected, LEN_CALL_WINDOW + 1);
+  radio->callsign[1] = strlen(selected);
+  request_async_dupe_partial(radio, true);
+  request_dupe_aware_display_update();
+  if (plogw->ostream)
+    plogw->ostream->printf("CALL STACK: selected=<%s> remaining=<%s>\n",
+                           selected, remaining);
+  return true;
+}
+
 void process_enter(int option) {
   // option 0: normal
   //        1: with SHIFT 
@@ -2131,6 +2290,16 @@ void process_enter(int option) {
     char secondary_contest[sizeof(plogw->contest_name) - 2] = {0};
     char separator_char = 0;
     strlcpy(raw_exch, radio->recv_exch + 2, sizeof(raw_exch));
+    if ((plogw->multi_type & 0xff) == MULTI_TYPE_CQWWRTTY &&
+        strchr(raw_exch, ',') == NULL) {
+      char normalized[LEN_EXCH + 1];
+      strlcpy(normalized, raw_exch, sizeof(normalized));
+      if (normalize_cqwwrtty_exchange(normalized, sizeof(normalized))) {
+        strlcpy(raw_exch, normalized, sizeof(raw_exch));
+        strlcpy(radio->recv_exch + 2, normalized, LEN_DUAL_EXCH_WINDOW + 1);
+        radio->recv_exch[1] = strlen(radio->recv_exch + 2);
+      }
+    }
     const bool split_ok = split_dual_recv_exch(raw_exch,
                                                 primary_exch, sizeof(primary_exch),
                                                 secondary_exch, sizeof(secondary_exch),
@@ -2166,6 +2335,17 @@ void process_enter(int option) {
       strlcpy(radio->recv_exch + 2, primary_exch, LEN_DUAL_EXCH_WINDOW + 1);
       radio->recv_exch[1] = strlen(radio->recv_exch + 2);
     }
+    // CQWWRTTY: validate the compound exchange against the worked station.
+    // CTY supplies entity and CQ-zone information (including prefix overrides).
+    if ((plogw->multi_type & 0xff) == MULTI_TYPE_CQWWRTTY &&
+        !validate_cqwwrtty_exchange_for_call(radio->recv_exch + 2,
+                                             radio->callsign + 2)) {
+      if (!plogw->f_console_emu) plogw->ostream->println("not valid CQWWRTTY exchange");
+      upd_display();
+      upd_display_info_contest_settings(radio);
+      if (!plogw->f_off_contest) break;
+    }
+
     // Always interpret the exchange using the currently selected contest,
     // including OFFCONTEST operation.  OFFCONTEST changes scoring/recording
     // policy, not the operator assistance used to interpret the exchange.
@@ -2213,6 +2393,32 @@ void process_enter(int option) {
                  secondary_contest, secondary_exch);
         upd_display_info_flash(dp->lcdbuf);
         info_disp.timer = 2000;
+      } else if (!plogw->f_off_contest) {
+        const uint8_t secondary_dupe_id =
+            contest_dupe_id_for_name(secondary_contest, secondary_id);
+        const uint8_t secondary_dupe_mask = (uint8_t)
+            contest_dupe_mask_for_name(secondary_contest, secondary_id,
+                                       plogw->mask);
+        const uint8_t saved_dupe_id = get_dupechk_contest_id();
+        set_dupechk_contest_id(secondary_dupe_id);
+        const bool secondary_is_dupe =
+            dupe_check_nocallhist(radio->callsign + 2, bandmode(radio),
+                                  secondary_dupe_mask);
+        if (!secondary_is_dupe) {
+          entry_dupechk_data_for(radio->callsign + 2, secondary_exch,
+                                 bandmode(radio), secondary_dupe_id);
+        }
+        set_dupechk_contest_id(saved_dupe_id);
+        contest_stats_record_secondary(secondary_dupe_id, radio->modetype,
+                                       radio->bandid, m2, secondary_is_dupe);
+        const char *m1_name = plogw->contest_name + 2;
+        const char *m2_name = secondary_contest;
+        if (strncasecmp(m1_name, "User", 4) == 0) m1_name += 4;
+        if (strncasecmp(m2_name, "User", 4) == 0) m2_name += 4;
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "M1:%.12s\nM2:%.12s", m1_name, m2_name);
+        upd_display_info_flash(dp->lcdbuf);
+        info_disp.timer = 1500;
       }
     }
     if (verbose&4) 	{
@@ -2236,7 +2442,10 @@ void process_enter(int option) {
 	if (!plogw->f_console_emu) plogw->ostream->println("dupechk entered");
       }
       
-      entry_multiplier(so2r.radio_qso_process());
+      // A duplicate must not create a new multiplier. This also keeps the
+      // live statistics identical to a later MAKEDUPE reconstruction.
+      if (!radio->dupe) entry_multiplier(so2r.radio_qso_process());
+      contest_stats_capture_current();
       if (verbose&4) 	{
 	if (!plogw->f_console_emu) plogw->ostream->println("multi entered ");
       }
@@ -2284,7 +2493,9 @@ void process_enter(int option) {
     if (verbose&4)     {
       console->print("after tu qso_process_radio="); console->println(so2r.qso_process_radio());
     }
-    wipe_log_entry_radio(&radio_list[so2r.qso_process_radio()]); // up to here need to  use tx radio
+    const int completed_radio = so2r.qso_process_radio();
+    wipe_log_entry_radio(&radio_list[completed_radio]); // up to here need to use tx radio
+    call_stack_restore_after_qso(&radio_list[completed_radio]);
     if (verbose &4) {
       console->print("ptr_curr=");console->println(so2r.radio_selected()->ptr_curr);
     }
@@ -2313,21 +2524,10 @@ void process_enter(int option) {
   case 8:  // grid locator
     set_grid_locator_information();
     break;
-  case 7:  // satellite name
+  case 7:  // satellite name: select satellite only; SATELLITE controls operation ON/OFF
     if (strlen(plogw->sat_name + 2) != 0) {
-
-      // force stop rotator tracking
-      plogw->f_rotator_track = 0;
-
-      // satellite name entered
+      // Selecting a satellite must not implicitly enter satellite operation.
       sat_name_entered();
-
-    } else {
-      // go to contest qso
-      if (!plogw->f_console_emu) plogw->ostream->println("non satellite");
-      plogw->sat = 0;
-      // force stop rotator tracking
-      plogw->f_rotator_track = 0;
     }
     upd_display();
     break;
@@ -2430,6 +2630,10 @@ void process_enter(int option) {
     int tmp;
     len = strlen(radio->callsign + 2);
     if (len == 0) {
+      if (call_stack_restore_if_pending(radio)) {
+        request_display_update_on_demand();
+        break;
+      }
       if (radio->cq[radio->modetype] == LOG_SandP) {
         // First Enter on an empty CALLSIGN may pick the on-frequency station,
         // but must NOT also transmit.  The next Enter runs normal ESM.
@@ -2456,6 +2660,21 @@ void process_enter(int option) {
         }
         break;
       }
+    }
+    if (plogw->call_stack_mode && strchr(radio->callsign + 2, ',') != NULL) {
+      if (!call_stack_select_at_cursor(radio)) {
+        upd_display_info_flash("CALL STACK NG\nEmpty item");
+        info_disp.timer = 1800;
+        break;
+      }
+      len = strlen(radio->callsign + 2);
+    }
+    // The physical edit buffer is wider for Call Stack, but every selected
+    // callsign and every QSO record retains the original single-call limit.
+    if (len > LEN_CALL_WINDOW) {
+      upd_display_info_flash("CALLSIGN too long");
+      info_disp.timer = 1800;
+      break;
     }
     // check for commands
     if (strncmp(radio->callsign + 2, "OLDEST", 6) == 0) {
@@ -2523,22 +2742,17 @@ void process_enter(int option) {
       break;
     }
     if (strcmp(radio->callsign + 2, "SATELLITE") == 0) {
-      // first read tle information from sd file 
-      readtlefile();
-      // check time
-      long int dt;
-      //      dt=rtctime.unixtime()-plogw->tle_unixtime;
-      dt=my_rtc.unixtime()-plogw->tle_unixtime;      
-      sprintf(dp->lcdbuf, "TLE %ld hrs old\n",dt/3600);
-      if (dt>84600*3) {
-	// need to update from the internet
-	strcat(dp->lcdbuf,"Update...\n");
-	upd_display_info_flash(dp->lcdbuf);	
-	getTLE();
+      const bool requested = !plogw->sat;
+      const bool ok = set_satellite_operation(requested);
+      if (!ok && requested) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SATELLITE OFF\nSelect satellite");
       } else {
-	strcat(dp->lcdbuf,"Keep.\n");
-	upd_display_info_flash(dp->lcdbuf);
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "SATELLITE %s\n%s",
+                 plogw->sat ? "ON" : "OFF",
+                 plogw->sat ? plogw->sat_name_set : "Normal operation");
       }
+      upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
     }
@@ -2684,24 +2898,43 @@ void process_enter(int option) {
     }
 
     if (strcmp(radio->callsign + 2, "SMETER") == 0) {
+      // SMETER is an explicit display selection.  Repeating it keeps the
+      // existing dBm -> RAW -> SEQNR cycle, but selecting SMETER always
+      // leaves INTERVAL mode first.
+      plogw->show_qso_interval = 0;
       plogw->show_smeter++;
       if (plogw->show_smeter >= 3) plogw->show_smeter = 0;
-      sprintf(dp->lcdbuf, "show_smeter=%d", plogw->show_smeter);
+      if (plogw->show_smeter == 1)
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SMETER ON\nDisplay: dBm");
+      else if (plogw->show_smeter == 2)
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SMETER RAW\nDiagnostic mode");
+      else
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "SEQNR ON\nQSO number: %d", plogw->seqnr);
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
     }
     if (strcmp(radio->callsign + 2, "INTERVAL") == 0) {
-      plogw->show_qso_interval=1-plogw->show_qso_interval;
-      sprintf(dp->lcdbuf, "show_qso_interval=%d", plogw->show_qso_interval);
+      // Select INTERVAL directly; do not toggle back to SEQNR implicitly.
+      plogw->show_smeter = 0;
+      plogw->show_qso_interval = 1;
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "INTERVAL ON\nQSO interval: %d sec",
+               plogw->qso_interval_timer / 1000);
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
     }
 
     if (strcmp(radio->callsign + 2, "SEQNR") == 0) {
-      plogw->show_smeter=0;
-      sprintf(dp->lcdbuf, "show_smeter=%d", plogw->show_smeter);
+      // Select SEQNR directly, independent of the previous INTERVAL state.
+      plogw->show_smeter = 0;
+      plogw->show_qso_interval = 0;
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "SEQNR ON\nQSO number: %d", plogw->seqnr);
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
@@ -2933,6 +3166,12 @@ void process_enter(int option) {
       break;
     }
 
+    if (strcmp(radio->callsign + 2, "ZMERGENEW") == 0) {
+      clear_buf(radio->callsign);
+      zserver_start_merge_new(10);
+      break;
+    }
+
     if (strcmp(radio->callsign + 2, "ANTENNAON") == 0) {
       antenna_control_enable = 1;
       antenna_settings_changed();
@@ -3059,6 +3298,34 @@ void process_enter(int option) {
       break;
     }
 
+    if (strncmp(radio->callsign + 2, "DUPEMAX", 7) == 0) {
+      const char *arg = radio->callsign + 9; // skip 2-byte field prefix + DUPEMAX
+      char *endp = NULL;
+      long requested = strtol(arg, &endp, 10);
+
+      // Phase-2 settings use the same supported range.  Require the complete
+      // CALLSIGN command to be numeric so typos do not silently change it.
+      if (*arg == '\0' || *endp != '\0' || requested < 200 || requested > 10000) {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+                 "DUPEMAX\n200 - 10000\nCurrent=%d", dupechk_max);
+        upd_display_info_flash(dp->lcdbuf);
+        clear_buf(radio->callsign);
+        break;
+      }
+
+      dupechk_max = (int)requested;
+      save_settings("");
+      request_makedupe_rebuild();
+      console->printf("DUPEMAX: requested=%d saved; MAKEDUPE rebuild queued\n",
+                      dupechk_max);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+               "DUPEMAX=%d\nSaved\nRebuild queued", dupechk_max);
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
+
     if (strcmp(radio->callsign + 2, "ESM")==0 ) {
       // ESM toggle
       plogw->f_esm = 1- plogw->f_esm;
@@ -3078,6 +3345,24 @@ void process_enter(int option) {
                plogw->wipe_key_swap ? "wipe QSO" : "clear field");
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
+      break;
+    }
+
+    if (strcmp(radio->callsign + 2, "CALLSTACK") == 0 ||
+        strcmp(radio->callsign + 2, "CALLSTACKON") == 0 ||
+        strcmp(radio->callsign + 2, "CALLSTACKOFF") == 0) {
+      if (strcmp(radio->callsign + 2, "CALLSTACKON") == 0)
+        set_call_stack_mode(true);
+      else if (strcmp(radio->callsign + 2, "CALLSTACKOFF") == 0)
+        set_call_stack_mode(false);
+      else
+        set_call_stack_mode(!plogw->call_stack_mode);
+      save_settings("");
+      clear_buf(radio->callsign);
+      snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "CALL STACK\n%s",
+               plogw->call_stack_mode ? "ON" : "OFF");
+      upd_display_info_flash(dp->lcdbuf);
+      info_disp.timer = 1800;
       break;
     }
     
@@ -3241,14 +3526,44 @@ void process_enter(int option) {
      
 
     if (strcmp(radio->callsign + 2, "CALLHISTMAIN") == 0) {
-      callhist_at = 0;
       plogw->enable_callhist = 1;
-      int n = read_callhist_list(callhistfn);
-      plogw->ostream->printf("Call History location: MAIN CPU, entries=%d\n", n);
+      int n = 0;
+      bool fallback = false;
+
+      // HW1 MAIN supports the compact RAM-index + SD-resident PKB backend
+      // when PSRAM is absent.  Other hardware keeps the existing policy.
+#if JK1DVPLOG_HWVER == 1
+      callhist_at = 0;
+      n = read_callhist_list(callhistfn);
+      if (n <= 0 && !f_spiram) {
+        console->println("CALLHISTMAIN: MAIN-SD failed; falling back to SUBCPU");
+        callhist_at = 1;
+        n = load_callhist_subcpu_or_main(callhistfn, &fallback);
+      }
+#else
+      if (f_spiram) {
+        callhist_at = 0;
+        n = read_callhist_list(callhistfn);
+      } else {
+        callhist_at = 1;
+        n = load_callhist_subcpu_or_main(callhistfn, &fallback);
+      }
+#endif
+
+      if (n > 0) {
+        if (callhist_at == 1) release_callhist_list();
+        // callhist_at is already registered in settings_dict, so persist the
+        // successful placement selected by this command.
+        save_settings("");
+      }
+
+      plogw->ostream->printf("Call History location: %s, entries=%d%s\n",
+                             callhist_at ? "SUB CPU" : (f_spiram ? "MAIN-PSRAM" : "MAIN-SD"), n,
+                             (!f_spiram && callhist_at == 1) ? " (no PSRAM)" : "");
       snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
                "Call History\n%s\n%d entries\nAt %s\n%s",
-               callhistfn, n, f_spiram ? "MAIN-PSRAM" : "MAIN-RAM",
-               n > 0 ? "Enabled" : "Load failed");
+               callhistfn, n, callhist_at ? "SUBCPU" : (f_spiram ? "MAIN-PSRAM" : "MAIN-SD"),
+               n > 0 ? "Enabled/Saved" : "Load failed");
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
@@ -3258,15 +3573,23 @@ void process_enter(int option) {
       plogw->enable_callhist = 1;
       bool fallback = false;
       int n = load_callhist_subcpu_or_main(callhistfn, &fallback);
+
+      if (n > 0 && !fallback && callhist_at == 1) {
+        // The SUBCPU now owns the database.  Drop any old MAIN-side .pck
+        // image/index so switching MAIN -> SUB really returns the PSRAM.
+        release_callhist_list();
+        save_settings("");
+      }
+
       plogw->ostream->printf("Call History location: %s, entries=%d%s\n",
                              callhist_at ? "SUB CPU" : "MAIN-PSRAM", n,
-                             fallback ? " (fallback)" : "");
+                             fallback ? " (fallback; setting not changed)" : "");
       snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
                "Call History\n%s\n%d entries\n%s\n%s",
                callhistfn, n,
-               n > 0 ? (fallback ? "MAIN-PSRAM fallback" : "At SUBCPU")
+               n > 0 ? (fallback ? "MAIN fallback" : "At SUBCPU")
                      : "SUB load failed",
-               n > 0 ? "Enabled" : "No PSRAM / Disabled");
+               n > 0 ? (fallback ? "Not saved" : "Enabled/Saved") : "Disabled");
       upd_display_info_flash(dp->lcdbuf);
       clear_buf(radio->callsign);
       break;
@@ -3291,6 +3614,24 @@ void process_enter(int option) {
     }
 
     
+    if (strncmp(radio->callsign + 2, "DELFILE", 7) == 0) {
+      const char *arg = radio->callsign + 9; // DELFILE + filename, no space
+      char fn[64];
+      if (*arg == '\0') {
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "DELFILE\nFilename required");
+      } else {
+        snprintf(fn, sizeof(fn), "%s%s", (*arg == '/') ? "" : "/", arg);
+        bool existed = SD.exists(fn);
+        bool ok = existed && SD.remove(fn);
+        console->printf("DELFILE: %s %s\n", fn, ok ? "removed" : (existed ? "remove FAILED" : "not found"));
+        snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "DELFILE\n%s\n%s", fn,
+                 ok ? "Removed" : (existed ? "Remove failed" : "Not found"));
+      }
+      upd_display_info_flash(dp->lcdbuf);
+      clear_buf(radio->callsign);
+      break;
+    }
+
     if (strcmp(radio->callsign + 2, "LISTDIR") == 0) {
       listDir(SD, "/", 0);
       clear_buf(radio->callsign);
@@ -3629,12 +3970,15 @@ void logw_handler(char key, char c)
 
   struct radio *radio;
   radio = so2r.radio_selected();
-  char callsign_before[LEN_CALL_WINDOW + 1];
+  char callsign_before[LEN_CALL_STACK_WINDOW + 1];
+  uint8_t callsign_cursor_before = 0;
   bool callsign_content_changed = false;
+  bool callsign_cursor_changed = false;
   bool defer_display_for_dupe = false;
   if (radio->ptr_curr == 0) {
-    strncpy(callsign_before, radio->callsign + 2, LEN_CALL_WINDOW);
-    callsign_before[LEN_CALL_WINDOW] = '\0';
+    callsign_cursor_before = (uint8_t)radio->callsign[1];
+    strncpy(callsign_before, radio->callsign + 2, LEN_CALL_STACK_WINDOW);
+    callsign_before[LEN_CALL_STACK_WINDOW] = '\0';
   } else {
     callsign_before[0] = '\0';
   }
@@ -3712,7 +4056,7 @@ void logw_handler(char key, char c)
 	pwin = plogw->my_name;
 	break;
       case 40:  // contest_name
-	pwin = plogw->contest_name;
+	pwin = plogw->contest_entry;
 	break;
       case 41:  // cluster2_name
 	pwin = plogw->cluster2_name;
@@ -3768,7 +4112,8 @@ void logw_handler(char key, char c)
     
     if (ptr_curr_req_callsign_exch_chr(radio)) {
       if (!(isalnum(c)||(c=='/')||(c=='.')||(c=='-')||
-            (radio->ptr_curr == 1 && c==','))) { // callsign/exchange characters
+            (radio->ptr_curr == 1 && c==',') ||
+            (radio->ptr_curr == 0 && plogw->call_stack_mode && c==','))) {
         return ;
       }
     } else {
@@ -3821,14 +4166,17 @@ void logw_handler(char key, char c)
   if (radio->ptr_curr == 0) {
     callsign_content_changed =
       strcmp(callsign_before, radio->callsign + 2) != 0;
+    callsign_cursor_changed =
+      callsign_cursor_before != (uint8_t)radio->callsign[1];
   }
 
   // on-demand processes after editing
   switch (radio->ptr_curr) {
   case 0:  // call sign window
-    if (!callsign_content_changed) break;
+    if (!callsign_content_changed && !callsign_cursor_changed) break;
     // Do not block keyboard handling on subcpu searches.  One combined
     // asynchronous request supplies DUPE, exact-match EXCH and partial data.
+    // For Call Stack input it extracts only the token under the cursor.
     request_async_dupe_partial(radio, true);
     request_dupe_aware_display_update();
     defer_display_for_dupe = true;
@@ -3901,7 +4249,7 @@ void switch_logw_entry(int option) {
     break;
   case 8:  // direct move to Contest name, cursor at the first character
     radio->ptr_curr = 40;
-    plogw->contest_name[1] = 0;
+    plogw->contest_entry[1] = 0;
     break;
   case 0:  // forward
     if ((radio->ptr_curr >= 10) && (radio->ptr_curr <= 10 + N_CWMSG - 1)) {
@@ -4101,15 +4449,63 @@ void switch_logw_entry(int option) {
 }
 
 
-void sat_name_entered() {
+bool set_satellite_operation(bool enabled) {
+  if (!enabled) {
+    // Persist the current satellite offset when leaving satellite operation.
+    // Dial tuning updates offset_freq in RAM; avoid SD writes while tuning and
+    // commit once here instead.
+    if (plogw->sat && plogw->sat_idx_selected >= 0 &&
+        plogw->sat_idx_selected < N_SATELLITES) {
+      save_satinfo();
+      if (verbose & 8) plogw->ostream->println("SAT OFS saved on SAT OFF");
+    }
+    plogw->sat = 0;
+    plogw->f_rotator_track = 0;
+    request_display_update_on_demand();
+    return true;
+  }
+
+  // A satellite must already be selected.  If the name field contains a
+  // candidate, resolve it first, but selection itself never enables SAT mode.
+  if ((plogw->sat_idx_selected < 0 || plogw->sat_idx_selected >= N_SATELLITES) &&
+      strlen(plogw->sat_name + 2) != 0) {
+    sat_name_entered();
+  }
+  if (plogw->sat_idx_selected < 0 || plogw->sat_idx_selected >= N_SATELLITES ||
+      sat_info[plogw->sat_idx_selected].name[0] == '\0') {
+    plogw->sat = 0;
+    return false;
+  }
+
+  if (plogw->tle_unixtime == 0) request_sat_tle_parse();
   plogw->sat = 1;
+  set_sat_info_calc();
+  // Establish IC-9700 MAIN/SUB layout before the first frequency write.
+  // In RATB, MAIN=RX/downlink and SUB=TX/uplink; in RBTA it is reversed.
+  sat_apply_vfo_mode_to_rig();
+  set_sat_freq_calc();
+  sat_apply_default_opmode();
+  request_display_update_on_demand();
+  return true;
+}
+
+void sat_name_entered() {
+  // Select/configure a satellite only.  SATELLITE (or Web SAT ON/OFF)
+  // is the single authority for entering/leaving satellite operation.
   // check sat_name
   //#ifdef notdef
   // check if tlefile read
   if (plogw->tle_unixtime==0) {
-    readtlefile();
+    request_sat_tle_parse();
   }
   if (strcmp(plogw->sat_name + 2, plogw->sat_name_set) != 0) {
+    // offset_freq may have been re-anchored by dial operation.  Save the
+    // current satellite before load_satinfo() reloads the database from SD.
+    if (plogw->sat_idx_selected >= 0 && plogw->sat_idx_selected < N_SATELLITES &&
+        sat_info[plogw->sat_idx_selected].name[0] != '\0') {
+      save_satinfo();
+      if (verbose & 8) plogw->ostream->println("SAT OFS saved before satellite change");
+    }
     load_satinfo();
     // set new satellite
     if (find_satname(plogw->sat_name + 2) != -1) {
@@ -4123,11 +4519,13 @@ void sat_name_entered() {
         plogw->ostream->print("SAT Auto VFO: ");
         plogw->ostream->println(auto_reason);
       }
-      struct radio *radio;
-      radio=so2r.radio_selected();
-      // set satellite opmode
-      //set_sat_opmode(plogw->opmode);
-      set_sat_opmode(radio, "CW");
+      // If satellite operation is already active, changing satellite also
+      // applies the new entry's transponder mode.  Merely selecting a
+      // satellite while SAT is OFF does not change the rig mode.
+      if (plogw->sat) {
+        sat_apply_vfo_mode_to_rig();
+        sat_apply_default_opmode();
+      }
     }
   }
   //#endif
@@ -4157,4 +4555,3 @@ void print_help(int option) {
   info_disp.show_info = INFO_DISP_HELP;
   info_disp.timer = 10000;
 }
-

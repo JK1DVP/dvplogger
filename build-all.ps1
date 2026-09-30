@@ -1,3 +1,8 @@
+param(
+    [ValidateSet("all", "hw1", "hw3", "1", "3", "mini", "wide")]
+    [string]$Target = "all"
+)
+
 $ErrorActionPreference = "Stop"
 
 # ============================================================
@@ -279,11 +284,14 @@ if (-not (Test-Path -LiteralPath $ExtArduinoH -PathType Leaf)) {
 
 
 # ============================================================
-# Build both hardware versions
+# Build selected hardware version(s)
 # ============================================================
 
-Build-Set 1 "mini"
-Build-Set 3 "Wide"
+$BuildHw1 = $Target -in @("all", "hw1", "1", "mini")
+$BuildHw3 = $Target -in @("all", "hw3", "3", "wide")
+
+if ($BuildHw1) { Build-Set 1 "mini" }
+if ($BuildHw3) { Build-Set 3 "Wide" }
 
 
 # ============================================================
@@ -292,27 +300,31 @@ Build-Set 3 "Wide"
 
 Write-Host ""
 Write-Host "============================================================"
-Write-Host " All builds completed successfully"
+Write-Host " Selected build(s) completed successfully"
 Write-Host "============================================================"
 
-Write-Host ""
-Write-Host "HW1 / mini:"
-Write-Host "  binaries/mini/dvplogger.bin"
-Write-Host "  binaries/mini/bootloader.bin"
-Write-Host "  binaries/mini/partition-table.bin"
-Write-Host "  binaries/mini/subcpu/app0.bin"
-Write-Host "  binaries/mini/subcpu/bootload.bin"
-Write-Host "  binaries/mini/subcpu/partitio.bin"
-Write-Host "  binaries/mini/subcpu/spiffs.bin"
-Write-Host "  binaries/mini/CRC32SUMS.txt"
+if ($BuildHw1) {
+    Write-Host ""
+    Write-Host "HW1 / mini:"
+    Write-Host "  binaries/mini/dvplogger.bin"
+    Write-Host "  binaries/mini/bootloader.bin"
+    Write-Host "  binaries/mini/partition-table.bin"
+    Write-Host "  binaries/mini/subcpu/app0.bin"
+    Write-Host "  binaries/mini/subcpu/bootload.bin"
+    Write-Host "  binaries/mini/subcpu/partitio.bin"
+    Write-Host "  binaries/mini/subcpu/spiffs.bin"
+    Write-Host "  binaries/mini/CRC32SUMS.txt"
+}
 
-Write-Host ""
-Write-Host "HW3 / Wide:"
-Write-Host "  binaries/Wide/dvplogger.bin"
-Write-Host "  binaries/Wide/bootloader.bin"
-Write-Host "  binaries/Wide/partition-table.bin"
-Write-Host "  binaries/Wide/subcpu/app0.bin"
-Write-Host "  binaries/Wide/subcpu/bootload.bin"
-Write-Host "  binaries/Wide/subcpu/partitio.bin"
-Write-Host "  binaries/Wide/subcpu/spiffs.bin"
-Write-Host "  binaries/Wide/CRC32SUMS.txt"
+if ($BuildHw3) {
+    Write-Host ""
+    Write-Host "HW3 / Wide:"
+    Write-Host "  binaries/Wide/dvplogger.bin"
+    Write-Host "  binaries/Wide/bootloader.bin"
+    Write-Host "  binaries/Wide/partition-table.bin"
+    Write-Host "  binaries/Wide/subcpu/app0.bin"
+    Write-Host "  binaries/Wide/subcpu/bootload.bin"
+    Write-Host "  binaries/Wide/subcpu/partitio.bin"
+    Write-Host "  binaries/Wide/subcpu/spiffs.bin"
+    Write-Host "  binaries/Wide/CRC32SUMS.txt"
+}

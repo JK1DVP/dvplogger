@@ -21,7 +21,7 @@
 
 #ifndef FILE_MISC_H
 #define FILE_MISC_H
-#define N_TIME_MEASURE_BANK 32
+#define N_TIME_MEASURE_BANK 62
 
 enum TimeProfileBank {
   PROF_LOOP_TOTAL = 0,
@@ -54,6 +54,38 @@ enum TimeProfileBank {
   PROF_CONSOLE,
   PROF_PADDLE_DIAG,
   PROF_MAKEDUPE,
+  PROF_MUX_SERVICE,
+  PROF_DISPLAY_SERVICE,
+  PROF_DISPLAY_REQUEST,
+  PROF_DISPLAY_DUPE_STATE,
+  PROF_DISPLAY_DUPE_DRAW,
+  PROF_DISPLAY_DUPE_FLUSH,
+  PROF_DISPLAY_DRAW_MUX_BEFORE,
+  PROF_DISPLAY_DRAW_RENDER,
+  PROF_DISPLAY_DRAW_MUX_AFTER,
+  PROF_DISPLAY_FLUSH_MUX_BEFORE,
+  PROF_DISPLAY_FLUSH_OLED,
+  PROF_DISPLAY_FLUSH_MUX_AFTER,
+  PROF_CIV_RX,
+  PROF_CIV_FRAME,
+  PROF_CIV_PRINT,
+  PROF_CIV_GET,
+  PROF_CIV_CLEAR,
+  PROF_CIV_QUERY,
+  PROF_CIV_TAIL,
+  PROF_WEB_BAND_DUPE,
+  PROF_WEB_BAND_CMD,
+  PROF_WEB_BAND_SNAPSHOT,
+  PROF_WEB_BAND_START,
+  PROF_MUX_PACKET_HANDLER,
+  PROF_MUX_DUPE_ACK,
+  PROF_MUX_DUPE_RESULT,
+  PROF_DUPE_RESULT_PARSE,
+  PROF_DUPE_RESULT_CALLHIST,
+  PROF_DUPE_RESULT_COMMIT,
+  PROF_DUPE_RESULT_PARTIAL_UI,
+  PROF_DUPE_RESULT_DISPLAY,
+  PROF_DUPE_RESULT_PENDING_SEND,
   PROF_BANK_COUNT
 };
 void copy_token(char *dest,char *src,int idx,const char *sep) ;
@@ -62,6 +94,8 @@ void time_measure_start(int bank);
 void time_measure_start_name(int bank, const char *name);
 void time_measure_stop(int bank);
 int time_measure_get(int bank);
+uint64_t time_measure_get_total(int bank);
+uint32_t time_measure_get_calls(int bank);
 const char *time_measure_get_name(int bank);
 unsigned int reverse_bits(unsigned int bin,int digits);
 void print_bin(char *print_to, unsigned int bin, int digits) ;

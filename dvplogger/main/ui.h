@@ -42,12 +42,16 @@ void function_keys(uint8_t key, uint8_t c) ;
 int ui_perform_partial_check(struct radio *radio);
 int ui_perform_exch_partial_check(struct radio *radio);
 void set_contest_from_name();
+void set_call_stack_mode(bool enabled);
+const char *call_stack_display_callsign(const struct radio *radio,
+                                        int *cursor);
 void process_enter(int option) ;
 int check_edit_mode() ; // CW key input and Remarks  return 1 (insert) else return 0 (overwrite edit)
 void logw_handler(char key, char c);
 void 	check_call_show_dx_entity_info(struct radio *radio) ;
 void switch_logw_entry(int option) ;
 void sat_name_entered() ;
+bool set_satellite_operation(bool enabled);
 void print_help(int option) ;
 
 

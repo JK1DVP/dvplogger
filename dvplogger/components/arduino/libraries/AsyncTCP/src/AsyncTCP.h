@@ -45,7 +45,7 @@ extern "C" {
 #endif
 
 #ifndef CONFIG_ASYNC_TCP_STACK_SIZE
-#define CONFIG_ASYNC_TCP_STACK_SIZE 8192 * 2
+#define CONFIG_ASYNC_TCP_STACK_SIZE 8192
 #endif
 
 #ifndef CONFIG_ASYNC_TCP_PRIORITY
@@ -59,6 +59,12 @@ extern "C" {
 #ifndef CONFIG_ASYNC_TCP_MAX_ACK_TIME
 #define CONFIG_ASYNC_TCP_MAX_ACK_TIME 5000
 #endif
+
+// Lightweight diagnostics for applications that need to monitor the shared
+// AsyncTCP service task without printing from inside that task.
+uint32_t asyncTCPStackHighWaterMark();
+uint32_t asyncTCPStackConfiguredSize();
+uint32_t asyncTCPQueueMessagesWaiting();
 
 class AsyncClient;
 

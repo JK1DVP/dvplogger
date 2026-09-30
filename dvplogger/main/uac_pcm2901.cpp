@@ -126,7 +126,7 @@ uint8_t PCMAudioCapture::getSampleRate(uint32_t *hz) {
 }
 
 void PCMAudioCapture::dumpConfiguration(Print *out) {
-  if (!out) out = &Serial;
+  if (!out) out = console;
   if (!pUsb || !bAddress) {
     out->println("USB AUDIO DESC: device not addressed");
     return;
@@ -220,7 +220,7 @@ void PCMAudioCapture::dumpConfiguration(Print *out) {
 }
 
 void PCMAudioCapture::diagnose(Print *out) {
-  if (!out) out = &Serial;
+  if (!out) out = console;
   if (!ready()) {
     out->println("USB AUDIO DIAG: PCM2901 is not ready");
     return;
@@ -302,39 +302,39 @@ uint8_t PCMAudioCapture::Init(uint8_t parent, uint8_t port, bool lowspeed) {
     // alternate-setting state instead of assuming IF2/alt1 silently worked.
     // Keep diagnostic locals scoped so earlier goto fail paths do not cross
     // their initialization.
-    dumpConfiguration(&Serial);
+    dumpConfiguration(console);
 
     uint8_t altBefore = 0xff;
     uint8_t getIfBefore = getInterface(kCaptureInterface, &altBefore);
-    Serial.printf("USB AUDIO INIT: GET_INTERFACE before IF=%u rcode=0x%02X alt=%u\n",
+    console->printf("USB AUDIO INIT: GET_INTERFACE before IF=%u rcode=0x%02X alt=%u\n",
                   kCaptureInterface, getIfBefore, altBefore);
 
     rcode = setInterface(kCaptureInterface, kCaptureAltSetting);
-    Serial.printf("USB AUDIO INIT: SET_INTERFACE IF=%u alt=%u rcode=0x%02X\n",
+    console->printf("USB AUDIO INIT: SET_INTERFACE IF=%u alt=%u rcode=0x%02X\n",
                   kCaptureInterface, kCaptureAltSetting, rcode);
     if (rcode) goto fail;
 
     uint8_t altAfter = 0xff;
     uint8_t getIfAfter = getInterface(kCaptureInterface, &altAfter);
-    Serial.printf("USB AUDIO INIT: GET_INTERFACE after  IF=%u rcode=0x%02X alt=%u\n",
+    console->printf("USB AUDIO INIT: GET_INTERFACE after  IF=%u rcode=0x%02X alt=%u\n",
                   kCaptureInterface, getIfAfter, altAfter);
 
     uint8_t setRateResult = setSampleRate48k();
-    Serial.printf("USB AUDIO INIT: SET_CUR EP=0x%02X rate=48000 rcode=0x%02X\n",
+    console->printf("USB AUDIO INIT: SET_CUR EP=0x%02X rate=48000 rcode=0x%02X\n",
                   kCaptureEndpoint, setRateResult);
     // Some UAC1 implementations are fixed at 48 kHz and may reject SET_CUR;
     // do not fail enumeration solely for that reason.
 
     uint32_t rateReadback = 0;
     uint8_t getRateResult = getSampleRate(&rateReadback);
-    Serial.printf("USB AUDIO INIT: GET_CUR EP=0x%02X rcode=0x%02X rate=%lu\n",
+    console->printf("USB AUDIO INIT: GET_CUR EP=0x%02X rcode=0x%02X rate=%lu\n",
                   kCaptureEndpoint, getRateResult, (unsigned long)rateReadback);
   }
 
   bReady = true;
   fCapture = false;
   resetStats();
-  Serial.printf(
+  console->printf(
       "USB AUDIO: PCM2901 ready addr=%u IF=%u alt=%u EP=0x%02X maxpkt=%u "
       "format=48000/16/stereo\n",
       bAddress, kCaptureInterface, kCaptureAltSetting, kCaptureEndpoint,
@@ -362,7 +362,7 @@ uint8_t PCMAudioCapture::Release() {
 }
 
 bool PCMAudioCapture::start(Print *out) {
-  if (!out) out = &Serial;
+  if (!out) out = console;
   if (!ready()) {
     out->println("USB AUDIO: PCM2901 is not ready");
     return false;
@@ -399,7 +399,7 @@ bool PCMAudioCapture::start(Print *out) {
 }
 
 void PCMAudioCapture::stop(Print *out) {
-  if (!out) out = &Serial;
+  if (!out) out = console;
   if (fCapture) {
     fCapture = false;
     finishedMs = millis();
@@ -410,7 +410,7 @@ void PCMAudioCapture::stop(Print *out) {
 
 void PCMAudioCapture::setSofSync(bool enable, Print *out) {
   fSofSync = enable;
-  if (!out) out = &Serial;
+  if (!out) out = console;
   out->printf("USB AUDIO: SOF sync=%d (%s ISO scheduling)\n",
               fSofSync ? 1 : 0, fSofSync ? "fresh-SOF" : "immediate");
 }
@@ -449,7 +449,7 @@ void PCMAudioCapture::dumpJerrRegisters(uint8_t result) {
   const uint8_t rcvbc = pUsb->regRd(rRCVBC);
   const uint8_t usbirq = pUsb->regRd(rUSBIRQ);
   const uint8_t usbctl = pUsb->regRd(rUSBCTL);
-  Serial.printf(
+  console->printf(
       "USB AUDIO JERR[%u] t=%lums us=%lu result=%02X HRSL=%02X HIRQ=%02X "
       "MODE=%02X PERADDR=%02X HCTL=%02X HXFR=%02X RCVBC=%u USBIRQ=%02X "
       "USBCTL=%02X sync=%d\n",
@@ -459,7 +459,7 @@ void PCMAudioCapture::dumpJerrRegisters(uint8_t result) {
 }
 
 void PCMAudioCapture::freeBuffer(Print *out) {
-  if (!out) out = &Serial;
+  if (!out) out = console;
   fCapture = false;
   if (captureBuf) {
     heap_caps_free(captureBuf);
@@ -471,7 +471,7 @@ void PCMAudioCapture::freeBuffer(Print *out) {
 }
 
 void PCMAudioCapture::status(Print *out) const {
-  if (!out) out = &Serial;
+  if (!out) out = console;
   const size_t bytes = captureSamples * sizeof(int16_t);
   uint32_t elapsed = 0;
   if (startedMs) {
@@ -673,7 +673,7 @@ void PCMAudioCapture::consumeStereo16(const uint8_t *buf, uint8_t len) {
   if (captureSamples >= kCaptureSamples) {
     fCapture = false;
     finishedMs = millis();
-    Serial.printf(
+    console->printf(
         "USB AUDIO: capture complete samples=%u packets=%u errors=%u "
         "elapsed=%ums min=%d max=%d\n",
         (unsigned int)captureSamples, (unsigned int)isoPackets,

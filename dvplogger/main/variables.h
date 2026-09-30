@@ -103,5 +103,7 @@ extern int callhistf_stat ;  // 0 not open 1 open for reading 2 open for writing
 extern char qsologfn[20];    // qso log filename (append)
 extern char callhistfn[20];  // call history file to read
 extern int callhist_at; // 0: MAIN, 1: SUBCPU
+extern int dupechk_at;  // placement setting: 0=AUTO, 1=SUBCPU, 2=MAIN
+extern int dupechk_max; // requested DUPE database capacity
 
 #endif

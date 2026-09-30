@@ -79,10 +79,16 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"help", "show this command list"},
   {"emu", "enter terminal screen emulation; EXITEMU exits"},
   {"verbose[n]", "toggle verbose output, or set verbose bit mask n"},
+  {"oledreport [0|1]", "disable/enable periodic OLED/I2C health report"},
+  {"catrx [0|1|2]", "0=off, 1=all CAT/CI-V RX, 2=Yaesu AI observation"},
+  {"ai [0|1|?]", "FTX-1/Yaesu Auto Information OFF/ON/query on selected radio"},
+  {"scope [center|cursor|fix]", "set FTX-1 normal waterfall scope display mode"},
   {"clusterverbose [1|2] [0-3]", "show/set Cluster 1 or 2 traffic display level"},
   {"c1cmd <command>", "send one command immediately to Cluster 1 (not saved)"},
   {"c2cmd <command>", "send one command immediately to Cluster 2 (not saved)"},
   {"loadsat", "load saved satellite information"},
+  {"satcivdiag [downlink_hz uplink_hz]", "IC-9700 SAT MAIN/SUB CI-V diagnostic"},
+  {"satcivswap", "IC-9700 test 07 B0 MAIN/SUB band swap and readback"},
   {"savesat", "save satellite information"},
   {"satellite", "load/update TLE data"},
   {"nextaos", "calculate and display upcoming AOS"},
@@ -94,6 +100,7 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"playq", "show current audio/CW playback queue"},
   {"newqsolog", "start a new QSO.TXT log"},
   {"zmerge [dry|repair]", "merge, compare, or repair duplicate QSOs"},
+  {"zmergenew [1|10]", "low-memory NEW merge; CHECKQSOIDS batch size (default 10)"},
   {"makedupe", "rebuild dupe/multiplier data from QSO.TXT"},
   {"dumpqso[n]", "dump current raw QSO log, or backup log n"},
   {"readqso", "print QSO.TXT in importable text format"},
@@ -107,6 +114,7 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"dumplast", "dump the last QSO record"},
   {"dump <n>", "dump QSO record number n"},
   {"listdir", "list files in the microSD root directory"},
+  {"delfile <file>", "remove one file from the microSD root directory"},
   {"sdput <file> <size> <crc32>", "receive raw file bytes from serial terminal into microSD"},
   {"ymodem", "receive one file to microSD using YMODEM-CRC (Tera Term compatible)"},
   {"DX de ...", "inject a cluster spot line"},
@@ -178,6 +186,10 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"cp2105baud0 <baud>", "set CP2105 port 0 baud rate"},
   {"cp2105baud1 <baud>", "set CP2105 port 1 baud rate"},
   {"cp2105ctl <port> <D|R> <0|1>", "directly set CP2105 DTR/RTS on port 0/1"},
+  {"cp2105diag <0|1>", "show CP2105 interface/flow and DTR/RTS test guide"},
+  {"cp2105state <port> <0..3>", "set DTR/RTS: bit0=DTR bit1=RTS"},
+  {"cp2105fsk", "physical test: RTS PTT + DTR toggle 500 ms x10"},
+  {"usbkeytrace [0|1|status]", "trace actual CW/FSK/PTT USB DTR/RTS operations"},
   {"cp2105flow <0|1>", "show CP2105 16-byte flow-control block"},
   {"cp2105manual <0|1>", "set CP2105 DTR/RTS to software/manual control"},
   {"cp2105debug", "toggle CP2105 TX/RX debug dump"},
@@ -360,6 +372,139 @@ void cmd_interp(char *cmd, Stream *output) {
 	load_satinfo();
         break;
       }
+      if (strcmp(cmd, "satcivswap") == 0) {
+        struct radio *diag_radio = &radio_list[0];
+        if (!diag_radio->enabled || !diag_radio->rig_spec ||
+            diag_radio->rig_spec->rig_type != 1) {
+          out->println("SATCIVSWAP ERROR: radio0 is not an enabled IC-9700");
+          break;
+        }
+
+        // Diagnostic only: show all CI-V replies, read MAIN/SUB, issue exactly
+        // one 07 B0 MAIN/SUB swap, then read MAIN/SUB again.  Do not write
+        // any frequency or mode here.
+        cat_rx_monitor = 1;
+        out->printf("SATCIVSWAP BEGIN radio0 addr=%02X catrx=1\r\n",
+                    diag_radio->rig_spec->civaddr);
+        out->println("SATCIVSWAP NOTE: sends exactly one 07 B0; run again only if you want to swap back");
+
+        auto swap_select = [&](byte sel, const char *label) {
+          out->printf("SATCIVSWAP TX select %s: FE FE %02X E0 07 %02X FD\r\n",
+                      label, diag_radio->rig_spec->civaddr, sel);
+          send_head_civ(diag_radio);
+          add_civ_buf((byte)0x07); add_civ_buf(sel);
+          send_tail_civ(diag_radio);
+          delay(200);
+        };
+        auto swap_query = [&](const char *label) {
+          out->printf("SATCIVSWAP TX query %s: FE FE %02X E0 03 FD\r\n",
+                      label, diag_radio->rig_spec->civaddr);
+          send_head_civ(diag_radio);
+          add_civ_buf((byte)0x03);
+          send_tail_civ(diag_radio);
+          delay(250);
+        };
+
+        swap_select((byte)0xd0, "MAIN-before");
+        swap_query("MAIN-before");
+        swap_select((byte)0xd1, "SUB-before");
+        swap_query("SUB-before");
+
+        out->printf("SATCIVSWAP TX swap MAIN/SUB: FE FE %02X E0 07 B0 FD\r\n",
+                    diag_radio->rig_spec->civaddr);
+        send_head_civ(diag_radio);
+        add_civ_buf((byte)0x07); add_civ_buf((byte)0xb0);
+        send_tail_civ(diag_radio);
+        delay(500);
+
+        swap_select((byte)0xd0, "MAIN-after");
+        swap_query("MAIN-after");
+        swap_select((byte)0xd1, "SUB-after");
+        swap_query("SUB-after");
+        swap_select((byte)0xd0, "MAIN-restore");
+
+        out->println("SATCIVSWAP END; swap is left in effect; catrx remains 1 (use: catrx 0)");
+        break;
+      }
+      if (strncmp(cmd, "satcivdiag", 10) == 0 &&
+          (cmd[10] == '\0' || cmd[10] == ' ' || cmd[10] == '\t')) {
+        struct radio *diag_radio = &radio_list[0];
+        if (!diag_radio->enabled || !diag_radio->rig_spec ||
+            diag_radio->rig_spec->rig_type != 1) {
+          out->println("SATCIVDIAG ERROR: radio0 is not an enabled IC-9700");
+          break;
+        }
+
+        unsigned long down_hz = (unsigned long)plogw->dn_f;
+        unsigned long up_hz = (unsigned long)plogw->up_f;
+        unsigned long arg_down = 0, arg_up = 0;
+        if (sscanf(cmd + 10, "%lu %lu", &arg_down, &arg_up) == 2) {
+          down_hz = arg_down;
+          up_hz = arg_up;
+        }
+        if (down_hz < 1000000UL || up_hz < 1000000UL) {
+          out->println("usage: satcivdiag [downlink_hz uplink_hz]");
+          break;
+        }
+
+        // Show every returned CI-V frame (including FB=OK / FA=NG).
+        cat_rx_monitor = 1;
+        out->printf("SATCIVDIAG BEGIN radio0 addr=%02X down=%lu up=%lu catrx=1\r\n",
+                    diag_radio->rig_spec->civaddr, down_hz, up_hz);
+        out->println("SATCIVDIAG NOTE: automatic satellite tracking may also emit CI-V; use explicit frequencies for this test");
+
+        auto diag_select = [&](byte sel, const char *label) {
+          out->printf("SATCIVDIAG TX select %s: FE FE %02X E0 07 %02X FD\r\n",
+                      label, diag_radio->rig_spec->civaddr, sel);
+          send_head_civ(diag_radio);
+          add_civ_buf((byte)0x07); add_civ_buf(sel);
+          send_tail_civ(diag_radio);
+          delay(150);
+        };
+        auto diag_query = [&](const char *label) {
+          out->printf("SATCIVDIAG TX query %s: FE FE %02X E0 03 FD\r\n",
+                      label, diag_radio->rig_spec->civaddr);
+          send_head_civ(diag_radio);
+          add_civ_buf((byte)0x03);
+          send_tail_civ(diag_radio);
+          delay(150);
+        };
+        auto diag_set = [&](unsigned long hz, const char *label) {
+          unsigned long f = hz;
+          byte b[5];
+          for (int i = 0; i < 5; ++i) {
+            b[i] = dec2bcd(f % 100UL);
+            f /= 100UL;
+          }
+          out->printf("SATCIVDIAG TX set %s %lu: FE FE %02X E0 05 %02X %02X %02X %02X %02X FD\r\n",
+                      label, hz, diag_radio->rig_spec->civaddr,
+                      b[0], b[1], b[2], b[3], b[4]);
+          send_head_civ(diag_radio);
+          add_civ_buf((byte)0x05);
+          for (int i = 0; i < 5; ++i) add_civ_buf(b[i]);
+          send_tail_civ(diag_radio);
+          delay(200);
+        };
+
+        // Read both sides before changing anything.
+        diag_select((byte)0xd0, "MAIN");
+        diag_query("MAIN-before");
+        diag_select((byte)0xd1, "SUB");
+        diag_query("SUB-before");
+
+        // Reproduce the intended native Satellite operation literally:
+        // MAIN select -> 05 downlink, then SUB select -> 05 uplink.
+        diag_select((byte)0xd0, "MAIN");
+        diag_set(down_hz, "MAIN/downlink");
+        diag_query("MAIN-after");
+        diag_select((byte)0xd1, "SUB");
+        diag_set(up_hz, "SUB/uplink");
+        diag_query("SUB-after");
+
+        diag_select((byte)0xd0, "MAIN-restore");
+        out->println("SATCIVDIAG END; catrx remains 1 (use: catrx 0)");
+        break;
+      }
       if (strncmp(cmd, "POWER", 5) == 0) {
         struct radio *radio = so2r.radio_selected();
         int watts = -1;
@@ -439,6 +584,41 @@ void cmd_interp(char *cmd, Stream *output) {
           break;
         }
         CP2105controlTest((uint8_t)port, line, on != 0, out);
+        break;
+      }
+
+      if (strcmp(cmd, "usbkeytrace") == 0 || strcmp(cmd, "usbkeytrace status") == 0) {
+        out->printf("USBKEYTRACE=%d\n", USBKeyTraceGet() ? 1 : 0);
+        break;
+      }
+      if (strcmp(cmd, "usbkeytrace 0") == 0) {
+        USBKeyTraceSet(false, out);
+        break;
+      }
+      if (strcmp(cmd, "usbkeytrace 1") == 0) {
+        USBKeyTraceSet(true, out);
+        break;
+      }
+
+      if (strcmp(cmd, "cp2105fsk") == 0) {
+        CP2105fskPhysicalTestStart(out);
+        break;
+      }
+
+      if (strncmp(cmd, "cp2105diag ", 11) == 0) {
+        int port = atoi(cmd + 11);
+        if (port < 0 || port > 1) out->println("usage: cp2105diag <0|1>");
+        else CP2105diag((uint8_t)port, out);
+        break;
+      }
+      if (strncmp(cmd, "cp2105state ", 12) == 0) {
+        int port = -1, state = -1;
+        if (sscanf(cmd + 12, "%d %d", &port, &state) != 2 ||
+            port < 0 || port > 1 || state < 0 || state > 3) {
+          out->println("usage: cp2105state <0|1> <0..3>");
+          break;
+        }
+        CP2105lineStateTest((uint8_t)port, (uint8_t)state, out);
         break;
       }
 
@@ -561,9 +741,11 @@ void cmd_interp(char *cmd, Stream *output) {
         break;
       }
       if (strncmp(cmd,"rttytx ",7)==0) {
-        struct radio *r = so2r.radio_tx();
+        struct radio *r = so2r.radio_selected();
         if (!r || r->modetype != LOG_MODETYPE_DG) {
-          out->println("RTTYTX: TX radio must be in RTTY/DG mode");
+          out->printf("RTTYTX: selected RIG%d mode=%s type=%d; must be RTTY/DG\n",
+                      r ? r->rig_idx : -1, r ? r->opmode : "(none)",
+                      r ? r->modetype : -1);
           break;
         }
         if (r->f_tone_keying || (rig_fsk_port(r->rig_spec) != 3 && rig_fsk_port(r->rig_spec) != 4)) {
@@ -580,9 +762,11 @@ void cmd_interp(char *cmd, Stream *output) {
         if (cmd[8]==' ') n = atoi(cmd + 9);
         if (n < 1) n = 1;
         if (n > 40) n = 40;
-        struct radio *r = so2r.radio_tx();
+        struct radio *r = so2r.radio_selected();
         if (!r || r->modetype != LOG_MODETYPE_DG) {
-          out->println("RTTYTEST: TX radio must be in RTTY/DG mode");
+          out->printf("RTTYTEST: selected RIG%d mode=%s type=%d; must be RTTY/DG\n",
+                      r ? r->rig_idx : -1, r ? r->opmode : "(none)",
+                      r ? r->modetype : -1);
           break;
         }
         if (r->f_tone_keying || (rig_fsk_port(r->rig_spec) != 3 && rig_fsk_port(r->rig_spec) != 4)) {
@@ -618,9 +802,11 @@ void cmd_interp(char *cmd, Stream *output) {
         if (*np) n = atoi(np);
         if (n < 1) n = 1;
         if (n > 24) n = 24;
-        struct radio *r = so2r.radio_tx();
+        struct radio *r = so2r.radio_selected();
         if (!r || r->modetype != LOG_MODETYPE_DG) {
-          out->println("RTTYTEST1: TX radio must be in RTTY/DG mode");
+          out->printf("RTTYTEST1: selected RIG%d mode=%s type=%d; must be RTTY/DG\n",
+                      r ? r->rig_idx : -1, r ? r->opmode : "(none)",
+                      r ? r->modetype : -1);
           break;
         }
         if (r->f_tone_keying || (rig_fsk_port(r->rig_spec) != 3 && rig_fsk_port(r->rig_spec) != 4)) {
@@ -837,6 +1023,75 @@ void cmd_interp(char *cmd, Stream *output) {
 	init_mux_serial();
       	break;
       }
+      if (strcmp(cmd, "ai") == 0 || strcmp(cmd, "ai ?") == 0 ||
+          strcmp(cmd, "ai?") == 0 || strcmp(cmd, "ai 0") == 0 ||
+          strcmp(cmd, "ai0") == 0 || strcmp(cmd, "ai 1") == 0 ||
+          strcmp(cmd, "ai1") == 0) {
+        struct radio *ai_radio = so2r.radio_selected();
+        if (!ai_radio || !ai_radio->rig_spec ||
+            ai_radio->rig_spec->cat_type != CAT_TYPE_YAESU_NEW) {
+          out->println("AI: selected radio is not Yaesu CAT");
+          break;
+        }
+
+        const char *ai_cmd = "AI;";
+        if (cmd[strlen(cmd) - 1] == '0') ai_cmd = "AI0;";
+        if (cmd[strlen(cmd) - 1] == '1') ai_cmd = "AI1;";
+        send_cat_cmd(ai_radio, ai_cmd);
+        out->printf("AI rig=%d sent %s\r\n", ai_radio->rig_idx, ai_cmd);
+        break;
+      }
+      if (strcmp(cmd, "scope center") == 0 ||
+          strcmp(cmd, "scope cursor") == 0 ||
+          strcmp(cmd, "scope fix") == 0) {
+        struct radio *scope_radio = so2r.radio_selected();
+        if (!scope_radio || !scope_radio->rig_spec ||
+            scope_radio->rig_spec->cat_type != CAT_TYPE_YAESU_NEW) {
+          out->println("SCOPE: selected radio is not Yaesu CAT");
+          break;
+        }
+
+        const char *scope_cmd = "SS0640000;";
+        const char *scope_name = "CENTER";
+        if (strcmp(cmd, "scope cursor") == 0) {
+          scope_cmd = "SS0670000;";
+          scope_name = "CURSOR";
+        } else if (strcmp(cmd, "scope fix") == 0) {
+          scope_cmd = "SS06A0000;";
+          scope_name = "FIX";
+        }
+        send_cat_cmd(scope_radio, scope_cmd);
+        out->printf("SCOPE rig=%d %s sent %s\r\n",
+                    scope_radio->rig_idx, scope_name, scope_cmd);
+        break;
+      }
+      if (strncmp(cmd, "catrx", 5) == 0 &&
+          (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t' ||
+           cmd[5] == '0' || cmd[5] == '1' || cmd[5] == '2')) {
+        int mode = -1;
+        const char *arg = cmd + 5;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        if (*arg != '\0') mode = atoi(arg);
+        if (mode >= 0) {
+          if (mode > 2) {
+            out->println("usage: catrx [0|1|2]");
+            break;
+          }
+          cat_rx_monitor = mode;
+        }
+        out->printf("catrx=%d\n", cat_rx_monitor);
+        break;
+      }
+      if (strncmp(cmd, "oledreport", 10) == 0) {
+        int on = -1;
+        int n = sscanf(cmd + 10, "%d", &on);
+        if (n == 1) {
+          if (on) verbose |= VERBOSE_OLED;
+          else verbose &= ~VERBOSE_OLED;
+        }
+        out->printf("oledreport=%d\n", (verbose & VERBOSE_OLED) ? 1 : 0);
+        break;
+      }
       if (strncmp(cmd, "verbose", 7) == 0) {
         tmp1 = sscanf(cmd + 7, "%d", &tmp);
         if (tmp1 == 1) {
@@ -882,7 +1137,7 @@ void cmd_interp(char *cmd, Stream *output) {
       if (strcmp(cmd, "satellite") == 0) {
         f_sat_updated = 0;  // reset flag
 	allocate_sat();
-	getTLE();
+	request_sat_tle_update();
         break;
       }
       if (strncmp(cmd,"addap ",6)==0) {
@@ -927,6 +1182,16 @@ void cmd_interp(char *cmd, Stream *output) {
       }
       if (strcmp(cmd, "zmerge repair") == 0) {
         zserver_start_repair();
+        break;
+      }
+      if (strcmp(cmd, "zmergenew") == 0) {
+        zserver_start_merge_new(10);
+        break;
+      }
+      if (strncmp(cmd, "zmergenew ", 10) == 0) {
+        int batch = atoi(cmd + 10);
+        if (batch != 1 && batch != 10) out->println("usage: zmergenew [1|10]");
+        else zserver_start_merge_new((uint8_t)batch);
         break;
       }
 
@@ -1235,6 +1500,25 @@ void cmd_interp(char *cmd, Stream *output) {
       if (strcmp(cmd, "newqsolog") == 0) {
         // create new QSO log
         create_new_qso_log();
+        break;
+      }
+
+      if (strncmp(cmd, "delfile ", 8) == 0) {
+        const char *arg = cmd + 8;
+        while (*arg == ' ') ++arg;
+        char fn[64];
+        if (*arg == '\0') {
+          out->println("delfile: filename required");
+        } else {
+          snprintf(fn, sizeof(fn), "%s%s", (*arg == '/') ? "" : "/", arg);
+          if (!SD.exists(fn)) {
+            out->print("delfile: not found "); out->println(fn);
+          } else if (SD.remove(fn)) {
+            out->print("delfile: removed "); out->println(fn);
+          } else {
+            out->print("delfile: FAILED to remove "); out->println(fn);
+          }
+        }
         break;
       }
 

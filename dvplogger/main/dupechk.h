@@ -24,6 +24,16 @@
 
 unsigned char bandmode(struct radio *radio) ;
 unsigned char bandmode_param(int bandid,int modetype) ;
+void set_dupechk_contest_id(uint8_t contest_id);
+uint8_t get_dupechk_contest_id();
+// Bitmap helpers. Public bandmode encoding remains bandid*4+modetype;
+// internally bandid 1..16 is packed densely into bitmap bits 0..63.
+bool dupechk_entry_matches_bandmode(int index, byte bandmode, byte mask);
+byte dupechk_entry_display_bandmode(int index, byte preferred, byte mask);
+// Bitmap helpers. Public bandmode encoding remains bandid*4+modetype;
+// internally bandid 1..16 is packed densely into bitmap bits 0..63.
+bool dupechk_entry_matches_bandmode(int index, byte bandmode, byte mask);
+byte dupechk_entry_display_bandmode(int index, byte preferred, byte mask);
 // Normalize only well-known portable suffixes for exact DUPE/CALLHIST matching.
 // The original callsign used for display/logging is never modified.
 bool normalize_dupe_callsign(const char *src, char *dst, size_t dst_size);
@@ -47,6 +57,9 @@ void request_async_dupe_partial(struct radio *radio, bool include_partial);
 // DUPE/CALLHIST/partial-check path used by normal operator entry.
 bool set_callsign_and_request_dupe(struct radio *radio, const char *callsign,
                                    bool include_partial);
+bool set_callsign_and_request_dupe_for_bandmode(
+    struct radio *radio, const char *callsign, bool include_partial,
+    unsigned char query_bandmode, bool show_partial_result = true);
 bool request_sp_send_after_dupe(struct radio *radio);
 
 bool dupe_check(struct radio *radio,char *call, byte bandmode, byte mask, bool callhist_check) ;
@@ -54,6 +67,9 @@ bool dupe_check_get_callhist(char *call, byte bandmode, byte mask, bool callhist
 void entry_dupechk_subcpu(char *s);
 void entry_dupechk_call_exch_bandmode(char *callsign,char *recv_exch,unsigned char bandmode);
 void entry_dupechk_data(const char *callsign, const char *recv_exch, unsigned char bandmode);
+void entry_dupechk_data_for(const char *callsign, const char *recv_exch,
+                            unsigned char bandmode, uint8_t contest_id);
+bool dupechk_setting_wants_subcpu();
 bool reset_dupechk_subcpu();
 void notify_dupechk_subcpu_reset(int remote_ncallsign);
 void sync_dupechk_mask_subcpu(unsigned char mask);
@@ -68,6 +84,7 @@ void start_finish_makedupe_subcpu();
 bool poll_finish_makedupe_subcpu();
 void note_makedupe_accepted_maincpu();
 bool dupechk_remote_query_pending();
+bool dupechk_query_log_enabled();
 bool dupechk_remote_ack_received();
 // Non-blocking exact DUPE query for low-priority background jobs.
 // start returns false while the single SUBCPU query slot is busy.
@@ -79,6 +96,9 @@ void dupechk_background_exact_cancel();
 void process_makedupe_score_maincpu(char *s, int group);
 void process_makedupe_diag_maincpu(char *s);
 void entry_makedupe_subcpu_data(const char *callsign, const char *recv_exch, unsigned char bandmode);
+void entry_makedupe_subcpu_data_for(const char *callsign, const char *recv_exch,
+                                    unsigned char bandmode, uint8_t contest_id,
+                                    uint8_t dupe_mask);
 void entry_dupechk(struct radio *radio) ;
 void init_score() ;
 //void init_dupechk() ;
@@ -98,4 +118,4 @@ void dupechk_note_main_ack(unsigned int query_id);
 void dupechk_note_main_rx();
 void dupechk_note_exact_response_success(unsigned int query_id);
 #endif
-int reset_dupechk_subcpu_database();
+int reset_dupechk_subcpu_database(int requested_capacity);

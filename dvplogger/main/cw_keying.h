@@ -47,6 +47,7 @@ extern int cw_send_update ;
 void set_tone(int note,int on);
 void set_tone_keying(struct radio *radio);
 void keying(int on);
+void keying_port_direct(int port, int on);
 void set_manual_cw_radio(int radio_idx);
 void clear_manual_cw_radio();
 int effective_cw_radio();
@@ -72,6 +73,8 @@ char *expand_macro_string(char *p,size_t p_size, const char *s) ; // expand macr
 void append_cwbuf_string(const char *s) ;
 void append_rtty_test1(char ch, int n);
 void append_rtty_test_text(const char *s);
+void append_manual_rtty_char(struct radio *radio, char c);
+void process_manual_rtty_tx();
 int cw_wptr_cw_send_buf_previous() ;
 void delete_cwbuf();
 void cancel_keying(struct radio *radio); // here radio indicates currently transmitting radio
@@ -91,5 +94,7 @@ extern int f_so2r_chgstat_rx ;  // nonzero if changing so2r receive requested
 extern int f_transmission ;     // 0 nothing   1 force transmission on active trx 2
 extern int cw_count_ms;          // CW/RTTY scheduler countdown (ms)
 extern volatile bool f_rtty_usb_lead_pending; // USB RTTY lead waits for PTT ON in main loop
+extern volatile bool f_rtty_message_end_pending; // SO2R message: restore focus after physical RTTY PTT OFF
+extern volatile int rtty_pending_lead_ms;
 //Ticker cw_sender, civ_reader;
 #endif

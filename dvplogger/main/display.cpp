@@ -61,10 +61,13 @@ class U8G2 *u8g2_r;
 #include "qso.h"
 #include "bandmap.h"
 #include "dupechk.h"
+#include "contest.h"
+#include "ui.h"
 #include "cw_keying.h"
 #include "so2r.h"
 #include "mux_transport.h"
 #include "satellite.h"
+#include "misc.h"
 #include "freertos/queue.h"
 //#include <u8g2_font_t0_8_mf.h>
 
@@ -79,7 +82,8 @@ enum DisplayRequestType : uint8_t {
   DISPLAY_REQ_CONTEST_SETTINGS,
   DISPLAY_REQ_BANDMAP,
   DISPLAY_REQ_CWBUF,
-  DISPLAY_REQ_RTTY_RX
+  DISPLAY_REQ_RTTY_RX,
+  DISPLAY_REQ_PARTIAL_CHECK
 };
 
 struct DisplayRequest {
@@ -154,6 +158,10 @@ void process_display_requests()
       case DISPLAY_REQ_BANDMAP: request_bandmap_update_on_demand(); break;
       case DISPLAY_REQ_CWBUF: display_cw_buf_lcd(req.text); break;
       case DISPLAY_REQ_RTTY_RX: upd_display_rtty_decoder(req.text); break;
+      case DISPLAY_REQ_PARTIAL_CHECK:
+        if (req.radio_idx >= 0 && req.radio_idx < 3)
+          display_partial_check(&radio_list[req.radio_idx]);
+        break;
     }
   }
   if (s_display_dropped) {
@@ -165,6 +173,17 @@ void process_display_requests()
 void request_display_update_on_demand()
 {
   request_dupe_aware_display_update();
+}
+
+void request_partial_check_display_on_demand(struct radio *radio)
+{
+  if (s_display_queue == nullptr || radio == nullptr) return;
+  const int ridx = (int)(radio - radio_list);
+  if (ridx < 0 || ridx >= 3) return;
+  DisplayRequest req{};
+  req.type = DISPLAY_REQ_PARTIAL_CHECK;
+  req.radio_idx = ridx;
+  if (xQueueSend(s_display_queue, &req, 0) != pdTRUE) ++s_display_dropped;
 }
 
 void request_bandmap_update_on_demand()
@@ -200,6 +219,16 @@ void request_dupe_aware_display_update()
                            : DUPE_DISPLAY_DRAW_PENDING;
 }
 
+bool dupe_aware_display_update_pending()
+{
+  // Cheap main-loop fast path: avoid entering the display state machine when
+  // there is no right-display or bandmap work pending.  The three service
+  // points in loop() are intentionally retained so a newly requested DUPE
+  // update can still advance WAIT -> DRAW -> FLUSH with minimum key latency.
+  return s_dupe_display_state != DUPE_DISPLAY_IDLE ||
+         s_bandmap_update_pending;
+}
+
 void process_dupe_aware_display_update()
 {
   if (!display_is_main_loop()) return;
@@ -210,6 +239,8 @@ void process_dupe_aware_display_update()
 
     case DUPE_DISPLAY_WAIT_ACK:
       // Keep the MUX moving while waiting, but never block the main loop.
+      // Profile this state separately from framebuffer drawing and OLED I/O.
+      time_measure_start_name(PROF_DISPLAY_DUPE_STATE, "dupe_state");
       service_mux_transport();
       if (dupechk_remote_ack_received() ||
           !dupechk_remote_query_pending() ||
@@ -217,22 +248,39 @@ void process_dupe_aware_display_update()
             DUPE_DISPLAY_ACK_BUDGET_US) {
         s_dupe_display_state = DUPE_DISPLAY_DRAW_PENDING;
       }
+      time_measure_stop(PROF_DISPLAY_DUPE_STATE);
       break;
 
     case DUPE_DISPLAY_DRAW_PENDING:
       // Draw into the RAM framebuffer only.  A later loop performs I2C.
+      time_measure_start_name(PROF_DISPLAY_DUPE_DRAW, "dupe_draw");
+      time_measure_start_name(PROF_DISPLAY_DRAW_MUX_BEFORE, "draw_mux_pre");
       service_mux_transport();
+      time_measure_stop(PROF_DISPLAY_DRAW_MUX_BEFORE);
+      time_measure_start_name(PROF_DISPLAY_DRAW_RENDER, "draw_render");
       upd_display_render(false);
+      time_measure_stop(PROF_DISPLAY_DRAW_RENDER);
+      time_measure_start_name(PROF_DISPLAY_DRAW_MUX_AFTER, "draw_mux_post");
       service_mux_transport();
+      time_measure_stop(PROF_DISPLAY_DRAW_MUX_AFTER);
+      time_measure_stop(PROF_DISPLAY_DUPE_DRAW);
       s_dupe_display_state = DUPE_DISPLAY_FLUSH_PENDING;
       break;
 
     case DUPE_DISPLAY_FLUSH_PENDING:
       // OLED transfer is still synchronous, so service MUX immediately before
       // and after it.  Consecutive key strokes coalesce by resetting the state.
+      time_measure_start_name(PROF_DISPLAY_DUPE_FLUSH, "dupe_flush");
+      time_measure_start_name(PROF_DISPLAY_FLUSH_MUX_BEFORE, "flush_mux_pre");
       service_mux_transport();
+      time_measure_stop(PROF_DISPLAY_FLUSH_MUX_BEFORE);
+      time_measure_start_name(PROF_DISPLAY_FLUSH_OLED, "flush_oled");
       right_display_sendBuffer();
+      time_measure_stop(PROF_DISPLAY_FLUSH_OLED);
+      time_measure_start_name(PROF_DISPLAY_FLUSH_MUX_AFTER, "flush_mux_post");
       service_mux_transport();
+      time_measure_stop(PROF_DISPLAY_FLUSH_MUX_AFTER);
+      time_measure_stop(PROF_DISPLAY_DUPE_FLUSH);
       s_dupe_display_state = DUPE_DISPLAY_IDLE;
       break;
   }
@@ -253,13 +301,146 @@ void process_dupe_aware_display_update()
   }
 }
 
+static uint32_t s_oled_flush_count = 0;
+// Right OLED duplicate-frame suppression.  Keep only a 32-bit fingerprint of
+// the last framebuffer that was successfully transferred; this avoids a
+// second 1 KiB shadow buffer on memory-constrained hardware.
+static uint32_t s_oled_r_last_hash = 0;
+static bool s_oled_r_hash_valid = false;
+static uint32_t s_oled_r_skip_count = 0;
+
+static uint32_t oled_frame_hash(const uint8_t *buf, size_t len)
+{
+  // FNV-1a: cheap enough for a 1 KiB framebuffer and deterministic.
+  uint32_t h = 2166136261UL;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= buf[i];
+    h *= 16777619UL;
+  }
+  return h;
+}
+static uint32_t s_oled_slow80_count = 0;
+static uint32_t s_oled_slow150_count = 0;
+static uint32_t s_oled_probe_fail_count = 0;
+static uint32_t s_oled_last_health_ms = 0;
+static uint32_t s_oled_window_max_io_us = 0;
+static uint32_t s_oled_window_max_lock_us = 0;
+static uint32_t s_oled_window_slow80 = 0;
+static uint32_t s_oled_window_slow100 = 0;
+static uint32_t s_oled_window_slow150 = 0;
+static uint32_t s_oled_window_lock2 = 0;
+static uint32_t s_oled_window_lock8 = 0;
+
+static uint8_t i2c_probe_address(uint8_t address)
+{
+  Wire.beginTransmission(address);
+  return Wire.endTransmission();
+}
+
+static void i2c_oled_health_diag(const char *owner, uint32_t elapsed_us, uint32_t lock_wait_us)
+{
+  ++s_oled_flush_count;
+  if (elapsed_us >= 80000U) ++s_oled_slow80_count;
+  if (elapsed_us >= 150000U) ++s_oled_slow150_count;
+
+  if (elapsed_us > s_oled_window_max_io_us) s_oled_window_max_io_us = elapsed_us;
+  if (lock_wait_us > s_oled_window_max_lock_us) s_oled_window_max_lock_us = lock_wait_us;
+  if (elapsed_us >= 80000U) ++s_oled_window_slow80;
+  if (elapsed_us >= 100000U) ++s_oled_window_slow100;
+  if (elapsed_us >= 150000U) ++s_oled_window_slow150;
+  if (lock_wait_us >= 2000U) ++s_oled_window_lock2;
+  if (lock_wait_us >= 8000U) ++s_oled_window_lock8;
+
+  // sendBuffer() on this hardware can legitimately take around 80 ms.
+  // Do not probe the bus or print a line for every such flush: doing that in
+  // the foreground input/display loop adds avoidable latency and floods the
+  // console.  Keep the counters continuously, but report/probe at most once
+  // every 10 seconds, and only when performance diagnostics are requested.
+  // The counters remain active all the time; `oledreport 1` enables the
+  // OLED health report when it is actually needed.
+  if (!(verbose & VERBOSE_OLED)) return;
+  const uint32_t now_ms = millis();
+  if ((uint32_t)(now_ms - s_oled_last_health_ms) < 10000U) return;
+
+  // Probe only at the rate-limited health sample.  endTransmission():
+  // 0=success, 2=address NACK, 3=data NACK, 4=other, 5=timeout.
+  const uint8_t probe_3c = i2c_probe_address(0x3c);
+  const uint8_t probe_3d = i2c_probe_address(0x3d);
+  if (probe_3c != 0) ++s_oled_probe_fail_count;
+  if (probe_3d != 0) ++s_oled_probe_fail_count;
+
+  console->printf(
+      "I2C OLED window owner=%s last=%lu us maxio=%lu us maxlock=%lu us "
+      "w80=%lu w100=%lu w150=%lu lock2=%lu lock8=%lu clock=%lu Hz "
+      "flush=%lu skip=%lu slow80=%lu slow150=%lu probe3c=%u probe3d=%u "
+      "probefail=%lu SDA=%d SCL=%d core=%d\n",
+      owner ? owner : "?",
+      (unsigned long)elapsed_us,
+      (unsigned long)s_oled_window_max_io_us,
+      (unsigned long)s_oled_window_max_lock_us,
+      (unsigned long)s_oled_window_slow80,
+      (unsigned long)s_oled_window_slow100,
+      (unsigned long)s_oled_window_slow150,
+      (unsigned long)s_oled_window_lock2,
+      (unsigned long)s_oled_window_lock8,
+      (unsigned long)Wire.getClock(),
+      (unsigned long)s_oled_flush_count,
+      (unsigned long)s_oled_r_skip_count,
+      (unsigned long)s_oled_slow80_count,
+      (unsigned long)s_oled_slow150_count,
+      (unsigned int)probe_3c,
+      (unsigned int)probe_3d,
+      (unsigned long)s_oled_probe_fail_count,
+      digitalRead(21), digitalRead(22), xPortGetCoreID());
+
+  s_oled_window_max_io_us = 0;
+  s_oled_window_max_lock_us = 0;
+  s_oled_window_slow80 = 0;
+  s_oled_window_slow100 = 0;
+  s_oled_window_slow150 = 0;
+  s_oled_window_lock2 = 0;
+  s_oled_window_lock8 = 0;
+  s_oled_last_health_ms = now_ms;
+}
+
 static void i2c_guarded_send_buffer(U8G2 *display, const char *owner)
 {
   if (display == nullptr) return;
+
+  // The right OLED is often requested repeatedly even though the rendered
+  // framebuffer is unchanged.  A full SH1106/SSD1309 transfer costs roughly
+  // 55--60 ms on the current hardware, so suppress identical frames before
+  // taking the I2C lock.  All right-OLED send paths pass through this helper,
+  // which keeps the fingerprint coherent even for non-DUPE display updates.
+  uint32_t right_hash = 0;
+  bool track_right_hash = (display == u8g2_r && dispbuf_r != nullptr);
+  if (track_right_hash) {
+    right_hash = oled_frame_hash(dispbuf_r, u8g2_r->getBufferSize());
+    if (s_oled_r_hash_valid && right_hash == s_oled_r_last_hash) {
+      ++s_oled_r_skip_count;
+      return;
+    }
+  }
+
+  uint32_t lock_started_us = micros();
   if (!i2c_bus_lock(owner, pdMS_TO_TICKS(10))) return;
+  uint32_t lock_wait_us = micros() - lock_started_us;
   uint32_t started_us = micros();
   display->sendBuffer();
   uint32_t elapsed_us = micros() - started_us;
+
+  // Keep the bus lock while probing so the diagnostic result belongs to
+  // the same I2C state immediately after this OLED transfer.
+  i2c_oled_health_diag(owner, elapsed_us, lock_wait_us);
+
+  // Only mark the frame as delivered after sendBuffer() completed.  If the
+  // I2C lock could not be obtained, this point is never reached and the next
+  // request will retry the transfer.
+  if (track_right_hash) {
+    s_oled_r_last_hash = right_hash;
+    s_oled_r_hash_valid = true;
+  }
+
   i2c_bus_unlock(owner);
   i2c_diag_io(owner, elapsed_us);
 }
@@ -404,7 +585,14 @@ void upd_display_info_flash(const char *s) {
   int count = 0;
   const char *p = s;
   while (p != NULL && *p != '\0' && count < 6) {
+    // Accept both a real newline and a literal "\\n" sequence.  The latter
+    // can arrive through command/keyboard display paths and used to appear on
+    // Japanese displays as "¥n" instead of starting a new line.
     const char *eol = strchr(p, '\n');
+    const char *escaped_eol = strstr(p, "\\n");
+    if (escaped_eol != NULL && (eol == NULL || escaped_eol < eol)) eol = escaped_eol;
+    const bool escaped_newline =
+        (eol != NULL && eol[0] == '\\' && eol[1] == 'n');
     size_t len = eol != NULL ? (size_t)(eol - p) : strlen(p);
 
     char line[96];
@@ -427,7 +615,7 @@ void upd_display_info_flash(const char *s) {
     count++;
 
     if (eol == NULL) break;
-    p = eol + 1;
+    p = eol + (escaped_newline ? 2 : 1);
   }
 
   info_disp.show_info = INFO_DISP_FLASH;
@@ -482,12 +670,44 @@ void upd_display_tm() {
   struct radio *radio;
   int x, y, line_flag;
   line_flag = 0;
+  bool draw_swr_label = false;
   radio = so2r.radio_selected();
   char clock_text[24];
   format_display_clock(clock_text, sizeof(clock_text), false);
   const bool utc_clock = (clock_display_mode == 1);
   if (plogw->show_smeter) {
-    if (radio->smeter_stat >= 1) {
+    // The same five-character field shows received signal strength in RX and
+    // SWR in TX.  The three-letter SWR label is drawn with a 5x7 font in the
+    // first two normal character cells; the value uses the normal font in the
+    // remaining three cells (for example "SWR1.5").
+    if (radio_tx_meter_active(radio)) {
+      const bool swr_fresh = radio->swr_x100 > 0 &&
+        (uint32_t)(millis() - radio->swr_updated_ms) <= 1500U;
+      if (swr_fresh) {
+        int swr_x10 = (radio->swr_x100 + 5) / 10;
+        if (swr_x10 > 99) swr_x10 = 99;
+        int focused = so2r.focused_radio();
+        if (focused < 0 || focused > 9) focused = 0;
+        const char focused_ch = (char)('0' + focused);
+        const char swr_whole_ch = (char)('0' + swr_x10 / 10);
+        const char swr_frac_ch = (char)('0' + swr_x10 % 10);
+        if (utc_clock)
+          snprintf(buf, sizeof(buf), "%c %.9s  %c.%c", focused_ch,
+                   clock_text, swr_whole_ch, swr_frac_ch);
+        else
+          snprintf(buf, sizeof(buf), "%c %-8.8s   %c.%c", focused_ch,
+                   clock_text, swr_whole_ch, swr_frac_ch);
+        draw_swr_label = true;
+      } else {
+        int focused = so2r.focused_radio();
+        if (focused < 0 || focused > 9) focused = 0;
+        if (utc_clock)
+          snprintf(buf, sizeof(buf), "%c %.9s  ---", (char)('0' + focused), clock_text);
+        else
+          snprintf(buf, sizeof(buf), "%c %-8.8s   ---", (char)('0' + focused), clock_text);
+        draw_swr_label = true;
+      }
+    } else if (radio->smeter_stat >= 1) {
       // show peak  with underline
       if (radio->smeter_peak != SMETER_MINIMUM_DBM) {
         if (utc_clock) sprintf(buf, "%1d %sS%4d", so2r.focused_radio(), clock_text, radio->smeter_peak/SMETER_UNIT_DBM);
@@ -524,6 +744,17 @@ void upd_display_tm() {
   // we still have some space to add some more information
   //display_printStr(plogw->tm + 3, 1);
   display_printStr(buf, 1);
+  if (draw_swr_label) {
+    // The S-meter field starts at normal character column 11 (11 * 8 px).
+    // u8g2_font_5x7_tf renders "SWR" in 15 px, fitting into two 8-px cells.
+    const int swr_y = dp->hcol[0] + (dp->hcol[0] - 7) / 2;
+    u8g2_r->setFont(u8g2_font_5x7_tf);
+    u8g2_r->setFontPosTop();
+    u8g2_r->drawStr(8 * 11, swr_y, "SWR");
+    u8g2_r->setFont(u8g2_font_unifont_t_japanese1);
+    u8g2_r->setFontRefHeightExtendedText();
+    u8g2_r->setFontPosTop();
+  }
   if (line_flag) u8g2_r->drawHLine(x, y, 8 * 5);
 }
 
@@ -661,7 +892,7 @@ int upd_cursor_calc(int cursor, int wsize)
   }
 }
 
-void upd_display_put_lcdbuf(char *s, int cursor, int wsize, int lcdpos) {
+void upd_display_put_lcdbuf(const char *s, int cursor, int wsize, int lcdpos) {
   // lcdpos is where the window starts in lcdbuf
   // store string in *s so that cursor is located within the window (of size wsize)
   // sprintf(dp->lcdbuf, "%-s", plogw->cluster_name + 2);
@@ -672,7 +903,8 @@ void upd_display_put_lcdbuf(char *s, int cursor, int wsize, int lcdpos) {
   } else {
     ofs = 0;
   }
-  char *p0, *p1;
+  char *p0;
+  const char *p1;
   p0 = dp->lcdbuf + lcdpos;
   p1 = s + ofs;
   for (int i = 0; i < wsize; i++) {
@@ -703,11 +935,17 @@ void upd_cursor() {
     } else {
       switch (radio->ptr_curr) {
         case 0:  // callsign
-          //x = radio->callsign[1] * 8;
-          x = upd_cursor_calc(radio->callsign[1], 9);
-	  if (radio->callsign[1]< strlen(radio->callsign+2)) {
-	    cursor_char=(radio->callsign+2)[(int)radio->callsign[1]];
-	  }
+          // During an uncommitted Call Stack QSO, keep showing the complete
+          // original list while all QSO logic uses the selected call.
+          {
+          int call_cursor = 0;
+          const char *call_display =
+              call_stack_display_callsign(radio, &call_cursor);
+          x = upd_cursor_calc(call_cursor, 9);
+          if (call_cursor < (int)strlen(call_display)) {
+            cursor_char = call_display[call_cursor];
+          }
+          }
           break;
         case 1:  // my exch (received exch)
           //          x = radio->recv_exch[1] * 8 + 70;
@@ -776,7 +1014,7 @@ void upd_cursor() {
           x = upd_cursor_calc(plogw->my_name[1], 16);
           break;
         case 40:  // contest_name
-          x = upd_cursor_calc(plogw->contest_name[1], 16);
+          x = upd_cursor_calc(plogw->contest_entry[1], 16);
           break;
         case 41:
           x = upd_cursor_calc(plogw->cluster2_name[1], 16);
@@ -885,7 +1123,12 @@ static void upd_display_render(bool flush_to_oled) {
         case 1:  // my exch
           //          sprintf(dp->lcdbuf, "%-8s %-7s", radio->callsign + 2, radio->recv_exch + 2);
           // better to allocate space to show 9 characters (??????/?_=9 chrs)
-          upd_display_put_lcdbuf(radio->callsign + 2, radio->callsign[1], 9, 0);
+          {
+          int call_cursor = 0;
+          const char *call_display =
+              call_stack_display_callsign(radio, &call_cursor);
+          upd_display_put_lcdbuf(call_display, call_cursor, 9, 0);
+          }
           upd_display_put_lcdbuf(radio->recv_exch + 2, radio->recv_exch[1], 7, 8 + 1);
           break;
         case 2:  // sent rst
@@ -966,7 +1209,8 @@ static void upd_display_render(bool flush_to_oled) {
           upd_display_put_lcdbuf(plogw->my_name + 2, plogw->my_name[1], 16, 0);
           break;
         case 40:  // Contest Name
-          upd_display_put_lcdbuf(plogw->contest_name + 2, plogw->contest_name[1], 16, 0);
+          upd_display_put_lcdbuf(plogw->contest_entry + 2,
+                                 plogw->contest_entry[1], 16, 0);
           break;
         case 41:
           upd_display_put_lcdbuf(plogw->cluster2_name + 2, plogw->cluster2_name[1], 16, 0);
@@ -1019,6 +1263,10 @@ void right_display_clearBuffer()
 
 void init_display() {
 
+  // The OLED controller is reinitialized below, so the physical screen can no
+  // longer be assumed to match the previously delivered framebuffer.
+  s_oled_r_hash_valid = false;
+
   if (dispbuf_r) {
     free(dispbuf_r);
     dispbuf_r = nullptr;
@@ -1056,6 +1304,7 @@ void init_display() {
   //  u8g2_l=&u8g2_l_2;
   //  display_flip=0; // 2.4" display
 
+  u8g2_r->setBusClock(400000);
   u8g2_r->begin();
 
   if (display_swap) {
@@ -1090,6 +1339,7 @@ void init_display() {
   plogw->ostream->print("u8g2_r hcol =");
   plogw->ostream->println(dp->hcol[0]);
 
+  u8g2_l->setBusClock(400000);
   u8g2_l->begin();
 
   if (display_swap) {
@@ -1435,6 +1685,27 @@ static void begin_multi_info_display() {
   if (plogw->f_console_emu) clear_display_emu(1);
 }
 
+static void utf8_truncate_to_pixel_width(char *s, int max_width);
+
+static const char *lcd_contest_short_name(const char *name) {
+  if (name == NULL || *name == '\0') return "-";
+  return strncasecmp(name, "User", 4) == 0 ? name + 4 : name;
+}
+
+// A single persistent header keeps the operating contest visible without
+// consuming two of the six OLED rows.  Seven characters per name gives:
+// "A>FUKOUT P:AKINT" and still fits the 21-column console emulation.
+static void display_multi_contest_pair() {
+  char previous[sizeof(plogw->contest_name) - 2] = "";
+  const bool have_previous = previous_contest_info(NULL, previous,
+                                                    sizeof(previous));
+  snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "A>%.7s P:%.7s",
+           lcd_contest_short_name(plogw->contest_name + 2),
+           have_previous ? lcd_contest_short_name(previous) : "-");
+  utf8_truncate_to_pixel_width(dp->lcdbuf, dp->wcol);
+  display_printStr(dp->lcdbuf, 10);
+}
+
 static void finish_multi_info_display() {
   i2c_guarded_send_buffer(u8g2_l, "oled_l");
   info_disp.show_info = INFO_DISP_CONTEST_SETTINGS;
@@ -1486,10 +1757,11 @@ static void print_wrapped_multi_item(int *row, int *column, const char *item) {
 
 void upd_display_info_multi_nearby(struct radio *radio) {
   begin_multi_info_display();
+  display_multi_contest_pair();
 
   int band_index = radio->bandid - 1;
   if (band_index < 0 || band_index >= N_BAND || multi_list.multi[band_index] == NULL) {
-    display_printStr("mult:No CHECK", 10);
+    display_printStr("mult:No CHECK", 11);
     finish_multi_info_display();
     return;
   }
@@ -1512,12 +1784,12 @@ void upd_display_info_multi_nearby(struct radio *radio) {
            multi_list.multi[band_index]->mul[selected],
            multi_list.multi[band_index]->name[selected]);
   utf8_truncate_to_pixel_width(dp->lcdbuf, dp->wcol);
-  display_printStr(dp->lcdbuf, 10);
+  display_printStr(dp->lcdbuf, 11);
 
   // Start a few entries before the selected multiplier.  The selected entry
   // is therefore normally visible near the beginning rather than at an edge.
   int start = max(0, selected - 3);
-  int row = 1;
+  int row = 2;
   int column = 0;
   *dp->lcdbuf = '\0';
 
@@ -1535,12 +1807,13 @@ void upd_display_info_multi_nearby(struct radio *radio) {
 
 void upd_display_info_multi_bands(struct radio *radio) {
   begin_multi_info_display();
+  display_multi_contest_pair();
 
   int current_band = radio->bandid - 1;
   if (current_band < 0 || current_band >= N_BAND ||
       multi_list.multi[current_band] == NULL ||
       multi_list.n_multi[current_band] <= 0) {
-    display_printStr("mult:No CHECK", 10);
+    display_printStr("mult:No CHECK", 11);
     finish_multi_info_display();
     return;
   }
@@ -1561,7 +1834,7 @@ void upd_display_info_multi_bands(struct radio *radio) {
   snprintf(dp->lcdbuf, sizeof(dp->lcdbuf), "mult: %s %s", selected_mul,
            multi_list.multi[current_band]->name[selected]);
   utf8_truncate_to_pixel_width(dp->lcdbuf, dp->wcol);
-  display_printStr(dp->lcdbuf, 10);
+  display_printStr(dp->lcdbuf, 11);
 
   // One-character band labels, from 1.8 through 1200 MHz.
   // Keep the header and the worked-status columns right-aligned.
@@ -1569,8 +1842,8 @@ void upd_display_info_multi_bands(struct radio *radio) {
   int header_width = u8g2_l->getUTF8Width(band_header);
   int header_x = max(0, dp->wcol - header_width);
 
-  display_printStr("", 11);  // clear the second line first
-  u8g2_l->drawUTF8(header_x, dp->hcol[1], band_header);
+  display_printStr("", 12);  // clear the third line first
+  u8g2_l->drawUTF8(header_x, dp->hcol[2], band_header);
 
   // Underline the current operating band using the same hline convention
   // used elsewhere in DVPlogger.  Measure the actual font width so that the
@@ -1584,7 +1857,7 @@ void upd_display_info_multi_bands(struct radio *radio) {
     current_char[1] = '\0';
     int underline_x = header_x + u8g2_l->getUTF8Width(prefix);
     int underline_width = u8g2_l->getUTF8Width(current_char);
-    int underline_y = 2 * dp->hcol[1] - 1;
+    int underline_y = 3 * dp->hcol[1] - 1;
     u8g2_l->drawHLine(underline_x, underline_y, underline_width);
   }
 
@@ -1593,23 +1866,22 @@ void upd_display_info_multi_bands(struct radio *radio) {
     int pad = max(0, 21 - 10);
     snprintf(emu_line, sizeof(emu_line), "%*s%s", pad, "", band_header);
     char esc[48];
-    snprintf(esc, sizeof(esc), "\033[2;1H%-21s", emu_line);
+    snprintf(esc, sizeof(esc), "\033[3;1H%-21s", emu_line);
     plogw->ostream->print(esc);
     if (current_band < 10) {
-      snprintf(esc, sizeof(esc), "\033[2;%dH\033[4m%c\033[0m",
+      snprintf(esc, sizeof(esc), "\033[3;%dH\033[4m%c\033[0m",
                pad + current_band + 1, band_header[current_band]);
       plogw->ostream->print(esc);
     }
   }
 
-  // Show four neighbouring multipliers. Normally this is one before the
-  // selected multiplier, the selected one, and two after it. Shift the
-  // window at either end so that four entries are shown whenever possible.
+  // Show three neighbouring multipliers below the contest, selected-multi,
+  // and band-header rows.
   int n_multi = multi_list.n_multi[current_band];
   int first = max(0, selected - 1);
-  if (first + 4 > n_multi) first = max(0, n_multi - 4);
+  if (first + 3 > n_multi) first = max(0, n_multi - 3);
 
-  for (int row = 0; row < 4 && first + row < n_multi; row++) {
+  for (int row = 0; row < 3 && first + row < n_multi; row++) {
     int multi_index = first + row;
     const char *mul = multi_list.multi[current_band]->mul[multi_index];
     char status[11];
@@ -1638,8 +1910,8 @@ void upd_display_info_multi_bands(struct radio *radio) {
     while (*dp->lcdbuf != '\0' && u8g2_l->getUTF8Width(dp->lcdbuf) > left_max_width) {
       dp->lcdbuf[strlen(dp->lcdbuf) - 1] = '\0';
     }
-    display_printStr(dp->lcdbuf, 12 + row);
-    u8g2_l->drawUTF8(header_x, (2 + row) * dp->hcol[1], status);
+    display_printStr(dp->lcdbuf, 13 + row);
+    u8g2_l->drawUTF8(header_x, (3 + row) * dp->hcol[1], status);
 
     if (plogw->f_console_emu) {
       char emu_line[40];
@@ -1648,7 +1920,7 @@ void upd_display_info_multi_bands(struct radio *radio) {
       snprintf(emu_line, sizeof(emu_line), "%.10s%*s%.10s",
                dp->lcdbuf, spaces, "", status);
       char esc[64];
-      snprintf(esc, sizeof(esc), "\033[%d;1H%-21s", 3 + row, emu_line);
+      snprintf(esc, sizeof(esc), "\033[%d;1H%-21s", 4 + row, emu_line);
       plogw->ostream->print(esc);
     }
   }
@@ -2241,4 +2513,3 @@ void upd_display_bandmap() {
 #endif
   }
 }
-

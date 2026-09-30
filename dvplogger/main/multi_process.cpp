@@ -28,8 +28,131 @@
 #include "log.h"
 #include "so2r.h"
 #include "user_contest_md.h"
+#include "cty_chk.h"
 
 struct multi_list multi_list;
+
+bool split_exchange_fields(const char *src, char separator, struct exchange_fields *out) {
+  if (!out) return false;
+  memset(out, 0, sizeof(*out));
+  if (!src || !*src || separator == '\0') return false;
+
+  const char *field_start = src;
+  while (true) {
+    if (out->count >= EXCHANGE_MAX_FIELDS) return false;
+    const char *sep = strchr(field_start, separator);
+    size_t len = sep ? (size_t)(sep - field_start) : strlen(field_start);
+    if (len == 0 || len > LEN_EXCH) return false;
+    memcpy(out->field[out->count], field_start, len);
+    out->field[out->count][len] = '\0';
+    out->count++;
+    if (!sep) break;
+    field_start = sep + 1;
+  }
+  return out->count > 0;
+}
+
+static bool cqwwrtty_valid_qth(const char *qth) {
+  if (!qth || !*qth) return false;
+  if (strcasecmp(qth, "DX") == 0) return true;
+
+  // Reuse the ARRLDX W/VE table.  Its Canadian spellings NT/PE are legacy;
+  // CQ WW RTTY requires NWT/PEI, so translate only for the shared lookup.
+  const char *lookup = qth;
+  if (strcasecmp(qth, "NWT") == 0) lookup = "NT";
+  else if (strcasecmp(qth, "PEI") == 0) lookup = "PE";
+
+  for (int i = 0; i < N_MULTI && multi_arrldx.mul[i][0] != '\0'; ++i) {
+    if (strcasecmp(lookup, multi_arrldx.mul[i]) == 0) return true;
+  }
+  return false;
+}
+
+bool normalize_cqwwrtty_exchange(char *s, size_t size) {
+  if (!s || size == 0 || !*s) return false;
+
+  struct exchange_fields fields;
+  if (!split_exchange_fields(s, '/', &fields)) return false;
+  if (fields.count < 1 || fields.count > 2) return false;
+
+  const char *zone_s = fields.field[0];
+  for (const char *p = zone_s; *p; ++p)
+    if (!isdigit((unsigned char)*p)) return false;
+  int zone = atoi(zone_s);
+  if (zone < 1 || zone > 40) return false;
+
+  const char *qth = (fields.count == 2) ? fields.field[1] : "DX";
+  if (!cqwwrtty_valid_qth(qth)) return false;
+
+  char uqth[LEN_EXCH + 1];
+  size_t qlen = strlen(qth);
+  if (qlen >= sizeof(uqth)) return false;
+  for (size_t i = 0; i < qlen; ++i) uqth[i] = toupper((unsigned char)qth[i]);
+  uqth[qlen] = '\0';
+
+  int n = snprintf(s, size, "%02d/%s", zone, uqth);
+  return n > 0 && (size_t)n < size;
+}
+
+
+bool validate_cqwwrtty_exchange_for_call(const char *exchange, const char *callsign) {
+  printf("CQWWRTTY DIAG begin call=[%s] exch=[%s]\n",
+         callsign ? callsign : "(null)", exchange ? exchange : "(null)");
+  if (!exchange || !*exchange || !callsign || !*callsign) {
+    printf("CQWWRTTY DIAG FAIL reason=empty-input\n");
+    return false;
+  }
+
+  char normalized[LEN_EXCH + 1];
+  strlcpy(normalized, exchange, sizeof(normalized));
+  if (!normalize_cqwwrtty_exchange(normalized, sizeof(normalized))) {
+    printf("CQWWRTTY DIAG FAIL reason=normalize raw=[%s]\n", exchange);
+    return false;
+  }
+  printf("CQWWRTTY DIAG normalized=[%s]\n", normalized);
+
+  struct exchange_fields fields;
+  if (!split_exchange_fields(normalized, '/', &fields) || fields.count != 2) {
+    printf("CQWWRTTY DIAG FAIL reason=split normalized=[%s] count=%d\n",
+           normalized, fields.count);
+    return false;
+  }
+  printf("CQWWRTTY DIAG split count=%d zone=[%s] qth=[%s]\n",
+         fields.count, fields.field[0], fields.field[1]);
+
+  // Use the existing CTY lookup, including its per-prefix CQ-zone overrides.
+  char callbuf[LEN_CALLSIGN + 1];
+  char entity[10], entity_desc[40], cqzone[4], ituzone[4], continent[4];
+  char lat[10], lon[10], tz[10];
+  strlcpy(callbuf, callsign, sizeof(callbuf));
+  int cty_ret = get_entity_info(callbuf, entity, entity_desc, cqzone, ituzone,
+                                continent, lat, lon, tz);
+  printf("CQWWRTTY DIAG cty ret=%d callbuf=[%s] entity=[%s] cqzone=[%s] itu=[%s] cont=[%s]\n",
+         cty_ret, callbuf, cty_ret ? entity : "", cty_ret ? cqzone : "",
+         cty_ret ? ituzone : "", cty_ret ? continent : "");
+  if (!cty_ret) {
+    printf("CQWWRTTY DIAG FAIL reason=cty-not-found\n");
+    return false;
+  }
+
+  // Do not require the CTY-derived CQ zone to match the received zone here.
+  // CQWW uses the station location; a callsign prefix is not authoritative for
+  // portable/remote operation.  Zone validity itself is checked by CQZONE.
+
+  const bool is_continental_wve =
+      (strcasecmp(entity, "K") == 0 || strcasecmp(entity, "VE") == 0);
+  const bool qth_is_dx = (strcasecmp(fields.field[1], "DX") == 0);
+  const bool qth_valid = cqwwrtty_valid_qth(fields.field[1]);
+  printf("CQWWRTTY DIAG classify wve=%d qth_is_dx=%d qth_valid=%d entity=[%s]\n",
+         is_continental_wve ? 1 : 0, qth_is_dx ? 1 : 0, qth_valid ? 1 : 0, entity);
+
+  // Continental USA/Canada require a valid W/VE QTH.  All other entities,
+  // including KL (Alaska) and KH6 (Hawaii), use DX in the Cabrillo QTH field.
+  bool result = is_continental_wve ? (!qth_is_dx && qth_valid) : qth_is_dx;
+  printf("CQWWRTTY DIAG result=%s call=[%s] exch=[%s]\n",
+         result ? "OK" : "NG", callsign, normalized);
+  return result;
+}
 
 // initialize multi for the given bands with given multi_item
 void init_multi(const struct multi_item *multi, int start_band, int stop_band) {
@@ -140,12 +263,13 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
 
   if (multi_list.multi[bandid-1] == NULL) return 0;
   char exch_buf[10];
+  char compound_multi_buf[10];  // field 0 of a compound exchange (e.g. CQWWRTTY zone)
   int len;
   int tmp;
   len = strlen(s);
   if (verbose & 4) {
-    Serial.print("multi_type=");
-    Serial.println(plogw->multi_type);
+    console->print("multi_type=");
+    console->println(plogw->multi_type);
   }
   int idx_multi_start=0; // start index to search target multiplier
   int idx_multi_end=multi_list.n_multi[bandid-1]; // start index to search target multiplier
@@ -156,6 +280,22 @@ int multi_check_option(char *s,int bandid,int option) {   // s: exch (such as in
   switch (plogw->multi_type &0xff) {
   case MULTI_TYPE_USER_MD:
     return user_md_multi_check(s, bandid);
+  case MULTI_TYPE_CQWWRTTY: {
+    char normalized[LEN_EXCH + 1];
+    strlcpy(normalized, s, sizeof(normalized));
+    if (!normalize_cqwwrtty_exchange(normalized, sizeof(normalized))) return -1;
+
+    // Validate the compound exchange first, then feed only field 0 (CQ Zone)
+    // to the existing CQ-zone multiplier lookup.
+    struct exchange_fields fields;
+    if (!split_exchange_fields(normalized, '/', &fields) || fields.count != 2) return -1;
+    // multi_cqzones stores 1..9 without a leading zero.  Keep 03/CA in the
+    // log, but use "3" for the existing multiplier-table lookup.
+    snprintf(compound_multi_buf, sizeof(compound_multi_buf), "%d", atoi(fields.field[0]));
+    s = compound_multi_buf;
+    len = strlen(s);
+    break;
+  }
   case MULTI_TYPE_NORMAL: // multi same as number
   case MULTI_TYPE_CQWW: // multi same as number     
   case MULTI_TYPE_JARL_PWR_NOMULTICHK: // jarl contest power_code but no multi-check performed (like ACAG)

@@ -30,6 +30,7 @@
 // Since USBHost.task() will put loop() into dormant state and prevent followed code from running
 // until there is USB host event.
 #include <Arduino.h>
+#include "decl.h"
 #if defined(ARDUINO_NRF52_ADAFRUIT) || defined(ARDUINO_ARCH_ESP32)
   #define USE_FREERTOS
 #endif
@@ -58,9 +59,14 @@ void forward_serial(void) {
   uint8_t buf[64];
 
   // Serial -> SerialHost
-  if (Serial.available()) {
-    size_t count = Serial.read(buf, sizeof(buf));
-    if (SerialHost && SerialHost.connected()) {
+  if (console && console->available()) {
+    size_t count = 0;
+    while (count < sizeof(buf) && console->available()) {
+      int c = console->read();
+      if (c < 0) break;
+      buf[count++] = (uint8_t)c;
+    }
+    if (count && SerialHost && SerialHost.connected()) {
       SerialHost.write(buf, count);
       SerialHost.flush();
     }
@@ -69,16 +75,16 @@ void forward_serial(void) {
   // SerialHost -> Serial
   if (SerialHost.connected() && SerialHost.available()) {
     size_t count = SerialHost.read(buf, sizeof(buf));
-    Serial.print("SerialHost:");
-    Serial.write(buf, count);
-    Serial.flush();
+    console->print("SerialHost:");
+    console->write(buf, count);
+    console->flush();
   }
   // SerialHost1 -> Serial
   if (SerialHost1.connected() && SerialHost1.available()) {
     size_t count = SerialHost1.read(buf, sizeof(buf));
-    Serial.print("SerialHost1:");
-    Serial.write(buf, count);
-    Serial.flush();
+    console->print("SerialHost1:");
+    console->write(buf, count);
+    console->flush();
   }
 }
 
@@ -124,7 +130,7 @@ void adafruit_usbhost_setup() {
   //#endif
 
 //  while ( !Serial ) delay(10);   // wait for native usb
-  Serial.println("TinyUSB Host Serial Echo Example");
+  console->println("TinyUSB Host Serial Echo Example");
 }
 
 void adafruit_usbhost_loop() {
@@ -144,7 +150,7 @@ void adafruit_usbhost_loop() {
 void adafruit_usbhost_setup() {
   Serial.begin(115200);
   // while ( !Serial ) delay(10);   // wait for native usb
-  Serial.println("TinyUSB Host Serial Echo Example");
+  console->println("TinyUSB Host Serial Echo Example");
 }
 
 void loop() {
@@ -190,8 +196,8 @@ void tuh_cdc_mount_cb(uint8_t idx) {
       break;
   }
   
-     Serial.print("SerialHost is connected to a new CDC device : ");
-  Serial.println(idx);
+     console->print("SerialHost is connected to a new CDC device : ");
+  console->println(idx);
 }
 
 // Invoked when a device with CDC interface is unmounted
@@ -202,8 +208,8 @@ void tuh_cdc_umount_cb(uint8_t idx) {
   case 1:    
   SerialHost1.umount(idx);break;
   }
-  Serial.print("SerialHost is disconnected :device =");
-  Serial.println(idx);
+  console->print("SerialHost is disconnected :device =");
+  console->println(idx);
 }
 
 
@@ -219,28 +225,28 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
   uint16_t vid, pid;
   tuh_vid_pid_get(dev_addr, &vid, &pid);
 
-  Serial.printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
-  Serial.printf("VID = %04x, PID = %04x\r\n", vid, pid);
+  console->printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
+  console->printf("VID = %04x, PID = %04x\r\n", vid, pid);
   if (!tuh_hid_receive_report(dev_addr, instance)) {
-    Serial.printf("Error: cannot request to receive report\r\n");
+    console->printf("Error: cannot request to receive report\r\n");
   }
 }
 
 // Invoked when device with hid interface is un-mounted
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
-  Serial.printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
+  console->printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
 }
 
 // Invoked when received report from device via interrupt endpoint
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len) {
-  Serial.printf("HIDreport : ");
+  console->printf("HIDreport : ");
   for (uint16_t i = 0; i < len; i++) {
-    Serial.printf("0x%02X ", report[i]);
+    console->printf("0x%02X ", report[i]);
   }
-  Serial.println();
+  console->println();
   // continue to request to receive report
   if (!tuh_hid_receive_report(dev_addr, instance)) {
-    Serial.printf("Error: cannot request to receive report\r\n");
+    console->printf("Error: cannot request to receive report\r\n");
   }
 }
 

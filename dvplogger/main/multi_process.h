@@ -28,7 +28,18 @@ void init_multi(const struct multi_item *multi, int start_band, int stop_band) ;
 //void init_multi() ;
 void clear_multi_worked() ;
 int multi_check_option(char *s,int bandid,int option);   // s: exch (such as in plogw->recv_exch +2)
-int multi_check(char *s,int bandid);   // s: exch (such as in plogw->recv_exch +2)
+int multi_check(char *s,int bandid);
+#define EXCHANGE_MAX_FIELDS 3
+struct exchange_fields {
+  int count;
+  char field[EXCHANGE_MAX_FIELDS][LEN_EXCH + 1];
+};
+
+// Generic compound-exchange parser. Contest-specific code decides the separator
+// and validates/normalizes the meaning of each field.
+bool split_exchange_fields(const char *src, char separator, struct exchange_fields *out);
+bool normalize_cqwwrtty_exchange(char *s, size_t size);   // CQWWRTTY: ZONE[/QTH]
+bool validate_cqwwrtty_exchange_for_call(const char *exchange, const char *callsign);
 //int multi_check(char *s);
 void print_multi_list(Stream *out = nullptr);
 int multi_check_old() ;

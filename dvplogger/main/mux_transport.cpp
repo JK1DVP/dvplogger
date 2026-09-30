@@ -47,6 +47,9 @@
 #include <Arduino.h>
 
 #include "mux_transport.h"
+#ifndef DVPLOGGER_EXT
+#include "misc.h"
+#endif
 // handler for each data packet defined in
 Mux_transport mux_transport;
 int f_mux_transport=0;
@@ -251,7 +254,13 @@ void Mux_transport::recv_pkt() {
 	  // complete packet received and process by handler
 	  packet_reading->status=2;
 	  if (port_handler[packet_reading->to]!= NULL) {
+#ifndef DVPLOGGER_EXT
+            time_measure_start_name(PROF_MUX_PACKET_HANDLER, "mux_pkt_hdl");
+#endif
 	    port_handler[packet_reading->to](packet_reading);
+#ifndef DVPLOGGER_EXT
+            time_measure_stop(PROF_MUX_PACKET_HANDLER);
+#endif
 	    // may need to use queue to buffer packets without blocking
 	  } else {
 	    // just print information : default handler
