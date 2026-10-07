@@ -3,6 +3,7 @@ set(DVP_EXT_SRCS
     "keyboard.cpp"
     "mux_transport.cpp"
     "dupechk.cpp"
+    "packed_string.cpp"
     "callhist_mem.cpp"
     "callhist_remote.cpp"
 )

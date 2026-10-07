@@ -32,8 +32,6 @@ extern int cluster_port ;
 extern char cluster2_startup_cmd[N_CLUSTER2_STARTUP_CMDS][LEN_CLUSTER_CMD + 3];
 void initialize_cluster2_startup_commands();
 
-#define NCHR_CLUSTER_RINGBUF 1024
-extern char cluster_buf[NCHR_CLUSTER_RINGBUF];
 extern struct cluster cluster;
 int is_international_contest();
 void print_cluster_info(struct bandmap_entry *entry, int bandid, int idx );

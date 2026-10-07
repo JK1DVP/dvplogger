@@ -39,6 +39,7 @@
 #include "misc.h"
 #include "processes.h"
 #include "so2r.h"
+#include "ui.h"
 
 
 void print_band_mask(struct radio *radio)
@@ -138,6 +139,11 @@ const char *switch_rigmode() {
 }
 
 void wipe_log_entry_radio(struct radio *radio) {
+  // QSO-completion cleanup only.  Do NOT discard CALLSTACK shadow/pending
+  // state here: process_enter() calls call_stack_restore_after_qso() after
+  // this function so that only the worked station is removed and the
+  // remaining calls return to the CALL field.
+  // Manual Wipe uses wipe_log_entry(), which does discard CALLSTACK state.
   // clear callsign and number
   clear_buf(radio->callsign);
   clear_buf(radio->recv_exch);
@@ -155,6 +161,8 @@ void wipe_log_entry() {
   struct radio *radio;
   radio = so2r.radio_selected();
   //  radio = so2r.radio_qso_process();
+  // A manual whole-QSO wipe must not allow CALLSTACK shadow data to restore.
+  call_stack_discard_state(radio);
   // clear callsign and number
   clear_buf(radio->callsign);
   clear_buf(radio->recv_exch);
@@ -454,7 +462,7 @@ void init_logwindow() {
         p = "$U $I $I $T"; // $U=CQ $T=TEST
         break;
       case 1:  // F2 send exchange
-        p = "$V$W$P";
+        p = "$V$W";
         break;
       case 2:  // F3 TU
         p = "$A $I $T"; // $A=TU $T=TEST
@@ -463,13 +471,13 @@ void init_logwindow() {
         p = "$I";
         break;
       case 4:  // F5 send callsign and number (ESM)
-        p = "$C $V$W$P";
+        p = "$C $V$W";
         break;
       case 5:  // F6  send callsign and number with JCC code
-        p = "$C $V$J$P";
+        p = "$C $V$J";
         break;
       case 6:          // F7  send number with JCC code
-        p = "$V$J$P";  // $P power_code
+        p = "$V$J";
         break;
       default:
         p = "";
@@ -618,13 +626,13 @@ int exch_partial_check(struct radio *radio,char *exch,unsigned char bandmode,uns
 
     
     if (part!=NULL) { // substring exch found in target exchange in dupechk list
-      strcpy(entry->callsign,dupechk->callsign[i]);
+      if (!dupechk_get_callsign(i, entry->callsign, sizeof(entry->callsign))) continue;
       strcpy(entry->exch,dupechk->exch[i]);
       entry->bandmode=dupechk_entry_display_bandmode(i, bandmode, mask);
       entry->flag|=CHECK_ENTRY_FLAG_DUPECHECK_LIST;
       entry_list->nentry++;
 
-      if (strlen(dupechk->callsign[i]) == strlen(radio->callsign+2)) {
+      if (dupechk_callsign_equal_at(i, radio->callsign + 2)) {
 	// exact match
 	entry->flag|=CHECK_ENTRY_FLAG_EXACT_MATCH;
 	if (dupechk_entry_matches_bandmode(i, bandmode, mask)) {
@@ -693,12 +701,12 @@ static int dupe_partial_check_local(const char *call,
   const int len = strlen(call);
 
   for (int i = 0; i < dupechk->ncallsign; i++) {
-    const char *callsign = dupechk->callsign[i];
-    if (!dupe_callsign_partial_match(callsign, call)) continue;
+    if (!dupechk_callsign_partial_at(i, call)) continue;
 
     struct check_entry *entry = &entry_list->entryl[entry_list->nentry];
     entry->flag = CHECK_ENTRY_FLAG_DUPECHECK_LIST;
-    strcpy(entry->callsign, callsign);
+    if (!dupechk_get_callsign(i, entry->callsign, sizeof(entry->callsign))) continue;
+    const char *callsign = entry->callsign;
     strcpy(entry->exch, dupechk->exch[i]);
     entry->bandmode = dupechk_entry_display_bandmode(i, bandmode, mask);
 
@@ -844,13 +852,13 @@ int dupe_callhist_check(const char *call,unsigned char bandmode, unsigned char m
     if ((ret == 0) || (f_callhist == 1)) {
       if (dupechk_entry_matches_bandmode(i, bandmode, mask)) {
         // current band and mode
-        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
+        if (dupechk_callsign_equal_at(i, call)) {
           // dupe
           ret = 1;
         }
       } else if (f_callhist) {
         // other band and mode
-        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
+        if (dupechk_callsign_equal_at(i, call)) {
           // hit !
           *exch_history=dupechk->exch[i];
           f_callhist = 0;  // no longer need to search for history

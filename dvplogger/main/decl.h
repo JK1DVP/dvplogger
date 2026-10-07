@@ -40,11 +40,6 @@
 #error "JK1DVPLOG_HWVER must be 1 or 3"
 #endif
 
-//#define JK1DVPLOG_VERSION_STRING "ver 25/8/19"
-//#define JK1DVPLOG_VERSION_STRING "ver 25/12/19"
-
-#define JK1DVPLOG_VERSION_STRING "ver 26/8/15"
-
 #if JK1DVPLOG_HWVER >= 2
 #define PSRAM_EXISTS
 #define SERIAL2_BAUD 3000000
@@ -204,6 +199,7 @@ struct rig {
   int tuner_port; // 0 disabled, 1 KEY1, 2 KEY2, 3 USB DTR, 4 USB RTS, 5 rig CAT tuner
   int swr_limit_x100; // automatic tuner threshold; 0 disables automatic action
   int tuner_hold_ms; // external tuner contact hold time
+  bool no_polling; // NP:1 disables normal periodic CAT/CI-V status polling
   int rig_spec_idx; // index number of the rig specification
   char rig_identification[6]; // rig identification number (although cat control share the same protocol (Yaesu/Kenwood/Icom) behavior of each rig differs, so receive ID by ID; command (yaesu) and store them here.)
   int transverter_enable[NMAX_TRANSVERTER];
@@ -336,6 +332,7 @@ struct radio {
   
   int f_freqchange_pending; // set when frequency change attempt from program is ongoing
   int f_freqchange_program;
+  bool freq_readback_once_pending; // NP:1: one readback in the existing Freq slot after SET
   int freq_change_count;
   unsigned int freq_change_candidate; // candidate frequency for manual dial-change confirmation
   int freqchange_program_guard; // suppress late CAT echoes after a program-originated frequency change
@@ -397,6 +394,7 @@ struct radio {
   // Program-originated mode change transaction.  Actual mode remains the last
   // mode confirmed by the rig; target is separate while CAT change is pending.
   int f_modechange_pending;
+  bool mode_readback_once_pending; // NP:1: one readback in the existing Mode/IF slot after SET
   int mode_target_modenum;
   int mode_target_filt;
   char mode_target_opmode[8];
@@ -779,7 +777,7 @@ struct bandmap_disp {
 //#define NMAXQSO_MAINCPU 300
 #define NMAXQSO_MAINCPU 500
 #define NMAXQSO_SUBCPU_DEFAULT 1300
-#define NMAXQSO_SUBCPU 2500
+#define NMAXQSO_SUBCPU 3500
 //#define NMAXQSO 200
 
 // dupe check link for each band/mode
@@ -787,7 +785,13 @@ struct dupechk {
   //  char callsign[NMAXQSO][LEN_CALLSIGN+1];
   //  char exch[NMAXQSO][LEN_EXCH+1]; // exchange in the previous contact
   //  byte bandmode[NMAXQSO]; // band and mode identity for each callsign
-  char (*callsign)[LEN_CALLSIGN+1];
+  // Callsigns are normalized and stored as one contiguous 6-bit packed pool.
+  // Lengths use 5 bits/entry; checkpoints store the pool offset every 16 entries.
+  uint8_t *call_pool;
+  uint8_t *call_len5;
+  uint32_t *call_checkpoint;
+  size_t call_pool_size;
+  size_t call_pool_used;
   char (*exch)[LEN_EXCH+1]; // exchange in the previous contact
   uint64_t *worked_bitmap; // 16 bands x 4 modes, dense bits 0..63
   byte *contest_id; // persistent contest identity (shared DUPE pool)

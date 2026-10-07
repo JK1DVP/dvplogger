@@ -36,6 +36,7 @@
 #include "multi_process.h"
 #include "contest.h"
 #include "misc.h"
+#include "packed_string.h"
 
 static uint32_t makedupe_sent_count = 0;
 static uint32_t makedupe_accepted_count = 0;
@@ -58,6 +59,132 @@ extern int f_spiram;
 
 struct dupechk *dupechk=NULL;
 
+// Packed DUPE callsign storage.  Eight packed bytes per configured entry is
+// deliberately an allocation target, not a per-entry limit: short callsigns
+// share one contiguous pool.  A single 16-character callsign still fits
+// because the pool is never allocated smaller than PACKED6_CALL_MAX_BYTES.
+#define DUPE_CALL_POOL_BYTES_PER_ENTRY 8U
+#define DUPE_CALL_CHECKPOINT_SHIFT 4U
+#define DUPE_CALL_CHECKPOINT_STRIDE (1U << DUPE_CALL_CHECKPOINT_SHIFT)
+
+struct dupe_packed_query {
+  uint8_t packed[PACKED6_CALL_MAX_BYTES];
+  uint8_t len;
+  uint8_t bytes;
+};
+
+static bool dupe_prepare_exact_query(const char *call,
+                                     struct dupe_packed_query *q) {
+  if (!call || !*call || !q) return false;
+  char normalized[LEN_CALLSIGN + 1];
+  normalize_dupe_callsign(call, normalized, sizeof(normalized));
+  const size_t len = strlen(normalized);
+  if (!len || len > LEN_CALLSIGN) return false;
+  memset(q, 0, sizeof(*q));
+  q->len = (uint8_t)len;
+  q->bytes = (uint8_t)packed6_size(len);
+  return packed6_encode(normalized, true, q->packed, sizeof(q->packed)) ==
+         q->bytes;
+}
+
+static size_t dupe_call_offset(int index) {
+  if (!dupechk || index < 0 || index >= dupechk->ncallsign) return (size_t)-1;
+  const int base = index & ~(int)(DUPE_CALL_CHECKPOINT_STRIDE - 1U);
+  size_t off = dupechk->call_checkpoint[(unsigned)base >>
+                                         DUPE_CALL_CHECKPOINT_SHIFT];
+  for (int i = base; i < index; ++i)
+    off += packed6_size(packed_len5_get(dupechk->call_len5, (uint16_t)i));
+  return off;
+}
+
+static const uint8_t *dupe_call_ptr(int index, uint8_t *len) {
+  const size_t off = dupe_call_offset(index);
+  if (off == (size_t)-1 || off >= dupechk->call_pool_used) return NULL;
+  const uint8_t l = packed_len5_get(dupechk->call_len5, (uint16_t)index);
+  const size_t n = packed6_size(l);
+  if (!l || off + n > dupechk->call_pool_used) return NULL;
+  if (len) *len = l;
+  return dupechk->call_pool + off;
+}
+
+static bool dupe_call_equal_query(int index,
+                                  const struct dupe_packed_query *q) {
+  uint8_t len = 0;
+  const uint8_t *p = dupe_call_ptr(index, &len);
+  return p && q && packed6_equal(p, len, q->packed, q->len);
+}
+
+static bool dupe_call_decode(int index, char *dst, size_t dst_size) {
+  uint8_t len = 0;
+  const uint8_t *p = dupe_call_ptr(index, &len);
+  return p && packed6_decode(p, packed6_size(len), len, true, dst, dst_size);
+}
+
+static bool dupe_call_append(const char *call) {
+  if (!dupechk || !call || !*call ||
+      dupechk->ncallsign >= dupechk->nmaxqso) return false;
+  char normalized[LEN_CALLSIGN + 1];
+  normalize_dupe_callsign(call, normalized, sizeof(normalized));
+  const size_t len = strlen(normalized);
+  if (!len || len > LEN_CALLSIGN) return false;
+  uint8_t packed[PACKED6_CALL_MAX_BYTES];
+  const size_t n = packed6_encode(normalized, true, packed, sizeof(packed));
+  if (!n || dupechk->call_pool_used + n > dupechk->call_pool_size) {
+    console->printf("DUPE CALL pool full: entries=%d/%d pool=%u/%u need=%u\n",
+                    dupechk->ncallsign, dupechk->nmaxqso,
+                    (unsigned)dupechk->call_pool_used,
+                    (unsigned)dupechk->call_pool_size, (unsigned)n);
+    return false;
+  }
+  const int i = dupechk->ncallsign;
+  if ((i & (DUPE_CALL_CHECKPOINT_STRIDE - 1U)) == 0)
+    dupechk->call_checkpoint[(unsigned)i >> DUPE_CALL_CHECKPOINT_SHIFT] =
+        (uint32_t)dupechk->call_pool_used;
+  memcpy(dupechk->call_pool + dupechk->call_pool_used, packed, n);
+  packed_len5_set(dupechk->call_len5, (uint16_t)i, (uint8_t)len);
+  dupechk->call_pool_used += n;
+  return true;
+}
+
+static bool dupe_call_equal_ascii(int index, const char *call) {
+  struct dupe_packed_query q;
+  return dupe_prepare_exact_query(call, &q) && dupe_call_equal_query(index, &q);
+}
+
+static bool dupe_call_partial_match_ascii(int index, const char *pattern) {
+  if (!pattern || !*pattern) return false;
+  uint8_t len = 0;
+  const uint8_t *stored = dupe_call_ptr(index, &len);
+  if (!stored) return false;
+
+  if (strchr(pattern, '-') != NULL) {
+    struct packed6_masked_query q;
+    return packed6_make_masked_query(pattern, '-', &q) &&
+           packed6_match_masked(stored, len, &q);
+  }
+
+  const size_t plen = strlen(pattern);
+  if (plen && plen <= LEN_CALLSIGN) {
+    uint8_t packed[PACKED6_CALL_MAX_BYTES];
+    const size_t n = packed6_encode(pattern, true, packed, sizeof(packed));
+    if (n && packed6_contains(stored, len, packed, (uint8_t)plen)) return true;
+  }
+  return dupe_call_equal_ascii(index, pattern);
+}
+
+bool dupechk_get_callsign(int index, char *dst, size_t dst_size) {
+  if (!dst || dst_size == 0) return false;
+  dst[0] = '\0';
+  return dupe_call_decode(index, dst, dst_size);
+}
+
+bool dupechk_callsign_equal_at(int index, const char *call) {
+  return dupe_call_equal_ascii(index, call);
+}
+
+bool dupechk_callsign_partial_at(int index, const char *pattern) {
+  return dupe_call_partial_match_ascii(index, pattern);
+}
 
 bool dupechk_setting_wants_subcpu() {
 #if JK1DVPLOG_HWVER == 1
@@ -224,6 +351,14 @@ static unsigned char dupechk_async_mask = 0xff;
 static bool dupechk_async_active = false;
 static bool dupechk_async_result_valid = false;
 static bool dupechk_async_pending_sp_send = false;
+// Keep only one operator partial query in flight. Fast typing used to send a
+// new SUBCPU packet for every character before the previous response arrived;
+// coalesce those edits and submit only the newest callsign after completion.
+static bool dupechk_async_resubmit_pending = false;
+static struct radio *dupechk_async_resubmit_radio = NULL;
+static bool dupechk_async_resubmit_include_partial = true;
+static unsigned char dupechk_async_resubmit_bandmode = 0;
+static bool dupechk_async_resubmit_show_partial = true;
 // Some non-keyboard sources (notably Web bandmap selection) need the full
 // DUPE/CALLHIST query but must not cover the LCD with partial-check results.
 static bool dupechk_async_show_partial_result = true;
@@ -654,10 +789,12 @@ void process_dupechk_partial_query_subcpu(char *s) {
     if (dupechk->contest_id[i] != (uint8_t)contest_id) continue;
     qso_scanned++;
     const bool uncertain = strchr(call, '-') != NULL;
-    const bool exact_match = !uncertain && dupe_callsign_equal(dupechk->callsign[i], call);
-    if (!dupe_callsign_partial_match(dupechk->callsign[i], call)) continue;
+    const bool exact_match = !uncertain && dupe_call_equal_ascii(i, call);
+    if (!dupe_call_partial_match_ascii(i, call)) continue;
+    char decoded_call[LEN_CALLSIGN + 1];
+    if (!dupe_call_decode(i, decoded_call, sizeof(decoded_call))) continue;
     if (nmatched_qso < 10) {
-      strncpy(matched_qso[nmatched_qso], dupechk->callsign[i], LEN_CALLSIGN);
+      strncpy(matched_qso[nmatched_qso], decoded_call, LEN_CALLSIGN);
       matched_qso[nmatched_qso][LEN_CALLSIGN] = '\0';
       nmatched_qso++;
     }
@@ -673,7 +810,7 @@ void process_dupechk_partial_query_subcpu(char *s) {
 
     char item[64];
     int item_len = snprintf(item, sizeof(item), "|%s,%s,%u,%d",
-                            dupechk->callsign[i],
+                            decoded_call,
                             dupechk->exch[i][0] ? dupechk->exch[i] : "-",
                             (unsigned int)dupechk_entry_display_bandmode(i, bandmode, mask), flags);
     if (item_len <= 0 || used + (size_t)item_len >= sizeof(response)) break;
@@ -741,6 +878,8 @@ static void cancel_async_dupe_query() {
   dupechk_async_active = false;
   dupechk_async_result_valid = false;
   dupechk_async_pending_sp_send = false;
+  dupechk_async_resubmit_pending = false;
+  dupechk_async_resubmit_radio = NULL;
   dupechk_partial_entry_list = NULL;
   dupechk_query_is_operator_entry = false;
 }
@@ -807,6 +946,19 @@ static void request_async_dupe_partial_for_bandmode(
     radio->check_entry_list.cursor = 0;
     radio->callsign_prev[2] = '\0';
     cancel_async_dupe_query();
+    return;
+  }
+
+  // SUBCPU mode has a single query/response slot. If an operator query is
+  // already in flight, do not overwrite its query id/state and do not flood
+  // the UART with intermediate prefixes. Remember only the newest edit.
+  if (dupechk->dupechk_at == 1 && dupechk_async_active &&
+      dupechk->dupechk_status == 1) {
+    dupechk_async_resubmit_pending = true;
+    dupechk_async_resubmit_radio = radio;
+    dupechk_async_resubmit_include_partial = include_partial;
+    dupechk_async_resubmit_bandmode = query_bandmode;
+    dupechk_async_resubmit_show_partial = show_partial_result;
     return;
   }
 
@@ -937,7 +1089,10 @@ static void append_main_callhist_partial(const char *call,
 
     uint32_t t0 = micros();
     const bool exact_match = dupe_callsign_equal(item, call);
-    const bool partial_match = strstr(item, call) != NULL;
+    // Keep CALLHIST partial semantics identical to DUPE: '-' matches exactly
+    // one callsign character. callhist_iter_set_filter() already disables its
+    // signature fast path for wildcard queries, so no candidate is hidden.
+    const bool partial_match = dupe_callsign_partial_match(item, call);
     callhist_partial_prof.match_us += (uint32_t)(micros() - t0);
     if (!partial_match && !exact_match) continue;
     callhist_partial_prof.matched++;
@@ -1121,8 +1276,30 @@ void process_dupechk_partial_response_maincpu(char *s) {
       }
 
       time_measure_start_name(PROF_DUPE_RESULT_DISPLAY, "dupe_res_disp");
-      request_dupe_aware_display_update();
+      // Latch the authoritative result together with the callsign.  A queued
+      // follow-up query is allowed to clear radio->dupe, but must not erase
+      // this just-completed result before the right OLED has rendered it.
+      request_dupe_committed_display_update(radio, dupechk_async_call,
+                                            radio->dupe);
+      if ((verbose & VERBOSE_DUPE) && dupechk_query_log_enabled()) {
+        console->printf("DUPE DISPLAY commit call=%s dupe=%d\n",
+                        dupechk_async_call, radio->dupe);
+      }
       time_measure_stop(PROF_DUPE_RESULT_DISPLAY);
+    }
+
+    // If the operator typed more characters while this query was in flight,
+    // immediately launch one query for the newest callsign. Intermediate
+    // prefixes are deliberately discarded.
+    if (dupechk_async_resubmit_pending) {
+      struct radio *next_radio = dupechk_async_resubmit_radio;
+      const bool next_partial = dupechk_async_resubmit_include_partial;
+      const unsigned char next_bandmode = dupechk_async_resubmit_bandmode;
+      const bool next_show = dupechk_async_resubmit_show_partial;
+      dupechk_async_resubmit_pending = false;
+      dupechk_async_resubmit_radio = NULL;
+      request_async_dupe_partial_for_bandmode(next_radio, next_partial,
+                                              next_bandmode, next_show);
     }
   }
 }
@@ -1137,7 +1314,7 @@ bool dupe_check_nocallhist(const char *call, byte bandmode, byte mask) {
   for (int i = 0; i < dupechk->ncallsign; i++) {
     if (dupechk->contest_id[i] != dupechk_current_contest_id) continue;
     if (dupechk_entry_matches_bandmode(i, bandmode, mask) &&
-        dupe_callsign_equal(dupechk->callsign[i], call)) {
+        dupe_call_equal_ascii(i, call)) {
       ret = 1;
       break;
     }
@@ -1165,7 +1342,7 @@ bool dupe_check_with_exch(const char *call, byte bandmode, byte mask,
   bool have_exch = false;
   for (int i = dupechk->ncallsign - 1; i >= 0; i--) {
       if (dupechk->contest_id[i] != dupechk_current_contest_id) continue;
-    if (!dupe_callsign_equal(dupechk->callsign[i], call)) continue;
+    if (!dupe_call_equal_ascii(i, call)) continue;
     if (!have_exch && exch && exch_size && dupechk->exch[i][0]) {
       strncpy(exch, dupechk->exch[i], exch_size - 1);
       exch[exch_size - 1] = '\0';
@@ -1272,7 +1449,7 @@ void process_dupechk_query_subcpu(char *s) {
     for (int i = dupechk->ncallsign - 1; i >= 0; i--) {
       if (dupechk->contest_id[i] != (uint8_t)contest_id) continue;
       qso_scanned++;
-      if (!dupe_callsign_equal(dupechk->callsign[i], callsign)) continue;
+      if (!dupe_call_equal_ascii(i, callsign)) continue;
       if (want_exch && !has_exch && dupechk->exch[i][0] != '\0') {
         strncpy(exch, dupechk->exch[i], LEN_EXCH);
         exch[LEN_EXCH] = '\0';
@@ -1381,7 +1558,7 @@ bool dupe_check_get_callhist(char *call, byte bandmode, byte mask, bool callhist
 
       if (dupechk_entry_matches_bandmode(i, bandmode, mask)) {
         // current band and mode
-        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
+        if (dupe_call_equal_ascii(i, call)) {
           // dupe
           if (verbose & 1) {
             plogw->ostream->println("dupe");
@@ -1390,7 +1567,7 @@ bool dupe_check_get_callhist(char *call, byte bandmode, byte mask, bool callhist
         }
       } else if (*f_callhist) {
         // other band and mode
-        if (dupe_callsign_equal(dupechk->callsign[i], call)) {
+        if (dupe_call_equal_ascii(i, call)) {
           // hit !
 
           strcpy(getexch, dupechk->exch[i]);
@@ -1655,7 +1832,7 @@ static bool entry_dupechk_call_exch_bandmode_for(const char *callsign,
   // bands/modes only set a bit, so database capacity is unique callsigns.
   for (int i = 0; i < dupechk->ncallsign; i++) {
     if (dupechk->contest_id[i] != contest_id) continue;
-    if (!dupe_callsign_equal(dupechk->callsign[i], callsign)) continue;
+    if (!dupe_call_equal_ascii(i, callsign)) continue;
     dupechk->worked_bitmap[i] |= bit;
     if (recv_exch && recv_exch[0]) {
       strncpy(dupechk->exch[i], recv_exch, LEN_EXCH);
@@ -1668,13 +1845,13 @@ static bool entry_dupechk_call_exch_bandmode_for(const char *callsign,
   }
 
   if (dupechk->ncallsign >= dupechk->nmaxqso) return false;
-  const int i = dupechk->ncallsign++;
-  strncpy(dupechk->callsign[i], callsign, LEN_CALLSIGN);
-  dupechk->callsign[i][LEN_CALLSIGN] = '\0';
+  const int i = dupechk->ncallsign;
+  if (!dupe_call_append(callsign)) return false;
   strncpy(dupechk->exch[i], recv_exch ? recv_exch : "", LEN_EXCH);
   dupechk->exch[i][LEN_EXCH] = '\0';
   dupechk->worked_bitmap[i] = bit;
   dupechk->contest_id[i] = contest_id;
+  dupechk->ncallsign++;
 #ifdef DVPLOGGER_EXT
   invalidate_dupe_exact_cache();
 #endif
@@ -1713,7 +1890,7 @@ void entry_makedupe_bulk_subcpu(char *s) {
 
   for (int i = 0; i < dupechk->ncallsign; i++) {
     if (dupechk_entry_matches_bandmode(i, (unsigned char)bandmode, makedupe_bulk_mask) &&
-        dupe_callsign_equal(dupechk->callsign[i], callsign)) {
+        dupe_call_equal_ascii(i, callsign)) {
       return;
     }
   }
@@ -1892,7 +2069,9 @@ void init_dupechk(int nmaxqso,int dupechk_at) {
   // allocate memory for dupechk pointer
   if (dupechk!=NULL) {
     // free contents
-    free(dupechk->callsign);
+    free(dupechk->call_pool);
+    free(dupechk->call_len5);
+    free(dupechk->call_checkpoint);
     free(dupechk->exch);
     free(dupechk->worked_bitmap);
     free(dupechk->contest_id);
@@ -1907,23 +2086,39 @@ void init_dupechk(int nmaxqso,int dupechk_at) {
     console->println(dupechk_at);
   }
   dupechk =(struct dupechk *) malloc(sizeof(struct dupechk));
+  memset(dupechk, 0, sizeof(*dupechk));
+
+  const size_t call_lens_bytes = ((size_t)nmaxqso * 5U + 7U) / 8U;
+  const size_t call_checkpoint_count =
+      ((size_t)nmaxqso + DUPE_CALL_CHECKPOINT_STRIDE - 1U) /
+      DUPE_CALL_CHECKPOINT_STRIDE;
+  size_t call_pool_bytes =
+      (size_t)nmaxqso * DUPE_CALL_POOL_BYTES_PER_ENTRY;
+  if (call_pool_bytes < PACKED6_CALL_MAX_BYTES)
+    call_pool_bytes = PACKED6_CALL_MAX_BYTES;
 
   if (f_spiram) {
     size_t psram_size = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     printf("PSRAM size: %d bytes\r\n", psram_size);
-    dupechk->callsign = (char (*)[LEN_CALLSIGN+1]) heap_caps_malloc(nmaxqso * (LEN_CALLSIGN+1),MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    dupechk->call_pool = (uint8_t *)heap_caps_malloc(call_pool_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    dupechk->call_len5 = (uint8_t *)heap_caps_calloc(call_lens_bytes, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    dupechk->call_checkpoint = (uint32_t *)heap_caps_calloc(call_checkpoint_count, sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     dupechk->exch=(char (*)[LEN_EXCH+1]) heap_caps_malloc((LEN_EXCH+1)*nmaxqso, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     dupechk->worked_bitmap=(uint64_t *) heap_caps_malloc(sizeof(uint64_t)*nmaxqso, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     dupechk->contest_id=(byte *) heap_caps_malloc(nmaxqso, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     //#else
   } else {
-    dupechk->callsign = (char (*)[LEN_CALLSIGN+1]) malloc(nmaxqso * (LEN_CALLSIGN+1));
+    dupechk->call_pool = (uint8_t *)malloc(call_pool_bytes);
+    dupechk->call_len5 = (uint8_t *)calloc(call_lens_bytes, 1);
+    dupechk->call_checkpoint = (uint32_t *)calloc(call_checkpoint_count, sizeof(uint32_t));
     dupechk->exch=(char (*)[LEN_EXCH+1]) malloc((LEN_EXCH+1)*nmaxqso);
     dupechk->worked_bitmap=(uint64_t *) malloc(sizeof(uint64_t)*nmaxqso);
     dupechk->contest_id=(byte *) malloc(nmaxqso);
     printf("dupechk allocated by malloc\n");
   }
   //#endif
+  dupechk->call_pool_size = call_pool_bytes;
+  dupechk->call_pool_used = 0;
   dupechk->nmaxqso=nmaxqso;
   dupechk->dupechk_at = dupechk_at;
   dupechk->dupechk_status=0;
@@ -1940,10 +2135,13 @@ void init_dupechk(int nmaxqso,int dupechk_at) {
 #endif
 
   for (int i = 0; i < nmaxqso; i++) {
-    strcpy(dupechk->callsign[i], "");
     strcpy(dupechk->exch[i], "");
     dupechk->worked_bitmap[i] = 0;
     dupechk->contest_id[i] = 0;
   }
   dupechk->ncallsign = 0;
+  console->printf("DUPE PACKED init entries=%d callpool=%u lens=%u checkpoints=%u\n",
+                  nmaxqso, (unsigned)call_pool_bytes,
+                  (unsigned)call_lens_bytes,
+                  (unsigned)(call_checkpoint_count * sizeof(uint32_t)));
 }

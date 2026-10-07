@@ -40,39 +40,45 @@
 #include "esp_heap_caps.h"
 #include "Plan13.h"
 #include "timekeep.h"
-HTTPClient http;
 #include <maidenhead.h>
 /// sattracking based on https://www.amsat.org/amsat/articles/g3ruh/111.html
 
-char *tlefilename = "/tle.txt";
-File tlefile;
 
-// TLE parsing is deliberately separated from HTTP download.  Web/AsyncTCP
-// responses can still own several KB immediately after a request completes;
-// starting orbit/TLE work in that window caused very low heap watermarks.
+char *tlefilename = "/tle.txt";
+
+// TLE download and TLE parsing are deliberately separated.
+// On HW1, parsing while AsyncTCP/Web responses are alive can exhaust heap.
 static volatile bool sat_tle_parse_pending = false;
 static uint32_t sat_tle_parse_not_before_ms = 0;
 static uint32_t sat_tle_parse_wait_log_ms = 0;
 
 static bool sat_tle_parse_heap_ready() {
-  const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t free_now =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t largest =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   const uint32_t async_q = asyncTCPQueueMessagesWaiting();
 
-  // These are admission thresholds, not HW1-specific limits.  On larger
-  // hardware they are naturally satisfied immediately.  On a busy small
-  // heap they serialize TLE parsing behind outstanding Web traffic.
+#if JK1DVPLOG_HWVER == 1
+  return free_now >= 16384 && largest >= 9216 && async_q == 0;
+#else
   return free_now >= 28672 && largest >= 16384 && async_q == 0;
+#endif
 }
 
 void request_sat_tle_parse(uint32_t delay_ms) {
   const uint32_t requested = millis() + delay_ms;
-  // Coalesce all callers into one parse job.  Never postpone an already
-  // scheduled earlier parse merely because another caller asks for one.
-  if (!sat_tle_parse_pending || (int32_t)(requested - sat_tle_parse_not_before_ms) < 0)
+  if (!sat_tle_parse_pending ||
+      (int32_t)(requested - sat_tle_parse_not_before_ms) < 0)
     sat_tle_parse_not_before_ms = requested;
   sat_tle_parse_pending = true;
 }
+
+bool sat_tle_work_pending() {
+  return sat_tle_parse_pending || sat_tle_update_requested ||
+         sat_tle_update_in_progress;
+}
+
 
 // index of sat_info[] sorted by  satellite aos
 int satidx_sort[N_SATELLITES];
@@ -1109,6 +1115,8 @@ bool sat_accept_frequency_report(struct radio *radio, int side, int freq_hz) {
 
 bool sat_accept_generic_frequency_report(struct radio *radio, int freq_units) {
   if (!plogw->sat) return false;
+  const int idx = plogw->sat_idx_selected;
+  if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].name[0] == '\0') return false;
   const int side = sat_side_for_radio(radio);
   if (side < 0) return false;
   return sat_accept_frequency_report(radio, side, freq_units * FREQ_UNIT);
@@ -1126,7 +1134,10 @@ static void sat_ic9700_select_main(struct radio *radio) {
 }
 
 bool sat_accept_icom_frequency_report(struct radio *radio, int freq_units) {
-  if (!plogw->sat || sat_query_radio != radio || sat_query_side < 0 ||
+  const int idx = plogw->sat_idx_selected;
+  if (!plogw->sat || idx < 0 || idx >= N_SATELLITES ||
+      sat_info[idx].name[0] == '\0' ||
+      sat_query_radio != radio || sat_query_side < 0 ||
       sat_query_stage != 2) return false;
   const int side = sat_query_side;
   const int freq_hz = freq_units * FREQ_UNIT;
@@ -2202,8 +2213,15 @@ void readtlefile() {
   }
   if (!have_sat_definition) load_satinfo();
 
-  plogw->ostream->printf("opening tlefile %s\n",tlefilename);  
-  tlefile = SD.open(tlefilename, FILE_READ);
+  plogw->ostream->printf("opening tlefile %s\n",tlefilename);
+  plogw->ostream->printf(
+      "TLE file open before: free=%u largest=%u\n",
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  int tle_records = 0;
+  int tle_matched = 0;
+  {
+  File tlefile = SD.open(tlefilename, FILE_READ);
   if (!tlefile) {
     if (!plogw->f_console_emu) {
       plogw->ostream->print("opening TLE file");
@@ -2222,8 +2240,6 @@ void readtlefile() {
   
   int count;
   int stat;
-  int tle_records = 0;
-  int tle_matched = 0;
   stat = 0;
   count = 0;
   //  allocate_sat();
@@ -2387,6 +2403,11 @@ void readtlefile() {
     }
   }
   tlefile.close();
+  } // destroy File and its FS/VFS wrapper before reporting final heap
+  plogw->ostream->printf(
+      "TLE file closed/destroyed: free=%u largest=%u\n",
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   plogw->ostream->printf("TLE parse: records=%d matched=%d unmatched=%d\n",
                         tle_records, tle_matched, tle_records - tle_matched);
   strcpy(dp->lcdbuf, "Read TLE file \nFinished");
@@ -2402,7 +2423,8 @@ void getTLE() {
 
   if (f_sat_updated) return;
   if (wifi_status != 1) {
-    request_sat_tle_parse(0);
+    // Do not parse from here.  Wait until the normal SAT service loop is safe.
+    request_sat_tle_parse(1000);
     return;
   }
 
@@ -2422,6 +2444,17 @@ void getTLE() {
   upd_display_info_flash(dp->lcdbuf);
   if (!plogw->f_console_emu) plogw->ostream->print("[HTTP] GET begin...\n");
 
+  int httpCode = 0;
+  int valid_records = 0;
+  bool download_ok = false;
+  bool file_committed = false;
+
+  plogw->ostream->printf(
+      "TLE HTTP before client: free=%u largest=%u\n",
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  {
+  HTTPClient http;
   // The AMSAT endpoint currently replies without Content-Length.  With the
   // default HTTP/1.1 keep-alive connection, http.connected() can remain true
   // after the complete body has arrived, so the old loop waited for its 10 s
@@ -2431,9 +2464,7 @@ void getTLE() {
   http.setReuse(false);
   http.begin(sat_tle_url);
   if (!plogw->f_console_emu) plogw->ostream->print("[HTTP] GET...\n");
-  int httpCode = http.GET();
-  int valid_records = 0;
-  bool download_ok = false;
+  httpCode = http.GET();
 
   if (httpCode > 0) {
     if (!plogw->f_console_emu) plogw->ostream->printf("[HTTP] GET... code: %d\n", httpCode);
@@ -2510,18 +2541,27 @@ void getTLE() {
       // Handle a final non-newline-terminated line only for diagnostics; a
       // complete TLE record normally ends with line 2 + newline.
       out.flush();
-      download_ok = (valid_records > 0);
+      // A stalled/timeout transfer is incomplete even if it happened to
+      // contain some valid records.  Never let a partial download replace
+      // the last known-good /tle.txt.
+      download_ok = (!rx_timeout && valid_records > 0);
       if (!plogw->f_console_emu)
         plogw->ostream->printf("[HTTP] TLE bytes=%lu records=%d eof=%s\n",
                               received, valid_records, rx_timeout ? "timeout" : "normal");
+      if (rx_timeout)
+        plogw->ostream->println("[HTTP] TLE transfer incomplete; old file will be kept");
     }
   } else {
     plogw->ostream->printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
 
-  // Release HTTP/TCP resources before touching the satellite database.  This is
-  // important on small heaps and also reduces overlap with AsyncTCP Web traffic.
+  // Release HTTP/TCP resources before touching the satellite database.
   http.end();
+  } // force HTTPClient destructor here, before any SD rename or TLE parsing
+  plogw->ostream->printf(
+      "TLE HTTP client destroyed: free=%u largest=%u\n",
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   out.close();
 
   if (download_ok) {
@@ -2532,6 +2572,7 @@ void getTLE() {
       if (SD.exists(bakfn)) SD.remove(bakfn);
       sat_tle_last_result = HTTP_CODE_OK;
       f_sat_updated = 1;
+      file_committed = true;
     } else {
       if (SD.exists(tmpfn)) SD.remove(tmpfn);
       if (had_old && SD.exists(bakfn) && !SD.exists(tlefilename)) SD.rename(bakfn, tlefilename);
@@ -2539,13 +2580,15 @@ void getTLE() {
     }
   } else {
     if (SD.exists(tmpfn)) SD.remove(tmpfn);
-    plogw->ostream->println("TLE download contained no complete records; old file kept");
+    plogw->ostream->println("TLE download incomplete/invalid; old file kept");
   }
 
   plogw->ostream->println("end of getTLE");
-  // Do not parse immediately after HTTPClient teardown.  Let lwIP/AsyncTCP and
-  // any Web response callbacks return their buffers first.
-  request_sat_tle_parse();
+
+  // Only parse data that was successfully committed.  On a timeout or other
+  // failed download, sat_info[] remains based on the previous known-good TLE
+  // and there is no reason to re-parse the old file.
+  if (file_committed) request_sat_tle_parse(1000);
 }
 
 
@@ -2889,35 +2932,54 @@ void service_sat_tle_update() {
   }
 
   if (!sat_tle_parse_pending) return;
+
   const uint32_t now = millis();
   if ((int32_t)(now - sat_tle_parse_not_before_ms) < 0) return;
 
   if (!sat_tle_parse_heap_ready()) {
     if (now - sat_tle_parse_wait_log_ms >= 2000) {
       sat_tle_parse_wait_log_ms = now;
-      const size_t free_now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      plogw->ostream->printf("TLE parse deferred: free=%u largest=%u async_q=%u\n",
-                            (unsigned)free_now, (unsigned)largest,
-                            (unsigned)asyncTCPQueueMessagesWaiting());
+      const size_t free_now =
+          heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      const size_t largest =
+          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      plogw->ostream->printf(
+          "TLE parse deferred: free=%u largest=%u async_q=%u\n",
+          (unsigned)free_now, (unsigned)largest,
+          (unsigned)asyncTCPQueueMessagesWaiting());
     }
     return;
   }
 
   sat_tle_parse_pending = false;
-  plogw->ostream->printf("TLE parse start: free=%u largest=%u async_q=%u\n",
-                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                        (unsigned)asyncTCPQueueMessagesWaiting());
+
+  plogw->ostream->printf(
+      "TLE parse start: free=%u largest=%u async_q=%u\n",
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned)asyncTCPQueueMessagesWaiting());
+
   readtlefile();
-  plogw->ostream->printf("TLE parse done: free=%u largest=%u\n",
-                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+  plogw->ostream->printf(
+      "TLE parse done: free=%u largest=%u\n",
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
 void sat_process() {
   service_sat_tle_update();
   if (plogw->sat) {
+    const int selected = plogw->sat_idx_selected;
+    if (selected < 0 || selected >= N_SATELLITES ||
+        sat_info[selected].name[0] == '\0' || sat_info[selected].YEAR == 0) {
+      // SAT mode may be entered before selecting a satellite.  In that state
+      // keep the mode/UI active but do not run stale p13, rotator or frequency
+      // control until a valid satellite is selected.
+      plogw->f_rotator_track = 0;
+      return;
+    }
+
     struct radio *radio;
 
     radio = radio_selected;

@@ -77,6 +77,7 @@ struct terminal_help_entry {
 
 static const terminal_help_entry terminal_help_entries[] = {
   {"help", "show this command list"},
+  {"version", "show hardware version and firmware build date/time"},
   {"emu", "enter terminal screen emulation; EXITEMU exits"},
   {"verbose[n]", "toggle verbose output, or set verbose bit mask n"},
   {"oledreport [0|1]", "disable/enable periodic OLED/I2C health report"},
@@ -102,8 +103,8 @@ static const terminal_help_entry terminal_help_entries[] = {
   {"zmerge [dry|repair]", "merge, compare, or repair duplicate QSOs"},
   {"zmergenew [1|10]", "low-memory NEW merge; CHECKQSOIDS batch size (default 10)"},
   {"makedupe", "rebuild dupe/multiplier data from QSO.TXT"},
-  {"dumpqso[n]", "dump current raw QSO log, or backup log n"},
-  {"readqso", "print QSO.TXT in importable text format"},
+  {"dumpqso[n]", "background raw QSO dump; q cancels"},
+  {"readqso", "background QSO print; q cancels"},
   {"listqsofile", "list available QSO backup files"},
   {"switchlog <0-999>", "switch to the specified QSO backup log"},
   {"mailqso", "reserved command; QSO mail sending is currently disabled"},
@@ -345,6 +346,12 @@ void cmd_interp(char *cmd, Stream *output) {
       out->print("cmd:");
       out->println(cmd);
 
+      if (strcmp(cmd, "version") == 0) {
+        out->printf("DVPlogger HW%d built %s %s\n",
+                    JK1DVPLOG_HWVER, __DATE__, __TIME__);
+        break;
+      }
+
       if (strcmp(cmd, "ymodem") == 0) {
         if (out != console) {
           out->println("YMODEM ERROR ymodem is available only on the serial console");
@@ -515,7 +522,7 @@ void cmd_interp(char *cmd, Stream *output) {
             out->println("usage: POWER [5..100]");
           } else {
             set_power(radio, watts);
-            out->printf("POWER set request %d W\\r\\n", watts);
+            out->printf("POWER set request %d W\r\n", watts);
           }
         } else {
           send_power_query_civ(radio);
@@ -537,15 +544,15 @@ void cmd_interp(char *cmd, Stream *output) {
         while (*p == ' ') ++p;
         if (*p == '1' && p[1] == '\0') {
           set_rig_antenna(radio, 1, true);
-          out->printf("RIGANT set ANT1 band=%d\\r\\n", radio->bandid);
+          out->printf("RIGANT set ANT1 band=%d\r\n", radio->bandid);
         } else if (*p == '2' && p[1] == '\0') {
           set_rig_antenna(radio, 2, true);
-          out->printf("RIGANT set ANT2 band=%d\\r\\n", radio->bandid);
+          out->printf("RIGANT set ANT2 band=%d\r\n", radio->bandid);
         } else if (*p == '\0' || (*p == '?' && p[1] == '\0')) {
           send_rig_antenna_query(radio);
           const int saved = (radio->bandid >= 1 && radio->bandid <= N_BAND)
                               ? radio->rig_antenna_band[radio->bandid] : -1;
-          out->printf("RIGANT current=%d saved-band=%d band=%d\\r\\n",
+          out->printf("RIGANT current=%d saved-band=%d band=%d\r\n",
                       radio->rig_antenna, saved, radio->bandid);
         } else {
           out->println("usage: RIGANT? | RIGANT1 | RIGANT2");
@@ -944,15 +951,19 @@ void cmd_interp(char *cmd, Stream *output) {
         out->println("[FLASHERSD] entering exclusive maintenance mode");
 
         // flashersd owns SD for the entire operation. Main-loop jobs are
-        // naturally blocked by this synchronous call; stop the two known
-        // independent users as well: AsyncWebServer callbacks and AudioPlayer.
+        // naturally blocked by this synchronous call; stop independent users.
         suspend_webserver_for_flash();
+#if JK1DVPLOG_HWVER != 1
+        // HW1 MAIN deliberately does not link AudioPlayer.  Audio playback is
+        // a SUBCPU responsibility and its permanent I2S/audio buffers are too
+        // expensive on the Mini.
         player.stop();
         uint32_t audio_deadline = millis() + 1000;
         while (player.isPlaying() && (int32_t)(millis() - audio_deadline) < 0)
           delay(10);
         if (player.isPlaying())
           out->println("[FLASHERSD] warning: AudioPlayer did not stop within 1 s");
+#endif
 
         // Close MAIN's normal SD writer before the flasher starts streaming.
         close_qsolog();
@@ -1273,22 +1284,26 @@ void cmd_interp(char *cmd, Stream *output) {
 	break;
       }
       
-      if (strncmp("dumpqso", cmd, 7) == 0) {
-        out->println("dumpqso command");
-        out->println(cmd + 8);
-	if (strlen(cmd)>7) {
-	  dump_qso_bak(cmd + 8, out);
-	} else {
-	  out->println("dumping current qso log.");	  
-	  dump_qso_log(out);
-	}
+      if (strcasecmp(cmd, "q") == 0 && qso_stream_job_busy()) {
+        cancel_qso_stream_job();
         break;
       }
 
-      
-      if (strncmp("readqso", cmd, 7) == 0) {
-        out->println("readqso command");
-        read_qso_log(READQSO_PRINT, out);
+      if (strncmp("dumpqso", cmd, 7) == 0) {
+        out->println("dumpqso command (background job; q cancels)");
+        if (strlen(cmd)>7) {
+          const char *arg = cmd + 7;
+          while (*arg == ' ') arg++;
+          start_dump_qso_backup_job(arg, out);
+        } else {
+          start_dump_qso_job(out);
+        }
+        break;
+      }
+
+      if (strcasecmp(cmd, "readqso") == 0) {
+        out->println("readqso command (background job; q cancels)");
+        start_read_qso_job(out);
         break;
       }
       if (strcasecmp(cmd, "listqsofile") == 0) {

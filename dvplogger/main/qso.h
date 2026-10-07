@@ -27,8 +27,13 @@ bool qso_log_is_open();
 bool open_qso_log_readonly(File *f);
 void close_qso_log_readonly(File *f);
 int read_qso_log_record(File *f, union qso_union_tag *record);
-size_t append_qso_log_record(const union qso_union_tag *record,
-                             size_t *size_before, size_t *size_after);
+enum qso_log_append_mode {
+  QSO_LOG_APPEND_NORMAL = 0,
+  QSO_LOG_APPEND_MERGE = 1
+};
+size_t qso_log_append_record(const union qso_union_tag *record,
+                             qso_log_append_mode mode);
+void qso_log_flush();
 
 struct qso_repair_stats {
   unsigned long total_records;
@@ -36,6 +41,7 @@ struct qso_repair_stats {
   unsigned long removed_records;
   unsigned long duplicate_groups;
   unsigned long groups_restored_by_zmerge;
+  unsigned long ambiguous_server_groups;
 };
 
 // Rebuild QSO.TXT through a temporary file. The original is preserved as
@@ -55,6 +61,48 @@ bool switch_qso_log(int backup_number);
 void list_qso_backup_files();
 void process_qso_file_operation();
 bool qso_file_operation_busy();
+bool qso_stream_job_busy();
+bool start_read_qso_job(Stream *out = nullptr);
+bool start_dump_qso_job(Stream *out = nullptr);
+bool start_dump_qso_backup_job(const char *numstr, Stream *out = nullptr);
+bool cancel_qso_stream_job();
+
+// Sequential Web export.  The source QSO file is opened once and read only
+// forward.  Formatted output is handed to the Web client through two small
+// FIFO slots; no source offset/seek is used by the browser.
+struct qso_web_export_info {
+  bool active;
+  bool complete;
+  bool failed;
+  bool cancelled;
+  bool chunk_ready;
+  uint32_t records_done;
+  uint32_t records_total;
+  uint32_t elapsed_ms;
+  uint32_t bytes;
+  uint32_t q_records;
+  uint32_t deleted_records;
+  uint32_t other_records;
+  uint32_t next_sequence;
+};
+bool start_read_qso_web_job(const char *numstr = nullptr);
+bool start_read_qso_web_file_job(const char *numstr = nullptr,
+                                     const char *conteststr = nullptr);
+bool cancel_read_qso_web_job();
+void get_read_qso_web_export_info(struct qso_web_export_info *info);
+void touch_read_qso_web_job();
+bool ack_read_qso_web_chunk(uint32_t sequence);
+bool acquire_read_qso_web_chunk(const uint8_t **data, size_t *len,
+                                uint32_t *sequence, bool *eof);
+void release_read_qso_web_chunk(uint32_t sequence);
+// Pull already-formatted bytes from the sequential Web producer.  This is for
+// one long HTTP response: source QSO.TXT remains owned/read by the main loop.
+// When no bytes are ready yet, returns 0 with *eof=false so the Web callback
+// can return RESPONSE_TRY_AGAIN instead of terminating the response.
+size_t pull_read_qso_web_stream(uint8_t *dst, size_t max_len, bool *eof);
+uint32_t qsoid_allocate_local();
+void qsoid_reconcile_observed(uint8_t txnum, uint32_t observed_ss);
+bool qsoid_extract_from_record(const union qso_union_tag *rec, uint32_t *id);
 void request_makedupe_rebuild();
 void process_pending_makedupe_rebuild();
 void open_qsolog() ;

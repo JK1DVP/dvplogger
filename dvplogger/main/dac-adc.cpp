@@ -275,6 +275,7 @@ void adc_timer_config(void) {
 #define ADC_INPUT ADC1_CHANNEL_0 //pin 36
 
 
+#if JK1DVPLOG_HWVER != 1
 uint16_t adc_ringbuf[ADC_RINGBUF_NBANK][NUM_MEM_SECT]; // i2s read will store to this buffer in the background
 
 volatile uint8_t adc_ridx_bank=0,adc_widx_bank=0;
@@ -384,4 +385,5 @@ int adc_read_i2s(uint16_t *storage,int ncount)
 void i2s_loop()
 {
 }
+#endif  // JK1DVPLOG_HWVER != 1
 

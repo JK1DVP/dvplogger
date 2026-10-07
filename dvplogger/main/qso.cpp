@@ -50,12 +50,122 @@
 #include "misc.h"
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
+#include "nvs.h"
 #include "so2r.h"
 #include "web_server.h"
 #include "bandmap.h"
 
 
 File qsologf;
+
+// QSOID allocator: persistent monotonic sequence per TX number.
+// NVS stores a reserved high-water mark, not merely the last used value.
+// IDs are reserved in blocks so a sudden power loss can create gaps but can
+// never cause a previously issued QSOID to be reused.
+static const uint32_t QSOID_SEQ_MAX = 9999;
+static const uint32_t QSOID_RESERVE_BLOCK = 64;
+static bool qsoid_state_loaded[10] = {false};
+static uint32_t qsoid_next_seq[10] = {0};
+static uint32_t qsoid_reserved_highwater[10] = {0};
+static bool qsoid_log_scan_done[10] = {false};
+
+static bool qsoid_nvs_get(uint8_t tx, uint32_t *value)
+{
+  if (tx > 9 || !value) return false;
+  nvs_handle_t h;
+  if (nvs_open("qsoid", NVS_READWRITE, &h) != ESP_OK) return false;
+  char key[8];
+  snprintf(key, sizeof(key), "tx%u", (unsigned)tx);
+  uint32_t v = 0;
+  esp_err_t e = nvs_get_u32(h, key, &v);
+  nvs_close(h);
+  if (e == ESP_ERR_NVS_NOT_FOUND) { *value = 0; return true; }
+  if (e != ESP_OK) return false;
+  *value = v;
+  return true;
+}
+
+static bool qsoid_nvs_set(uint8_t tx, uint32_t value)
+{
+  if (tx > 9) return false;
+  nvs_handle_t h;
+  if (nvs_open("qsoid", NVS_READWRITE, &h) != ESP_OK) return false;
+  char key[8];
+  snprintf(key, sizeof(key), "tx%u", (unsigned)tx);
+  esp_err_t e = nvs_set_u32(h, key, value);
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  return e == ESP_OK;
+}
+
+static bool qsoid_ensure_loaded(uint8_t tx)
+{
+  if (tx > 9) return false;
+  if (qsoid_state_loaded[tx]) return true;
+  uint32_t stored = 0;
+  if (!qsoid_nvs_get(tx, &stored)) return false;
+  if (stored > QSOID_SEQ_MAX) stored = QSOID_SEQ_MAX;
+  qsoid_reserved_highwater[tx] = stored;
+  qsoid_next_seq[tx] = stored + 1;
+  qsoid_state_loaded[tx] = true;
+  return true;
+}
+
+void qsoid_reconcile_observed(uint8_t tx, uint32_t observed_ss)
+{
+  if (tx > 9 || observed_ss > QSOID_SEQ_MAX) return;
+  if (!qsoid_ensure_loaded(tx)) return;
+  qsoid_log_scan_done[tx] = true;
+  if (observed_ss <= qsoid_reserved_highwater[tx]) return;
+
+  uint32_t reserve_to = observed_ss + QSOID_RESERVE_BLOCK;
+  if (reserve_to > QSOID_SEQ_MAX) reserve_to = QSOID_SEQ_MAX;
+  if (!qsoid_nvs_set(tx, reserve_to)) {
+    console->printf("QSOID allocator: NVS recovery save failed tx=%u observed=%lu\n",
+                    (unsigned)tx, (unsigned long)observed_ss);
+    return;
+  }
+  qsoid_reserved_highwater[tx] = reserve_to;
+  if (qsoid_next_seq[tx] <= observed_ss) qsoid_next_seq[tx] = observed_ss + 1;
+  console->printf("QSOID allocator recovery: tx=%u log_max=%lu reserved=%lu next=%lu\n",
+                  (unsigned)tx, (unsigned long)observed_ss,
+                  (unsigned long)reserve_to, (unsigned long)qsoid_next_seq[tx]);
+}
+
+uint32_t qsoid_allocate_local()
+{
+  uint8_t tx = plogw ? (uint8_t)plogw->txnum : 0;
+  if (tx > 9 || !qsoid_ensure_loaded(tx)) return 0;
+  // On first installation NVS has no reservation yet.  Do not risk reusing
+  // an ID from an existing QSO.TXT before the startup MAKEDUPE scan has
+  // established its high-water mark.
+  if (qsoid_reserved_highwater[tx] == 0 && !qsoid_log_scan_done[tx]) {
+    console->printf("QSOID allocator: waiting for MAKEDUPE QSOID scan (tx=%u)\n",
+                    (unsigned)tx);
+    return 0;
+  }
+  if (qsoid_next_seq[tx] > QSOID_SEQ_MAX) {
+    console->printf("QSOID allocator exhausted for tx=%u (max ss=%lu)\n",
+                    (unsigned)tx, (unsigned long)QSOID_SEQ_MAX);
+    return 0;
+  }
+  if (qsoid_next_seq[tx] > qsoid_reserved_highwater[tx]) {
+    uint32_t reserve_to = qsoid_next_seq[tx] + QSOID_RESERVE_BLOCK - 1;
+    if (reserve_to > QSOID_SEQ_MAX) reserve_to = QSOID_SEQ_MAX;
+    // Persist reservation before issuing any ID from it.
+    if (!qsoid_nvs_set(tx, reserve_to)) {
+      console->printf("QSOID allocator: cannot reserve NVS block tx=%u\n", (unsigned)tx);
+      return 0;
+    }
+    qsoid_reserved_highwater[tx] = reserve_to;
+    console->printf("QSOID allocator reserve: tx=%u next=%lu highwater=%lu\n",
+                    (unsigned)tx, (unsigned long)qsoid_next_seq[tx],
+                    (unsigned long)reserve_to);
+  }
+  const uint32_t ss = qsoid_next_seq[tx]++;
+  return (uint32_t)(tx * 100000000UL + ss * 10000UL + (uint32_t)random(100) * 100UL);
+}
+
 static uint32_t makedupe_main_overflow_count = 0;
 
 // MAKEDUPE diagnostics.  These counters describe the MAIN-side QSO.TXT scan
@@ -164,12 +274,19 @@ static void makedupe_diag_finish()
     end_contest_id, end_contest, end_mask);
 }
 
+// QSO.TXT has one persistent writer: qsologf.  Normal logging and Z-server
+// merge downloads must both use qso_log_append_record() so two File objects
+// can never append to the same file concurrently.
+//
 // A synchronous SD flush can take long enough to block the keyboard path.
-// Commit the record immediately, but defer the media flush briefly so the
-// next key/PTT event can be handled first.
+// Normal QSOs therefore keep the existing short deferred flush.  Merge
+// downloads are flushed in small batches for throughput, and explicitly at
+// merge completion/failure.
 static bool qso_log_flush_pending = false;
 static uint32_t qso_log_flush_due_ms = 0;
+static uint8_t qso_log_merge_unflushed = 0;
 static const uint32_t QSO_LOG_FLUSH_DELAY_MS = 250;            // qso logf
+static const uint8_t QSO_LOG_MERGE_FLUSH_RECORDS = 16;
 
 bool qso_log_is_open()
 {
@@ -195,21 +312,55 @@ int read_qso_log_record(File *f, union qso_union_tag *record)
   return f->read(record->all, sizeof(record->all));
 }
 
-size_t append_qso_log_record(const union qso_union_tag *record,
-                             size_t *size_before, size_t *size_after)
+size_t qso_log_append_record(const union qso_union_tag *record,
+                             qso_log_append_mode mode)
 {
-  if (size_before) *size_before = 0;
-  if (size_after) *size_after = 0;
-  if (record == NULL || !qsologf) return 0;
+  if (record == NULL) return 0;
 
-  const size_t before = qsologf.size();
-  const size_t written = qsologf.write(record->all, sizeof(record->all));
-  qsologf.flush();
-  const size_t after = qsologf.size();
+  // create_new_qso_log() closes/renames QSO.TXT and opens a new persistent
+  // append handle.  Recover that same owner handle if it is unexpectedly
+  // closed, but never create a second append File object for verification.
+  if (!qsologf) {
+    qsologf = SD.open(qsologfn, "a+");
+    if (!qsologf) {
+      if (!plogw->f_console_emu)
+        plogw->ostream->println("QSO append: failed to reopen QSO.TXT");
+      return 0;
+    }
+    if (!plogw->f_console_emu)
+      plogw->ostream->println("QSO append: reopened QSO.TXT");
+  }
 
-  if (size_before) *size_before = before;
-  if (size_after) *size_after = after;
+  const size_t record_size = sizeof(record->all);
+  const size_t written = qsologf.write(record->all, record_size);
+
+  // Never retry a short/failed write: the SD layer may already have committed
+  // part or all of the record, and retrying could duplicate a QSO.
+  if (written != record_size) {
+    if (!plogw->f_console_emu)
+      plogw->ostream->printf("QSO append: short write %u/%u\n",
+                             (unsigned)written, (unsigned)record_size);
+    return written;
+  }
+
+  if (mode == QSO_LOG_APPEND_MERGE) {
+    if (++qso_log_merge_unflushed >= QSO_LOG_MERGE_FLUSH_RECORDS) {
+      qsologf.flush();
+      qso_log_merge_unflushed = 0;
+    }
+  } else {
+    qso_log_flush_pending = true;
+    qso_log_flush_due_ms = millis() + QSO_LOG_FLUSH_DELAY_MS;
+  }
+
   return written;
+}
+
+void qso_log_flush()
+{
+  if (qsologf) qsologf.flush();
+  qso_log_flush_pending = false;
+  qso_log_merge_unflushed = 0;
 }
 
 
@@ -240,6 +391,7 @@ static bool qso_repair_qsoid_from_remarks(const char *remarks, uint32_t *id)
 {
   if (remarks == NULL || id == NULL) return false;
   const char *p = strstr(remarks, "ZQID:");
+  if (p == NULL) p = strstr(remarks, "LQID:");
   if (p == NULL) return false;
   p += 5;
   if (*p < '0' || *p > '9') return false;
@@ -277,6 +429,12 @@ static bool qso_repair_get_qsoid(const union qso_union_tag *rec, uint32_t *id)
   return true;
 }
 
+bool qsoid_extract_from_record(const union qso_union_tag *rec, uint32_t *id)
+{
+  if (!rec || !id) return false;
+  return qso_repair_get_qsoid(rec, id);
+}
+
 static bool qso_repair_server_has(const uint32_t *ids, size_t count, uint32_t id)
 {
   size_t lo = 0, hi = count;
@@ -310,7 +468,7 @@ static void qso_repair_normalize(union qso_union_tag *dst,
   // ZQID:<id> is identity metadata, not operator memo content. Ignore it
   // when grouping otherwise-identical QSO records. This also lets repair
   // group old malformed/truncated ZQID records with corrected ones.
-  if (!strncmp(body, "ZQID:", 5)) {
+  if (!strncmp(body, "ZQID:", 5) || !strncmp(body, "LQID:", 5)) {
     const char *space = strchr(body, ' ');
     body = space ? space + 1 : body + strlen(body);
   }
@@ -399,16 +557,27 @@ bool repair_qso_log(const uint32_t *server_ids, size_t server_count,
     for (size_t i = 0; i < count; i++) {
       if (meta[i].leader != i || meta[i].group_count <= 1) continue;
       if (stats) stats->duplicate_groups++;
+      // If two or more IDs from the same content group already exist on the
+      // server, local repair cannot know which server object is authoritative.
+      // Keep the complete group and report it; otherwise a following merge
+      // would simply download the discarded server duplicate again.
+      if (meta[i].server_count >= 2) {
+        if (stats) stats->ambiguous_server_groups++;
+        for (size_t j = i; j < count; j++) {
+          if (meta[j].leader == i || j == i) meta[j].keep = 1;
+        }
+        continue;
+      }
+
       bool kept_server = false;
       for (size_t j = i; j < count; j++) {
         if (meta[j].leader != i && j != i) continue;
-        if (meta[i].server_count != 0) {
+        if (meta[i].server_count == 1) {
           meta[j].keep = meta[j].server_match && !kept_server;
           if (meta[j].keep) kept_server = true;
         } else {
-          // Repeated records whose reconstructed IDs are all absent from the
-          // server are removed as a group. A following normal zmerge restores
-          // one authoritative record with the correct ID.
+          // No reconstructed ID matches the server. Remove the local copies;
+          // a following merge may restore an authoritative server record.
           meta[j].keep = 0;
         }
       }
@@ -705,6 +874,14 @@ void read_qso_log(int option, Stream *out) {
 
   int count;
   count = 0;
+  int print_count = 0;
+
+  if (option & READQSO_PRINT) {
+    if (out) out->printf("[READQSO-MEM] begin free=%u largest=%u min=%u\r\n",
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                         (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+  }
 
   if ((option & READQSO_MAKEDUPE) && dupechk->dupechk_at == 1)
     begin_makedupe_subcpu(plogw->mask);
@@ -762,7 +939,40 @@ void read_qso_log(int option, Stream *out) {
 
     // operations
 
-    if (option & READQSO_PRINT) print_qso_entry(&qso_read, out);
+    if (option & READQSO_PRINT) {
+      print_qso_entry(&qso_read, out);
+      ++print_count;
+
+      // HW1 has no PSRAM and normally reaches READQSO with only a few KB of
+      // contiguous heap left.  AsyncTCPBufferedStream copies output chunks
+      // with malloc() before sending them.  Do not let READQSO outrun the
+      // network sender and fill that queue: periodically flush and yield.
+      if (!psramFound() && (print_count & 1) == 0) {
+        out->flush();
+
+        const size_t free8 =
+            heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        const size_t largest8 =
+            heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+        // Under fragmentation pressure give AsyncTCP/Telnet more time to
+        // release queued chunks and pbufs.  READQSO is an operator command,
+        // so reliability is more important than bulk-print speed.
+        if (free8 < 10000 || largest8 < 4096)
+          delay(20);
+        else
+          delay(8);
+      }
+
+      if (print_count == 1 || print_count == 10 ||
+          print_count == 25 || (print_count % 50) == 0) {
+        out->printf("[READQSO-MEM] qso=%d free=%u largest=%u min=%u\r\n",
+                    print_count,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+      }
+    }
     if (option & READQSO_MAKEDUPE) {
       makedupe_qso_entry(&qso_read);
       ++count;
@@ -801,6 +1011,15 @@ end:
              "Reading QSO\nFinished\nPos=%d", pos);
 
   upd_display_info_flash(dp->lcdbuf);
+  if (option & READQSO_PRINT) {
+    out->flush();
+    if (!psramFound()) delay(20);
+    out->printf("[READQSO-MEM] end qso=%d free=%u largest=%u min=%u\r\n",
+                print_count,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+  }
   if (!plogw->f_console_emu) out->println("end of read_qso_log");
   out->print("Pos:");out->println(pos);    
   if (!qsologf.seek(memo_pos)) {
@@ -909,6 +1128,12 @@ void set_qsodata_from_qso_entry() {
   radio->recv_exch[1] = strlen(radio->recv_exch + 2);
   strcpy(radio->remarks + 2, qso.entry.remarks);
   radio->remarks[1] = 0;
+
+  // Preserve the original QSOID for edit operations.  New allocation is
+  // intentionally skipped while qsodata_loaded is true.
+  uint32_t loaded_qsoid = 0;
+  if (qsoid_extract_from_record(&qso, &loaded_qsoid))
+    plogw->qsoid = loaded_qsoid;
 }
 
 void print_qso_entry_file(File *f) {
@@ -1009,6 +1234,10 @@ enum qso_file_op_state_t {
   QSO_FILE_OP_SWITCH_PREPARE_REBUILD,
   QSO_FILE_OP_SWITCH_REBUILD,
   QSO_FILE_OP_SWITCH_FINISH,
+  QSO_FILE_OP_READ_OPEN,
+  QSO_FILE_OP_READ_NEXT,
+  QSO_FILE_OP_DUMP_OPEN,
+  QSO_FILE_OP_DUMP_NEXT,
   QSO_FILE_OP_ERROR
 };
 
@@ -1042,9 +1271,153 @@ struct qso_file_op_context_t {
   File root;
   File src;
   File dst;
+  Stream *out;
+  uint32_t started_ms;
+  uint32_t next_step_ms;
+  size_t bytes_done;
+  size_t bytes_total;
+  bool dump_backup;
+  bool web_export;
+  bool web_count_only;
+  bool web_make_file;
+  char web_contest_filter[40];
 };
 
 static qso_file_op_context_t qso_file_op = { QSO_FILE_OP_IDLE };
+static struct qso_web_export_info qso_web_export = {};
+
+// READQSO contest filter used only by Web file generation.  No filter means
+// every recorded QSO (type=Q) is exported, including C:-.  With a filter,
+// explicit C:- and other contest tags are excluded while legacy records
+// without C: remain included for compatibility with older logs.
+static bool web_readqso_contest_match(const union qso_union_tag *qso,
+                                      const char *wanted)
+{
+  if (!wanted || !*wanted) return true;
+  if (!qso) return false;
+  const char *p = strstr(qso->entry.remarks, "C:");
+  if (!p) return true;  // legacy record without C:
+  p += 2;
+  char tagged[40];
+  size_t n = 0;
+  while (*p && *p != ' ' && *p != '\r' && *p != '\n') {
+    if (n + 1 < sizeof(tagged)) tagged[n++] = *p;
+    ++p;
+  }
+  tagged[n] = '\0';
+  if (n == 0) return true;
+  if (strcmp(tagged, "-") == 0) return false;
+  return strcasecmp(tagged, wanted) == 0;
+}
+
+// Web READQSO uses a two-slot sequential FIFO.  The producer is the normal
+// main-loop QSO reader; Web callbacks only ACK and read complete immutable
+// slots.  A slot is not reused until the browser ACKs its sequence number, so
+// a failed HTTP request can safely retry the same chunk without losing data.
+static const size_t QSO_WEB_FIFO_TARGET_BYTES = 4096;
+static const size_t QSO_WEB_FIFO_MIN_BYTES = 2048;
+static const size_t QSO_WEB_LINE_ROOM = 512;
+static const uint32_t QSO_WEB_IDLE_TIMEOUT_MS = 60000UL;
+
+struct qso_web_fifo_slot_t {
+  uint8_t *data;
+  size_t len;
+  size_t read_off;
+  uint32_t sequence;
+  bool ready;
+  bool acked;
+  uint16_t inflight;
+  bool eof;
+};
+
+struct qso_web_fifo_t {
+  uint8_t *storage;
+  size_t slot_capacity;
+  qso_web_fifo_slot_t slot[2];
+  int write_slot;
+  uint32_t sequence_next;
+  uint32_t last_access_ms;
+  bool source_eof;
+  bool final_ack_received;
+  bool retire_pending;
+};
+
+static qso_web_fifo_t qso_web_fifo = {};
+static portMUX_TYPE qso_web_fifo_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool qso_web_fifo_try_free()
+{
+  if (!qso_web_fifo.storage) {
+    memset(&qso_web_fifo, 0, sizeof(qso_web_fifo));
+    qso_web_fifo.write_slot = -1;
+    return true;
+  }
+  bool busy = false;
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  for (int i = 0; i < 2; ++i)
+    if (qso_web_fifo.slot[i].inflight != 0) busy = true;
+  if (busy) qso_web_fifo.retire_pending = true;
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+  if (busy) return false;
+  free(qso_web_fifo.storage);
+  memset(&qso_web_fifo, 0, sizeof(qso_web_fifo));
+  qso_web_fifo.write_slot = -1;
+  return true;
+}
+
+static bool qso_web_fifo_alloc()
+{
+  if (!qso_web_fifo_try_free()) return false;
+  size_t total = QSO_WEB_FIFO_TARGET_BYTES;
+  uint8_t *mem = (uint8_t *)heap_caps_malloc(total,
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!mem) mem = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_8BIT);
+  if (!mem) {
+    total = QSO_WEB_FIFO_MIN_BYTES;
+    mem = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_8BIT);
+  }
+  if (!mem) return false;
+  qso_web_fifo.storage = mem;
+  qso_web_fifo.slot_capacity = total / 2;
+  for (int i = 0; i < 2; ++i) {
+    qso_web_fifo.slot[i].data = mem + i * qso_web_fifo.slot_capacity;
+    qso_web_fifo.slot[i].len = 0;
+    qso_web_fifo.slot[i].read_off = 0;
+    qso_web_fifo.slot[i].sequence = 0;
+    qso_web_fifo.slot[i].ready = false;
+    qso_web_fifo.slot[i].acked = false;
+    qso_web_fifo.slot[i].inflight = 0;
+    qso_web_fifo.slot[i].eof = false;
+  }
+  qso_web_fifo.write_slot = 0;
+  qso_web_fifo.sequence_next = 1;
+  qso_web_fifo.last_access_ms = millis();
+  return true;
+}
+
+static int qso_web_fifo_find_free_slot()
+{
+  for (int i = 0; i < 2; ++i)
+    if (!qso_web_fifo.slot[i].ready && qso_web_fifo.slot[i].len == 0) return i;
+  return -1;
+}
+
+static bool qso_web_fifo_publish_slot(int idx, bool eof)
+{
+  if (idx < 0 || idx > 1) return false;
+  qso_web_fifo_slot_t &slot = qso_web_fifo.slot[idx];
+  if (slot.ready || slot.len == 0) return false;
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  slot.sequence = qso_web_fifo.sequence_next++;
+  slot.read_off = 0;
+  slot.eof = eof;
+  slot.acked = false;
+  slot.inflight = 0;
+  slot.ready = true;
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+  qso_web_fifo.write_slot = qso_web_fifo_find_free_slot();
+  return true;
+}
 
 static void close_qso_file_op_files() {
   if (qso_file_op.file) qso_file_op.file.close();
@@ -1080,7 +1453,17 @@ static void reset_qso_file_op_context() {
   qso_file_op.candidate_name[0] = '\0';
   qso_file_op.first_tm[0] = '\0';
   qso_file_op.last_tm[0] = '\0';
+  qso_file_op.out = nullptr;
+  qso_file_op.started_ms = 0;
+  qso_file_op.next_step_ms = 0;
+  qso_file_op.bytes_done = 0;
+  qso_file_op.bytes_total = 0;
+  qso_file_op.dump_backup = false;
+  qso_file_op.web_export = false;
+  qso_file_op.web_count_only = false;
+  qso_file_op.web_make_file = false;
 }
+
 
 static void finish_qso_file_op() {
   reset_qso_file_op_context();
@@ -1201,6 +1584,25 @@ static void show_qso_file_op_progress(bool force) {
       snprintf(progress, sizeof(progress), "SWITCHLOG%03d\nFinishing",
                qso_file_op.requested_number);
       break;
+    case QSO_FILE_OP_READ_OPEN:
+      snprintf(progress, sizeof(progress), "READQSO\nOpening QSO log");
+      break;
+    case QSO_FILE_OP_READ_NEXT:
+      snprintf(progress, sizeof(progress),
+               "READQSO\nQSO %u/%u\nq: cancel",
+               (unsigned int)qso_file_op.record_index,
+               (unsigned int)qso_file_op.record_count);
+      break;
+    case QSO_FILE_OP_DUMP_OPEN:
+      snprintf(progress, sizeof(progress), "DUMPQSO\nOpening QSO log");
+      break;
+    case QSO_FILE_OP_DUMP_NEXT:
+      snprintf(progress, sizeof(progress),
+               "DUMPQSO%s\n%u/%u bytes\nq: cancel",
+               qso_file_op.dump_backup ? " BAK" : "",
+               (unsigned int)qso_file_op.bytes_done,
+               (unsigned int)qso_file_op.bytes_total);
+      break;
     default:
       return;
   }
@@ -1248,6 +1650,7 @@ struct makedupe_rebuild_context {
   int len;
   uint32_t started_ms;
   uint32_t next_record_ms;
+  uint32_t qsoid_observed_max_ss;
 };
 
 static struct makedupe_rebuild_context makedupe_rebuild = {};
@@ -1282,6 +1685,400 @@ bool qso_file_operation_busy()
   return qso_file_op.state != QSO_FILE_OP_IDLE;
 }
 
+bool qso_stream_job_busy()
+{
+  return qso_file_op.state == QSO_FILE_OP_READ_OPEN ||
+         qso_file_op.state == QSO_FILE_OP_READ_NEXT ||
+         qso_file_op.state == QSO_FILE_OP_DUMP_OPEN ||
+         qso_file_op.state == QSO_FILE_OP_DUMP_NEXT;
+}
+
+static bool start_qso_stream_job(qso_file_op_state_t state, Stream *out)
+{
+  if (qso_file_op.state != QSO_FILE_OP_IDLE) {
+    if (!out) out = console;
+    out->println("QSO file operation already in progress");
+    upd_display_info_flash("QSO file operation\nin progress");
+    return false;
+  }
+  reset_qso_file_op_context();
+  qso_file_op.state = state;
+  qso_file_op.out = out ? out : console;
+  qso_file_op.started_ms = millis();
+  qso_file_op.next_step_ms = qso_file_op.started_ms;
+  show_qso_file_op_progress(true);
+  return true;
+}
+
+bool start_read_qso_job(Stream *out)
+{
+  return start_qso_stream_job(QSO_FILE_OP_READ_OPEN, out);
+}
+
+void get_read_qso_web_export_info(struct qso_web_export_info *info)
+{
+  if (!info) return;
+  *info = qso_web_export;
+  if (info->active) info->elapsed_ms = millis() - qso_file_op.started_ms;
+  bool any_ready = false;
+  uint32_t next_seq = 0;
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  for (int i = 0; i < 2; ++i) {
+    if (qso_web_fifo.slot[i].ready) {
+      any_ready = true;
+      if (next_seq == 0 || qso_web_fifo.slot[i].sequence < next_seq)
+        next_seq = qso_web_fifo.slot[i].sequence;
+    }
+  }
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+  info->chunk_ready = any_ready;
+  info->next_sequence = next_seq;
+}
+
+void touch_read_qso_web_job()
+{
+  qso_web_fifo.last_access_ms = millis();
+}
+
+bool ack_read_qso_web_chunk(uint32_t sequence)
+{
+  if (!sequence) return true;
+  bool matched = false;
+  bool was_eof = false;
+  bool final_now = false;
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  for (int i = 0; i < 2; ++i) {
+    qso_web_fifo_slot_t &slot = qso_web_fifo.slot[i];
+    if ((slot.ready || slot.acked) && slot.sequence == sequence) {
+      was_eof = slot.eof;
+      slot.ready = false;       // never serve this sequence again after ACK
+      slot.acked = true;
+      if (slot.inflight == 0) {
+        final_now = was_eof;
+        slot.acked = false;
+        slot.eof = false;
+        slot.sequence = 0;
+        slot.len = 0;
+        slot.read_off = 0;
+      }
+      matched = true;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+  if (matched) {
+    qso_web_fifo.last_access_ms = millis();
+    if (qso_web_fifo.write_slot < 0)
+      qso_web_fifo.write_slot = qso_web_fifo_find_free_slot();
+    if (final_now) qso_web_fifo.final_ack_received = true;
+  }
+  return matched;
+}
+
+bool acquire_read_qso_web_chunk(const uint8_t **data, size_t *len,
+                                uint32_t *sequence, bool *eof)
+{
+  if (!data || !len || !sequence || !eof) return false;
+  int best = -1;
+  uint32_t best_seq = 0;
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  for (int i = 0; i < 2; ++i) {
+    if (!qso_web_fifo.slot[i].ready || qso_web_fifo.slot[i].acked) continue;
+    if (best < 0 || qso_web_fifo.slot[i].sequence < best_seq) {
+      best = i;
+      best_seq = qso_web_fifo.slot[i].sequence;
+    }
+  }
+  if (best >= 0) {
+    qso_web_fifo.slot[best].inflight++;
+    *data = qso_web_fifo.slot[best].data;
+    *len = qso_web_fifo.slot[best].len;
+    *sequence = qso_web_fifo.slot[best].sequence;
+    *eof = qso_web_fifo.slot[best].eof;
+  }
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+  if (best >= 0) {
+    qso_web_fifo.last_access_ms = millis();
+    return true;
+  }
+  return false;
+}
+
+void release_read_qso_web_chunk(uint32_t sequence)
+{
+  if (!sequence) return;
+  bool final_now = false;
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  for (int i = 0; i < 2; ++i) {
+    qso_web_fifo_slot_t &slot = qso_web_fifo.slot[i];
+    if (slot.sequence != sequence) continue;
+    if (slot.inflight > 0) slot.inflight--;
+    if (slot.acked && slot.inflight == 0) {
+      final_now = slot.eof;
+      slot.acked = false;
+      slot.eof = false;
+      slot.sequence = 0;
+      slot.len = 0;
+      slot.read_off = 0;
+    }
+    break;
+  }
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+  if (final_now) qso_web_fifo.final_ack_received = true;
+  if (qso_web_fifo.write_slot < 0)
+    qso_web_fifo.write_slot = qso_web_fifo_find_free_slot();
+  if (qso_web_fifo.retire_pending) qso_web_fifo_try_free();
+}
+
+// Consumer for a single long HTTP response.  The main-loop producer owns
+// QSO.TXT and fills immutable ready slots sequentially.  This function never
+// reads/seeks the source file; it only drains the oldest ready FIFO slot.
+// A temporary empty FIFO is NOT EOF: callers should return RESPONSE_TRY_AGAIN.
+size_t pull_read_qso_web_stream(uint8_t *dst, size_t max_len, bool *eof)
+{
+  if (eof) *eof = false;
+  if (!dst || max_len == 0) return 0;
+
+  int best = -1;
+  uint32_t best_seq = 0;
+  const uint8_t *src = nullptr;
+  size_t off = 0;
+  size_t n = 0;
+
+  // Ready slots are immutable while published.  Mark one inflight while the
+  // bytes are copied so legacy /next ACK handling cannot recycle it under us.
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  for (int i = 0; i < 2; ++i) {
+    qso_web_fifo_slot_t &slot = qso_web_fifo.slot[i];
+    if (!slot.ready || slot.acked || slot.read_off >= slot.len) continue;
+    if (best < 0 || slot.sequence < best_seq) {
+      best = i;
+      best_seq = slot.sequence;
+    }
+  }
+  if (best >= 0) {
+    qso_web_fifo_slot_t &slot = qso_web_fifo.slot[best];
+    off = slot.read_off;
+    n = slot.len - off;
+    if (n > max_len) n = max_len;
+    src = slot.data + off;
+    slot.inflight++;
+  }
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+
+  if (best < 0) {
+    // No published bytes right now.  This is true EOF only after the producer
+    // has reached source EOF and every published slot has been drained.
+    bool any_ready = false;
+    bool source_eof = false;
+    portENTER_CRITICAL(&qso_web_fifo_mux);
+    source_eof = qso_web_fifo.source_eof;
+    for (int i = 0; i < 2; ++i)
+      if (qso_web_fifo.slot[i].ready &&
+          qso_web_fifo.slot[i].read_off < qso_web_fifo.slot[i].len)
+        any_ready = true;
+    portEXIT_CRITICAL(&qso_web_fifo_mux);
+    if (eof) *eof = source_eof && !any_ready;
+    qso_web_fifo.last_access_ms = millis();
+    return 0;
+  }
+
+  memcpy(dst, src, n);
+
+  bool final_now = false;
+  portENTER_CRITICAL(&qso_web_fifo_mux);
+  qso_web_fifo_slot_t &slot = qso_web_fifo.slot[best];
+  // The inflight marker guarantees this sequence cannot have been recycled.
+  if (slot.sequence == best_seq) {
+    slot.read_off += n;
+    if (slot.inflight > 0) slot.inflight--;
+    if (slot.read_off >= slot.len) {
+      final_now = slot.eof;
+      slot.ready = false;
+      slot.acked = false;
+      slot.eof = false;
+      slot.sequence = 0;
+      slot.len = 0;
+      slot.read_off = 0;
+    }
+  }
+  portEXIT_CRITICAL(&qso_web_fifo_mux);
+
+  if (final_now) qso_web_fifo.final_ack_received = true;
+  if (qso_web_fifo.write_slot < 0)
+    qso_web_fifo.write_slot = qso_web_fifo_find_free_slot();
+  qso_web_fifo.last_access_ms = millis();
+  if (eof && final_now) *eof = true;
+  return n;
+}
+
+bool start_read_qso_web_job(const char *numstr)
+{
+  if (qso_file_op.state != QSO_FILE_OP_IDLE) return false;
+
+  reset_qso_file_op_context();
+  qso_web_fifo_try_free();
+  memset(&qso_web_export, 0, sizeof(qso_web_export));
+  if (!qso_web_fifo_alloc()) {
+    qso_web_export.failed = true;
+    console->println("WEB READQSO: cannot allocate sequential FIFO");
+    return false;
+  }
+
+  if (numstr && *numstr) {
+    char *endp = nullptr;
+    long n = strtol(numstr, &endp, 10);
+    if (endp == numstr || *endp != '\0' || n < 0 || n > 999) {
+      qso_web_fifo_try_free();
+      qso_web_export.failed = true;
+      return false;
+    }
+    snprintf(qso_file_op.source_name, sizeof(qso_file_op.source_name),
+             "/qsobak.%03ld", n);
+    if (!SD.exists(qso_file_op.source_name)) {
+      qso_web_fifo_try_free();
+      qso_web_export.failed = true;
+      return false;
+    }
+  }
+
+  qso_file_op.web_export = true;
+  qso_file_op.out = nullptr;
+  qso_file_op.started_ms = millis();
+  qso_file_op.next_step_ms = qso_file_op.started_ms;
+  qso_file_op.state = QSO_FILE_OP_READ_OPEN;
+  qso_web_export.active = true;
+  qso_web_export.complete = false;
+  qso_web_export.failed = false;
+  qso_web_export.cancelled = false;
+  qso_web_fifo.last_access_ms = millis();
+  show_qso_file_op_progress(true);
+  console->printf("WEB READQSO sequential job started fifo=%u x 2 bytes\n",
+                  (unsigned)qso_web_fifo.slot_capacity);
+  return true;
+}
+
+bool start_read_qso_web_file_job(const char *numstr, const char *conteststr)
+{
+  if (qso_file_op.state != QSO_FILE_OP_IDLE) return false;
+
+  reset_qso_file_op_context();
+  memset(&qso_web_export, 0, sizeof(qso_web_export));
+
+  if (conteststr && *conteststr)
+    strlcpy(qso_file_op.web_contest_filter, conteststr,
+            sizeof(qso_file_op.web_contest_filter));
+
+  if (numstr && *numstr) {
+    char *endp = nullptr;
+    long n = strtol(numstr, &endp, 10);
+    if (endp == numstr || *endp != '\0' || n < 0 || n > 999) {
+      qso_web_export.failed = true;
+      return false;
+    }
+    snprintf(qso_file_op.source_name, sizeof(qso_file_op.source_name),
+             "/qsobak.%03ld", n);
+    if (!SD.exists(qso_file_op.source_name)) {
+      qso_web_export.failed = true;
+      return false;
+    }
+  }
+
+  if (SD.exists("/READQSO.TMP")) SD.remove("/READQSO.TMP");
+  qso_file_op.dst = SD.open("/READQSO.TMP", FILE_WRITE);
+  if (!qso_file_op.dst) {
+    qso_web_export.failed = true;
+    console->println("WEB READQSO: cannot create /READQSO.TMP");
+    return false;
+  }
+
+  qso_file_op.web_export = true;
+  qso_file_op.web_make_file = true;
+  qso_file_op.out = nullptr;
+  qso_file_op.started_ms = millis();
+  qso_file_op.next_step_ms = qso_file_op.started_ms;
+  qso_file_op.state = QSO_FILE_OP_READ_OPEN;
+  qso_web_export.active = true;
+  qso_web_export.complete = false;
+  qso_web_export.failed = false;
+  qso_web_export.cancelled = false;
+  show_qso_file_op_progress(true);
+  if (qso_file_op.web_contest_filter[0])
+    console->printf("WEB READQSO file generation job started contest=%s\n",
+                    qso_file_op.web_contest_filter);
+  else
+    console->println("WEB READQSO file generation job started (all QSOs)");
+  return true;
+}
+
+bool cancel_read_qso_web_job()
+{
+  if (!qso_file_op.web_export || !qso_stream_job_busy()) return false;
+  close_qso_file_op_files();
+  qso_web_export.active = false;
+  qso_web_export.complete = false;
+  qso_web_export.failed = false;
+  qso_web_export.cancelled = true;
+  qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+  if (qso_file_op.web_make_file) {
+    if (SD.exists("/READQSO.TMP")) SD.remove("/READQSO.TMP");
+  } else {
+    qso_web_fifo_try_free();
+  }
+  console->println(qso_file_op.web_make_file
+                     ? "WEB READQSO file generation cancelled"
+                     : "WEB READQSO sequential job cancelled");
+  upd_display_info_flash("WEB READQSO\nCancelled");
+  reset_qso_file_op_context();
+  return true;
+}
+
+bool start_dump_qso_job(Stream *out)
+{
+  qso_file_op.dump_backup = false;
+  return start_qso_stream_job(QSO_FILE_OP_DUMP_OPEN, out);
+}
+
+bool start_dump_qso_backup_job(const char *numstr, Stream *out)
+{
+  if (qso_file_op.state != QSO_FILE_OP_IDLE) {
+    if (!out) out = console;
+    out->println("QSO file operation already in progress");
+    return false;
+  }
+  if (!numstr || !*numstr) return false;
+  char *endp = nullptr;
+  long n = strtol(numstr, &endp, 10);
+  if (endp == numstr || *endp != '\0' || n < 0 || n > 999) {
+    if (!out) out = console;
+    out->println("Usage: DUMPQSO[n]");
+    return false;
+  }
+  reset_qso_file_op_context();
+  snprintf(qso_file_op.source_name, sizeof(qso_file_op.source_name),
+           "/qsobak.%03ld", n);
+  qso_file_op.dump_backup = true;
+  qso_file_op.out = out ? out : console;
+  qso_file_op.started_ms = millis();
+  qso_file_op.next_step_ms = qso_file_op.started_ms;
+  qso_file_op.state = QSO_FILE_OP_DUMP_OPEN;
+  show_qso_file_op_progress(true);
+  return true;
+}
+
+bool cancel_qso_stream_job()
+{
+  if (!qso_stream_job_busy()) return false;
+  if (qso_file_op.web_export) return cancel_read_qso_web_job();
+  Stream *out = qso_file_op.out ? qso_file_op.out : console;
+  close_qso_file_op_files();
+  out->println("QSO output job cancelled");
+  out->flush();
+  upd_display_info_flash("QSO output\nCancelled");
+  reset_qso_file_op_context();
+  return true;
+}
+
 static void finish_incremental_makedupe_rebuild()
 {
   close_qso_log_readonly(&makedupe_rebuild_file);
@@ -1297,6 +2094,13 @@ static void finish_incremental_makedupe_rebuild()
   snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
            "MAKEDUPE\nFinished\nQSO %d", makedupe_rebuild.count);
   upd_display_info_flash(dp->lcdbuf);
+  if (plogw) {
+    qsoid_reconcile_observed((uint8_t)plogw->txnum,
+                             makedupe_rebuild.qsoid_observed_max_ss);
+    console->printf("QSOID scan: tx=%d log_max_ss=%lu\n",
+                    plogw->txnum,
+                    (unsigned long)makedupe_rebuild.qsoid_observed_max_ss);
+  }
   console->printf("MAKEDUPE incremental finished QSO=%d elapsed=%lu ms\n",
                   makedupe_rebuild.count,
                   (unsigned long)(millis() - makedupe_rebuild.started_ms));
@@ -1367,6 +2171,7 @@ static bool start_incremental_makedupe_rebuild()
   makedupe_rebuild.len = QSO_RECORD_SIZE;
   makedupe_rebuild.started_ms = millis();
   makedupe_rebuild.next_record_ms = makedupe_rebuild.started_ms;
+  makedupe_rebuild.qsoid_observed_max_ss = 0;
 
   if (dupechk->dupechk_at == 1) begin_makedupe_subcpu(plogw->mask);
   if (verbose & 16384) {
@@ -1455,6 +2260,21 @@ void process_pending_makedupe_rebuild()
   }
 
   makedupe_diag_qrecords++;
+
+  // Recover the local QSOID allocator high-water mark while MAKEDUPE is
+  // already scanning QSO.TXT. Only IDs belonging to this logger TX number
+  // are relevant; server-downloaded IDs from other TX numbers must not move
+  // our allocator.
+  if (plogw) {
+    uint32_t qid = 0;
+    if (qsoid_extract_from_record(&qso_read, &qid)) {
+      const uint8_t tx = (uint8_t)((qid / 100000000UL) % 10UL);
+      const uint32_t ss = (qid % 100000000UL) / 10000UL;
+      if (tx == (uint8_t)plogw->txnum && ss > makedupe_rebuild.qsoid_observed_max_ss)
+        makedupe_rebuild.qsoid_observed_max_ss = ss;
+    }
+  }
+
   reformat_qso_entry(&qso_read);
   makedupe_qso_entry(&qso_read);
   makedupe_rebuild.count++;
@@ -1754,6 +2574,350 @@ void process_qso_file_operation() {
       upd_display_info_flash(display_buf);
       finish_qso_file_op();
       return;
+
+    case QSO_FILE_OP_READ_OPEN: {
+      Stream *out = qso_file_op.out ? qso_file_op.out : console;
+      bool opened = false;
+      if (qso_file_op.web_export && qso_file_op.source_name[0]) {
+        qso_file_op.file = SD.open(qso_file_op.source_name, FILE_READ);
+        opened = (bool)qso_file_op.file;
+      } else {
+        opened = open_qso_log_readonly(&qso_file_op.file);
+      }
+      if (!opened) {
+        if (qso_file_op.web_export) {
+          console->println("WEB READQSO: cannot open QSO log");
+          close_qso_file_op_files();
+          qso_web_export.active = false;
+          qso_web_export.failed = true;
+          qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+          qso_web_fifo_try_free();
+          reset_qso_file_op_context();
+        } else {
+          out->println("READQSO: cannot open QSO log");
+          finish_qso_file_op();
+        }
+        return;
+      }
+      qso_file_op.record_count = qso_file_op.file.size() / QSO_RECORD_SIZE;
+      qso_file_op.record_index = 0;
+      if (qso_file_op.web_export) {
+        qso_web_export.records_total = (uint32_t)qso_file_op.record_count;
+        qso_web_export.records_done = 0;
+        qso_web_export.bytes = 0;
+        qso_web_export.q_records = 0;
+        qso_web_export.deleted_records = 0;
+        qso_web_export.other_records = 0;
+        console->printf(qso_file_op.web_count_only
+                          ? "WEB READQSO pass1 started: %u records (sequential source)\n"
+                          : "WEB READQSO started: %u records (sequential source)\n",
+                        (unsigned int)qso_file_op.record_count);
+      } else {
+        out->printf("READQSO started: %u records; enter q to cancel\r\n",
+                    (unsigned int)qso_file_op.record_count);
+      }
+      qso_file_op.state = QSO_FILE_OP_READ_NEXT;
+      return;
+    }
+
+    case QSO_FILE_OP_READ_NEXT: {
+      Stream *out = qso_file_op.out ? qso_file_op.out : console;
+
+      if (qso_file_op.web_export && !qso_file_op.web_count_only && !qso_file_op.web_make_file) {
+        // Legacy FIFO Web export only.  The fixed-length READQSO path uses a
+        // count-only first pass and therefore has no browser idle dependency.
+        if ((uint32_t)(millis() - qso_web_fifo.last_access_ms) >
+            QSO_WEB_IDLE_TIMEOUT_MS) {
+          console->println("WEB READQSO: idle timeout; cancelling sequential job");
+          cancel_read_qso_web_job();
+          return;
+        }
+
+        if (qso_web_fifo.source_eof) {
+          if (qso_web_fifo.final_ack_received) {
+            qso_web_export.records_done = (uint32_t)qso_file_op.record_index;
+            qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+            close_qso_file_op_files();
+            qso_web_export.active = false;
+            qso_web_export.complete = true;
+            console->printf("WEB READQSO complete: %u records, %lu bytes, %lu ms\n",
+                            (unsigned int)qso_web_export.records_done,
+                            (unsigned long)qso_web_export.bytes,
+                            (unsigned long)qso_web_export.elapsed_ms);
+            upd_display_info_flash("WEB READQSO\nFinished");
+            qso_web_fifo_try_free();
+            reset_qso_file_op_context();
+          }
+          return;
+        }
+
+        if (qso_web_fifo.write_slot < 0)
+          qso_web_fifo.write_slot = qso_web_fifo_find_free_slot();
+        if (qso_web_fifo.write_slot < 0) return;
+      }
+
+      if (qso_file_op.record_index >= qso_file_op.record_count) {
+        if (qso_file_op.web_export) {
+          if (qso_file_op.web_make_file) {
+            if (qso_file_op.dst) {
+              qso_file_op.dst.flush();
+              qso_file_op.dst.close();
+            }
+            if (qso_file_op.file) qso_file_op.file.close();
+
+            if (SD.exists("/READQSO.TXT")) SD.remove("/READQSO.TXT");
+            if (!SD.rename("/READQSO.TMP", "/READQSO.TXT")) {
+              console->println("WEB READQSO: rename /READQSO.TMP -> /READQSO.TXT failed");
+              if (SD.exists("/READQSO.TMP")) SD.remove("/READQSO.TMP");
+              qso_web_export.active = false;
+              qso_web_export.complete = false;
+              qso_web_export.failed = true;
+              qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+              reset_qso_file_op_context();
+              return;
+            }
+
+            File ready = SD.open("/READQSO.TXT", FILE_READ);
+            if (!ready) {
+              console->println("WEB READQSO: cannot reopen /READQSO.TXT");
+              qso_web_export.active = false;
+              qso_web_export.complete = false;
+              qso_web_export.failed = true;
+              qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+              reset_qso_file_op_context();
+              return;
+            }
+            qso_web_export.bytes = (uint32_t)ready.size();
+            ready.close();
+            qso_web_export.records_done = (uint32_t)qso_file_op.record_index;
+            qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+            qso_web_export.active = false;
+            qso_web_export.complete = true;
+            console->printf("WEB READQSO file ready: source=%lu Q=%lu D=%lu other=%lu bytes=%lu ms=%lu\n",
+                            (unsigned long)qso_web_export.records_done,
+                            (unsigned long)qso_web_export.q_records,
+                            (unsigned long)qso_web_export.deleted_records,
+                            (unsigned long)qso_web_export.other_records,
+                            (unsigned long)qso_web_export.bytes,
+                            (unsigned long)qso_web_export.elapsed_ms);
+            upd_display_info_flash("WEB READQSO\nFile ready");
+            reset_qso_file_op_context();
+            return;
+          }
+          close_qso_file_op_files();
+          qso_web_fifo.source_eof = true;
+          int idx = qso_web_fifo.write_slot;
+          if (idx >= 0 && qso_web_fifo.slot[idx].len > 0) {
+            qso_web_fifo_publish_slot(idx, true);
+          } else {
+            // Exact slot boundary: tag the newest queued chunk as EOF.  If
+            // there is no queued data at all, completion needs no data chunk.
+            int newest = -1;
+            uint32_t newest_seq = 0;
+            portENTER_CRITICAL(&qso_web_fifo_mux);
+            for (int i = 0; i < 2; ++i) {
+              if (qso_web_fifo.slot[i].ready &&
+                  (newest < 0 || qso_web_fifo.slot[i].sequence > newest_seq)) {
+                newest = i;
+                newest_seq = qso_web_fifo.slot[i].sequence;
+              }
+            }
+            if (newest >= 0) qso_web_fifo.slot[newest].eof = true;
+            portEXIT_CRITICAL(&qso_web_fifo_mux);
+            if (newest < 0) qso_web_fifo.final_ack_received = true;
+          }
+          return;
+        }
+
+        close_qso_file_op_files();
+        out->printf("READQSO complete: %u records, %lu ms\r\n",
+                    (unsigned int)qso_file_op.record_index,
+                    (unsigned long)(millis() - qso_file_op.started_ms));
+        out->flush();
+        upd_display_info_flash("READQSO\nFinished");
+        reset_qso_file_op_context();
+        return;
+      }
+
+      // Process a modest batch per main-loop pass.  For Web export the source
+      // is still strictly sequential; output is copied into the current FIFO
+      // slot and the producer pauses when both slots await browser ACKs.
+      static const unsigned int READQSO_BATCH_RECORDS = 16;
+      for (unsigned int batch = 0;
+           batch < READQSO_BATCH_RECORDS &&
+           qso_file_op.record_index < qso_file_op.record_count;
+           ++batch) {
+        if (qso_file_op.web_export && !qso_file_op.web_count_only && !qso_file_op.web_make_file) {
+          if (qso_web_fifo.write_slot < 0)
+            qso_web_fifo.write_slot = qso_web_fifo_find_free_slot();
+          if (qso_web_fifo.write_slot < 0) return;
+          qso_web_fifo_slot_t &slot = qso_web_fifo.slot[qso_web_fifo.write_slot];
+          // Publish before reading the next source record if there is not
+          // enough room for any possible formatted QSO line.  This avoids
+          // read-back/seek and preserves the forward-only source contract.
+          if (slot.len > 0 &&
+              qso_web_fifo.slot_capacity - slot.len < QSO_WEB_LINE_ROOM) {
+            qso_web_fifo_publish_slot(qso_web_fifo.write_slot, false);
+            if (qso_web_fifo.write_slot < 0) return;
+          }
+        }
+
+        union qso_union_tag qso_read;
+        if (qso_file_op.file.read(qso_read.all, QSO_RECORD_SIZE) != QSO_RECORD_SIZE) {
+          if (qso_file_op.web_export) {
+            console->println("WEB READQSO: read error");
+            close_qso_file_op_files();
+            qso_web_export.active = false;
+            qso_web_export.complete = false;
+            qso_web_export.failed = true;
+            qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+            if (!qso_file_op.web_count_only && !qso_file_op.web_make_file) qso_web_fifo_try_free();
+            reset_qso_file_op_context();
+          } else {
+            out->println("READQSO: read error");
+            close_qso_file_op_files();
+            reset_qso_file_op_context();
+          }
+          return;
+        }
+        qso_file_op.record_index++;
+        const char record_type = qso_read.entry.type[0];
+        if (record_type == 'Q') {
+          reformat_qso_entry(&qso_read);
+          if (qso_file_op.web_export && qso_file_op.web_make_file &&
+              !web_readqso_contest_match(&qso_read, qso_file_op.web_contest_filter)) {
+            qso_web_export.records_done = (uint32_t)qso_file_op.record_index;
+            continue;
+          }
+          if (qso_file_op.web_export) {
+            char line[512];
+            sprint_qso_entry(line, &qso_read);
+            size_t n = strnlen(line, sizeof(line));
+            if (n >= sizeof(line) - 1) {
+              console->printf("WEB READQSO: formatted line too large (%u bytes)\n",
+                              (unsigned)n);
+              close_qso_file_op_files();
+              qso_web_export.active = false;
+              qso_web_export.failed = true;
+              qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+              if (!qso_file_op.web_count_only && !qso_file_op.web_make_file) qso_web_fifo_try_free();
+              reset_qso_file_op_context();
+              return;
+            }
+            qso_web_export.q_records++;
+            qso_web_export.bytes += (uint32_t)n;
+            if (qso_file_op.web_make_file) {
+              size_t nw = qso_file_op.dst.write((const uint8_t *)line, n);
+              if (nw != n) {
+                console->printf("WEB READQSO: /READQSO.TMP write failed (%u/%u bytes)\n",
+                                (unsigned)nw, (unsigned)n);
+                close_qso_file_op_files();
+                if (SD.exists("/READQSO.TMP")) SD.remove("/READQSO.TMP");
+                qso_web_export.active = false;
+                qso_web_export.failed = true;
+                qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+                reset_qso_file_op_context();
+                return;
+              }
+            } else if (!qso_file_op.web_count_only) {
+              int idx = qso_web_fifo.write_slot;
+              if (idx < 0 || n >= qso_web_fifo.slot_capacity ||
+                  qso_web_fifo.slot[idx].len + n > qso_web_fifo.slot_capacity) {
+                console->printf("WEB READQSO: FIFO line too large (%u bytes)\n",
+                                (unsigned)n);
+                close_qso_file_op_files();
+                qso_web_export.active = false;
+                qso_web_export.failed = true;
+                qso_web_export.elapsed_ms = millis() - qso_file_op.started_ms;
+                qso_web_fifo_try_free();
+                reset_qso_file_op_context();
+                return;
+              }
+              memcpy(qso_web_fifo.slot[idx].data + qso_web_fifo.slot[idx].len,
+                     line, n);
+              qso_web_fifo.slot[idx].len += n;
+            }
+          } else {
+            print_qso_entry(&qso_read, out);
+          }
+        } else if (qso_file_op.web_export && record_type == 'D') {
+          qso_web_export.deleted_records++;
+        } else if (qso_file_op.web_export) {
+          qso_web_export.other_records++;
+        }
+        if (qso_file_op.web_export) {
+          qso_web_export.records_done = (uint32_t)qso_file_op.record_index;
+        } else if ((qso_file_op.record_index % 100) == 0) {
+          out->printf("[READQSO] %u/%u\r\n",
+                      (unsigned int)qso_file_op.record_index,
+                      (unsigned int)qso_file_op.record_count);
+          out->flush();
+        }
+      }
+
+      if (qso_file_op.web_export && !qso_file_op.web_count_only && !qso_file_op.web_make_file &&
+          qso_web_fifo.write_slot >= 0) {
+        qso_web_fifo_slot_t &slot = qso_web_fifo.slot[qso_web_fifo.write_slot];
+        if (slot.len > 0 &&
+            qso_web_fifo.slot_capacity - slot.len < QSO_WEB_LINE_ROOM)
+          qso_web_fifo_publish_slot(qso_web_fifo.write_slot, false);
+      }
+      return;
+    }
+
+    case QSO_FILE_OP_DUMP_OPEN: {
+      Stream *out = qso_file_op.out ? qso_file_op.out : console;
+      if (qso_file_op.dump_backup)
+        qso_file_op.file = SD.open(qso_file_op.source_name, FILE_READ);
+      else if (!open_qso_log_readonly(&qso_file_op.file))
+        qso_file_op.file = File();
+      if (!qso_file_op.file) {
+        out->println("DUMPQSO: cannot open QSO log");
+        finish_qso_file_op();
+        return;
+      }
+      qso_file_op.bytes_total = qso_file_op.file.size();
+      qso_file_op.bytes_done = 0;
+      out->printf("DUMPQSO started: %u bytes; enter q to cancel\r\n",
+                  (unsigned int)qso_file_op.bytes_total);
+      qso_file_op.state = QSO_FILE_OP_DUMP_NEXT;
+      return;
+    }
+
+    case QSO_FILE_OP_DUMP_NEXT: {
+      Stream *out = qso_file_op.out ? qso_file_op.out : console;
+      if (!qso_file_op.file.available()) {
+        close_qso_file_op_files();
+        out->printf("\r\nDUMPQSO complete: %u bytes, %lu ms\r\n",
+                    (unsigned int)qso_file_op.bytes_done,
+                    (unsigned long)(millis() - qso_file_op.started_ms));
+        out->flush();
+        upd_display_info_flash("DUMPQSO\nFinished");
+        reset_qso_file_op_context();
+        return;
+      }
+
+      // Dump up to 16 QSO-record-sized chunks per main-loop pass (~4 KiB),
+      // but reuse one 256-byte buffer so HW1 does not pay a 4 KiB stack cost.
+      static const unsigned int DUMPQSO_BATCH_RECORDS = 16;
+      uint8_t chunk[QSO_RECORD_SIZE];
+      for (unsigned int batch = 0;
+           batch < DUMPQSO_BATCH_RECORDS && qso_file_op.file.available();
+           ++batch) {
+        size_t nr = qso_file_op.file.read(chunk, sizeof(chunk));
+        if (nr == 0) break;
+        size_t nw = out->write(chunk, nr);
+        qso_file_op.bytes_done += nw;
+        if (nw != nr) {
+          out->println("\r\nDUMPQSO: short output write");
+          close_qso_file_op_files();
+          reset_qso_file_op_context();
+          return;
+        }
+      }
+      out->flush();
+      return;
+    }
 
     case QSO_FILE_OP_ERROR:
     default:
@@ -2417,7 +3581,7 @@ void print_qso_logfile() {
   }
   int len = sizeof(qso.all);
   int ret;
-  ret = qsologf.write(qso.all, len);
+  ret = (int)qso_log_append_record(&qso, QSO_LOG_APPEND_NORMAL);
   if (verbose&4) 	{
     if (!plogw->f_console_emu) plogw->ostream->println("print_qso_logfile():3");
   }
@@ -2427,11 +3591,7 @@ void print_qso_logfile() {
     plogw->ostream->print(ret);
     plogw->ostream->println("bytes");
   }
-  // Do not block the key-input path on an SD media flush.  The record is
-  // already copied into the filesystem buffer; process_qso_file_operation()
-  // performs the actual flush after a short grace period.
-  qso_log_flush_pending = true;
-  qso_log_flush_due_ms = millis() + QSO_LOG_FLUSH_DELAY_MS;
+  // qso_log_append_record() schedules the normal deferred flush.
   if (verbose&4) 	{
     if (!plogw->f_console_emu) plogw->ostream->println("print_qso_logfile():4 flush deferred");
   }
@@ -2577,17 +3737,15 @@ bool append_secondary_contest_qso(const char *recv_exch,
         "keeping primary Sent EXCH\n", contest_name);
   }
 
-  // Give the second logical contest record its own QSOID while retaining the
-  // same physical QSO time/sequence number. QSOID is encoded in CQ/SP trr.
-  const uint32_t primary_qsoid = plogw->qsoid;
-  uint32_t second_qsoid = primary_qsoid;
-  for (int tries = 0; tries < 8 && second_qsoid == primary_qsoid; ++tries)
-    second_qsoid = plogw->txnum * 100000000UL +
-                   plogw->seqnr * 10000UL + random(100) * 100UL;
-  if (second_qsoid == primary_qsoid)
-    second_qsoid = plogw->txnum * 100000000UL +
-                   plogw->seqnr * 10000UL +
-                   (((primary_qsoid / 100UL) + 1UL) % 100UL) * 100UL;
+  // The second logical contest record is a separate QSO object and therefore
+  // consumes its own persistent QSOID sequence number.  Do not rely on the
+  // random suffix to distinguish two records with the same display seqnr.
+  const uint32_t second_qsoid = qsoid_allocate_local();
+  if (second_qsoid == 0) {
+    if (plogw->ostream) plogw->ostream->println("DUAL QSO: QSOID allocation failed");
+    free(w);
+    return false;
+  }
 
   memcpy(w->remarks, w->second.entry.remarks, LEN_REMARKS);
   w->remarks[LEN_REMARKS] = '\0';
@@ -2600,6 +3758,18 @@ bool append_secondary_contest_qso(const char *recv_exch,
              (unsigned long)((second_qsoid / 100000000UL) % 10UL),
              (unsigned long)((second_qsoid / 100UL) % 100UL), body);
     strlcpy(w->remarks, w->rebuilt, sizeof(w->remarks));
+  }
+  // Replace the primary local-ID metadata with the independently allocated
+  // QSOID for the secondary contest record.
+  char *lq = strstr(w->remarks, "LQID:");
+  if (lq) {
+    char *end = strchr(lq, ' ');
+    if (end) {
+      char tail[LEN_REMARKS + 1];
+      strlcpy(tail, end + 1, sizeof(tail));
+      snprintf(lq, sizeof(w->remarks) - (size_t)(lq - w->remarks),
+               "LQID:%lu %s", (unsigned long)second_qsoid, tail);
+    }
   }
 
   if (!qso_replace_contest_tag(w->remarks, sizeof(w->remarks),
@@ -2615,9 +3785,8 @@ bool append_secondary_contest_qso(const char *recv_exch,
           sizeof(w->second.entry.remarks) - 1);
   w->second.all[QSO_RECORD_SIZE - 1] = 0x0d;
 
-  const size_t written = qsologf.write(w->second.all, sizeof(w->second.all));
-  qso_log_flush_pending = true;
-  qso_log_flush_due_ms = millis() + QSO_LOG_FLUSH_DELAY_MS;
+  const size_t written = qso_log_append_record(&w->second,
+                                               QSO_LOG_APPEND_NORMAL);
   if (written != sizeof(w->second.all)) {
     free(w);
     return false;
@@ -2821,6 +3990,14 @@ void make_qsolog_entry() {
 	    (plogw->qsoid/100000000)%10,
 	    (plogw->qsoid/100)%100);
     strcat(qso.entry.remarks,tmpbuf);
+    // Store the exact locally-issued QSOID.  This separates QSO identity from
+    // the display/log seqnr and lets zmerge distinguish safe local IDs from
+    // legacy records whose origin is uncertain.
+    char lqidbuf[24];
+    snprintf(lqidbuf, sizeof(lqidbuf), "LQID:%lu ",
+             (unsigned long)plogw->qsoid);
+    strncat(qso.entry.remarks, lqidbuf,
+            sizeof(qso.entry.remarks) - strlen(qso.entry.remarks) - 1);
 
     if ((radio->modetype==LOG_MODETYPE_PH) && (radio->f_tone_keying)) {
       // F2A

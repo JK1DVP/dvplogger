@@ -134,7 +134,7 @@ private:
     float    mag; 
   }  ;
 
-  static RingBuffer<RmsBlock> g_rms_rb;
+  static RingBuffer<RmsBlock> *g_rms_rb;
   static SemaphoreHandle_t    g_rb_mtx ;
   static TaskHandle_t         s_i2s_task ;
   static volatile bool        s_run ;

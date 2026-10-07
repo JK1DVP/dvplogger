@@ -27,6 +27,8 @@ void resume_webserver_after_flash();
 void process_web_terminal_log_queue();
 void process_web_bandmap();
 void process_web_ui_queue();
+void process_web_prepared_export_job();
+void process_web_filelist_job();
 
 // Contest runtime preset helpers used by keyboard/terminal contest switching.
 bool save_contest_runtime_preset(const char *contest_name);

@@ -53,6 +53,7 @@
 #include "antenna.h"
 #include "satellite.h"
 #include "ui.h"
+#include "network_arena.h"
 #include "Plan13.h"
 #include "multi_process.h"
 #include "iambic_keyer.h"
@@ -445,7 +446,7 @@ static void web_trace_heap(uint32_t id, const char *event, const char *path,
   const uint32_t awm = asyncTCPStackHighWaterMark();
   const uint32_t astack = asyncTCPStackConfiguredSize();
   const uint32_t aused = (awm && awm <= astack) ? astack - awm : 0;
-  console->printf("[WEBTRACE] #%lu %-6s %-20s free=%u largest=%u min=%u async_used~=%u q=%u total=%u\\n",
+  console->printf("[WEBTRACE] #%lu %-6s %-20s free=%u largest=%u min=%u async_used~=%u q=%u total=%u\n",
                   (unsigned long)id, event ? event : "?", path ? path : "?",
                   (unsigned)info.total_free_bytes, (unsigned)info.largest_free_block,
                   (unsigned)info.minimum_free_bytes, (unsigned)aused,
@@ -477,6 +478,17 @@ static void web_trace_touch(uint32_t id, const char *path, const char *event,
   web_trace_heap(id, event, path, total);
 }
 
+static void sat_web_diag(const char *event, const char *path) {
+  if (!f_low_memory_mode || !lowmem_trace || !console) return;
+  multi_heap_info_t info;
+  heap_caps_get_info(&info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  console->printf("[SATWEB] %-7s %-20s free=%u largest=%u min=%u async_q=%u\n",
+                  event ? event : "?", path ? path : "?",
+                  (unsigned)info.total_free_bytes, (unsigned)info.largest_free_block,
+                  (unsigned)info.minimum_free_bytes,
+                  (unsigned)asyncTCPQueueMessagesWaiting());
+}
+
 static void web_trace_poll() {
   if (!f_low_memory_mode || !lowmem_trace) return;
   const uint32_t now = millis();
@@ -500,29 +512,18 @@ static void web_trace_poll() {
 // tight; small control/API requests remain available.  The browser can retry.
 static bool web_lowmem_admit_heavy(AsyncWebServerRequest *request,
                                    const char *path) {
-  if (!f_low_memory_mode) return true;
-  const size_t free_internal =
-      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const size_t largest_internal =
-      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const unsigned q = (unsigned)asyncTCPQueueMessagesWaiting();
-  // Base admission on the *current* heap/AsyncTCP state.  A completed earlier
-  // request may have driven the historical minimum very low; that is not a
-  // reason to reject a new request after the heap has recovered.
-  if (free_internal >= 14000 && largest_internal >= 7000 && q < 10) return true;
-
-  if (lowmem_trace && console) {
-    console->printf("[WEBGUARD] reject %-20s free=%u largest=%u q=%u\n",
-                    path ? path : "?", (unsigned)free_internal,
-                    (unsigned)largest_internal, q);
-  }
-  AsyncWebServerResponse *response =
-      request->beginResponse(503, "text/plain",
-                             "Web busy / low memory; retry shortly");
-  response->addHeader("Retry-After", "1");
-  response->addHeader("Cache-Control", "no-store");
-  request->send(response);
-  return false;
+  // LOWMEM admission guard disabled.
+  //
+  // The old 14 KiB / 7 KiB thresholds were rejecting normal Web functions
+  // even when the current heap still had a healthy contiguous block
+  // (for example free~=13 KiB, largest~=9.7 KiB, AsyncTCP queue empty).
+  //
+  // Heavy Web formatting is now serialized by Network Arena, so let the
+  // request proceed and allow the actual allocator / arena ownership to be
+  // authoritative.  Keep the function so existing handlers need no changes.
+  (void)request;
+  (void)path;
+  return true;
 }
 
 // HW1 POTA/SOTA nearest-search admission control.  These handlers scan SD
@@ -530,95 +531,57 @@ static bool web_lowmem_admit_heavy(AsyncWebServerRequest *request,
 // searches can otherwise accumulate faster than TCP can drain them.
 static bool web_lowmem_admit_near(AsyncWebServerRequest *request,
                                   const char *path) {
-  if (!f_low_memory_mode) return true;
-  const size_t free_internal =
-      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const size_t largest_internal =
-      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  const unsigned q = (unsigned)asyncTCPQueueMessagesWaiting();
-  // Nearest searches only scan the SD file and return a small JSON object.
-  // Do not require the old 22 KiB reserve or an arbitrary time cooldown.
-  // The shared scratch lock already serializes the formatting phase.
-  if (free_internal >= 14000 && largest_internal >= 7000 && q < 8) return true;
-
-  if (lowmem_trace && console) {
-    console->printf("[WEBGUARD] reject %-20s free=%u largest=%u q=%u\\n",
-                    path ? path : "?", (unsigned)free_internal,
-                    (unsigned)largest_internal, q);
-  }
-  AsyncWebServerResponse *response =
-      request->beginResponse(503, "text/plain", "Search busy; retry shortly");
-  response->addHeader("Retry-After", "2");
-  response->addHeader("Cache-Control", "no-store");
-  request->send(response);
-  return false;
+  // Same policy as heavy Web responses: Network Arena / AsyncTCP now provide
+  // the real serialization/backpressure.  Do not reject solely because HW1
+  // happens to be below a conservative historical heap threshold.
+  (void)request;
+  (void)path;
+  return true;
 }
 
-// Shared Web formatting workspace.  6144 bytes is the experimentally chosen
-// bounded-buffer size used by the Web paths on both HW1 and HW3.  Keep it
-// static so large response formatting never fragments the Arduino heap.
-static constexpr size_t WEB_SHARED_SCRATCH_SIZE = 6144;
-static constexpr uint32_t WEB_SHARED_SCRATCH_STALE_MS = 30000U;
-static char web_shared_scratch[WEB_SHARED_SCRATCH_SIZE];
-static portMUX_TYPE web_shared_scratch_mux = portMUX_INITIALIZER_UNLOCKED;
-static bool web_shared_scratch_busy = false;
-static uint32_t web_shared_scratch_lease_seq = 0;
-static uint32_t web_shared_scratch_active_lease = 0;
-static uint32_t web_shared_scratch_acquired_ms = 0;
-static const char *web_shared_scratch_owner = nullptr;
+// Shared network formatting workspace.  Web keeps the whole 6144-byte arena
+// exclusively while a response is being formatted.  Telnet reuses the same
+// physical bytes as fixed 512-byte TX blocks whenever no Web lease is active.
+static constexpr size_t WEB_SHARED_SCRATCH_SIZE = NETWORK_SHARED_ARENA_SIZE;
+#define web_shared_scratch ((char *)network_arena_data())
 
 static bool web_shared_scratch_acquire(AsyncWebServerRequest *request,
                                        const char *path,
                                        uint32_t *lease_out) {
-  const uint32_t now = millis();
-  bool acquired = false;
   bool stale_reclaimed = false;
   const char *old_owner = nullptr;
   uint32_t old_age = 0;
   uint32_t lease = 0;
+  NetworkArenaStatus busy = {};
 
-  portENTER_CRITICAL(&web_shared_scratch_mux);
-  if (web_shared_scratch_busy) {
-    old_age = (uint32_t)(now - web_shared_scratch_acquired_ms);
-    if (old_age >= WEB_SHARED_SCRATCH_STALE_MS) {
-      old_owner = web_shared_scratch_owner;
-      web_shared_scratch_busy = false;
-      web_shared_scratch_active_lease = 0;
-      web_shared_scratch_owner = nullptr;
-      stale_reclaimed = true;
-    }
-  }
-  if (!web_shared_scratch_busy) {
-    web_shared_scratch_busy = true;
-    if (++web_shared_scratch_lease_seq == 0) ++web_shared_scratch_lease_seq;
-    lease = web_shared_scratch_lease_seq;
-    web_shared_scratch_active_lease = lease;
-    web_shared_scratch_acquired_ms = now;
-    web_shared_scratch_owner = path;
-    acquired = true;
-  }
-  const char *busy_owner = web_shared_scratch_owner;
-  const uint32_t busy_age = web_shared_scratch_busy ?
-      (uint32_t)(now - web_shared_scratch_acquired_ms) : 0;
-  portEXIT_CRITICAL(&web_shared_scratch_mux);
+  const bool acquired = network_arena_web_acquire(
+      path, &lease, &stale_reclaimed, &old_owner, &old_age, &busy);
 
   if (stale_reclaimed && console) {
-    console->printf("[WEBSCRATCH] STALE release owner=%s age=%u ms\n",
+    console->printf("[NETARENA] STALE web release owner=%s age=%u ms\n",
                     old_owner ? old_owner : "?", (unsigned)old_age);
   }
   if (acquired) {
     if (lease_out) *lease_out = lease;
     if (lowmem_trace && console)
-      console->printf("[WEBSCRATCH] acquire %-20s lease=%u\n",
+      console->printf("[NETARENA] web acquire %-20s lease=%u\n",
                       path ? path : "?", (unsigned)lease);
     return true;
   }
-  if (lowmem_trace && console)
-    console->printf("[WEBSCRATCH] busy %-20s owner=%s age=%u ms lease=%u\n",
-                    path ? path : "?", busy_owner ? busy_owner : "?",
-                    (unsigned)busy_age, (unsigned)web_shared_scratch_active_lease);
+
+  if (lowmem_trace && console) {
+    if (busy.mode == NETWORK_ARENA_TELNET) {
+      console->printf("[NETARENA] web busy %-20s telnet_blocks=%u\n",
+                      path ? path : "?", (unsigned)busy.telnet_blocks);
+    } else {
+      console->printf("[NETARENA] web busy %-20s owner=%s age=%u ms lease=%u\n",
+                      path ? path : "?", busy.owner ? busy.owner : "?",
+                      (unsigned)busy.age_ms, (unsigned)busy.web_lease);
+    }
+  }
   AsyncWebServerResponse *response =
-      request->beginResponse(503, "text/plain", "Web formatter busy; retry shortly");
+      request->beginResponse(503, "text/plain",
+                             "Network formatter busy; retry shortly");
   response->addHeader("Retry-After", "1");
   response->addHeader("Cache-Control", "no-store");
   request->send(response);
@@ -627,22 +590,11 @@ static bool web_shared_scratch_acquire(AsyncWebServerRequest *request,
 
 static void web_shared_scratch_release(uint32_t lease) {
   if (!lease) return;
-  const uint32_t now = millis();
-  bool released = false;
   const char *owner = nullptr;
   uint32_t age = 0;
-  portENTER_CRITICAL(&web_shared_scratch_mux);
-  if (web_shared_scratch_busy && web_shared_scratch_active_lease == lease) {
-    owner = web_shared_scratch_owner;
-    age = (uint32_t)(now - web_shared_scratch_acquired_ms);
-    web_shared_scratch_busy = false;
-    web_shared_scratch_active_lease = 0;
-    web_shared_scratch_owner = nullptr;
-    released = true;
-  }
-  portEXIT_CRITICAL(&web_shared_scratch_mux);
+  const bool released = network_arena_web_release(lease, &owner, &age);
   if (released && lowmem_trace && console)
-    console->printf("[WEBSCRATCH] release %-20s lease=%u age=%u ms\n",
+    console->printf("[NETARENA] web release %-20s lease=%u age=%u ms\n",
                     owner ? owner : "?", (unsigned)lease, (unsigned)age);
 }
 
@@ -681,146 +633,226 @@ static void humanReadableSizeToBuffer(size_t bytes, char *out, size_t out_size) 
   }
 }
 
-// Stream the SD-card directory as HTML.  Only one table row is retained in
-// RAM, rather than constructing the complete file list in a String.
-static void setupSdFileListHandler() {
-  web_server.on("/filelist", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!web_lowmem_admit_heavy(request, "/filelist")) return;
-    struct FileListState {
-      enum Stage : uint8_t { Header, OpenEntry, Row, Footer, Done } stage = Header;
-      File root;
-      File entry;
-      size_t offset = 0;
-      size_t length = 0;
-      char text[320];
-      uint32_t trace_id = 0;
-      size_t trace_total = 0;
-      size_t trace_next = 4096;
-      bool trace_eof = false;
-    };
+// Build the SD-card directory listing outside the AsyncTCP callback on HW1.
+// The old beginChunkedResponse() implementation called openNextFile() from the
+// response producer and repeatedly created/destroyed FS objects while AsyncTCP
+// buffers were live.  v20 moved this work to the main loop, but kept the root
+// directory and output File open across several loop passes.  That allowed TLE
+// parsing and other SD/network work to interleave with the directory scan.
+//
+// v20a keeps the prepare/download split, but performs the complete directory
+// open -> scan -> output close transaction in ONE main-loop call.  It starts
+// only when TLE work is idle, the AsyncTCP event queue is empty, and the HW1
+// heap has enough contiguous space.  No File object survives the call.
+namespace {
+enum WebFileListPhase : uint8_t {
+  WEB_FILELIST_IDLE = 0,
+  WEB_FILELIST_START,
+  WEB_FILELIST_READY,
+  WEB_FILELIST_FAILED
+};
 
-    std::shared_ptr<FileListState> state = std::make_shared<FileListState>();
-    if (!state) {
-      request->send(503, "text/plain", "Not enough memory for SD file list");
-      return;
-    }
+struct WebFileListJob {
+  volatile WebFileListPhase phase = WEB_FILELIST_IDLE;
+  uint32_t generation = 0;
+  uint32_t entries = 0;
+  uint32_t bytes = 0;
+  uint32_t started_ms = 0;
+  uint32_t last_defer_log_ms = 0;
+};
 
-    state->trace_id = web_trace_begin("/filelist");
-    state->root = SD.open("/");
-    if (!state->root) {
-      request->send(500, "text/plain", "Failed to open SD card root");
-      return;
-    }
+static WebFileListJob web_filelist_job;
+static constexpr const char *WEB_FILELIST_TMP = "/WEBFL.TMP";
+static constexpr const char *WEB_FILELIST_OUT = "/WEBFL.HTM";
 
-    webLog.println("Listing files stored on SD card (streamed)");
-
-    AsyncWebServerResponse *response = request->beginChunkedResponse(
-      "text/html; charset=utf-8",
-      [state](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
-        (void)index;
-        size_t written = 0;
-        const size_t chunkLimit = web_stream_chunk_limit(maxLen);
-
-        auto copy_pending = [&]() -> bool {
-          if (state->offset >= state->length) return true;
-          const size_t remain = state->length - state->offset;
-          const size_t available = chunkLimit - written;
-          const size_t ncopy = remain < available ? remain : available;
-          if (ncopy) {
-            memcpy(buffer + written, state->text + state->offset, ncopy);
-            state->offset += ncopy;
-            written += ncopy;
-          }
-          return state->offset >= state->length;
-        };
-
-        auto set_text = [&](const char *text) {
-          strlcpy(state->text, text, sizeof(state->text));
-          state->length = strlen(state->text);
-          state->offset = 0;
-        };
-
-        while (written < chunkLimit && state->stage != FileListState::Done) {
-          switch (state->stage) {
-          case FileListState::Header:
-            if (state->length == 0) {
-              set_text("<table><tr><th align='left'>Name</th>"
-                       "<th align='left'>Size</th>"
-                       "<th align='left'>Modified</th></tr>");
-            }
-            if (copy_pending()) {
-              state->length = 0;
-              state->stage = FileListState::OpenEntry;
-            }
-            break;
-
-          case FileListState::OpenEntry:
-            state->entry = state->root.openNextFile();
-            if (!state->entry) {
-              state->root.close();
-              state->stage = FileListState::Footer;
-              break;
-            }
-            {
-              char size_text[32];
-              char modified_text[32] = "-";
-              humanReadableSizeToBuffer(state->entry.size(), size_text, sizeof(size_text));
-
-              time_t modified = state->entry.getLastWrite();
-              if (modified > 0) {
-                struct tm tm_info;
-                if (localtime_r(&modified, &tm_info) != nullptr) {
-                  strftime(modified_text, sizeof(modified_text),
-                           "%Y-%m-%d %H:%M:%S", &tm_info);
-                }
-              }
-
-              snprintf(state->text, sizeof(state->text),
-                       "<tr align='left'><td>%s</td><td>%s</td><td>%s</td></tr>",
-                       state->entry.name(), size_text, modified_text);
-              state->entry.close();
-              state->length = strlen(state->text);
-              state->offset = 0;
-              state->stage = FileListState::Row;
-            }
-            break;
-
-          case FileListState::Row:
-            if (copy_pending()) {
-              state->length = 0;
-              state->stage = FileListState::OpenEntry;
-            }
-            break;
-
-          case FileListState::Footer:
-            if (state->length == 0) set_text("</table>");
-            if (copy_pending()) {
-              state->length = 0;
-              state->stage = FileListState::Done;
-            }
-            break;
-
-          case FileListState::Done:
-            break;
-          }
-        }
-        state->trace_total += written;
-        if (state->trace_total >= state->trace_next) {
-          web_trace_touch(state->trace_id, "/filelist", "CHUNK", state->trace_total);
-          state->trace_next += 4096;
-        }
-        if (state->stage == FileListState::Done && !state->trace_eof) {
-          state->trace_eof = true;
-          web_trace_touch(state->trace_id, "/filelist", "EOF", state->trace_total);
-        }
-        return written;
-      });
-
-    response->addHeader("Cache-Control", "no-store");
-    request->send(response);
-    web_trace_touch(state->trace_id, "/filelist", "QUEUED");
-  });
+static bool web_filelist_write(File &dst, uint32_t &bytes, const char *text) {
+  if (!text || !dst) return false;
+  const size_t n = strlen(text);
+  if (!n) return true;
+  const size_t wrote = dst.write((const uint8_t *)text, n);
+  if (wrote != n) return false;
+  bytes += wrote;
+  return true;
 }
+
+static void web_filelist_fail(const char *reason) {
+  web_filelist_job.phase = WEB_FILELIST_FAILED;
+  if (console) {
+    console->printf("WEB FILELIST failed: %s free=%u largest=%u\n",
+                    reason ? reason : "?",
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+}
+
+static uint32_t web_filelist_request_generation() {
+  // If a build is already waiting to start, let all callers wait for that
+  // generation. READY/FAILED requests create a fresh listing.
+  if (web_filelist_job.phase == WEB_FILELIST_START) {
+    return web_filelist_job.generation;
+  }
+  ++web_filelist_job.generation;
+  web_filelist_job.entries = 0;
+  web_filelist_job.bytes = 0;
+  web_filelist_job.started_ms = millis();
+  web_filelist_job.last_defer_log_ms = 0;
+  web_filelist_job.phase = WEB_FILELIST_START;
+  if (console) {
+    console->printf("WEB FILELIST prepare requested gen=%lu free=%u largest=%u\n",
+                    (unsigned long)web_filelist_job.generation,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  return web_filelist_job.generation;
+}
+
+static bool web_filelist_heap_ready(size_t free_now, size_t largest,
+                                    uint32_t async_q) {
+#if JK1DVPLOG_HWVER == 1
+  return free_now >= 16384 && largest >= 9216 && async_q == 0;
+#else
+  return free_now >= 24576 && largest >= 12288 && async_q == 0;
+#endif
+}
+
+static void process_web_filelist_job_internal() {
+  if (web_filelist_job.phase != WEB_FILELIST_START) return;
+
+  const uint32_t now = millis();
+
+  // The browser starts prepare only after /api/storage has completed, but its
+  // AsyncTCP/lwIP resources can remain alive briefly afterwards.  Give them a
+  // little extra settling time before opening the SD directory.
+  if ((uint32_t)(now - web_filelist_job.started_ms) < 600) return;
+
+  const size_t free_now =
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const size_t largest =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t async_q = asyncTCPQueueMessagesWaiting();
+  const bool tle_busy = sat_tle_work_pending();
+
+  if (tle_busy || !web_filelist_heap_ready(free_now, largest, async_q)) {
+    if (console && (web_filelist_job.last_defer_log_ms == 0 ||
+                    now - web_filelist_job.last_defer_log_ms >= 2000)) {
+      web_filelist_job.last_defer_log_ms = now;
+      console->printf(
+          "WEB FILELIST deferred gen=%lu tle=%u free=%u largest=%u async_q=%u\n",
+          (unsigned long)web_filelist_job.generation, tle_busy ? 1U : 0U,
+          (unsigned)free_now, (unsigned)largest, (unsigned)async_q);
+    }
+    return;
+  }
+
+  uint32_t entries = 0;
+  uint32_t bytes = 0;
+  bool ok = true;
+  const char *fail_reason = nullptr;
+
+  if (SD.exists(WEB_FILELIST_TMP)) SD.remove(WEB_FILELIST_TMP);
+
+  // Keep all File objects inside this scope.  No return to the main loop until
+  // root, every entry, and dst have all been closed/destroyed.
+  {
+    File root = SD.open("/");
+    if (!root) {
+      ok = false;
+      fail_reason = "cannot open SD root";
+    }
+
+    File dst;
+    if (ok) {
+      dst = SD.open(WEB_FILELIST_TMP, FILE_WRITE);
+      if (!dst) {
+        ok = false;
+        fail_reason = "cannot create temp file";
+      }
+    }
+
+    if (ok && !web_filelist_write(
+                  dst, bytes,
+                  "<table><tr><th align='left'>Name</th><th align='left'>Size</th><th align='left'>Modified</th></tr>")) {
+      ok = false;
+      fail_reason = "header write error";
+    }
+
+    while (ok) {
+      File entry = root.openNextFile();
+      if (!entry) break;
+
+      char size_text[32];
+      char modified_text[32] = "-";
+      char row[320];
+      humanReadableSizeToBuffer(entry.size(), size_text, sizeof(size_text));
+      time_t modified = entry.getLastWrite();
+      if (modified > 0) {
+        struct tm tm_info;
+        if (localtime_r(&modified, &tm_info) != nullptr) {
+          strftime(modified_text, sizeof(modified_text), "%Y-%m-%d %H:%M:%S", &tm_info);
+        }
+      }
+      snprintf(row, sizeof(row),
+               "<tr align='left'><td>%s</td><td>%s</td><td>%s</td></tr>",
+               entry.name(), size_text, modified_text);
+      entry.close();
+
+      if (!web_filelist_write(dst, bytes, row)) {
+        ok = false;
+        fail_reason = "row write error";
+        break;
+      }
+      ++entries;
+    }
+
+    if (ok && !web_filelist_write(dst, bytes, "</table>")) {
+      ok = false;
+      fail_reason = "footer write error";
+    }
+
+    if (dst) {
+      dst.flush();
+      dst.close();
+    }
+    if (root) root.close();
+  }
+
+  if (!ok) {
+    if (SD.exists(WEB_FILELIST_TMP)) SD.remove(WEB_FILELIST_TMP);
+    web_filelist_fail(fail_reason);
+    return;
+  }
+
+  if (SD.exists(WEB_FILELIST_OUT)) SD.remove(WEB_FILELIST_OUT);
+  if (!SD.rename(WEB_FILELIST_TMP, WEB_FILELIST_OUT)) {
+    web_filelist_fail("rename failed");
+    return;
+  }
+
+  {
+    File f = SD.open(WEB_FILELIST_OUT, FILE_READ);
+    if (!f) {
+      web_filelist_fail("cannot reopen output");
+      return;
+    }
+    bytes = f.size();
+    f.close();
+  }
+
+  web_filelist_job.entries = entries;
+  web_filelist_job.bytes = bytes;
+  web_filelist_job.phase = WEB_FILELIST_READY;
+  if (console) {
+    console->printf(
+        "WEB FILELIST ready gen=%lu entries=%lu bytes=%lu ms=%lu free=%u largest=%u\n",
+        (unsigned long)web_filelist_job.generation,
+        (unsigned long)web_filelist_job.entries,
+        (unsigned long)web_filelist_job.bytes,
+        (unsigned long)(millis() - web_filelist_job.started_ms),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+}
+} // namespace
 
 // Make size of files human readable.  Used only for the three small storage
 // values inserted into the top page; the directory itself is streamed above.
@@ -1687,6 +1719,10 @@ static const char rigs_page_header[] PROGMEM = R"rawliteral(
     For example <code>SWR:200</code> means 2.00:1. Omit or use 0 to disable automatic action.</li>
   <li><strong>TH:<em>milliseconds</em></strong> external tuner contact hold time
     (500..3000, default 1500).</li>
+  <li><strong>NP:<em>0|1</em></strong> normal periodic CAT/CI-V polling:
+    0=enabled (default), 1=disabled. Existing Yaesu query queues are left intact.
+    After a DVPlogger frequency/mode SET, one confirmation readback is allowed
+    in the corresponding existing interval-query slot.</li>
   <li><strong>B:<em>baudrate</em></strong></li>
   <li><strong>P:<em>catport_number</em></strong> ((-2:Manual) ‑1:USB, 1:Bluetooth, 2:CI‑V, 3:CAT, 4:CAT2)</li>
   <li><strong>ADR:<em>CI‑V_address</em></strong></li>
@@ -1949,9 +1985,9 @@ static const char contests_page_footer[] PROGMEM = R"rawliteral(
 <tr><td>F1</td><td><code>$U $T DE $I $I $T</code></td><td><code>CQ TEST DE JK1DVP JK1DVP TEST</code></td></tr>
 <tr><td>F2</td><td><code>$C $V $W</code></td><td><code>JA1ABC 5NN 1115</code></td></tr>
 <tr><td>F3</td><td><code>$A $I $T</code></td><td><code>TU JK1DVP TEST</code></td></tr>
-<tr><td>F5</td><td><code>$C $V$W$P</code></td><td><code>JA1ABC 5NN1115M</code></td></tr>
+<tr><td>F5</td><td><code>$C $V$W</code></td><td><code>JA1ABC 5NN1115M</code></td></tr>
 </tbody></table>
-<p class="note">メッセージ中の空白は語間として送信されます。<code>$V$W$P</code> のように、マクロを空白なしで連結することもできます。</p>
+<p class="note">メッセージ中の空白は語間として送信されます。<code>$V$W</code> のように、マクロを空白なしで連結することもできます。</p>
 </body></html>
 )rawliteral";
 
@@ -1993,8 +2029,8 @@ static const char contests_page_footer_en[] PROGMEM = R"rawliteral(
 <h3>CW message macros</h3><p class="note">Enter the value actually sent (for example <code>11</code> or <code>1115</code>) in “Sent exchange”. <code>$W</code> expands to this value. Abbreviated CW numerals follow the DVPlogger CW-number setting.</p>
 <table class="help"><thead><tr><th>Macro</th><th>Expansion</th></tr></thead><tbody>
 <tr><td><code>$I</code></td><td>Your callsign</td></tr><tr><td><code>$C</code></td><td>Other station's callsign</td></tr><tr><td><code>$U</code></td><td><code>CQ</code> in CW/Digital modes</td></tr><tr><td><code>$T</code></td><td><code>TEST</code> in CW/Digital modes</td></tr><tr><td><code>$A</code></td><td><code>TU</code> in CW/Digital modes</td></tr><tr><td><code>$V</code></td><td>Sent RST; normally shortened to <code>5NN</code> in CW</td></tr><tr><td><code>$W</code></td><td>Sent exchange in this table</td></tr><tr><td><code>$P</code></td><td>Band-specific power code</td></tr><tr><td><code>$J</code></td><td>Your JCC/JCG number from settings</td></tr><tr><td><code>$S</code></td><td>Current overall QSO serial number</td></tr><tr><td><code>$Q</code></td><td>Next band-specific serial number (3 digits)</td></tr><tr><td><code>$N</code></td><td>Operator name</td></tr></tbody></table>
-<h3>Examples</h3><table class="help examples"><thead><tr><th>Key</th><th>Input</th><th>Sent text</th></tr></thead><tbody><tr><td>F1</td><td><code>$U $T DE $I $I $T</code></td><td><code>CQ TEST DE JK1DVP JK1DVP TEST</code></td></tr><tr><td>F2</td><td><code>$C $V $W</code></td><td><code>JA1ABC 5NN 1115</code></td></tr><tr><td>F3</td><td><code>$A $I $T</code></td><td><code>TU JK1DVP TEST</code></td></tr><tr><td>F5</td><td><code>$C $V$W$P</code></td><td><code>JA1ABC 5NN1115M</code></td></tr></tbody></table>
-<p class="note">Spaces in a message are sent as word spaces. Macros may also be concatenated without spaces, as in <code>$V$W$P</code>.</p></body></html>
+<h3>Examples</h3><table class="help examples"><thead><tr><th>Key</th><th>Input</th><th>Sent text</th></tr></thead><tbody><tr><td>F1</td><td><code>$U $T DE $I $I $T</code></td><td><code>CQ TEST DE JK1DVP JK1DVP TEST</code></td></tr><tr><td>F2</td><td><code>$C $V $W</code></td><td><code>JA1ABC 5NN 1115</code></td></tr><tr><td>F3</td><td><code>$A $I $T</code></td><td><code>TU JK1DVP TEST</code></td></tr><tr><td>F5</td><td><code>$C $V$W</code></td><td><code>JA1ABC 5NN1115M</code></td></tr></tbody></table>
+<p class="note">Spaces in a message are sent as word spaces. Macros may also be concatenated without spaces, as in <code>$V$W</code>.</p></body></html>
 )rawliteral";
 
 struct ContestWebPreset {
@@ -3154,6 +3190,11 @@ struct QsoDumpState {
   bool owns_scratch = false;
   uint32_t scratch_lease = 0;
   bool headerWritten = false;  // added
+  // Optional bounded range used by the browser READQSO pager.  Keeping each
+  // HTTP response short avoids holding one AsyncTCP response open for the
+  // entire multi-megabyte QSO log.
+  size_t recordsRemaining = SIZE_MAX;
+  bool suppressFooter = false;
   ~QsoDumpState() { if (file) file.close(); if (owns_scratch) web_shared_scratch_release(scratch_lease); }
   char park[24] = {0};
   char summit[24] = {0};
@@ -3231,8 +3272,9 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
     }
   }
 
-  // 2. ファイル終端チェック
-  if (!state.file || state.finished || state.pos >= state.file.size()) {
+  // 2. ファイル終端 / bounded-page 終端チェック
+  if (!state.file || state.finished || state.pos >= state.file.size() ||
+      state.recordsRemaining == 0) {
     state.finished = true;
     return 0;
   }
@@ -3240,7 +3282,7 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
   // main qso read & dump loop
   while (bytesWritten < chunkLimit) {
     //  while ((bytesWritten < maxLen)) {
-    if (state.pos >= state.file.size()) {
+    if (state.pos >= state.file.size() || state.recordsRemaining == 0) {
       state.finished = true;
       webLog.print("chk state.pos:");      webLog.print(state.pos);
       webLog.print(" state.file.size():");      webLog.println(state.file.size());      
@@ -3255,6 +3297,7 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
       break;
     }
     state.pos += n;
+    if (state.recordsRemaining != SIZE_MAX) --state.recordsRemaining;
 
     // 整形処理
     state.dumpbuf[0]='\0';
@@ -3362,6 +3405,10 @@ size_t readQsoChunk( struct QsoDumpState& state, uint8_t* buffer, size_t maxLen)
     webLog.println("state.finished reached");
     char *footer = web_shared_scratch + 2048;
     size_t footerTotal = 0;
+    if (state.suppressFooter) {
+      footer[0] = '\0';
+      footerTotal = 0;
+    } else
     if (state.type == 5) {
       strlcpy(footer, "END-OF-LOG:\r\n", 1024);
       footerTotal = strlen(footer);
@@ -3448,6 +3495,28 @@ void handleQsoLogDump(AsyncWebServerRequest* request, const String& numstr, int 
       return;
     }
 
+    // Browser READQSO uses short, bounded responses.  _start/_count are
+    // intentionally private-ish query names so normal export URLs retain
+    // their historical all-record behavior.
+    size_t qso_total_records = state->file.size() / sizeof(state->qso.all);
+    if (type == 1 && request->hasParam("_count")) {
+      unsigned long start = request->hasParam("_start")
+          ? request->getParam("_start")->value().toInt() : 0;
+      unsigned long count = request->getParam("_count")->value().toInt();
+      if (count == 0) count = 512;
+      // Browser READQSO deliberately uses fairly large pages.  Very small
+      // pages caused excessive AsyncWebServer/AsyncTCP response churn on HW1
+      // (7,848 QSOs at 64/page meant ~123 separate responses).  512 records
+      // is still a bounded/short response, but reduces that churn to ~16.
+      if (count > 512) count = 512;
+      if (start > qso_total_records) start = qso_total_records;
+      state->pos = (size_t)start * sizeof(state->qso.all);
+      state->recordsRemaining = (size_t)count;
+      if (state->recordsRemaining > qso_total_records - start)
+        state->recordsRemaining = qso_total_records - start;
+      state->suppressFooter = true;
+    }
+
     if (type == 5) {
       // Cabrillo is a contest log, unlike /readqso.  Export only QSOs tagged
       // with the currently selected contest.  If no contest is selected, use
@@ -3512,9 +3581,1036 @@ void handleQsoLogDump(AsyncWebServerRequest* request, const String& numstr, int 
     if (type == 5) response->addHeader("Content-Disposition", "attachment; filename=contest.log");
     response->addHeader("Server", "ESP Async Web Server");
     response->addHeader("Cache-Control", "no-store");
+    if (type == 1 && request->hasParam("_count")) {
+      char total_buf[24];
+      snprintf(total_buf, sizeof(total_buf), "%u", (unsigned)qso_total_records);
+      response->addHeader("X-QSO-Total", total_buf);
+    }
     request->send(response);
   }
 
+
+
+// Dedicated lightweight READQSO Web stream.  Unlike handleQsoLogDump(), this
+// state does not hold the shared Network Arena for the lifetime of a long HTTP
+// response.  The source File is opened once and consumed strictly forward;
+// there is no record offset/seek protocol and no application-level ACK/FIFO.
+struct ReadQsoStreamState {
+  File file;
+  union qso_union_tag qso;
+  char pending[512];
+  size_t pending_len = 0;
+  size_t pending_off = 0;
+  uint32_t records_total = 0;
+  uint32_t records_done = 0;
+  uint32_t q_records = 0;
+  uint32_t deleted_records = 0;
+  uint32_t other_records = 0;
+  uint32_t bytes_sent = 0;
+  uint32_t started_ms = 0;
+  bool finished = false;
+  bool read_error = false;
+  char source_name[20] = {0};
+
+  ~ReadQsoStreamState() {
+    if (file) file.close();
+  }
+};
+
+static size_t readQsoSequentialStreamChunk(ReadQsoStreamState& state,
+                                           uint8_t *buffer,
+                                           size_t maxLen) {
+  if (!buffer || maxLen == 0 || state.finished) return 0;
+
+  // Keep each AsyncTCP producer invocation modest.  TCP itself supplies the
+  // ACK/retransmit/back-pressure; this cap only limits work done in one callback.
+  const size_t chunkLimit = std::min(web_stream_chunk_limit(maxLen),
+                                     (size_t)2048);
+  size_t written = 0;
+
+  while (written < chunkLimit) {
+    // Finish a formatted line that did not fit in the previous TCP buffer.
+    if (state.pending_off < state.pending_len) {
+      size_t n = state.pending_len - state.pending_off;
+      size_t room = chunkLimit - written;
+      if (n > room) n = room;
+      memcpy(buffer + written, state.pending + state.pending_off, n);
+      state.pending_off += n;
+      written += n;
+      state.bytes_sent += (uint32_t)n;
+      if (state.pending_off < state.pending_len) break;
+      state.pending_len = 0;
+      state.pending_off = 0;
+      continue;
+    }
+
+    if (state.records_done >= state.records_total) {
+      state.finished = true;
+      if (state.file) state.file.close();
+      if (console) {
+        console->printf("WEB READQSO complete: source=%lu Q=%lu D=%lu other=%lu bytes=%lu ms=%lu\n",
+                        (unsigned long)state.records_done,
+                        (unsigned long)state.q_records,
+                        (unsigned long)state.deleted_records,
+                        (unsigned long)state.other_records,
+                        (unsigned long)state.bytes_sent,
+                        (unsigned long)(millis() - state.started_ms));
+      }
+      break;
+    }
+
+    // Sequential source read only: never seek and never reopen per chunk.
+    if (state.file.read(state.qso.all, sizeof(state.qso.all)) != sizeof(state.qso.all)) {
+      state.read_error = true;
+      state.finished = true;
+      if (state.file) state.file.close();
+      if (console) {
+        console->printf("WEB READQSO stream read error at %lu/%lu\n",
+                        (unsigned long)state.records_done,
+                        (unsigned long)state.records_total);
+      }
+      break;
+    }
+    state.records_done++;
+
+    const char record_type = state.qso.entry.type[0];
+    if (record_type == 'Q') {
+      state.q_records++;
+    } else if (record_type == 'D') {
+      state.deleted_records++;
+      continue;
+    } else {
+      state.other_records++;
+      // Keep READQSO semantics conservative for now: unknown record types are
+      // not exported.  Report the first few so we can distinguish old-format
+      // records from record-boundary/corruption problems without a second pass.
+      if (console && state.other_records <= 8) {
+        const unsigned char t = (unsigned char)record_type;
+        console->printf("WEB READQSO non-Q record #%lu source_index=%lu type=0x%02X '%c'\n",
+                        (unsigned long)state.other_records,
+                        (unsigned long)state.records_done,
+                        (unsigned)t,
+                        (t >= 32 && t < 127) ? (char)t : '.');
+      }
+      continue;
+    }
+    reformat_qso_entry(&state.qso);
+    state.pending[0] = '\0';
+    sprint_qso_entry(state.pending, &state.qso);
+    state.pending_len = strnlen(state.pending, sizeof(state.pending));
+    state.pending_off = 0;
+
+    if (state.pending_len >= sizeof(state.pending) - 1) {
+      // A normal READQSO line is far smaller than this.  Stop rather than risk
+      // emitting a truncated/unterminated record if a corrupt QSO expands badly.
+      state.read_error = true;
+      state.finished = true;
+      if (state.file) state.file.close();
+      if (console) console->println("WEB READQSO stream: formatted line too long");
+      break;
+    }
+  }
+
+  return written;
+}
+
+// /readqso intentionally has no JavaScript staging page.  Export output is
+// sent directly as an HTTP attachment so the browser can write it to disk
+// while bytes arrive instead of retaining the entire log in a Blob.
+
+
+static void handleReadQsoSequentialDownload(AsyncWebServerRequest *request) {
+  if (!request) return;
+  if (!web_lowmem_admit_heavy(request, "/readqso")) return;
+
+  std::shared_ptr<ReadQsoStreamState> state = std::make_shared<ReadQsoStreamState>();
+  if (!state) {
+    request->send(503, "text/plain", "Not enough memory for READQSO stream state");
+    return;
+  }
+
+  if (request->hasParam("num")) {
+    String numstr = request->getParam("num")->value();
+    char *endp = nullptr;
+    long n = strtol(numstr.c_str(), &endp, 10);
+    if (endp == numstr.c_str() || *endp != '\0' || n < 0 || n > 999) {
+      request->send(400, "text/plain", "Invalid QSO backup number");
+      return;
+    }
+    snprintf(state->source_name, sizeof(state->source_name), "/qsobak.%03ld", n);
+  } else {
+    strlcpy(state->source_name, qsologfn, sizeof(state->source_name));
+  }
+
+  state->file = SD.open(state->source_name, FILE_READ);
+  if (!state->file) {
+    request->send(404, "text/plain", "QSO log not found");
+    return;
+  }
+  state->records_total = (uint32_t)(state->file.size() / QSO_RECORD_SIZE);
+  state->started_ms = millis();
+
+  if (console) {
+    console->printf("WEB READQSO download started: source_records=%lu source=%s free=%u largest=%u\n",
+                    (unsigned long)state->records_total,
+                    state->source_name,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+
+  AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "text/plain; charset=utf-8",
+      [state](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+        (void)index;
+        return readQsoSequentialStreamChunk(*state, buffer, maxLen);
+      });
+  response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Content-Disposition", "attachment; filename=READQSO.TXT");
+  request->send(response);
+}
+
+
+// READQSO download from the completed intermediate file.  The generator has
+// already written the exact bytes to /READQSO.TXT.  Use a lightweight custom
+// response here instead of AsyncFileResponse so HW1 does not accumulate large
+// response-side allocations.  Only one READQSO download may be active at a
+// time.  The response reports separately how many body bytes were queued and
+// how many bytes were acknowledged before the response object is destroyed.
+namespace {
+
+static volatile bool paced_download_active = false;
+static uint32_t readqso_download_generation = 0;
+
+class ReadQsoAckFileResponse : public AsyncWebServerResponse {
+public:
+  explicit ReadQsoAckFileResponse(File file, const char *download_name,
+                                  const char *content_type = "text/plain; charset=utf-8",
+                                  const char *log_label = "READQSO",
+                                  bool attachment = true)
+      : _file(file),
+        _download_name(download_name ? download_name : "EXPORT.DAT"),
+        _log_label(log_label ? log_label : "EXPORT"),
+        _attachment(attachment) {
+    _code = 200;
+    _contentType = content_type ? content_type : "application/octet-stream";
+    _contentLength = _file ? _file.size() : 0;
+    _sendContentLength = true;
+    _chunked = false;
+    _state = RESPONSE_SETUP;
+    _generation = ++readqso_download_generation;
+
+    addHeader("Cache-Control", "no-store");
+    addHeader("Connection", "close");
+    if (_attachment) {
+      String disposition = String("attachment; filename=") + _download_name;
+      addHeader("Content-Disposition", disposition.c_str());
+    }
+
+    paced_download_active = true;
+  }
+
+  ~ReadQsoAckFileResponse() override {
+    if (_file) _file.close();
+    paced_download_active = false;
+
+    if (console) {
+      const size_t ack_body = acknowledgedBodyBytes();
+      const bool complete = (_contentLength > 0 && ack_body >= _contentLength);
+      console->printf(
+          "WEB %s response destroy gen=%lu result=%s state=%u content=%lu "
+          "queued=%lu written=%lu ack_raw=%lu ack_body=%lu outstanding=%lu remain=%lu free=%u largest=%u\\n",
+          _log_label.c_str(), (unsigned long)_generation, complete ? "COMPLETE" : "ABORTED",
+          (unsigned)_state, (unsigned long)_contentLength,
+          (unsigned long)_sentLength, (unsigned long)_writtenLength,
+          (unsigned long)_ackedLength, (unsigned long)ack_body,
+          (unsigned long)(_sentLength > ack_body ? _sentLength - ack_body : 0),
+          (unsigned long)(_contentLength > ack_body ? _contentLength - ack_body : 0),
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+  }
+
+  bool _sourceValid() const override { return (bool)_file; }
+
+  void _respond(AsyncWebServerRequest *request) override {
+    if (!request || !_file) {
+      _state = RESPONSE_FAILED;
+      if (request && request->client()) request->client()->close();
+      return;
+    }
+
+    _head = _assembleHead(request->version());
+    _head_offset = 0;
+    _state = RESPONSE_HEADERS;
+    _last_reported_ack = 0;
+    _start_ms = millis();
+
+    if (console) {
+      console->printf(
+          "WEB %s paced download begin gen=%lu file=%lu head=%lu free=%u largest=%u\\n",
+          _log_label.c_str(), (unsigned long)_generation, (unsigned long)_contentLength,
+          (unsigned long)_headLength,
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+
+    pumpOne(request);
+  }
+
+  size_t _ack(AsyncWebServerRequest *request, size_t len, uint32_t time) override {
+    (void)time;
+    _ackedLength += len;
+
+    const size_t ack_body = acknowledgedBodyBytes();
+    if (console && (ack_body == _contentLength || ack_body >= _last_reported_ack + 32768U)) {
+      _last_reported_ack = ack_body;
+      console->printf(
+          "WEB %s ACK gen=%lu body=%lu/%lu raw=%lu queued=%lu outstanding=%lu remain=%lu ms=%lu\\n",
+          _log_label.c_str(), (unsigned long)_generation,
+          (unsigned long)ack_body, (unsigned long)_contentLength,
+          (unsigned long)_ackedLength, (unsigned long)_sentLength,
+          (unsigned long)(_sentLength > ack_body ? _sentLength - ack_body : 0),
+          (unsigned long)(_contentLength > ack_body ? _contentLength - ack_body : 0),
+          (unsigned long)(millis() - _start_ms));
+    }
+
+    const size_t target = _headLength + _contentLength;
+    if (_sentLength >= _contentLength && _ackedLength >= target) {
+      _state = RESPONSE_END;
+      if (console) {
+        console->printf(
+            "WEB %s fully ACKed gen=%lu body=%lu/%lu raw=%lu target=%lu ms=%lu\\n",
+            _log_label.c_str(), (unsigned long)_generation, (unsigned long)ack_body,
+            (unsigned long)_contentLength, (unsigned long)_ackedLength,
+            (unsigned long)target, (unsigned long)(millis() - _start_ms));
+      }
+      return 0;
+    }
+
+    return pumpOne(request);
+  }
+
+private:
+  static constexpr size_t SEND_SLICE = 1024;
+  File _file;
+  String _download_name;
+  String _log_label;
+  bool _attachment = true;
+  String _head;
+  size_t _head_offset = 0;
+  uint8_t _pending[SEND_SLICE];
+  size_t _pending_len = 0;
+  size_t _pending_off = 0;
+  size_t _last_reported_ack = 0;
+  uint32_t _start_ms = 0;
+  uint32_t _generation = 0;
+
+  size_t acknowledgedBodyBytes() const {
+    if (_ackedLength <= _headLength) return 0;
+    const size_t n = _ackedLength - _headLength;
+    return n > _contentLength ? _contentLength : n;
+  }
+
+  size_t queueBytes(AsyncWebServerRequest *request, const uint8_t *data, size_t len) {
+    if (!request || !request->client() || !data || !len) return 0;
+    const size_t room = request->client()->space();
+    if (!room) return 0;
+    const size_t n = len < room ? len : room;
+    const size_t added = request->client()->add((const char *)data, n);
+    if (added) {
+      request->client()->send();
+      _writtenLength += added;
+    }
+    return added;
+  }
+
+  size_t pumpOne(AsyncWebServerRequest *request) {
+    if (!request || !request->client()) return 0;
+
+    if (_state == RESPONSE_HEADERS) {
+      if (_head_offset < _head.length()) {
+        const size_t added = queueBytes(
+            request, (const uint8_t *)_head.c_str() + _head_offset,
+            _head.length() - _head_offset);
+        _head_offset += added;
+        if (_head_offset < _head.length()) return added;
+      }
+      _head = String();
+      _state = RESPONSE_CONTENT;
+    }
+
+    if (_state != RESPONSE_CONTENT && _state != RESPONSE_WAIT_ACK) return 0;
+
+    // Keep the first body chunk out of AsyncTCP until the complete HTTP head
+    // has been acknowledged.  This minimizes peak outstanding bytes.
+    if (_ackedLength < _headLength) {
+      _state = RESPONSE_WAIT_ACK;
+      return 0;
+    }
+
+    // Strict one-chunk-in-flight pacing: do not queue another body byte until
+    // every body byte previously queued has been acknowledged by TCP.
+    const size_t ack_body_now = acknowledgedBodyBytes();
+    if (_sentLength > ack_body_now) {
+      _state = RESPONSE_WAIT_ACK;
+      return 0;
+    }
+    if (_state == RESPONSE_WAIT_ACK) _state = RESPONSE_CONTENT;
+
+    // If a previous File.read() was only partially accepted by AsyncTCP, send
+    // the remainder first.  _sentLength counts only bytes actually queued.
+    if (_pending_off < _pending_len) {
+      const size_t added = queueBytes(request, _pending + _pending_off,
+                                      _pending_len - _pending_off);
+      _pending_off += added;
+      _sentLength += added;
+      if (_pending_off >= _pending_len) _pending_len = _pending_off = 0;
+      if (added) _state = RESPONSE_WAIT_ACK;
+      return added;
+    }
+
+    if (_sentLength >= _contentLength) {
+      _state = RESPONSE_WAIT_ACK;
+      return 0;
+    }
+
+    const size_t room = request->client()->space();
+    if (!room) return 0;
+    size_t want = _contentLength - _sentLength;
+    if (want > SEND_SLICE) want = SEND_SLICE;
+    if (want > room) want = room;
+    if (!want) return 0;
+
+    const size_t got = _file.read(_pending, want);
+    if (!got) {
+      _state = RESPONSE_FAILED;
+      if (console) {
+        console->printf("WEB %s paced download read error gen=%lu queued=%lu/%lu\n",
+                        _log_label.c_str(), (unsigned long)_generation, (unsigned long)_sentLength,
+                        (unsigned long)_contentLength);
+      }
+      request->client()->close();
+      return 0;
+    }
+
+    _pending_len = got;
+    _pending_off = 0;
+
+    const size_t added = queueBytes(request, _pending, _pending_len);
+    _pending_off = added;
+    _sentLength += added;
+    if (_pending_off >= _pending_len) _pending_len = _pending_off = 0;
+    if (added) _state = RESPONSE_WAIT_ACK;
+    if (_sentLength >= _contentLength && _pending_len == 0) {
+      _state = RESPONSE_WAIT_ACK;
+    }
+    return added;
+  }
+};
+
+}  // namespace
+
+static void handle_web_filelist_download(AsyncWebServerRequest *request) {
+  if (!request) return;
+  if (web_filelist_job.phase != WEB_FILELIST_READY) {
+    request->send(409, "text/plain", "File list is not ready");
+    return;
+  }
+  if (request->hasParam("generation")) {
+    const uint32_t g = strtoul(request->getParam("generation")->value().c_str(), nullptr, 10);
+    if (g != web_filelist_job.generation) {
+      request->send(409, "text/plain", "Stale file list generation");
+      return;
+    }
+  }
+  if (paced_download_active) {
+    request->send(409, "text/plain", "Another paced download is active");
+    return;
+  }
+  File f = SD.open(WEB_FILELIST_OUT, FILE_READ);
+  if (!f) {
+    request->send(404, "text/plain", "Prepared file list missing");
+    return;
+  }
+  ReadQsoAckFileResponse *response = new (std::nothrow) ReadQsoAckFileResponse(
+      f, "WEBFL.HTM", "text/html; charset=utf-8", "FILELIST", false);
+  if (!response) {
+    f.close();
+    request->send(503, "text/plain", "Not enough memory for file list response");
+    return;
+  }
+  request->send(response);
+}
+
+static void handleReadQsoFixedDownload(AsyncWebServerRequest *request) {
+  if (!request) return;
+  if (!web_lowmem_admit_heavy(request, "/readqso/download")) return;
+
+  if (paced_download_active) {
+    if (console) console->println("WEB READQSO download rejected: previous response still active");
+    AsyncWebServerResponse *busy = request->beginResponse(
+        409, "text/plain", "Previous READQSO download is still active; retry after it closes.");
+    busy->addHeader("Connection", "close");
+    request->send(busy);
+    return;
+  }
+
+  struct qso_web_export_info info;
+  get_read_qso_web_export_info(&info);
+  if (!info.complete || info.failed || info.cancelled) {
+    request->send(409, "text/plain", "READQSO file is not ready yet");
+    return;
+  }
+  if (!SD.exists("/READQSO.TXT")) {
+    request->send(404, "text/plain", "READQSO.TXT not found");
+    return;
+  }
+
+  File f = SD.open("/READQSO.TXT", FILE_READ);
+  if (!f) {
+    request->send(404, "text/plain", "Cannot open READQSO.TXT");
+    return;
+  }
+  const size_t file_bytes = f.size();
+
+  if (console) {
+    console->printf(
+        "WEB READQSO download request: file_bytes=%lu prepared_bytes=%lu free=%u largest=%u\\n",
+        (unsigned long)file_bytes, (unsigned long)info.bytes,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+
+  ReadQsoAckFileResponse *response =
+      new (std::nothrow) ReadQsoAckFileResponse(f, "READQSO.TXT");
+  if (!response) {
+    f.close();
+    request->send(503, "text/plain", "Not enough memory for READQSO download response");
+    return;
+  }
+  if (!response->_sourceValid()) {
+    delete response;
+    request->send(500, "text/plain", "READQSO download source invalid");
+    return;
+  }
+
+  request->send(response);
+}
+
+static void handleReadQsoPreparePage(AsyncWebServerRequest *request) {
+  if (!request) return;
+  if (!web_lowmem_admit_heavy(request, "/readqso")) return;
+
+  String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
+  String conteststr = request->hasParam("contest") ? request->getParam("contest")->value() : "";
+  if (!start_read_qso_web_file_job(numstr.c_str(), conteststr.c_str())) {
+    request->send(409, "text/plain", "QSO file operation busy or source log unavailable");
+    return;
+  }
+
+  String suffix = numstr.length() ? (String("?num=") + numstr) : String("");
+  String html;
+  html.reserve(900);
+  html += F("<!doctype html><meta charset=utf-8><title>READQSO</title><pre id=s>Preparing READQSO");
+  if (conteststr.length()) { html += F(" contest="); html += conteststr; }
+  html += F("...</pre><script>");
+  html += F("const S=document.getElementById('s');const U='/api/readqso/status';async function p(){try{const r=await fetch(U,{cache:'no-store'});const j=await r.json();S.textContent=`Preparing READQSO: ${j.done}/${j.total} records\\n${j.bytes} bytes`;if(j.failed||j.cancelled){S.textContent+='\\nFailed';return;}if(j.complete){location.href='/api/readqso/download");
+  html += suffix;
+  html += F("';return;}}catch(e){S.textContent='Status retry: '+e;}setTimeout(p,500);}p();</script>");
+  request->send(200, "text/html; charset=utf-8", html);
+}
+
+
+// Generic prepared Web export.  Large QSO-derived downloads are generated
+// sequentially on the main loop into a small SD intermediate file and then
+// sent through the same 1 KiB strict one-in-flight ACK-paced response used by
+// READQSO.  Only one prepared export job is active at a time.
+namespace {
+
+enum WebPreparedExportType {
+  WEB_EXPORT_DUMP = 0,
+  WEB_EXPORT_ADIF = 2,
+  WEB_EXPORT_CSV = 3,
+  WEB_EXPORT_JARL = 4,
+  WEB_EXPORT_CABRILLO = 5
+};
+
+enum WebPreparedExportPhase {
+  WEB_EXPORT_IDLE = 0,
+  WEB_EXPORT_SCAN_META,
+  WEB_EXPORT_OPEN_OUTPUT,
+  WEB_EXPORT_GENERATE,
+  WEB_EXPORT_FINISH,
+  WEB_EXPORT_READY,
+  WEB_EXPORT_FAILED
+};
+
+struct WebPreparedExportJob {
+  WebPreparedExportPhase phase = WEB_EXPORT_IDLE;
+  int type = WEB_EXPORT_DUMP;
+  File src;
+  File dst;
+  union qso_union_tag qso;
+  char source_name[24] = {0};
+  char temp_name[20] = "/WEBEXP.TMP";
+  char final_name[20] = "/WEBEXP.OUT";
+  char download_name[40] = "EXPORT.DAT";
+  char content_type[48] = "application/octet-stream";
+  char log_label[20] = "EXPORT";
+  char park[24] = {0};
+  char summit[24] = {0};
+  char cabrillo_source_contest[40] = {0};
+  char cabrillo_contest[40] = {0};
+  char cabrillo_call[LEN_QSO_CALLSIGN + 1] = {0};
+  uint32_t generation = 0;
+  uint32_t started_ms = 0;
+  uint32_t records_total = 0;
+  uint32_t records_done = 0;
+  uint32_t q_records = 0;
+  uint32_t d_records = 0;
+  uint32_t other_records = 0;
+  uint32_t bytes = 0;
+  bool attachment = true;
+  bool header_done = false;
+  bool footer_done = false;
+};
+
+static WebPreparedExportJob web_prepared_export;
+static uint32_t web_prepared_export_generation = 0;
+
+static void web_export_close_files() {
+  if (web_prepared_export.src) web_prepared_export.src.close();
+  if (web_prepared_export.dst) web_prepared_export.dst.close();
+}
+
+static void web_export_fail(const char *msg) {
+  web_export_close_files();
+  if (SD.exists(web_prepared_export.temp_name)) SD.remove(web_prepared_export.temp_name);
+  web_prepared_export.phase = WEB_EXPORT_FAILED;
+  if (console) console->printf("WEB %s export failed: %s\n",
+                               web_prepared_export.log_label,
+                               msg ? msg : "unknown");
+}
+
+static bool web_export_write(const void *data, size_t len) {
+  if (!len) return true;
+  if (!web_prepared_export.dst) return false;
+  const size_t nw = web_prepared_export.dst.write((const uint8_t *)data, len);
+  if (nw != len) return false;
+  web_prepared_export.bytes += (uint32_t)nw;
+  return true;
+}
+
+static bool web_export_write_text(const char *text) {
+  return text ? web_export_write(text, strlen(text)) : true;
+}
+
+static bool web_export_match_location(const union qso_union_tag *qso) {
+  if (!qso) return false;
+  if (web_prepared_export.park[0]) {
+    const char *p = strstr(qso->entry.remarks, "POTA_MY:");
+    if (!p) return false;
+    p += 8;
+    char code[24]; size_t i = 0;
+    while (*p && !isspace((unsigned char)*p) && i + 1 < sizeof(code)) code[i++] = *p++;
+    code[i] = '\0';
+    if (strcmp(code, web_prepared_export.park) != 0) return false;
+  }
+  if (web_prepared_export.summit[0]) {
+    const char *p = strstr(qso->entry.remarks, "SOTA_MY:");
+    if (!p) return false;
+    p += 8;
+    char code[24]; size_t i = 0;
+    while (*p && !isspace((unsigned char)*p) && i + 1 < sizeof(code)) code[i++] = *p++;
+    code[i] = '\0';
+    if (strcmp(code, web_prepared_export.summit) != 0) return false;
+  }
+  return true;
+}
+
+// Return contest-tag state for Cabrillo export.
+//   1: explicit C:<name>
+//   0: legacy record without C: (belongs to the selected contest)
+//  -1: explicit C:- (OFFCONTEST; exclude from Cabrillo)
+static int web_cabrillo_contest_tag_state(const union qso_union_tag *qso,
+                                          char *out, size_t out_size) {
+  if (out && out_size) out[0] = '\0';
+  if (!qso || !out || out_size == 0) return 0;
+  const char *p = strstr(qso->entry.remarks, "C:");
+  if (!p) return 0;
+  p += 2;
+  size_t n = 0;
+  while (*p && *p != ' ' && *p != '\r' && *p != '\n') {
+    if (n + 1 < out_size) out[n++] = *p;
+    ++p;
+  }
+  out[n] = '\0';
+  if (n == 0) return 0;
+  if (strcmp(out, "-") == 0) {
+    out[0] = '\0';
+    return -1;
+  }
+  return 1;
+}
+
+static void web_export_set_cabrillo_name(const char *contest, const char *mode) {
+  if (!contest || !*contest) {
+    strlcpy(web_prepared_export.cabrillo_contest, "UNKNOWN",
+            sizeof(web_prepared_export.cabrillo_contest));
+    return;
+  }
+  if (strcasecmp(contest, "ARRL10m") == 0 || strcasecmp(contest, "ARRL10") == 0)
+    strlcpy(web_prepared_export.cabrillo_contest, "ARRL-10", sizeof(web_prepared_export.cabrillo_contest));
+  else if (strcasecmp(contest, "CQWWRTTY") == 0)
+    strlcpy(web_prepared_export.cabrillo_contest, "CQ-WW-RTTY", sizeof(web_prepared_export.cabrillo_contest));
+  else if (strcasecmp(contest, "ARRLDX") == 0)
+    strlcpy(web_prepared_export.cabrillo_contest,
+            (mode && strncmp(mode, "CW", 2) == 0) ? "ARRL-DX-CW" : "ARRL-DX-SSB",
+            sizeof(web_prepared_export.cabrillo_contest));
+  else {
+    size_t j = 0;
+    for (size_t i = 0; contest[i] && j + 1 < sizeof(web_prepared_export.cabrillo_contest); ++i) {
+      const unsigned char c = (unsigned char)contest[i];
+      if (isalnum(c)) web_prepared_export.cabrillo_contest[j++] = toupper(c);
+      else if (c == '-' || c == '_') web_prepared_export.cabrillo_contest[j++] = '-';
+    }
+    web_prepared_export.cabrillo_contest[j] = '\0';
+  }
+}
+
+static bool web_export_open_source() {
+  if (web_prepared_export.src) web_prepared_export.src.close();
+  web_prepared_export.src = SD.open(web_prepared_export.source_name, FILE_READ);
+  return (bool)web_prepared_export.src;
+}
+
+static bool start_web_prepared_export(AsyncWebServerRequest *request, int type) {
+  if (!request) return false;
+  if (web_prepared_export.phase != WEB_EXPORT_IDLE &&
+      web_prepared_export.phase != WEB_EXPORT_READY &&
+      web_prepared_export.phase != WEB_EXPORT_FAILED) return false;
+  if (paced_download_active) return false;
+
+  web_export_close_files();
+  if (SD.exists("/WEBEXP.TMP")) SD.remove("/WEBEXP.TMP");
+  if (SD.exists("/WEBEXP.OUT")) SD.remove("/WEBEXP.OUT");
+  web_prepared_export = WebPreparedExportJob();
+  web_prepared_export.type = type;
+  web_prepared_export.generation = ++web_prepared_export_generation;
+  web_prepared_export.started_ms = millis();
+
+  String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
+  if (numstr.length())
+    snprintf(web_prepared_export.source_name, sizeof(web_prepared_export.source_name), "/qsobak.%s", numstr.c_str());
+  else
+    strlcpy(web_prepared_export.source_name, qsologfn, sizeof(web_prepared_export.source_name));
+
+  if (!SD.exists(web_prepared_export.source_name)) {
+    web_prepared_export.phase = WEB_EXPORT_FAILED;
+    return false;
+  }
+  if (request->hasParam("park"))
+    strlcpy(web_prepared_export.park, request->getParam("park")->value().c_str(), sizeof(web_prepared_export.park));
+  if (request->hasParam("summit"))
+    strlcpy(web_prepared_export.summit, request->getParam("summit")->value().c_str(), sizeof(web_prepared_export.summit));
+
+  switch (type) {
+    case WEB_EXPORT_DUMP:
+      strlcpy(web_prepared_export.download_name, "DUMPQSO.BIN", sizeof(web_prepared_export.download_name));
+      strlcpy(web_prepared_export.content_type, "application/octet-stream", sizeof(web_prepared_export.content_type));
+      strlcpy(web_prepared_export.log_label, "DUMPQSO", sizeof(web_prepared_export.log_label));
+      break;
+    case WEB_EXPORT_ADIF:
+      strlcpy(web_prepared_export.download_name, "DVPLOGGER.ADI", sizeof(web_prepared_export.download_name));
+      strlcpy(web_prepared_export.content_type, "text/plain; charset=utf-8", sizeof(web_prepared_export.content_type));
+      strlcpy(web_prepared_export.log_label, "ADIF", sizeof(web_prepared_export.log_label));
+      break;
+    case WEB_EXPORT_CSV:
+      strlcpy(web_prepared_export.download_name, "HAMLOG.CSV", sizeof(web_prepared_export.download_name));
+      strlcpy(web_prepared_export.content_type, "text/csv; charset=utf-8", sizeof(web_prepared_export.content_type));
+      strlcpy(web_prepared_export.log_label, "CSV", sizeof(web_prepared_export.log_label));
+      break;
+    case WEB_EXPORT_JARL:
+      strlcpy(web_prepared_export.download_name, "JARLLOG.HTML", sizeof(web_prepared_export.download_name));
+      strlcpy(web_prepared_export.content_type, "text/html; charset=utf-8", sizeof(web_prepared_export.content_type));
+      strlcpy(web_prepared_export.log_label, "JARLLOG", sizeof(web_prepared_export.log_label));
+      web_prepared_export.attachment = false; // preserve auto-submit behavior
+      break;
+    case WEB_EXPORT_CABRILLO:
+      strlcpy(web_prepared_export.download_name, "CONTEST.LOG", sizeof(web_prepared_export.download_name));
+      strlcpy(web_prepared_export.content_type, "text/plain; charset=utf-8", sizeof(web_prepared_export.content_type));
+      strlcpy(web_prepared_export.log_label, "CABRILLO", sizeof(web_prepared_export.log_label));
+      strlcpy(web_prepared_export.cabrillo_call, plogw->my_callsign + 2, sizeof(web_prepared_export.cabrillo_call));
+      if (request->hasParam("contest") && request->getParam("contest")->value().length())
+        strlcpy(web_prepared_export.cabrillo_source_contest,
+                request->getParam("contest")->value().c_str(),
+                sizeof(web_prepared_export.cabrillo_source_contest));
+      else if (plogw->contest_name[2])
+        strlcpy(web_prepared_export.cabrillo_source_contest, plogw->contest_name + 2,
+                sizeof(web_prepared_export.cabrillo_source_contest));
+      break;
+    default:
+      return false;
+  }
+
+  if (type == WEB_EXPORT_ADIF) {
+    if (web_prepared_export.park[0]) {
+      snprintf(web_prepared_export.download_name, sizeof(web_prepared_export.download_name),
+               "pota_log_%s.adi", web_prepared_export.park);
+    } else if (web_prepared_export.summit[0]) {
+      char safe[24]; strlcpy(safe, web_prepared_export.summit, sizeof(safe));
+      for (size_t i=0; safe[i]; ++i) if (safe[i] == '/') safe[i] = '_';
+      snprintf(web_prepared_export.download_name, sizeof(web_prepared_export.download_name),
+               "sota_log_%s.adi", safe);
+    }
+  }
+
+  if (!web_export_open_source()) {
+    web_prepared_export.phase = WEB_EXPORT_FAILED;
+    return false;
+  }
+  web_prepared_export.records_total = web_prepared_export.src.size() / sizeof(web_prepared_export.qso.all);
+  web_prepared_export.records_done = 0;
+  web_prepared_export.phase = (type == WEB_EXPORT_CABRILLO) ? WEB_EXPORT_SCAN_META : WEB_EXPORT_OPEN_OUTPUT;
+  if (console) console->printf("WEB %s export generation started: source=%s records=%lu\n",
+                               web_prepared_export.log_label,
+                               web_prepared_export.source_name,
+                               (unsigned long)web_prepared_export.records_total);
+  return true;
+}
+
+static bool web_export_write_header() {
+  char buf[1024]; buf[0] = '\0';
+  if (web_prepared_export.type == WEB_EXPORT_ADIF) {
+    strlcpy(buf, "<eoh>\n", sizeof(buf));
+  } else if (web_prepared_export.type == WEB_EXPORT_JARL) {
+    snprintf(buf, sizeof(buf),
+      "<body onload=\"document.getElementById('form').submit()\"><form id=\"form\" method=\"POST\" action=\"https://contest.jarl.org/cgi-bin/logsheetform.cgi\"> <input type=\"hidden\" name=\"command\" value=\"load\" />    <textarea name=\"logsheet_file\" cols=\"80\" rows=\"10\">\r\nDVPlogger text log follows; time:%s\r\n",
+      plogw->tm);
+  } else if (web_prepared_export.type == WEB_EXPORT_CABRILLO) {
+    int n = snprintf(buf, sizeof(buf),
+      "START-OF-LOG: 3.0\r\nCALLSIGN: %s\r\nCONTEST: %s\r\nCREATED-BY: DVPlogger\r\n",
+      web_prepared_export.cabrillo_call[0] ? web_prepared_export.cabrillo_call : plogw->my_callsign + 2,
+      web_prepared_export.cabrillo_contest[0] ? web_prepared_export.cabrillo_contest : "UNKNOWN");
+    size_t used = n > 0 ? std::min((size_t)n, sizeof(buf)-1) : 0;
+    const char *email = plogw->email_addr + 2;
+    if (email[0] && strcasecmp(email, "email@address") != 0 && used < sizeof(buf)-1) {
+      n = snprintf(buf + used, sizeof(buf)-used, "EMAIL: %s\r\n", email);
+      if (n > 0) used += std::min((size_t)n, sizeof(buf)-1-used);
+    }
+    const char *name = plogw->my_name + 2;
+    if (name[0] && strcasecmp(name, "NoName") != 0 && used < sizeof(buf)-1)
+      snprintf(buf + used, sizeof(buf)-used, "NAME: %.75s\r\n", name);
+  }
+  return web_export_write_text(buf);
+}
+
+static bool web_export_write_footer() {
+  if (web_prepared_export.type == WEB_EXPORT_CABRILLO)
+    return web_export_write_text("END-OF-LOG:\r\n");
+  if (web_prepared_export.type == WEB_EXPORT_JARL) {
+    char footer[96];
+    const char *src_label = (strcmp(web_prepared_export.source_name, qsologfn) == 0)
+        ? "(current)" : web_prepared_export.source_name;
+    snprintf(footer, sizeof(footer), "---- end of file %s -----\n", src_label);
+    if (!web_export_write_text(footer)) return false;
+    return web_export_write_text("</textarea> <br /><input type=\"submit\" value=\"send to logsheetform\" /></form></body>");
+  }
+  return true;
+}
+
+static void process_web_prepared_export_job_internal() {
+  static const unsigned BATCH = 16;
+  if (web_prepared_export.phase == WEB_EXPORT_IDLE ||
+      web_prepared_export.phase == WEB_EXPORT_READY ||
+      web_prepared_export.phase == WEB_EXPORT_FAILED) return;
+
+  if (web_prepared_export.phase == WEB_EXPORT_SCAN_META) {
+    for (unsigned b=0; b<BATCH; ++b) {
+      if (!web_prepared_export.src.available()) {
+        if (!web_prepared_export.cabrillo_source_contest[0])
+          strlcpy(web_prepared_export.cabrillo_source_contest, "UNKNOWN", sizeof(web_prepared_export.cabrillo_source_contest));
+        if (!web_prepared_export.cabrillo_contest[0])
+          web_export_set_cabrillo_name(web_prepared_export.cabrillo_source_contest, "");
+        web_prepared_export.src.close();
+        if (!web_export_open_source()) { web_export_fail("cannot reopen source"); return; }
+        web_prepared_export.records_done = 0;
+        web_prepared_export.phase = WEB_EXPORT_OPEN_OUTPUT;
+        return;
+      }
+      if (web_prepared_export.src.read(web_prepared_export.qso.all, sizeof(web_prepared_export.qso.all)) != sizeof(web_prepared_export.qso.all)) {
+        web_export_fail("metadata scan read error"); return;
+      }
+      union qso_union_tag probe = web_prepared_export.qso;
+      reformat_qso_entry(&probe);
+      if (probe.entry.type[0] != 'Q') continue;
+      if (!web_prepared_export.cabrillo_call[0] && probe.entry.mycall[0])
+        strlcpy(web_prepared_export.cabrillo_call, probe.entry.mycall, sizeof(web_prepared_export.cabrillo_call));
+      char contest[40];
+      const int contest_tag = web_cabrillo_contest_tag_state(&probe, contest, sizeof(contest));
+      if (contest_tag < 0) continue;  // explicit C:- / OFFCONTEST
+      if (contest_tag > 0) {
+        if (!web_prepared_export.cabrillo_source_contest[0])
+          strlcpy(web_prepared_export.cabrillo_source_contest, contest, sizeof(web_prepared_export.cabrillo_source_contest));
+        if (strcasecmp(contest, web_prepared_export.cabrillo_source_contest) != 0) continue;
+        if (!web_prepared_export.cabrillo_contest[0])
+          web_export_set_cabrillo_name(contest, probe.entry.mode);
+      } else {
+        // Legacy QSO without C: belongs to the selected contest, matching
+        // MAKEDUPE compatibility behavior.  Do not discard it.
+        if (!web_prepared_export.cabrillo_contest[0] && web_prepared_export.cabrillo_source_contest[0])
+          web_export_set_cabrillo_name(web_prepared_export.cabrillo_source_contest, probe.entry.mode);
+      }
+    }
+    return;
+  }
+
+  if (web_prepared_export.phase == WEB_EXPORT_OPEN_OUTPUT) {
+    if (SD.exists(web_prepared_export.temp_name)) SD.remove(web_prepared_export.temp_name);
+    web_prepared_export.dst = SD.open(web_prepared_export.temp_name, FILE_WRITE);
+    if (!web_prepared_export.dst) { web_export_fail("cannot create temp file"); return; }
+    web_prepared_export.bytes = 0;
+    if (!web_export_write_header()) { web_export_fail("header write error"); return; }
+    web_prepared_export.phase = WEB_EXPORT_GENERATE;
+    return;
+  }
+
+  if (web_prepared_export.phase == WEB_EXPORT_GENERATE) {
+    char line[1024];
+    for (unsigned b=0; b<BATCH; ++b) {
+      if (!web_prepared_export.src.available()) {
+        web_prepared_export.phase = WEB_EXPORT_FINISH;
+        return;
+      }
+      if (web_prepared_export.src.read(web_prepared_export.qso.all, sizeof(web_prepared_export.qso.all)) != sizeof(web_prepared_export.qso.all)) {
+        web_export_fail("source read error"); return;
+      }
+      web_prepared_export.records_done++;
+      if (web_prepared_export.type == WEB_EXPORT_DUMP) {
+        if (!web_export_write(web_prepared_export.qso.all, sizeof(web_prepared_export.qso.all))) {
+          web_export_fail("dump write error"); return;
+        }
+        continue;
+      }
+      const char record_type = web_prepared_export.qso.entry.type[0];
+      if (record_type == 'Q') web_prepared_export.q_records++;
+      else if (record_type == 'D') web_prepared_export.d_records++;
+      else web_prepared_export.other_records++;
+      reformat_qso_entry(&web_prepared_export.qso);
+      if (!web_export_match_location(&web_prepared_export.qso)) continue;
+      line[0] = '\0';
+      if (web_prepared_export.type == WEB_EXPORT_ADIF) {
+        sprint_qso_entry_adif(line, &web_prepared_export.qso);
+      } else if (web_prepared_export.type == WEB_EXPORT_CSV) {
+        sprint_qso_entry_hamlogcsv(line, &web_prepared_export.qso);
+      } else if (web_prepared_export.type == WEB_EXPORT_JARL) {
+        sprint_qso_entry(line, &web_prepared_export.qso);
+      } else if (web_prepared_export.type == WEB_EXPORT_CABRILLO) {
+        if (record_type != 'Q') continue;
+        char contest[40];
+        const int contest_tag = web_cabrillo_contest_tag_state(&web_prepared_export.qso, contest, sizeof(contest));
+        if (contest_tag < 0) continue;  // explicit C:- / OFFCONTEST
+        if (contest_tag > 0 && web_prepared_export.cabrillo_source_contest[0] &&
+            strcasecmp(contest, web_prepared_export.cabrillo_source_contest) != 0) continue;
+        // contest_tag == 0 is a legacy QSO without C:.  Keep it as part of
+        // the currently selected contest, same as MAKEDUPE compatibility.
+        sprint_qso_entry_cabrillo(line, &web_prepared_export.qso);
+      }
+      const size_t n = strnlen(line, sizeof(line));
+      if (n >= sizeof(line)-1) { web_export_fail("formatted line too large"); return; }
+      if (!web_export_write(line, n)) { web_export_fail("formatted write error"); return; }
+    }
+    return;
+  }
+
+  if (web_prepared_export.phase == WEB_EXPORT_FINISH) {
+    if (!web_export_write_footer()) { web_export_fail("footer write error"); return; }
+    if (web_prepared_export.dst) { web_prepared_export.dst.flush(); web_prepared_export.dst.close(); }
+    if (web_prepared_export.src) web_prepared_export.src.close();
+    if (SD.exists(web_prepared_export.final_name)) SD.remove(web_prepared_export.final_name);
+    if (!SD.rename(web_prepared_export.temp_name, web_prepared_export.final_name)) {
+      web_export_fail("rename temp file failed"); return;
+    }
+    File f = SD.open(web_prepared_export.final_name, FILE_READ);
+    if (f) { web_prepared_export.bytes = f.size(); f.close(); }
+    web_prepared_export.phase = WEB_EXPORT_READY;
+    if (console) console->printf(
+      "WEB %s export ready: source=%lu Q=%lu D=%lu other=%lu bytes=%lu ms=%lu\n",
+      web_prepared_export.log_label,
+      (unsigned long)web_prepared_export.records_total,
+      (unsigned long)web_prepared_export.q_records,
+      (unsigned long)web_prepared_export.d_records,
+      (unsigned long)web_prepared_export.other_records,
+      (unsigned long)web_prepared_export.bytes,
+      (unsigned long)(millis()-web_prepared_export.started_ms));
+  }
+}
+
+static void handle_web_prepared_export_status(AsyncWebServerRequest *request) {
+  char json[320];
+  const bool ready = web_prepared_export.phase == WEB_EXPORT_READY;
+  const bool failed = web_prepared_export.phase == WEB_EXPORT_FAILED;
+  const bool active = !ready && !failed && web_prepared_export.phase != WEB_EXPORT_IDLE;
+  snprintf(json, sizeof(json),
+    "{\"generation\":%lu,\"active\":%s,\"ready\":%s,\"failed\":%s,\"done\":%lu,\"total\":%lu,\"bytes\":%lu}",
+    (unsigned long)web_prepared_export.generation,
+    active?"true":"false", ready?"true":"false", failed?"true":"false",
+    (unsigned long)web_prepared_export.records_done,
+    (unsigned long)web_prepared_export.records_total,
+    (unsigned long)web_prepared_export.bytes);
+  request->send(200, "application/json", json);
+}
+
+static void handle_web_prepared_export_download(AsyncWebServerRequest *request) {
+  if (!request) return;
+  if (web_prepared_export.phase != WEB_EXPORT_READY) {
+    request->send(409, "text/plain", "Export is not ready"); return;
+  }
+  if (request->hasParam("generation")) {
+    const uint32_t g = strtoul(request->getParam("generation")->value().c_str(), nullptr, 10);
+    if (g != web_prepared_export.generation) { request->send(409, "text/plain", "Stale export generation"); return; }
+  }
+  if (paced_download_active) {
+    request->send(409, "text/plain", "Another paced download is active"); return;
+  }
+  File f = SD.open(web_prepared_export.final_name, FILE_READ);
+  if (!f) { request->send(404, "text/plain", "Prepared export file missing"); return; }
+  ReadQsoAckFileResponse *response = new (std::nothrow) ReadQsoAckFileResponse(
+      f, web_prepared_export.download_name, web_prepared_export.content_type,
+      web_prepared_export.log_label, web_prepared_export.attachment);
+  if (!response) { f.close(); request->send(503, "text/plain", "Not enough memory for export response"); return; }
+  request->send(response);
+}
+
+static void handle_web_prepared_export_page(AsyncWebServerRequest *request, int type) {
+  if (!web_lowmem_admit_heavy(request, "/export")) return;
+  if (!start_web_prepared_export(request, type)) {
+    request->send(409, "text/plain", "Export busy or source unavailable"); return;
+  }
+  const uint32_t generation = web_prepared_export.generation;
+  char html[900];
+  snprintf(html, sizeof(html),
+    "<!doctype html><meta charset=utf-8><title>Export</title><pre id=s>Preparing %s...</pre>"
+    "<script>const S=document.getElementById('s'),G=%lu;async function p(){try{const r=await fetch('/api/export/status',{cache:'no-store'});const j=await r.json();if(j.generation!==G){S.textContent='Export replaced';return;}S.textContent='Preparing %s: '+j.done+'/'+j.total+' records\\n'+j.bytes+' bytes';if(j.failed){S.textContent+='\\nFailed';return;}if(j.ready){location.href='/api/export/download?generation='+G;return;}}catch(e){S.textContent='Status retry: '+e;}setTimeout(p,500);}p();</script>",
+    web_prepared_export.log_label, (unsigned long)generation, web_prepared_export.log_label);
+  request->send(200, "text/html; charset=utf-8", html);
+}
+
+} // namespace
+
+void process_web_prepared_export_job() {
+  process_web_prepared_export_job_internal();
+}
+
+void process_web_filelist_job() {
+  process_web_filelist_job_internal();
+}
+
+struct ReadQsoChunkLease {
+  uint32_t sequence;
+  explicit ReadQsoChunkLease(uint32_t s) : sequence(s) {}
+  ~ReadQsoChunkLease() { release_read_qso_web_chunk(sequence); }
+};
 
 
 const char index_html[] PROGMEM = R"rawliteral(
@@ -3533,6 +4629,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <p><a href="/adif">/adif</a> to read QSO data in ADIF format.</p>
 <p><a href="/dumpqso">/dumpqso</a> to dump backup qso data\n(*) </p>
 <p>jarllog,readqso,cabrillo,dumpqso,csv,adif?num=QSOFILENUM(001,...) to process backup QSO files.</p>
+<p>?contest=CONTEST でreadqso/cabrilloをRemarksのC:タグで絞り込みます。readqsoはcontest=なしなら全QSOを出力します。</p>
 <p>?park=PARK# でPARK#からQRVしたログ(Remarks にPOTA_MY:PARK#)のみ出力します。</p>
 <p>?summit=SUMMIT# でSOTA SUMMIT#からQRVしたログ(Remarks にSOTA_MY:SUMMIT#)のみ出力します。</p>
 <p><a href="/potahelp?lang=ja">POTA helper (jp)</a> <a href="/potahelp?lang=en">(en)</a> Nearest-park search / ADIF export</p>
@@ -3569,9 +4666,26 @@ new Promise(function(resolve){ setTimeout(resolve, 500); })
     document.getElementById('sdFree').textContent=j.free;
     document.getElementById('sdUsed').textContent=j.used;
     document.getElementById('sdTotal').textContent=j.total;
-    return new Promise(function(resolve){ setTimeout(resolve, 350); });
+    return new Promise(function(resolve){ setTimeout(resolve, 1000); });
   })
-  .then(function(){ return fetch('/filelist', {cache:'no-store'}); })
+  .then(function(){ return fetch('/api/filelist/prepare', {cache:'no-store'}); })
+  .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+  .then(function(j){
+    const g=j.generation;
+    return new Promise(function(resolve,reject){
+      function poll(){
+        fetch('/api/filelist/status?generation='+g,{cache:'no-store'})
+          .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+          .then(function(s){
+            if(s.failed){ reject(new Error('file list failed')); return; }
+            if(s.ready){ resolve(g); return; }
+            setTimeout(poll,350);
+          }).catch(reject);
+      }
+      poll();
+    });
+  })
+  .then(function(g){ return fetch('/api/filelist/download?generation='+g, {cache:'no-store'}); })
   .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
   .then(function(html){ document.getElementById('filelist').innerHTML=html; })
   .catch(function(e){ document.getElementById('filelist').textContent='SD info error: '+e; });
@@ -3858,11 +4972,16 @@ const passFreqEl=document.getElementById('passfreq');
 let expandedPassIndex=-1, expandedPassData=null;
 let trackingDirty=false, vfoDirty=false;
 let lastTleTime=null;
+let satEnabled=false;
+let tleUpdateActive=false;
+let aosCalculationActive=false;
+let satRefreshTimer=null;
+let satRefreshTick=0;
 trackingEl.addEventListener('change',()=>trackingDirty=true);
 vfoModeEl.addEventListener('change',()=>vfoDirty=true);
 async function loadList(){const d=await (await fetch('/api/sat/list',{cache:'no-store'})).json();satEl.innerHTML=d.satellites.map(x=>`<option value="${x.index}" ${x.selected?'selected':''}>${esc(x.name)}</option>`).join('');}
-async function loadStatus(){try{const r=await fetch('/api/sat/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();satModeEl.textContent=d.enabled?'SAT ON':'SAT OFF';satModeEl.className=d.enabled?'sat-on':'sat-off';statusEl.innerHTML=`衛星: <b>${esc(d.name)}</b><br>衛星運用: ${d.enabled?'ON':'OFF'}<br>方位: ${Number(d.az).toFixed(1)}°<br>仰角: ${Number(d.el).toFixed(1)}°<br>距離速度: ${Number(d.rr).toFixed(3)} km/s<br>追尾モード: ${esc(d.tracking_name)}<br>VFOモード: ${esc(d.vfo_name)}<br>Uplink: ${d.up_hz} Hz<br>Downlink: ${d.down_hz} Hz<br>Sat Uplink: ${d.sat_up_hz} Hz<br>Sat Downlink: ${d.sat_down_hz} Hz<br>Offset: ${d.offset_hz} Hz`;if(!trackingDirty)trackingEl.value=String(d.tracking_mode);if(!vfoDirty)vfoModeEl.value=String(d.vfo_mode);if(document.activeElement!==gridLocEl)gridLocEl.value=d.grid;locStatusEl.textContent=`Lat: ${Number(d.lat).toFixed(5)}°  Lon: ${Number(d.lon).toFixed(5)}°`;clockStatusEl.textContent=`JST: ${d.jst}   UTC: ${d.utc}`;}catch(e){statusEl.textContent='状態取得失敗: '+e.message;}}
-async function loadAos(){try{const r=await fetch('/api/sat/aos',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();aosStateEl.textContent=d.calculating?`計算中 ${d.completed}/${d.total}: ${d.current_name} (${d.state_name})`:(d.passes.length?`計算完了 (${d.total} satellites / showing ${d.passes.length})`:'有効な計算結果はありません');aosEl.innerHTML=d.passes.map(x=>`<tr class="passrow ${x.index===expandedPassIndex?'sel':''}" onclick="togglePass(${x.index})" title="クリックしてパス詳細を表示"><td>${esc(x.name)}</td><td>${esc(x.aos)}</td><td>${esc(x.los)}</td><td>${Number(x.max_el).toFixed(0)}°</td></tr>`).join('');if(expandedPassIndex>=0&&!d.passes.some(x=>x.index===expandedPassIndex))closePass();}catch(e){aosStateEl.textContent='AOS状態取得失敗: '+e.message;}}
+async function loadStatus(){try{const r=await fetch('/api/sat/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();satEnabled=!!d.enabled;satModeEl.textContent=d.enabled?'SAT ON':'SAT OFF';satModeEl.className=d.enabled?'sat-on':'sat-off';statusEl.innerHTML=`衛星: <b>${esc(d.name)}</b><br>衛星運用: ${d.enabled?'ON':'OFF'}<br>方位: ${Number(d.az).toFixed(1)}°<br>仰角: ${Number(d.el).toFixed(1)}°<br>距離速度: ${Number(d.rr).toFixed(3)} km/s<br>追尾モード: ${esc(d.tracking_name)}<br>VFOモード: ${esc(d.vfo_name)}<br>Uplink: ${d.up_hz} Hz<br>Downlink: ${d.down_hz} Hz<br>Sat Uplink: ${d.sat_up_hz} Hz<br>Sat Downlink: ${d.sat_down_hz} Hz<br>Offset: ${d.offset_hz} Hz`;if(!trackingDirty)trackingEl.value=String(d.tracking_mode);if(!vfoDirty)vfoModeEl.value=String(d.vfo_mode);if(document.activeElement!==gridLocEl)gridLocEl.value=d.grid;locStatusEl.textContent=`Lat: ${Number(d.lat).toFixed(5)}°  Lon: ${Number(d.lon).toFixed(5)}°`;clockStatusEl.textContent=`JST: ${d.jst}   UTC: ${d.utc}`;return d;}catch(e){statusEl.textContent='状態取得失敗: '+e.message;return null;}}
+async function loadAos(){try{const r=await fetch('/api/sat/aos',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();aosCalculationActive=!!d.calculating;aosStateEl.textContent=d.calculating?`計算中 ${d.completed}/${d.total}: ${d.current_name} (${d.state_name})`:(d.passes.length?`計算完了 (${d.total} satellites / showing ${d.passes.length})`:'有効な計算結果はありません');aosEl.innerHTML=d.passes.map(x=>`<tr class="passrow ${x.index===expandedPassIndex?'sel':''}" onclick="togglePass(${x.index})" title="クリックしてパス詳細を表示"><td>${esc(x.name)}</td><td>${esc(x.aos)}</td><td>${esc(x.los)}</td><td>${Number(x.max_el).toFixed(0)}°</td></tr>`).join('');if(expandedPassIndex>=0&&!d.passes.some(x=>x.index===expandedPassIndex))closePass();return d;}catch(e){aosStateEl.textContent='AOS状態取得失敗: '+e.message;return null;}}
 
 function skyXY(az,el,R,cx,cy){const rr=R*Math.max(0,Math.min(1,(90-el)/90));const a=az*Math.PI/180;return [cx+rr*Math.sin(a),cy-rr*Math.cos(a)];}
 function drawSky(points,nowp){
@@ -3904,16 +5023,25 @@ async function updateExpandedNow(){
     drawSky(expandedPassData.points,d);
   }catch(e){}
 }
-async function selectSat(){const q=new URLSearchParams({index:satEl.value});const r=await fetch('/api/sat/select?'+q,{method:'POST'});selectMsgEl.textContent=await r.text();trackingDirty=false;vfoDirty=false;await loadStatus();await loadList();await loadSatDb();}
-async function satOn(){const r=await fetch('/api/sat/enable?enabled=1',{method:'POST'});const msg=await r.text();selectMsgEl.textContent=r.ok?msg:`SAT ON失敗 (HTTP ${r.status}): ${msg}`;trackingDirty=false;vfoDirty=false;if(r.ok){await loadList();await loadSatDb();await loadAos();}await loadStatus();}
-async function satOff(){const r=await fetch('/api/sat/enable?enabled=0',{method:'POST'});selectMsgEl.textContent=await r.text();await loadStatus();}
+async function selectSat(){const q=new URLSearchParams({index:satEl.value});const r=await fetch('/api/sat/select?'+q,{method:'POST'});selectMsgEl.textContent=await r.text();trackingDirty=false;vfoDirty=false;await loadStatus();await loadList();}
+async function satOn(){
+  // Enter SAT mode first.  Satellite selection is a separate operation.
+  const r=await fetch('/api/sat/enable?enabled=1',{method:'POST'});
+  const msg=await r.text();
+  selectMsgEl.textContent=r.ok?msg:`SAT ON失敗 (HTTP ${r.status}): ${msg}`;
+  trackingDirty=false;vfoDirty=false;
+  if(r.ok){await loadList();await loadAos();}
+  await loadStatus();
+  if(r.ok)startSatPolling();
+}
+async function satOff(){const r=await fetch('/api/sat/enable?enabled=0',{method:'POST'});selectMsgEl.textContent=await r.text();await loadStatus();if(!tleUpdateActive)stopSatPolling();}
 async function setTracking(){const r=await fetch('/api/sat/tracking?mode='+trackingEl.value,{method:'POST'});opMsgEl.textContent=await r.text();if(r.ok)trackingDirty=false;await loadStatus();}
 async function setVfo(){const r=await fetch('/api/sat/vfo?mode='+vfoModeEl.value,{method:'POST'});opMsgEl.textContent=await r.text();if(r.ok)vfoDirty=false;await loadStatus();}
 async function autoVfo(){const r=await fetch('/api/sat/vfo/auto',{method:'POST'});autoVfoMsgEl.textContent=await r.text();if(r.ok)vfoDirty=false;await loadStatus();}
 async function action(name){const r=await fetch('/api/sat/action?name='+encodeURIComponent(name),{method:'POST'});opMsgEl.textContent=await r.text();await loadStatus();}
 async function offset(hz){const r=await fetch('/api/sat/offset?hz='+hz,{method:'POST'});opMsgEl.textContent=await r.text();await loadStatus();}
 async function saveLocation(){const q=new URLSearchParams({grid:gridLocEl.value.trim().toUpperCase()});const r=await fetch('/api/sat/location?'+q,{method:'POST'});locStatusEl.textContent=await r.text();if(r.ok)await loadStatus();}
-async function recalcAos(){await fetch('/api/sat/aos/recalculate',{method:'POST'});loadAos();}
+async function recalcAos(){const r=await fetch('/api/sat/aos/recalculate',{method:'POST'});if(!r.ok){aosStateEl.textContent=`AOS再計算開始失敗 (HTTP ${r.status})`;return;}aosCalculationActive=true;await loadAos();if(satEnabled)startSatPolling();}
 let satDbRows=[];
 function mhz(v){return (Number(v)/1000000).toFixed(6);}
 async function loadSatDb(){try{const [db,status]=await Promise.all([(await fetch('/api/sat/db',{cache:'no-store'})).json(),(await fetch('/api/sat/status',{cache:'no-store'})).json()]);satDbRows=db.satellites;satdbbody.innerHTML=db.satellites.map(x=>`<tr><td><button onclick="selectSatDb(${x.index})" ${x.index===status.index?'disabled':''}>${x.index===status.index?'選択中':'選択'}</button></td><td>${esc(x.name)}</td><td>${mhz(x.up0)}-${mhz(x.up1)}</td><td>${esc(x.upmode)}</td><td>${mhz(x.dn0)}-${mhz(x.dn1)}</td><td>${esc(x.dnmode)}</td><td>${mhz(x.beacon)}</td><td>${x.offset}</td><td>${x.tle?'OK':'--'}</td><td><button onclick="editSatDb(${x.index})">編集</button> <button onclick="deleteSatDb(${x.index})">削除</button></td></tr>`).join('');}catch(e){satdbmsg.textContent='一覧取得失敗: '+e.message;}}
@@ -3923,11 +5051,60 @@ function editSatDb(idx){const x=satDbRows.find(v=>v.index===idx);if(!x)return;sa
 async function saveSatDb(){const q=new URLSearchParams({index:satdbindex.value,name:satdbname.value.trim(),up0:satup0.value,up1:satup1.value,upmode:satupmode.value.trim().toUpperCase(),dn0:satdn0.value,dn1:satdn1.value,dnmode:satdnmode.value.trim().toUpperCase(),beacon:satbeacon.value,offset:satoffset.value});const r=await fetch('/api/sat/db/save?'+q,{method:'POST'});satdbmsg.textContent=await r.text();if(r.ok){newSatDb();await loadSatDb();await loadList();}}
 async function deleteSatDb(idx){const x=satDbRows.find(v=>v.index===idx);if(!x||!confirm('削除しますか: '+x.name+' ?'))return;const r=await fetch('/api/sat/db/delete?index='+idx,{method:'POST'});satdbmsg.textContent=await r.text();if(r.ok){newSatDb();await loadSatDb();await loadList();}}
 
-async function loadTle(){try{const r=await fetch('/api/sat/tle/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();if(document.activeElement!==tleUrlEl)tleUrlEl.value=d.url;if(d.in_progress){tleStateEl.className='warn';tleStateEl.textContent='TLE更新中...';}else if(d.requested){tleStateEl.className='warn';tleStateEl.textContent='TLE更新待機中...';}else if(d.last_result===200){tleStateEl.className='ok';tleStateEl.textContent=`TLE更新成功 (HTTP 200 / 読込 ${d.valid_satellites}衛星)`;}else if(d.last_result){tleStateEl.className='err';tleStateEl.textContent=d.last_result>0?`TLE更新失敗 (HTTP ${d.last_result})`:`TLE更新失敗 (${d.last_result})`;}else{tleStateEl.className='';tleStateEl.textContent=d.tle_time?`SD上のTLE読込済 (${d.valid_satellites}衛星)`:'TLE未読込';}if(lastTleTime===null){lastTleTime=d.tle_time;}else if(d.tle_time!==lastTleTime){lastTleTime=d.tle_time;await loadList();await loadSatDb();await loadAos();}}catch(e){tleStateEl.className='err';tleStateEl.textContent='TLE状態取得失敗: '+e.message;}}
+async function loadTle(){try{const r=await fetch('/api/sat/tle/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();tleUpdateActive=!!d.busy;if(document.activeElement!==tleUrlEl)tleUrlEl.value=d.url;if(d.in_progress){tleStateEl.className='warn';tleStateEl.textContent='TLE更新中...';}else if(d.requested){tleStateEl.className='warn';tleStateEl.textContent='TLE更新待機中...';}else if(d.busy){tleStateEl.className='warn';tleStateEl.textContent='TLE解析・反映中...';}else if(d.last_result===200){tleStateEl.className='ok';tleStateEl.textContent=`TLE更新成功 (HTTP 200 / 読込 ${d.valid_satellites}衛星)`;}else if(d.last_result){tleStateEl.className='err';tleStateEl.textContent=d.last_result>0?`TLE更新失敗 (HTTP ${d.last_result})`:`TLE更新失敗 (${d.last_result})`;}else{tleStateEl.className='';tleStateEl.textContent=d.tle_time?`SD上のTLE読込済 (${d.valid_satellites}衛星)`:'TLE未読込';}
+// Do not publish a new satellite list while the TLE job is still pending or
+// parsing.  tle_unixtime may change before readtlefile() has finished filling
+// all sat_info[] entries, so only accept the generation once busy becomes false.
+if(!d.busy){const firstReady=(lastTleTime===null);const changed=(!firstReady&&d.tle_time!==lastTleTime);lastTleTime=d.tle_time;if(firstReady||changed){await loadList();if(changed)await loadAos();}}return d;}catch(e){tleStateEl.className='err';tleStateEl.textContent='TLE状態取得失敗: '+e.message;return null;}}
 async function saveTleUrl(){const q=new URLSearchParams({url:tleUrlEl.value});const r=await fetch('/api/sat/tle/config?'+q,{method:'POST'});const msg=await r.text();tleStateEl.className=r.ok?'ok':'err';tleStateEl.textContent=r.ok?'TLE URL保存完了':`URL保存失敗 (HTTP ${r.status}): ${msg}`;}
-async function updateTle(){const r=await fetch('/api/sat/tle/update',{method:'POST'});const msg=await r.text();if(r.status===202){tleStateEl.className='warn';tleStateEl.textContent='TLE更新要求を受け付けました';}else{tleStateEl.className='err';tleStateEl.textContent=`TLE更新開始失敗 (HTTP ${r.status}): ${msg}`;}await loadTle();}
-async function refresh(){await Promise.all([loadStatus(),loadAos(),loadTle()]);await updateExpandedNow();}
-loadList();loadSatDb();refresh();setInterval(refresh,1000);
+async function updateTle(){const r=await fetch('/api/sat/tle/update',{method:'POST'});const msg=await r.text();if(r.status===202){tleUpdateActive=true;tleStateEl.className='warn';tleStateEl.textContent='TLE更新要求を受け付けました';startSatPolling();}else{tleStateEl.className='err';tleStateEl.textContent=`TLE更新開始失敗 (HTTP ${r.status}): ${msg}`;}await loadTle();}
+let satRefreshRunning=false;
+function stopSatPolling(){if(satRefreshTimer!==null){clearTimeout(satRefreshTimer);satRefreshTimer=null;}}
+function scheduleSatPolling(delay=1000){
+  if(!(satEnabled||tleUpdateActive)){stopSatPolling();return;}
+  stopSatPolling();
+  satRefreshTimer=setTimeout(satRefreshLoop,delay);
+}
+function startSatPolling(){scheduleSatPolling(1000);}
+async function satRefreshLoop(){
+  satRefreshTimer=null;
+  if(satRefreshRunning){scheduleSatPolling(1000);return;}
+  if(!(satEnabled||tleUpdateActive))return;
+  satRefreshRunning=true;
+  try{
+    satRefreshTick++;
+    if(satEnabled){
+      await loadStatus();
+      await updateExpandedNow();
+      // During a manually requested AOS calculation, poll every cycle so the
+      // completed result is reflected promptly.  Otherwise keep the low-rate
+      // 5-tick refresh used for normal display updates.
+      if(aosCalculationActive||(satRefreshTick%5)===0)await loadAos();
+      // TLE state changes slowly. During an update, keep 1-second polling even
+      // with SAT OFF so completion is visible; otherwise refresh every 10 s.
+      if(tleUpdateActive||(satRefreshTick%10)===0)await loadTle();
+    }else if(tleUpdateActive){
+      await loadTle();
+    }
+  }finally{
+    satRefreshRunning=false;
+  }
+  if(satEnabled||tleUpdateActive)scheduleSatPolling(1000);
+}
+async function initialSatPageLoad(){
+  // Preserve the proven HW1 startup sequence: populate the page once in full
+  // regardless of SAT ON/OFF. Only the recurring polling is gated afterwards.
+  // If the first status request fails, retry the whole initial sequence instead
+  // of leaving the page permanently idle (an older HW1 failure mode).
+  const status=await loadStatus();
+  await loadAos();
+  await loadTle();
+  await updateExpandedNow();
+  if(status===null){satRefreshTimer=setTimeout(initialSatPageLoad,1500);return;}
+  if(satEnabled||tleUpdateActive)startSatPolling();
+}
+initialSatPageLoad();
+setTimeout(loadSatDb,1500);
 </script></body></html>
 )rawliteral";
 
@@ -5388,7 +6565,14 @@ static void send_progmem_stream(AsyncWebServerRequest *request,
         return 0;
       }
       const size_t remain = state->length - index;
-      const size_t ncopy = std::min(remain, web_stream_chunk_limit(maxLen));
+      size_t chunk_limit = web_stream_chunk_limit(maxLen);
+#if JK1DVPLOG_HWVER == 1
+      // HW1 has very little contiguous internal RAM once Wi-Fi/AsyncTCP are
+      // active.  Keep static PROGMEM page producer chunks small so / and /sat
+      // do not transiently consume most of the largest free heap block.
+      chunk_limit = std::min(chunk_limit, static_cast<size_t>(1024));
+#endif
+      const size_t ncopy = std::min(remain, chunk_limit);
       memcpy_P(buffer, state->body + index, ncopy);
       return ncopy;
     });
@@ -5827,8 +7011,6 @@ static void send_web_location_json(AsyncWebServerRequest *request) {
 void init_webserver() {
   web_heap_point("before web handlers");
 
-  setupSdFileListHandler();
-
   web_server.on("/api/storage", HTTP_GET, [](AsyncWebServerRequest *request) {
     const uint32_t trace_id = web_trace_begin("/api/storage");
     char free_text[24], used_text[24], total_text[24], payload[128];
@@ -5844,10 +7026,41 @@ void init_webserver() {
     web_trace_touch(trace_id, "/api/storage", "QUEUED");
   });
 
+  web_server.on("/api/filelist/prepare", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const uint32_t generation = web_filelist_request_generation();
+    char json[80];
+    snprintf(json, sizeof(json), "{\"generation\":%lu}", (unsigned long)generation);
+    request->send(200, "application/json", json);
+  });
+
+  web_server.on("/api/filelist/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const bool ready = web_filelist_job.phase == WEB_FILELIST_READY;
+    const bool failed = web_filelist_job.phase == WEB_FILELIST_FAILED;
+    const bool active = !ready && !failed && web_filelist_job.phase != WEB_FILELIST_IDLE;
+    char json[160];
+    snprintf(json, sizeof(json),
+             "{\"generation\":%lu,\"active\":%s,\"ready\":%s,\"failed\":%s,\"entries\":%lu,\"bytes\":%lu}",
+             (unsigned long)web_filelist_job.generation,
+             active ? "true" : "false", ready ? "true" : "false", failed ? "true" : "false",
+             (unsigned long)web_filelist_job.entries, (unsigned long)web_filelist_job.bytes);
+    request->send(200, "application/json", json);
+  });
+
+  web_server.on("/api/filelist/download", HTTP_GET, [](AsyncWebServerRequest *request) {
+    handle_web_filelist_download(request);
+  });
+
+  // Compatibility: direct /filelist starts a refresh and returns its generation.
+  // The home page uses the explicit /api/filelist/* sequence above.
+  web_server.on("/filelist", HTTP_GET, [](AsyncWebServerRequest *request) {
+    const uint32_t generation = web_filelist_request_generation();
+    char text[96];
+    snprintf(text, sizeof(text), "File list preparation started (generation %lu).", (unsigned long)generation);
+    request->send(202, "text/plain", text);
+  });
+
   web_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     webLog.println("Client:/");
-    // Static top page: use the same bounded streaming path on HW1 and HW3.
-    // Dynamic SD values are fetched separately by the page.
     send_progmem_stream(request, "text/html; charset=utf-8", index_html, "/");
   });
 
@@ -5910,6 +7123,7 @@ void init_webserver() {
   });
 
   web_server.on("/api/sat/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    sat_web_diag("BEGIN", "/api/sat/status");
     const int idx = plogw->sat_idx_selected;
     const char *name = (idx >= 0 && idx < N_SATELLITES) ? sat_info[idx].name : "";
     char payload[768];
@@ -5936,27 +7150,108 @@ void init_webserver() {
              plogw->up_f, plogw->dn_f, plogw->satup_f, plogw->satdn_f, offset_hz,
              plogw->grid_locator_set, plogw->latitude, plogw->longitude, jst, utc);
     request->send(200, "application/json", payload);
+    sat_web_diag("QUEUED", "/api/sat/status");
   });
 
   web_server.on("/api/sat/db", HTTP_GET, [](AsyncWebServerRequest *request) {
-    uint32_t scratch_lease = 0;
-    if (!web_shared_scratch_acquire(request, "/api/sat/db", &scratch_lease)) return;
-    auto state = std::make_shared<FixedJsonState>();
-    if (!state) { web_shared_scratch_release(scratch_lease); request->send(503, "text/plain", "Not enough memory"); return; }
-    state->owns_scratch = true; state->scratch_lease = scratch_lease; size_t &pos = state->len;
-    bool ok = json_appendf_checked(state->data, WEB_SHARED_SCRATCH_SIZE, pos, "{\"satellites\":[");
-    bool first = true;
-    for (int i=0; ok && i<N_SATELLITES; ++i) {
-      if (!sat_info[i].name[0]) continue;
-      ok = json_appendf_checked(state->data, WEB_SHARED_SCRATCH_SIZE, pos,
-        "%s{\"index\":%d,\"name\":\"%s\",\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\",\"dn0\":%d,\"dn1\":%d,\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"tle\":%s}",
-        first?"":",", i,sat_info[i].name,sat_info[i].up_f0,sat_info[i].up_f1,sat_info[i].up_mode,
-        sat_info[i].dn_f0,sat_info[i].dn_f1,sat_info[i].dn_mode,sat_info[i].bc_f0,sat_info[i].offset_freq,sat_info[i].YEAR?"true":"false");
-      first=false;
+    sat_web_diag("BEGIN", "/api/sat/db");
+
+    // Do not build the complete satellite database JSON in an
+    // AsyncResponseStream.  On HW1 that temporarily duplicated several KB of
+    // JSON into internal RAM and, together with AsyncTCP buffers, drove the
+    // largest free block down to only a few KB.  Produce one small record at a
+    // time instead.
+    struct SatDbStreamState {
+      int next_index = 0;
+      bool first = true;
+      bool prefix_sent = false;
+      bool suffix_sent = false;
+      char pending[320] = {0};
+      size_t pending_len = 0;
+      size_t pending_off = 0;
+    };
+
+    std::shared_ptr<SatDbStreamState> state = std::make_shared<SatDbStreamState>();
+    if (!state) {
+      request->send(503, "text/plain", "Not enough memory for satellite DB stream");
+      return;
     }
-    if (ok) ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"]}");
-    if (!ok) { request->send(507,"text/plain","Satellite database JSON exceeds shared Web buffer"); return; }
-    send_fixed_json_state(request,state);
+    sat_web_diag("STREAM", "/api/sat/db");
+
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "application/json",
+      [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        (void)index;
+        if (!buffer || maxLen == 0) return 0;
+
+        size_t limit = web_stream_chunk_limit(maxLen);
+#if JK1DVPLOG_HWVER == 1
+        limit = std::min(limit, static_cast<size_t>(1024));
+#endif
+        size_t out = 0;
+
+        while (out < limit) {
+          if (state->pending_off < state->pending_len) {
+            const size_t avail = state->pending_len - state->pending_off;
+            const size_t n = std::min(avail, limit - out);
+            memcpy(buffer + out, state->pending + state->pending_off, n);
+            state->pending_off += n;
+            out += n;
+            if (out >= limit) break;
+            continue;
+          }
+
+          state->pending_len = 0;
+          state->pending_off = 0;
+
+          if (!state->prefix_sent) {
+            static const char prefix[] = "{\"satellites\":[";
+            memcpy(state->pending, prefix, sizeof(prefix) - 1);
+            state->pending_len = sizeof(prefix) - 1;
+            state->prefix_sent = true;
+            continue;
+          }
+
+          int i = state->next_index;
+          while (i < N_SATELLITES && sat_info[i].name[0] == '\0') ++i;
+          if (i < N_SATELLITES) {
+            state->next_index = i + 1;
+            const int n = snprintf(
+              state->pending, sizeof(state->pending),
+              "%s{\"index\":%d,\"name\":\"%s\",\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\","
+              "\"dn0\":%d,\"dn1\":%d,\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"tle\":%s}",
+              state->first ? "" : ",",
+              i, sat_info[i].name, sat_info[i].up_f0, sat_info[i].up_f1, sat_info[i].up_mode,
+              sat_info[i].dn_f0, sat_info[i].dn_f1, sat_info[i].dn_mode,
+              sat_info[i].bc_f0, sat_info[i].offset_freq,
+              sat_info[i].YEAR ? "true" : "false");
+            state->first = false;
+            if (n < 0 || static_cast<size_t>(n) >= sizeof(state->pending)) {
+              // The fixed buffer is intentionally larger than the maximum
+              // sat_info record.  Abort rather than emitting malformed JSON if
+              // that assumption ever changes.
+              return 0;
+            }
+            state->pending_len = static_cast<size_t>(n);
+            continue;
+          }
+
+          if (!state->suffix_sent) {
+            state->pending[0] = ']';
+            state->pending[1] = '}';
+            state->pending_len = 2;
+            state->suffix_sent = true;
+            continue;
+          }
+
+          break;
+        }
+
+        return out;
+      });
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+    sat_web_diag("QUEUED", "/api/sat/db");
   });
 
   web_server.on("/api/sat/db/save", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -6027,7 +7322,7 @@ void init_webserver() {
       sat_info[idx].maxel = 0;
     }
     save_satinfo();
-    request_sat_tle_parse();
+    readtlefile();
     start_calc_nextaos();
     request->send(200, "text/plain", sat_info[idx].YEAR ? "Saved; TLE matched" : "Saved; no matching TLE yet");
   });
@@ -6051,6 +7346,7 @@ void init_webserver() {
   });
 
   web_server.on("/api/sat/list", HTTP_GET, [](AsyncWebServerRequest *request) {
+    sat_web_diag("BEGIN", "/api/sat/list");
     bool have_valid_sat = false;
     for (int i = 0; i < N_SATELLITES; ++i) {
       if (sat_info[i].name[0] != '\0' && sat_info[i].YEAR != 0) {
@@ -6060,20 +7356,92 @@ void init_webserver() {
     }
     if (!have_valid_sat) {
       load_satinfo();
-      request_sat_tle_parse();
+      request_sat_tle_parse(1000);
     }
 
-    uint32_t scratch_lease = 0;
-    if (!web_shared_scratch_acquire(request, "/api/sat/list", &scratch_lease)) return;
-    auto state=std::make_shared<FixedJsonState>();
-    if (!state) { web_shared_scratch_release(scratch_lease); request->send(503,"text/plain","Not enough memory"); return; }
-    state->owns_scratch=true; state->scratch_lease=scratch_lease; size_t &pos=state->len;
-    bool ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"satellites\":["); bool first=true;
-    for(int i=0; ok && i<N_SATELLITES; ++i){ if(!sat_info[i].name[0]||!sat_info[i].YEAR) continue;
-      ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"%s{\"index\":%d,\"name\":\"%s\",\"selected\":%s}",first?"":",",i,sat_info[i].name,i==plogw->sat_idx_selected?"true":"false"); first=false; }
-    if(ok) ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"]}");
-    if(!ok){ request->send(507,"text/plain","Satellite list JSON exceeds shared Web buffer"); return; }
-    send_fixed_json_state(request,state);
+    // Produce the compact satellite list one record at a time.  The previous
+    // AsyncResponseStream version accumulated the whole JSON document in heap
+    // before AsyncTCP could drain it, which is unnecessarily expensive on HW1.
+    struct SatListStreamState {
+      int next_index = 0;
+      bool first = true;
+      bool prefix_sent = false;
+      bool suffix_sent = false;
+      char pending[160] = {0};
+      size_t pending_len = 0;
+      size_t pending_off = 0;
+    };
+
+    std::shared_ptr<SatListStreamState> state = std::make_shared<SatListStreamState>();
+    if (!state) {
+      request->send(503, "text/plain", "Not enough memory for satellite list stream");
+      return;
+    }
+    sat_web_diag("STREAM", "/api/sat/list");
+
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "application/json",
+      [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        (void)index;
+        if (!buffer || maxLen == 0) return 0;
+
+        size_t limit = web_stream_chunk_limit(maxLen);
+#if JK1DVPLOG_HWVER == 1
+        limit = std::min(limit, static_cast<size_t>(1024));
+#endif
+        size_t out = 0;
+
+        while (out < limit) {
+          if (state->pending_off < state->pending_len) {
+            const size_t avail = state->pending_len - state->pending_off;
+            const size_t n = std::min(avail, limit - out);
+            memcpy(buffer + out, state->pending + state->pending_off, n);
+            state->pending_off += n;
+            out += n;
+            if (out >= limit) break;
+            continue;
+          }
+
+          state->pending_len = 0;
+          state->pending_off = 0;
+
+          if (!state->prefix_sent) {
+            static const char prefix[] = "{\"satellites\":[";
+            memcpy(state->pending, prefix, sizeof(prefix) - 1);
+            state->pending_len = sizeof(prefix) - 1;
+            state->prefix_sent = true;
+            continue;
+          }
+
+          int i = state->next_index;
+          while (i < N_SATELLITES &&
+                 (sat_info[i].name[0] == '\0' || sat_info[i].YEAR == 0)) ++i;
+          if (i < N_SATELLITES) {
+            state->next_index = i + 1;
+            const int n = snprintf(state->pending, sizeof(state->pending),
+                                   "%s{\"index\":%d,\"name\":\"%s\",\"selected\":%s}",
+                                   state->first ? "" : ",", i, sat_info[i].name,
+                                   i == plogw->sat_idx_selected ? "true" : "false");
+            state->first = false;
+            if (n < 0 || static_cast<size_t>(n) >= sizeof(state->pending)) return 0;
+            state->pending_len = static_cast<size_t>(n);
+            continue;
+          }
+
+          if (!state->suffix_sent) {
+            state->pending[0] = ']';
+            state->pending[1] = '}';
+            state->pending_len = 2;
+            state->suffix_sent = true;
+            continue;
+          }
+          break;
+        }
+        return out;
+      });
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+    sat_web_diag("QUEUED", "/api/sat/list");
   });
 
   web_server.on("/api/sat/select", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -6091,6 +7459,7 @@ void init_webserver() {
   });
 
   web_server.on("/api/sat/enable", HTTP_POST, [](AsyncWebServerRequest *request) {
+    sat_web_diag("BEGIN", "/api/sat/enable");
     if (!request->hasParam("enabled")) { request->send(400, "text/plain", "Missing enabled"); return; }
     const bool enabled = request->getParam("enabled")->value().toInt() != 0;
     if (!set_satellite_operation(enabled)) {
@@ -6099,6 +7468,7 @@ void init_webserver() {
     }
     request->send(200, "text/plain",
                   enabled ? "Satellite operation ON" : "Satellite operation OFF");
+    sat_web_diag(enabled ? "ON" : "OFF", "/api/sat/enable");
   });
 
   web_server.on("/api/sat/tracking", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -6170,6 +7540,7 @@ void init_webserver() {
   });
 
   web_server.on("/api/sat/pass", HTTP_GET, [](AsyncWebServerRequest *request) {
+    sat_web_diag("BEGIN", "/api/sat/pass");
     if (!request->hasParam("index")) { request->send(400, "text/plain", "Missing index"); return; }
     const int idx = request->getParam("index")->value().toInt();
     if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].name[0] == '\0' || sat_info[idx].YEAR == 0) {
@@ -6192,12 +7563,9 @@ void init_webserver() {
     web_sat_format_datetime(aos, aos_text, sizeof(aos_text));
     web_sat_format_datetime(los, los_text, sizeof(los_text));
 
-    uint32_t scratch_lease = 0;
-    if (!web_shared_scratch_acquire(request, "/api/sat/pass", &scratch_lease)) return;
-    auto state=std::make_shared<FixedJsonState>();
-    if(!state){ web_shared_scratch_release(scratch_lease); request->send(503,"text/plain","Not enough memory"); return; }
-    state->owns_scratch=true; state->scratch_lease=scratch_lease; size_t &pos=state->len;
-    bool ok=json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\","
+    AsyncResponseStream *res = request->beginResponseStream("application/json");
+    sat_web_diag("STREAM", "/api/sat/pass");
+    res->printf("{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\","
                 "\"up0\":%d,\"up1\":%d,\"upmode\":\"%s\",\"dn0\":%d,\"dn1\":%d,"
                 "\"dnmode\":\"%s\",\"beacon\":%d,\"offset\":%d,\"points\":[",
                 idx, sat_info[idx].name, aos_text, los_text,
@@ -6215,17 +7583,17 @@ void init_webserver() {
       if (!web_sat_calc_point(idx, t, &az, &el, &rr)) continue;
       if (off == 0) aos_az = az;
       if (el > max_el) { max_el = el; mel_az = az; mel_time = t; }
-      if (!first) ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,",");
+      if (!first) res->print(',');
       first = false;
-      ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)t.unixtime(), az, el);
+      res->printf("{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)t.unixtime(), az, el);
       last_off = off;
       if (duration - off < step) break;
     }
     if (last_off != duration) {
       double az = 0, el = 0, rr = 0;
       if (web_sat_calc_point(idx, los, &az, &el, &rr)) {
-        if (!first) ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,",");
-        ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)los.unixtime(), az, el);
+        if (!first) res->print(',');
+        res->printf("{\"t\":%lu,\"az\":%.3f,\"el\":%.3f}", (unsigned long)los.unixtime(), az, el);
         los_az = az;
         if (el > max_el) { max_el = el; mel_az = az; mel_time = los; }
       }
@@ -6234,13 +7602,14 @@ void init_webserver() {
       web_sat_calc_point(idx, los, &los_az, &el, &rr);
     }
     web_sat_format_datetime(mel_time, mel_text, sizeof(mel_text));
-    ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"],\"aos_az\":%.3f,\"mel\":\"%s\",\"mel_az\":%.3f,\"mel_el\":%.3f,\"los_az\":%.3f}",
+    res->printf("],\"aos_az\":%.3f,\"mel\":\"%s\",\"mel_az\":%.3f,\"mel_el\":%.3f,\"los_az\":%.3f}",
                 aos_az, mel_text, mel_az, max_el, los_az);
-    if(!ok){ request->send(507,"text/plain","Satellite pass JSON exceeds shared Web buffer"); return; }
-    send_fixed_json_state(request,state);
+    request->send(res);
+    sat_web_diag("QUEUED", "/api/sat/pass");
   });
 
   web_server.on("/api/sat/nowpos", HTTP_GET, [](AsyncWebServerRequest *request) {
+    sat_web_diag("BEGIN", "/api/sat/nowpos");
     if (!request->hasParam("index")) { request->send(400, "text/plain", "Missing index"); return; }
     const int idx = request->getParam("index")->value().toInt();
     if (idx < 0 || idx >= N_SATELLITES || sat_info[idx].name[0] == '\0' || sat_info[idx].YEAR == 0) {
@@ -6263,81 +7632,175 @@ void init_webserver() {
              active ? "true" : "false", selected ? "true" : "false",
              selected ? plogw->up_f : 0, selected ? plogw->dn_f : 0);
     request->send(200, "application/json", payload);
+    sat_web_diag("QUEUED", "/api/sat/nowpos");
   });
 
   web_server.on("/api/sat/aos", HTTP_GET, [](AsyncWebServerRequest *request) {
-    uint32_t scratch_lease = 0;
-    if (!web_shared_scratch_acquire(request, "/api/sat/aos", &scratch_lease)) return;
-    auto state=std::make_shared<FixedJsonState>();
-    if(!state){ web_shared_scratch_release(scratch_lease); request->send(503,"text/plain","Not enough memory"); return; }
-    state->owns_scratch=true; state->scratch_lease=scratch_lease; size_t &pos=state->len; bool ok=true;
-    int total = 0;
-    int completed = 0;
-    for (int i=0;i<N_SATELLITES;i++) {
-      if (!(sat_info[i].name[0] && sat_info[i].YEAR)) continue;
-      total++;
-      if (!plogw->f_nextaos || i < plogw->nextaos_satidx) completed++;
+    sat_web_diag("BEGIN", "/api/sat/aos");
+
+    // Snapshot only the small amount of ordering/progress metadata needed for
+    // this response, then format one pass record at a time.  This avoids the
+    // whole-document AsyncResponseStream allocation while keeping AOS
+    // calculation itself unchanged.
+    struct SatAosStreamState {
+      bool calculating = false;
+      int completed = 0;
+      int total = 0;
+      int current_index = -1;
+      int state_code = 0;
+      char current_name[32] = {0};
+      char state_name[20] = {0};
+      int aos_idx[N_SATELLITES] = {0};
+      int shown_count = 0;
+      int next_pass = 0;
+      bool prefix_sent = false;
+      bool suffix_sent = false;
+      char pending[256] = {0};
+      size_t pending_len = 0;
+      size_t pending_off = 0;
+    };
+
+    std::shared_ptr<SatAosStreamState> state = std::make_shared<SatAosStreamState>();
+    if (!state) {
+      request->send(503, "text/plain", "Not enough memory for AOS stream");
+      return;
     }
-    const int current_idx = plogw->nextaos_satidx;
-    const char *current_name = (current_idx >= 0 && current_idx < N_SATELLITES && sat_info[current_idx].name[0]) ? sat_info[current_idx].name : "";
+
+    state->calculating = plogw->f_nextaos != 0;
+    state->current_index = plogw->nextaos_satidx;
+    state->state_code = plogw->f_nextaos;
     const char *state_name = plogw->f_nextaos == 1 ? "prepare" :
                              plogw->f_nextaos == 2 ? "AOS search" :
                              plogw->f_nextaos == 3 ? "LOS search" :
                              plogw->f_nextaos == 4 ? "finalize" :
                              plogw->f_nextaos == 5 ? "next satellite" : "idle";
-    ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"calculating\":%s,\"completed\":%d,\"total\":%d,\"current_index\":%d,\"current_name\":\"%s\",\"state\":%d,\"state_name\":\"%s\",\"passes\":[",
-                plogw->f_nextaos ? "true" : "false", completed, total, current_idx,
-                current_name, plogw->f_nextaos, state_name);
-    int aos_idx[N_SATELLITES];
+    strlcpy(state->state_name, state_name, sizeof(state->state_name));
+    if (state->current_index >= 0 && state->current_index < N_SATELLITES &&
+        sat_info[state->current_index].name[0]) {
+      strlcpy(state->current_name, sat_info[state->current_index].name,
+              sizeof(state->current_name));
+    }
+
     int aos_count = 0;
     for (int i = 0; i < N_SATELLITES; ++i) {
-      if (sat_info[i].name[0] == '\0' || sat_info[i].YEAR == 0) continue;
+      if (!(sat_info[i].name[0] && sat_info[i].YEAR)) continue;
+      state->total++;
+      if (!plogw->f_nextaos || i < plogw->nextaos_satidx) state->completed++;
       if (plogw->f_nextaos && i >= plogw->nextaos_satidx) continue;
       if (compare_datetime(sat_info[i].nextlos, my_rtc) <= 0) continue;
       if (compare_datetime(sat_info[i].nextlos, sat_info[i].nextaos) <= 0) continue;
-      aos_idx[aos_count++] = i;
+      state->aos_idx[aos_count++] = i;
     }
 
     for (int a = 1; a < aos_count; ++a) {
-      const int key = aos_idx[a];
+      const int key = state->aos_idx[a];
       int b = a - 1;
       while (b >= 0 &&
-             compare_datetime(sat_info[aos_idx[b]].nextaos,
+             compare_datetime(sat_info[state->aos_idx[b]].nextaos,
                               sat_info[key].nextaos) > 0) {
-        aos_idx[b + 1] = aos_idx[b];
+        state->aos_idx[b + 1] = state->aos_idx[b];
         --b;
       }
-      aos_idx[b + 1] = key;
+      state->aos_idx[b + 1] = key;
     }
-
-    bool first = true;
     const int max_show = 15;
-    const int shown_count = aos_count < max_show ? aos_count : max_show;
-    for (int n = 0; n < shown_count; ++n) {
-      const int i = aos_idx[n];
-      if (!first) ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,",");
-      first = false;
-      char aos[24], los[24];
-      snprintf(aos,sizeof(aos),"%04d-%02d-%02d %02d:%02d",sat_info[i].nextaos.year(),sat_info[i].nextaos.month(),sat_info[i].nextaos.day(),sat_info[i].nextaos.hour(),sat_info[i].nextaos.minute());
-      snprintf(los,sizeof(los),"%04d-%02d-%02d %02d:%02d",sat_info[i].nextlos.year(),sat_info[i].nextlos.month(),sat_info[i].nextlos.day(),sat_info[i].nextlos.hour(),sat_info[i].nextlos.minute());
-      ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\",\"los\":\"%s\",\"max_el\":%.2f}",i,sat_info[i].name,aos,los,sat_info[i].maxel);
-    }
-    ok=ok && json_appendf_checked(state->data,WEB_SHARED_SCRATCH_SIZE,pos,"]}");
-    if(!ok){ request->send(507,"text/plain","Satellite AOS JSON exceeds shared Web buffer"); return; }
-    send_fixed_json_state(request,state);
+    state->shown_count = aos_count < max_show ? aos_count : max_show;
+    sat_web_diag("STREAM", "/api/sat/aos");
+
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "application/json",
+      [state](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        (void)index;
+        if (!buffer || maxLen == 0) return 0;
+
+        size_t limit = web_stream_chunk_limit(maxLen);
+#if JK1DVPLOG_HWVER == 1
+        limit = std::min(limit, static_cast<size_t>(1024));
+#endif
+        size_t out = 0;
+
+        while (out < limit) {
+          if (state->pending_off < state->pending_len) {
+            const size_t avail = state->pending_len - state->pending_off;
+            const size_t n = std::min(avail, limit - out);
+            memcpy(buffer + out, state->pending + state->pending_off, n);
+            state->pending_off += n;
+            out += n;
+            if (out >= limit) break;
+            continue;
+          }
+
+          state->pending_len = 0;
+          state->pending_off = 0;
+
+          if (!state->prefix_sent) {
+            const int n = snprintf(
+              state->pending, sizeof(state->pending),
+              "{\"calculating\":%s,\"completed\":%d,\"total\":%d,"
+              "\"current_index\":%d,\"current_name\":\"%s\","
+              "\"state\":%d,\"state_name\":\"%s\",\"passes\":[",
+              state->calculating ? "true" : "false", state->completed, state->total,
+              state->current_index, state->current_name, state->state_code,
+              state->state_name);
+            if (n < 0 || static_cast<size_t>(n) >= sizeof(state->pending)) return 0;
+            state->pending_len = static_cast<size_t>(n);
+            state->prefix_sent = true;
+            continue;
+          }
+
+          if (state->next_pass < state->shown_count) {
+            const int i = state->aos_idx[state->next_pass];
+            char aos[24], los[24];
+            snprintf(aos, sizeof(aos), "%04d-%02d-%02d %02d:%02d",
+                     sat_info[i].nextaos.year(), sat_info[i].nextaos.month(),
+                     sat_info[i].nextaos.day(), sat_info[i].nextaos.hour(),
+                     sat_info[i].nextaos.minute());
+            snprintf(los, sizeof(los), "%04d-%02d-%02d %02d:%02d",
+                     sat_info[i].nextlos.year(), sat_info[i].nextlos.month(),
+                     sat_info[i].nextlos.day(), sat_info[i].nextlos.hour(),
+                     sat_info[i].nextlos.minute());
+            const int n = snprintf(
+              state->pending, sizeof(state->pending),
+              "%s{\"index\":%d,\"name\":\"%s\",\"aos\":\"%s\","
+              "\"los\":\"%s\",\"max_el\":%.2f}",
+              state->next_pass == 0 ? "" : ",", i, sat_info[i].name,
+              aos, los, sat_info[i].maxel);
+            if (n < 0 || static_cast<size_t>(n) >= sizeof(state->pending)) return 0;
+            state->next_pass++;
+            state->pending_len = static_cast<size_t>(n);
+            continue;
+          }
+
+          if (!state->suffix_sent) {
+            state->pending[0] = ']';
+            state->pending[1] = '}';
+            state->pending_len = 2;
+            state->suffix_sent = true;
+            continue;
+          }
+          break;
+        }
+        return out;
+      });
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+    sat_web_diag("QUEUED", "/api/sat/aos");
   });
 
 
   web_server.on("/api/sat/tle/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    sat_web_diag("BEGIN", "/api/sat/tle/status");
     int valid_satellites = 0;
     for (int i = 0; i < N_SATELLITES; ++i) {
       if (sat_info[i].name[0] && sat_info[i].YEAR) valid_satellites++;
     }
     char payload[448];
-    snprintf(payload,sizeof(payload),"{\"url\":\"%s\",\"requested\":%s,\"in_progress\":%s,\"last_result\":%d,\"tle_time\":%lu,\"valid_satellites\":%d}",
+    const bool tle_busy = sat_tle_work_pending();
+    snprintf(payload,sizeof(payload),"{\"url\":\"%s\",\"requested\":%s,\"in_progress\":%s,\"busy\":%s,\"last_result\":%d,\"tle_time\":%lu,\"valid_satellites\":%d}",
              sat_tle_url, sat_tle_update_requested?"true":"false", sat_tle_update_in_progress?"true":"false",
-             sat_tle_last_result, plogw->tle_unixtime, valid_satellites);
+             tle_busy?"true":"false", sat_tle_last_result, plogw->tle_unixtime, valid_satellites);
     request->send(200,"application/json",payload);
+    sat_web_diag("QUEUED", "/api/sat/tle/status");
   });
   web_server.on("/api/sat/tle/config", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("url")) { request->send(400,"text/plain","Missing URL"); return; }
@@ -6351,7 +7814,9 @@ void init_webserver() {
   });
 
   web_server.on("/api/sat/aos/recalculate", HTTP_POST, [](AsyncWebServerRequest *request) {
+    sat_web_diag("BEGIN", "/api/sat/aos/recalc");
     start_calc_nextaos(); request->send(202, "text/plain", "Started");
+    sat_web_diag("QUEUED", "/api/sat/aos/recalc");
   });
 
   // /potahelp
@@ -6393,7 +7858,7 @@ body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#2
 
 <h2>3. この公園のADIFログを作成</h2>
 <div class="step"><p>下のボタンは、Remarksに現在の公園番号が記録されたQSOだけを抽出します。</p>
-<a id="dl" class="button primary" href="/adif" download="pota_log.adi">この公園のADIFをダウンロード</a>
+<a id="dl" class="button primary" href="/adif">この公園のADIFをダウンロード</a>
 <p id="status" class="status"></p>
 <p class="small">ファイル名は <code>pota_log_JP-xxxx.adi</code> です。ダウンロード前に公園番号が正しいことを確認してください。</p></div>
 
@@ -6424,7 +7889,7 @@ function setCurrentPark(){
 }
 function selectPark(code,name,grid){notifyPark(code,name,grid).then(()=>{document.getElementById('park').value=code;updateDownloadLink();document.getElementById('setStatus').textContent=`${code} ${name} を現在の運用公園として設定しました。`;window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}
 function openParkPage(){const code=normPark();if(!code){document.getElementById('setStatus').textContent='公園番号を入力してください。';return;}window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}
-function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';link.download='pota_log.adi';st.textContent='公園番号を入力し、本体へ設定してください。';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;link.download=`pota_log_${park}.adi`;st.textContent=`${park} のQSOだけを抽出する準備ができています。`;}}
+function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';st.textContent='公園番号を入力し、本体へ設定してください。';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;st.textContent=`${park} のQSOだけを抽出する準備ができています。`;}}
 function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}
 </script></body></html>
 )rawliteral";  
@@ -6435,10 +7900,10 @@ function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}
 <h2>1. Set the park being activated</h2><div class="step"><label for="park"><strong>POTA park reference</strong></label><div class="row"><input type="text" id="park" %PARK_ID% placeholder="Example: JP-1001" oninput="updateDownloadLink()"><button class="primary" onclick="setCurrentPark()">Set this park in DVPlogger</button><button onclick="openParkPage()">Open park information</button></div><p id="setStatus" class="status"></p><p class="small">DVPlogger stores <code>POTA/JP-xxxx</code> in the JCC/JCG field. QSOs logged afterward are identified as activation QSOs from this park.</p></div>
 <h2>Find a nearby park</h2><div class="step"><p>Search for nearby parks using the current grid locator. Clicking a result sets the park in DVPlogger and opens its POTA page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button id="nearBtn" onclick="findNearest()">Find nearby POTA parks</button></div><p id="searchStatus" class="status"></p><ul id="results"></ul></div>
 <h2>2. Log QSOs normally</h2><div class="step"><p>Enter callsign, RST and exchange normally. Each QSO logged after setting the park is tagged with the current park reference.</p><p class="note">After moving to another park, set the new park before logging more QSOs. Logs can be exported separately for each park.</p></div>
-<h2>3. Export this park's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current park reference.</p><a id="dl" class="button primary" href="/adif" download="pota_log.adi">Download ADIF for this park</a><p id="status" class="status"></p><p class="small">The filename is <code>pota_log_JP-xxxx.adi</code>. Verify the park reference before downloading.</p></div>
+<h2>3. Export this park's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current park reference.</p><a id="dl" class="button primary" href="/adif">Download ADIF for this park</a><p id="status" class="status"></p><p class="small">The filename is <code>pota_log_JP-xxxx.adi</code>. Verify the park reference before downloading.</p></div>
 <h2>4. Upload to POTA</h2><div class="step"><ol><li>Save the ADIF file above.</li><li>Open POTA Log Manager and sign in.</li><li>Select or drag the saved ADIF file into the upload page.</li><li>Confirm the park, date/time and callsign before submitting.</li></ol><button onclick="openPOTA()">Open POTA Log Manager</button></div>
 <h2>Button reference</h2><ul><li><strong>Set this park in DVPlogger:</strong> tags subsequently logged QSOs with the park reference.</li><li><strong>Open park information:</strong> opens the official POTA park page without changing DVPlogger.</li><li><strong>Find nearby POTA parks:</strong> lists candidates from the park file on the SD card.</li><li><strong>Download ADIF for this park:</strong> exports only QSOs made from the selected park.</li><li><strong>Open POTA Log Manager:</strong> opens the official log page; upload is not automatic.</li></ul><p><a href="/sotahelp?lang=en">SOTA helper</a></p>
-<script>function normPark(){return document.getElementById('park').value.trim().toUpperCase();}let nearBusy=false;async function findNearest(){const grid=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');if(!grid){st.textContent='Enter a grid locator.';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='Searching...';try{const r=await fetch(`/nearest?grid=${encodeURIComponent(grid)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'DVPlogger is busy. Please retry shortly.':'Search failed');showResults(await r.json());}catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}}function showResults(list){const ul=document.getElementById('results');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a park name to set it.`:'No candidates found.';list.forEach(p=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${p.code}: ${p.name} (${p.distance_km} km, bearing ${p.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectPark(p.code,p.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifyPark(code,name,grid){return fetch(`/select?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentPark(){const code=normPark(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a park reference.';return;}notifyPark(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('park').value=code;updateDownloadLink();st.textContent=`${code} is now the active park. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectPark(code,name,grid){notifyPark(code,name,grid).then(()=>{document.getElementById('park').value=code;updateDownloadLink();document.getElementById('setStatus').textContent=`${code} ${name} is now the active park.`;window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openParkPage(){const code=normPark();if(!code){document.getElementById('setStatus').textContent='Enter a park reference.';return;}window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';link.download='pota_log.adi';st.textContent='Enter a park reference and set it in DVPlogger.';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;link.download=`pota_log_${park}.adi`;st.textContent=`Ready to extract QSOs for ${park}.`;}}function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}</script></body></html>
+<script>function normPark(){return document.getElementById('park').value.trim().toUpperCase();}let nearBusy=false;async function findNearest(){const grid=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');if(!grid){st.textContent='Enter a grid locator.';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='Searching...';try{const r=await fetch(`/nearest?grid=${encodeURIComponent(grid)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'DVPlogger is busy. Please retry shortly.':'Search failed');showResults(await r.json());}catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}}function showResults(list){const ul=document.getElementById('results');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a park name to set it.`:'No candidates found.';list.forEach(p=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${p.code}: ${p.name} (${p.distance_km} km, bearing ${p.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectPark(p.code,p.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifyPark(code,name,grid){return fetch(`/select?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentPark(){const code=normPark(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a park reference.';return;}notifyPark(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('park').value=code;updateDownloadLink();st.textContent=`${code} is now the active park. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectPark(code,name,grid){notifyPark(code,name,grid).then(()=>{document.getElementById('park').value=code;updateDownloadLink();document.getElementById('setStatus').textContent=`${code} ${name} is now the active park.`;window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openParkPage(){const code=normPark();if(!code){document.getElementById('setStatus').textContent='Enter a park reference.';return;}window.open(`https://pota.app/#/park/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLink(){const park=normPark(),link=document.getElementById('dl'),st=document.getElementById('status');if(!park){link.href='/adif';st.textContent='Enter a park reference and set it in DVPlogger.';}else{link.href=`/adif?park=${encodeURIComponent(park)}`;st.textContent=`Ready to extract QSOs for ${park}.`;}}function openPOTA(){window.open('https://pota.app/#/user/logs','_blank');}</script></body></html>
 )rawliteral";
 
   web_server.on("/potahelp", HTTP_GET, [pota_page,pota_page_en](AsyncWebServerRequest* request){
@@ -6511,7 +7976,7 @@ body{font-family:sans-serif;line-height:1.6;margin:18px;max-width:920px;color:#2
 
 <h2>3. この山頂のADIFログを作成</h2>
 <div class="step"><p>下のボタンは、Remarksに現在の山頂IDが記録されたQSOだけを抽出します。</p>
-<a id="dl" class="button primary" href="/adif" download="sota_log.adi">この山頂のADIFをダウンロード</a><p id="status" class="status"></p>
+<a id="dl" class="button primary" href="/adif">この山頂のADIFをダウンロード</a><p id="status" class="status"></p>
 <p class="small">ファイル名は <code>sota_log_JA_xx-xxx.adi</code> です。ブラウザーによっては山頂ID中の「/」が「_」などへ置換されます。</p></div>
 
 <h2>4. SOTA Databaseへアップロード</h2>
@@ -6527,7 +7992,7 @@ function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encode
 function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='山頂IDを入力してください。';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} を現在の運用山頂として設定しました。これ以後のQSOへ記録されます。`;}).catch(e=>st.textContent=e.message);}
 function selectSota(code,name,grid){notifySummit(code,name,grid).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();document.getElementById('setStatus').textContent=`${code} ${name} を現在の運用山頂として設定しました。`;window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}
 function openSummitPage(){const code=normSummit();if(!code){document.getElementById('setStatus').textContent='山頂IDを入力してください。';return;}window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}
-function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';link.download='sota_log.adi';st.textContent='山頂IDを入力し、本体へ設定してください。';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;link.download=`sota_log_${summit.replaceAll('/','_')}.adi`;st.textContent=`${summit} のQSOだけを抽出する準備ができています。`;}}
+function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';st.textContent='山頂IDを入力し、本体へ設定してください。';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;st.textContent=`${summit} のQSOだけを抽出する準備ができています。`;}}
 function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank');}
 </script></body></html>
 )rawliteral";  
@@ -6537,10 +8002,10 @@ function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank'
 <h2>1. Set the summit being activated</h2><div class="step"><label for="summit"><strong>SOTA summit reference</strong></label><div class="row"><input type="text" id="summit" %SUMMIT_ID% placeholder="Example: JA/KN-006" oninput="updateDownloadLinkSOTA()"><button class="primary" onclick="setCurrentSummit()">Set this summit in DVPlogger</button><button onclick="openSummitPage()">Open summit information</button></div><p id="setStatus" class="status"></p><p class="small">DVPlogger stores <code>SOTA/JA/xx-xxx</code> in the JCC/JCG field. QSOs logged afterward are identified as activation QSOs from this summit.</p></div>
 <h2>Find a nearby summit</h2><div class="step"><p>Search for nearby summits using the current grid locator. Clicking a result sets the summit in DVPlogger and opens its information page.</p><div class="row"><input id="grid" value="%GRID_LOCATOR%" placeholder="Grid example: PM95ru"><button id="nearBtn" onclick="findSota()">Find nearby SOTA summits</button></div><p id="searchStatus" class="status"></p><ul id="sotaResults"></ul></div>
 <h2>2. Log QSOs normally</h2><div class="step"><p>Enter callsign, RST and exchange normally. Each QSO logged after setting the summit is tagged with the current summit reference.</p><p class="note">After moving to another summit, set the new reference before logging more QSOs. Logs can be exported separately for each summit.</p></div>
-<h2>3. Export this summit's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current summit reference.</p><a id="dl" class="button primary" href="/adif" download="sota_log.adi">Download ADIF for this summit</a><p id="status" class="status"></p><p class="small">The filename is <code>sota_log_JA_xx-xxx.adi</code>. A browser may replace “/” in the summit reference with “_”.</p></div>
+<h2>3. Export this summit's ADIF log</h2><div class="step"><p>The button below extracts only QSOs whose Remarks contain the current summit reference.</p><a id="dl" class="button primary" href="/adif">Download ADIF for this summit</a><p id="status" class="status"></p><p class="small">The filename is <code>sota_log_JA_xx-xxx.adi</code>. A browser may replace “/” in the summit reference with “_”.</p></div>
 <h2>4. Upload to SOTA Database</h2><div class="step"><ol><li>Save the ADIF file above.</li><li>Open SOTA log upload and sign in.</li><li>Select Activator log upload and choose the saved ADIF file.</li><li>Confirm the summit, date/time and callsign before submitting.</li></ol><button onclick="openSOTA()">Open SOTA log upload</button></div>
 <h2>Button reference</h2><ul><li><strong>Set this summit in DVPlogger:</strong> tags subsequently logged QSOs with the summit reference.</li><li><strong>Open summit information:</strong> opens the SOTLAS summit page without changing DVPlogger.</li><li><strong>Find nearby SOTA summits:</strong> lists candidates from the summit file on the SD card.</li><li><strong>Download ADIF for this summit:</strong> exports only QSOs made from the selected summit.</li><li><strong>Open SOTA log upload:</strong> opens the SOTA Database upload page; upload is not automatic.</li></ul><p><a href="/potahelp?lang=en">POTA helper</a></p>
-<script>function normSummit(){return document.getElementById('summit').value.trim().toUpperCase();}let nearBusy=false;async function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');if(!g){st.textContent='Enter a grid locator.';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='Searching...';try{const r=await fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'DVPlogger is busy. Please retry shortly.':'Search failed');showSota(await r.json());}catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}}function showSota(list){const ul=document.getElementById('sotaResults');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a summit name to set it.`:'No candidates found.';list.forEach(x=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${x.code}: ${x.name} (${x.distance_km} km, altitude ${x.alt} m, bearing ${x.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectSota(x.code,x.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a summit reference.';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} is now the active summit. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectSota(code,name,grid){notifySummit(code,name,grid).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();document.getElementById('setStatus').textContent=`${code} ${name} is now the active summit.`;window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openSummitPage(){const code=normSummit();if(!code){document.getElementById('setStatus').textContent='Enter a summit reference.';return;}window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';link.download='sota_log.adi';st.textContent='Enter a summit reference and set it in DVPlogger.';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;link.download=`sota_log_${summit.replaceAll('/','_')}.adi`;st.textContent=`Ready to extract QSOs for ${summit}.`;}}function openSOTA(){window.open('https://www.sotadata.org.uk/en/upload','_blank');}</script></body></html>
+<script>function normSummit(){return document.getElementById('summit').value.trim().toUpperCase();}let nearBusy=false;async function findSota(){const g=document.getElementById('grid').value.trim(),st=document.getElementById('searchStatus'),btn=document.getElementById('nearBtn');if(!g){st.textContent='Enter a grid locator.';return;}if(nearBusy)return;nearBusy=true;btn.disabled=true;st.textContent='Searching...';try{const r=await fetch(`/nearest_summit?grid=${encodeURIComponent(g)}`,{cache:'no-store'});if(!r.ok)throw new Error(r.status===503?'DVPlogger is busy. Please retry shortly.':'Search failed');showSota(await r.json());}catch(e){st.textContent=e.message;}finally{nearBusy=false;btn.disabled=false;}}function showSota(list){const ul=document.getElementById('sotaResults');ul.innerHTML='';document.getElementById('searchStatus').textContent=list.length?`${list.length} candidate(s). Click a summit name to set it.`:'No candidates found.';list.forEach(x=>{const li=document.createElement('li'),a=document.createElement('a');a.href='#';a.textContent=`${x.code}: ${x.name} (${x.distance_km} km, altitude ${x.alt} m, bearing ${x.bearing_deg}°)`;a.onclick=(ev)=>{ev.preventDefault();selectSota(x.code,x.name,document.getElementById('grid').value);};li.appendChild(a);ul.appendChild(li);});}function notifySummit(code,name,grid){return fetch(`/select_summit?code=${encodeURIComponent(code)}&name=${encodeURIComponent(name||'')}&grid=${encodeURIComponent(grid||'')}`).then(r=>{if(!r.ok)throw new Error('Failed to set DVPlogger');return r.text();});}function setCurrentSummit(){const code=normSummit(),st=document.getElementById('setStatus');if(!code){st.textContent='Enter a summit reference.';return;}notifySummit(code,'',document.getElementById('grid').value).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();st.textContent=`${code} is now the active summit. It will be recorded in subsequent QSOs.`;}).catch(e=>st.textContent=e.message);}function selectSota(code,name,grid){notifySummit(code,name,grid).then(()=>{document.getElementById('summit').value=code;updateDownloadLinkSOTA();document.getElementById('setStatus').textContent=`${code} ${name} is now the active summit.`;window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}).catch(e=>document.getElementById('setStatus').textContent=e.message);}function openSummitPage(){const code=normSummit();if(!code){document.getElementById('setStatus').textContent='Enter a summit reference.';return;}window.open(`https://sotl.as/summits/${encodeURIComponent(code)}`,'_blank');}function updateDownloadLinkSOTA(){const summit=normSummit(),link=document.getElementById('dl'),st=document.getElementById('status');if(!summit){link.href='/adif';st.textContent='Enter a summit reference and set it in DVPlogger.';}else{link.href=`/adif?summit=${encodeURIComponent(summit)}`;st.textContent=`Ready to extract QSOs for ${summit}.`;}}function openSOTA(){window.open('https://www.sotadata.org.uk/en/upload','_blank');}</script></body></html>
 )rawliteral";
 
   web_server.on("/sotahelp", HTTP_GET, [sota_page,sota_page_en](AsyncWebServerRequest* request){
@@ -6593,39 +8058,156 @@ function openSOTA(){window.open('https://www.sotadata.org.uk/ja/upload','_blank'
 
   // /jarlog
   web_server.on("/jarllog", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
-    handleQsoLogDump(request, numstr,4);  //   type 0:dump 1:txt 2:adif 3:csv 4:jarllog
+    handle_web_prepared_export_page(request, WEB_EXPORT_JARL);
   });
 
   // /readqso
-  web_server.on("/readqso", HTTP_GET, [](AsyncWebServerRequest* request) {
+  // Primary Web READQSO path: one HTTP stream.  QSO.TXT is read strictly
+  // forward by the main-loop producer; the AsyncWebServer callback only
+  // drains already-formatted FIFO bytes.
+  web_server.on("/api/readqso/stream", HTTP_GET, [](AsyncWebServerRequest* request) {
+    handleReadQsoFixedDownload(request);
+  });
+
+  web_server.on("/api/readqso/download", HTTP_GET, [](AsyncWebServerRequest* request) {
+    handleReadQsoFixedDownload(request);
+  });
+
+  // Legacy FIFO/ACK API remains temporarily available for diagnosis, but the
+  // /readqso page no longer uses it.
+  // Normal Web READQSO is a producer/consumer stream.  The QSO source is
+  // opened once and read strictly forward by the main-loop job.  HTTP
+  // callbacks only ACK and return already-formatted FIFO chunks.
+  web_server.on("/api/readqso/start", HTTP_GET, [](AsyncWebServerRequest* request) {
     String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
-    handleQsoLogDump(request, numstr,1);  // type 0:dump 1:txt 2:adif 3:csv 4:jarlog
+    if (!start_read_qso_web_job(numstr.c_str())) {
+      request->send(409, "text/plain", "QSO file operation busy or source log unavailable");
+      return;
+    }
+    request->send(202, "application/json", "{\"started\":true}");
+  });
+
+  web_server.on("/api/readqso/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    touch_read_qso_web_job();
+    struct qso_web_export_info info;
+    get_read_qso_web_export_info(&info);
+    char json[288];
+    snprintf(json, sizeof(json),
+             "{\"active\":%s,\"complete\":%s,\"failed\":%s,\"cancelled\":%s,"
+             "\"chunk_ready\":%s,\"done\":%lu,\"total\":%lu,\"elapsed\":%lu,"
+             "\"bytes\":%lu,\"q\":%lu,\"d\":%lu,\"other\":%lu,\"next_sequence\":%lu}",
+             info.active ? "true" : "false",
+             info.complete ? "true" : "false",
+             info.failed ? "true" : "false",
+             info.cancelled ? "true" : "false",
+             info.chunk_ready ? "true" : "false",
+             (unsigned long)info.records_done,
+             (unsigned long)info.records_total,
+             (unsigned long)info.elapsed_ms,
+             (unsigned long)info.bytes,
+             (unsigned long)info.q_records,
+             (unsigned long)info.deleted_records,
+             (unsigned long)info.other_records,
+             (unsigned long)info.next_sequence);
+    request->send(200, "application/json", json);
+  });
+
+  web_server.on("/api/readqso/cancel", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (cancel_read_qso_web_job()) request->send(200, "application/json", "{\"cancelled\":true}");
+    else request->send(409, "application/json", "{\"cancelled\":false}");
+  });
+
+  web_server.on("/api/readqso/next", HTTP_GET, [](AsyncWebServerRequest* request) {
+    uint32_t ack = 0;
+    if (request->hasParam("ack"))
+      ack = (uint32_t)strtoul(request->getParam("ack")->value().c_str(), nullptr, 10);
+    if (ack) ack_read_qso_web_chunk(ack);  // idempotent if already ACKed
+    touch_read_qso_web_job();
+
+    const uint8_t *data = nullptr;
+    size_t len = 0;
+    uint32_t sequence = 0;
+    bool eof = false;
+    if (acquire_read_qso_web_chunk(&data, &len, &sequence, &eof)) {
+      std::shared_ptr<ReadQsoChunkLease> lease = std::make_shared<ReadQsoChunkLease>(sequence);
+      if (!lease) {
+        release_read_qso_web_chunk(sequence);
+        request->send(503, "text/plain", "Not enough memory for chunk lease");
+        return;
+      }
+      size_t sent = 0;
+      AsyncWebServerResponse *response = request->beginChunkedResponse(
+        "text/plain; charset=utf-8",
+        [data, len, sent, lease](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+          (void)index;
+          if (sent >= len) return 0;
+          size_t n = len - sent;
+          if (n > maxLen) n = maxLen;
+          memcpy(buffer, data + sent, n);
+          sent += n;
+          return n;
+        });
+      struct qso_web_export_info info;
+      get_read_qso_web_export_info(&info);
+      char h[24];
+      snprintf(h, sizeof(h), "%lu", (unsigned long)sequence);
+      response->addHeader("X-Export-Seq", h);
+      response->addHeader("X-Export-Eof", eof ? "1" : "0");
+      snprintf(h, sizeof(h), "%lu", (unsigned long)info.records_done);
+      response->addHeader("X-Records-Done", h);
+      snprintf(h, sizeof(h), "%lu", (unsigned long)info.records_total);
+      response->addHeader("X-Records-Total", h);
+      snprintf(h, sizeof(h), "%lu", (unsigned long)info.bytes);
+      response->addHeader("X-Bytes-Produced", h);
+      response->addHeader("Cache-Control", "no-store");
+      request->send(response);
+      return;
+    }
+
+    struct qso_web_export_info info;
+    get_read_qso_web_export_info(&info);
+    AsyncWebServerResponse *response = request->beginResponse(204, "text/plain", "");
+    char h[24];
+    response->addHeader("X-Export-Complete", info.complete ? "1" : "0");
+    snprintf(h, sizeof(h), "%lu", (unsigned long)info.records_done);
+    response->addHeader("X-Records-Done", h);
+    snprintf(h, sizeof(h), "%lu", (unsigned long)info.records_total);
+    response->addHeader("X-Records-Total", h);
+    snprintf(h, sizeof(h), "%lu", (unsigned long)info.bytes);
+    response->addHeader("X-Bytes-Produced", h);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+  });
+
+  web_server.on("/readqso", HTTP_GET, [](AsyncWebServerRequest* request) {
+    handleReadQsoPreparePage(request);
+  });
+
+  web_server.on("/api/export/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    handle_web_prepared_export_status(request);
+  });
+  web_server.on("/api/export/download", HTTP_GET, [](AsyncWebServerRequest* request) {
+    handle_web_prepared_export_download(request);
   });
 
   // /cabrillo
   web_server.on("/cabrillo", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
-    handleQsoLogDump(request, numstr,5);  // Cabrillo 3.0
+    handle_web_prepared_export_page(request, WEB_EXPORT_CABRILLO);
   });
 
   // /dumpqso
   web_server.on("/dumpqso", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
-    handleQsoLogDump(request, numstr,0);  // type 0:dump 1:txt 2:adif 3:csv 4:jarlog
+    handle_web_prepared_export_page(request, WEB_EXPORT_DUMP);
   });
   
   // /adif
   web_server.on("/adif", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
-
-    handleQsoLogDump(request, numstr,2);  // type 0:dump 1:txt 2:adif 3:csv 4:jarlog
+    handle_web_prepared_export_page(request, WEB_EXPORT_ADIF);
   });
   
   // /csv hamlogcsv
   web_server.on("/csv", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String numstr = request->hasParam("num") ? request->getParam("num")->value() : "";
-    handleQsoLogDump(request, numstr,3);  // type 0:dump 1:txt 2:adif 3:csv 4:jarlog
+    handle_web_prepared_export_page(request, WEB_EXPORT_CSV);
   });
 
 // static変数としてShiftキーの状態を保持
@@ -6835,6 +8417,10 @@ web_server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
           break;
         }
         case 4: {
+          snprintf(tmp, sizeof(tmp), "HW%d", JK1DVPLOG_HWVER);
+          add_row(F("ハードウェア"), F("Hardware"), tmp);
+          snprintf(tmp, sizeof(tmp), "%s %s", __DATE__, __TIME__);
+          add_row(F("ビルド日時"), F("Build date/time"), tmp);
           const uint32_t seconds = millis() / 1000UL;
           snprintf(tmp, sizeof(tmp), "%ud %uh %um %us", (unsigned)(seconds / 86400UL), (unsigned)((seconds / 3600UL) % 24UL), (unsigned)((seconds / 60UL) % 60UL), (unsigned)(seconds % 60UL)); add_row(F("稼働時間"), F("Uptime"), tmp);
           snprintf(tmp, sizeof(tmp), "%u bytes", (unsigned)ESP.getFreeHeap()); add_row(F("空きヒープ"), F("Free heap"), tmp);

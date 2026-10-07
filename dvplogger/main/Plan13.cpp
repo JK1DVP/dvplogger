@@ -1,28 +1,16 @@
 /*
- * dvplogger - field companion for ham radio operator
- * dvplogger - アマチュア無線家のためのフィールド支援ツール
+ * PLAN-13 satellite position calculation
+ *
+ * Original PLAN-13 BASIC implementation:
+ * Copyright (c) 1990 J.R. Miller G3RUH
+ *
+ * C/C++ port and subsequent modifications for DVPlogger:
  * Copyright (c) 2021-2026 Eiichiro Araki
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * Based on the PLAN-13 BASIC implementation by James R. Miller, G3RUH.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-// Copyright (c) 2021-2024 Eiichiro Araki
-// SPDX-FileCopyrightText: 2025 2021-2025 Eiichiro Araki
-//
-// SPDX-License-Identifier: GPL-2.0-or-later
-
 #include <Arduino.h>
 #include "Plan13.h"
 #include "decl.h"

@@ -14,6 +14,11 @@ Circuits At Home, LTD
 Web      :  http://www.circuitsathome.com
 e-mail   :  support@circuitsathome.com
  */
+/*
+ * DVPlogger-specific modifications:
+ * Copyright (c) 2025-2026 Eiichiro Araki
+ */
+
 #include "cdcacm.h"
 
 extern int verbose;

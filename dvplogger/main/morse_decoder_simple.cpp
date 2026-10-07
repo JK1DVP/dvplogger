@@ -23,6 +23,7 @@
 #include "Arduino.h"
 #include <cmath>
 #include <cstdint>
+#include <new>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -76,7 +77,7 @@ void Morse_decoder::monitor_task()
 
 }
 
-RingBuffer<Morse_decoder::RmsBlock> Morse_decoder::g_rms_rb(512);
+RingBuffer<Morse_decoder::RmsBlock> *Morse_decoder::g_rms_rb = nullptr;
 SemaphoreHandle_t Morse_decoder::g_rb_mtx = nullptr;
 TaskHandle_t      Morse_decoder::s_i2s_task = nullptr;
 volatile bool     Morse_decoder::s_run = false;
@@ -239,8 +240,9 @@ void Morse_decoder::truncate_tail_utf8(char *str, size_t keep_chars) {
 
 bool Morse_decoder::rb_push(const RmsBlock &blk) {
   bool ok = false;
+  if (!g_rms_rb || !g_rb_mtx) return false;
   if (xSemaphoreTake(g_rb_mtx, portMAX_DELAY) == pdTRUE) {
-    ok = g_rms_rb.push(blk);
+    ok = g_rms_rb->push(blk);
     xSemaphoreGive(g_rb_mtx);
   }
   if (!ok) s_drop++;
@@ -249,8 +251,9 @@ bool Morse_decoder::rb_push(const RmsBlock &blk) {
 
 bool Morse_decoder::pop_rms_block(RmsBlock &out) {
   bool ok = false;
+  if (!g_rms_rb || !g_rb_mtx) return false;
   if (xSemaphoreTake(g_rb_mtx, 0) == pdTRUE) {
-    ok = g_rms_rb.pop(out);
+    ok = g_rms_rb->pop(out);
     xSemaphoreGive(g_rb_mtx);
   }
   return ok;
@@ -259,7 +262,7 @@ bool Morse_decoder::pop_rms_block(RmsBlock &out) {
 
 void Morse_decoder::i2s_adc_task_i2sread()
 {
-  static uint16_t buf[MORSE_DMA_BUF_LEN];
+  uint16_t buf[MORSE_DMA_BUF_LEN];
   static size_t   br = 0;
   static uint64_t t0 = esp_timer_get_time();
   static uint32_t nsamp_acc = 0;
@@ -489,17 +492,49 @@ void Morse_decoder::feed_i2s_block_for_goertzel(const uint16_t* buf16, uint16_t 
 
 void Morse_decoder::start_i2s_adc_24k_rms_task()
 {
+  // The decoder is optional.  Keep its 512-entry (~2 KiB) RMS queue out of
+  // MAIN heap until the operator actually starts decoding.
+  if (!g_rms_rb) {
+    g_rms_rb = new (std::nothrow) RingBuffer<RmsBlock>(512);
+    if (!g_rms_rb) {
+      ESP_LOGE("CW_MON", "RMS ring allocation failed");
+      return;
+    }
+  }
   if (!g_rb_mtx) g_rb_mtx = xSemaphoreCreateMutex();
+  if (!g_rb_mtx) {
+    delete g_rms_rb;
+    g_rms_rb = nullptr;
+    ESP_LOGE("CW_MON", "RMS mutex allocation failed");
+    return;
+  }
   if (!s_i2s_task) {
-    xTaskCreatePinnedToCore(i2s_adc_rms_task, "i2s_adc_24k_rms",
+    BaseType_t rc = xTaskCreatePinnedToCore(i2s_adc_rms_task, "i2s_adc_24k_rms",
 			    TASK_STACK, nullptr, TASK_PRIO, &s_i2s_task, TASK_CORE);
+    if (rc != pdPASS) {
+      vSemaphoreDelete(g_rb_mtx);
+      g_rb_mtx = nullptr;
+      delete g_rms_rb;
+      g_rms_rb = nullptr;
+      ESP_LOGE("CW_MON", "decoder task allocation failed");
+    }
   }
 }
 void Morse_decoder::stop_i2s_adc_24k_rms_task()
 {
-  if (!s_i2s_task) return;
-  s_run = false;
-  for (int i=0; i<100 && s_i2s_task; ++i) vTaskDelay(pdMS_TO_TICKS(10));
+  if (s_i2s_task) {
+    s_run = false;
+    for (int i=0; i<100 && s_i2s_task; ++i) vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  // Release optional decoder working memory when the task has stopped.
+  if (!s_i2s_task) {
+    if (g_rb_mtx) {
+      vSemaphoreDelete(g_rb_mtx);
+      g_rb_mtx = nullptr;
+    }
+    delete g_rms_rb;
+    g_rms_rb = nullptr;
+  }
 }
 
 

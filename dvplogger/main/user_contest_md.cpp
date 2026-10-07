@@ -508,7 +508,7 @@ static void activate_no_multi_contest() {
            plogw->contest_name + 2,
            plogw->mask == CW_PH_DUPE_OK ? "OK C/P" : "NG C/P");
   upd_display_info_flash(msg);
-  plogw->ostream->printf("%s not found: User contest active without multipliers, CW/Phone %s\\n",
+  plogw->ostream->printf("%s not found: User contest active without multipliers, CW/Phone %s\n",
                          ctx.filename,
                          plogw->mask == CW_PH_DUPE_OK ? "separate" : "combined");
 }

@@ -86,17 +86,41 @@ const char *zserver_client_commands[]={ "FREQ","QSOIDS","ENDQSOIDS","PROMPTUPDAT
 #define ZMERGE_SD_BUCKETS 16
 struct __attribute__((packed)) zmerge_sd_id { uint32_t id; uint8_t seen; };
 static File zmerge_sd_raw;
+
+// Old zmerge and zmergenew are mutually exclusive.  Share their callback
+// receive buffers so zmergenew can use the RAM that was otherwise reserved
+// for the old zmerge QSOID/PUTLOGEX handoff.  The total static RAM footprint
+// is no larger than before, while the NEW receive queue grows 32 -> 45 slots.
+#define ZMERGE_SD_ID_QUEUE 1024  // 4096 bytes; one slot is kept empty
+#define ZMERGENEW_MAX_BATCH 10
+#define ZMERGENEW_LINE_SIZE 384
+#define ZMERGENEW_LINE_QUEUE 45  // 44 usable; shared with old-zmerge buffers
+union zmerge_lowmem_shared_arena {
+  struct {
+    uint32_t idq[ZMERGE_SD_ID_QUEUE];
+    char putlogex[NCHR_ZSERVER_CMD + 1];
+  } old_merge;
+  char new_lines[ZMERGENEW_LINE_QUEUE][ZMERGENEW_LINE_SIZE + 1];
+};
+static union zmerge_lowmem_shared_arena zmerge_lowmem_arena;
+#define zmerge_sd_idq       (zmerge_lowmem_arena.old_merge.idq)
+#define zmerge_sd_putlogex  (zmerge_lowmem_arena.old_merge.putlogex)
+#define zmergenew_lines     (zmerge_lowmem_arena.new_lines)
+static_assert(sizeof(zmerge_lowmem_arena.new_lines) >=
+              sizeof(zmerge_lowmem_arena.old_merge),
+              "shared zmerge arena too small for old merge buffers");
+
 // AsyncTCP callback -> MAIN handoff for no-PSRAM systems.  Keep the callback
 // free of SD/FAT calls: it only parses QSOIDs into this small fixed ring.
-#define ZMERGE_SD_ID_QUEUE 128  // 512 bytes; one slot is kept empty
 #define ZMERGE_SD_EV_BEGIN_OK  0x01
 #define ZMERGE_SD_EV_BEGIN_NG  0x02
 #define ZMERGE_SD_EV_END_IDS   0x04
 #define ZMERGE_SD_EV_PUTLOGEX  0x08
-static uint32_t zmerge_sd_idq[ZMERGE_SD_ID_QUEUE];
-static volatile uint8_t zmerge_sd_idq_r = 0;
-static volatile uint8_t zmerge_sd_idq_w = 0;
+static volatile uint16_t zmerge_sd_idq_r = 0;
+static volatile uint16_t zmerge_sd_idq_w = 0;
+static volatile uint16_t zmerge_sd_idq_highwater = 0;
 static volatile uint8_t zmerge_sd_events = 0;
+static volatile bool zmerge_sd_putlogex_ready = false;
 static volatile bool zmerge_sd_idq_overflow = false;
 static portMUX_TYPE zmerge_sd_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t zmerge_sd_fetch_bucket = 0;
@@ -113,7 +137,10 @@ static void zmerge_sd_cleanup()
   for (uint8_t b=0; b<ZMERGE_SD_BUCKETS; b++) { zmerge_sd_bucket_name(b, fn, sizeof(fn)); SD.remove(fn); }
   portENTER_CRITICAL(&zmerge_sd_mux);
   zmerge_sd_idq_r = zmerge_sd_idq_w = 0;
+  zmerge_sd_idq_highwater = 0;
   zmerge_sd_events = 0;
+  zmerge_sd_putlogex[0] = '\0';
+  zmerge_sd_putlogex_ready = false;
   zmerge_sd_idq_overflow = false;
   portEXIT_CRITICAL(&zmerge_sd_mux);
   zmerge_sd_fetch_bucket = 0; zmerge_sd_fetch_pos = 0;
@@ -137,6 +164,7 @@ struct zmerge_context {
   unsigned long common_records;
   unsigned long local_only_records;
   unsigned long skipped_no_qsoid;
+  unsigned long skipped_legacy;
   unsigned long skipped_deleted;
   unsigned long received_records;
   size_t fetch_index;
@@ -163,9 +191,7 @@ static char *zmerge_tx_line = nullptr;
 // NEW merge protocol (Z-Server v3.0.1.0, DVPlogger low-memory path).
 // Only one CHECKQSOIDS batch is outstanding, so RAM use is bounded by the
 // selected batch size (1..10) rather than the complete server QSOID list.
-#define ZMERGENEW_MAX_BATCH 10
-#define ZMERGENEW_LINE_QUEUE 8
-#define ZMERGENEW_LINE_SIZE NCHR_ZSERVER_CMD
+// Receive queue storage is the shared low-memory arena declared above.
 
 struct zmergenew_context {
   uint8_t phase; // 0 idle, 1 scan/send CHECK, 2 wait CHECK reply, 3 wait server-only/NEWENDMERGE
@@ -180,6 +206,7 @@ struct zmergenew_context {
   unsigned long sent_records;
   unsigned long received_records;
   unsigned long skipped_no_qsoid;
+  unsigned long skipped_legacy;
   unsigned long skipped_deleted;
   unsigned long check_rounds;
   uint32_t batch_ids[ZMERGENEW_MAX_BATCH];
@@ -187,19 +214,30 @@ struct zmergenew_context {
 };
 static struct zmergenew_context zmergenew;
 static File zmergenew_scanf;
-static char zmergenew_lines[ZMERGENEW_LINE_QUEUE][ZMERGENEW_LINE_SIZE + 1];
 static volatile uint8_t zmergenew_line_rptr=0, zmergenew_line_wptr=0;
+static volatile uint8_t zmergenew_line_highwater=0;
 static volatile bool zmergenew_line_overflow=false;
+static volatile bool zmergenew_line_too_long=false;
 static portMUX_TYPE zmergenew_line_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// Detailed ZMERGENEW protocol trace: enable with `verbose 2048`.
-#define ZMERGENEW_TRACE_ENABLED() ((verbose & 2048) != 0)
+// Detailed per-line ZMERGENEW wire trace is intentionally separate from
+// normal merge progress.  Use verbose bit 4096 only for deep protocol debug;
+// ordinary nonzero verbose gives throttled (~100 QSO) progress without
+// flooding the AsyncTCP receive path.
+#define ZMERGENEW_TRACE_ENABLED() ((verbose & 4096) != 0)
 
 static void zmergenew_queue_line(const char *line)
 {
+  size_t line_len = strlen(line);
   if (zmergenew.phase != 0 && ZMERGENEW_TRACE_ENABLED())
     plogw->ostream->printf("ZMERGENEW TRACE RXRAW phase=%u len=%u: <%s>\n",
-                           (unsigned)zmergenew.phase, (unsigned)strlen(line), line);
+                           (unsigned)zmergenew.phase, (unsigned)line_len, line);
+  if (line_len > ZMERGENEW_LINE_SIZE) {
+    portENTER_CRITICAL(&zmergenew_line_mux);
+    zmergenew_line_too_long = true;
+    portEXIT_CRITICAL(&zmergenew_line_mux);
+    return;
+  }
   portENTER_CRITICAL(&zmergenew_line_mux);
   uint8_t next=(uint8_t)((zmergenew_line_wptr+1)%ZMERGENEW_LINE_QUEUE);
   if (next==zmergenew_line_rptr) zmergenew_line_overflow=true;
@@ -207,6 +245,10 @@ static void zmergenew_queue_line(const char *line)
     strlcpy(zmergenew_lines[zmergenew_line_wptr], line,
             sizeof(zmergenew_lines[zmergenew_line_wptr]));
     zmergenew_line_wptr=next;
+    uint8_t used = (zmergenew_line_wptr >= zmergenew_line_rptr)
+                     ? (uint8_t)(zmergenew_line_wptr - zmergenew_line_rptr)
+                     : (uint8_t)(ZMERGENEW_LINE_QUEUE - zmergenew_line_rptr + zmergenew_line_wptr);
+    if (used > zmergenew_line_highwater) zmergenew_line_highwater = used;
   }
   portEXIT_CRITICAL(&zmergenew_line_mux);
 }
@@ -228,6 +270,8 @@ static bool zmergenew_dequeue_line(char *line, size_t n)
 static File zmerge_scanf;
 
 static void zmerge_reset(bool restore_log_pos);
+static const char *zmerge_phase_name(uint8_t phase);
+static void zmerge_recover_stale_state(const char *where);
 static void zmerge_finish(bool success, const char *reason);
 static void zmerge_process_line(const char *line);
 static bool zmerge_build_putlog(const union qso_union_tag *rec, uint32_t qsoid,
@@ -250,6 +294,7 @@ static bool zmerge_alloc_work_buffers();
 static void zmerge_free_work_buffers();
 static void zmergenew_finish(bool success, const char *reason);
 static void zmergenew_process_line(char *line);
+static void zmergenew_show_progress(const char *stage);
 
 static void zmerge_lcd(const char *line1, const char *line2, uint32_t timeout_ms=2000)
 {
@@ -289,6 +334,23 @@ static void zmerge_show_progress(bool force=false)
       info_disp.timer = 1500;
       break;
   }
+}
+
+static void zmergenew_show_progress(const char *stage)
+{
+  const uint32_t elapsed_s = (millis() - zmergenew.started_ms) / 1000UL;
+  if (stage && !strcmp(stage, "DOWNLOAD")) {
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "ZMERGENEW DOWNLOAD\nDown:%lu\n%lus",
+             zmergenew.received_records, (unsigned long)elapsed_s);
+  } else {
+    snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
+             "ZMERGENEW CHECK\nChecked:%lu Common:%lu\nUp:%lu %lus",
+             zmergenew.valid_records, zmergenew.common_records,
+             zmergenew.sent_records, (unsigned long)elapsed_s);
+  }
+  upd_display_info_flash(dp->lcdbuf);
+  info_disp.timer = 1500;
 }
 
 static bool zmerge_alloc_work_buffers()
@@ -380,13 +442,14 @@ static void fixed_field_to_cstr(char *dst, size_t dst_size,
 }
 
 
-// ZQID:<decimal> is local ASCII metadata stored in Remarks for records
-// downloaded from Z-Server.  It is intentionally human-readable and is
-// stripped before operator memo text is sent back to Z-Server.
-static bool zmerge_qsoid_from_remarks(const char *remarks, uint32_t *qsoid)
+// ZQID:<decimal> is an authoritative server ID. LQID:<decimal> is an ID
+// issued by the persistent local allocator. Both are safe for automatic
+// CHECK/PUTLOG. Legacy records without either marker are not.
+static bool zmerge_qsoid_tag_from_remarks(const char *remarks, const char *tag,
+                                           uint32_t *qsoid)
 {
-  if (remarks == NULL || qsoid == NULL) return false;
-  const char *p = strstr(remarks, "ZQID:");
+  if (remarks == NULL || tag == NULL || qsoid == NULL) return false;
+  const char *p = strstr(remarks, tag);
   if (p == NULL) return false;
   p += 5;
   if (*p < '0' || *p > '9') return false;
@@ -410,7 +473,7 @@ static const char *zmerge_operator_memo_from_remarks(char *remarks)
 
   // Downloaded records have "ZQID:<id> " immediately after the existing
   // local CQ/SP + tx/rnd metadata.  Keep it local; do not send it as memo.
-  if (!strncmp(memo, "ZQID:", 5)) {
+  if (!strncmp(memo, "ZQID:", 5) || !strncmp(memo, "LQID:", 5)) {
     char *space = strchr(memo, ' ');
     memo = space ? space + 1 : memo + strlen(memo);
   }
@@ -418,29 +481,32 @@ static const char *zmerge_operator_memo_from_remarks(char *remarks)
 }
 
 static bool zmerge_qsoid_from_record(const union qso_union_tag *rec,
-                                     uint32_t *qsoid)
+                                     uint32_t *qsoid, bool *safe_upload)
 {
   char remarks[sizeof(rec->entry.remarks) + 1];
   fixed_field_to_cstr(remarks, sizeof(remarks), rec->entry.remarks,
                       sizeof(rec->entry.remarks));
+  if (safe_upload) *safe_upload = false;
 
-  // For QSOs downloaded from Z-Server, use the exact authoritative QSOID
-  // saved as human-readable local metadata in Remarks.
-  if (zmerge_qsoid_from_remarks(remarks, qsoid)) return true;
+  if (zmerge_qsoid_tag_from_remarks(remarks, "ZQID:", qsoid) ||
+      zmerge_qsoid_tag_from_remarks(remarks, "LQID:", qsoid)) {
+    if (safe_upload) *safe_upload = true;
+    return true;
+  }
 
+  // Legacy fallback is retained only for diagnostics/repair compatibility.
+  // Its origin is uncertain because the log seqnr need not equal QSOID ss;
+  // callers must never automatically PUTLOG an ID obtained this way.
   char seqbuf[sizeof(rec->entry.seqnr) + 1];
   char run[3] = {0};
   unsigned int tx = 0, rnd = 0;
-
   fixed_field_to_cstr(seqbuf, sizeof(seqbuf), rec->entry.seqnr,
                       sizeof(rec->entry.seqnr));
   unsigned long seq = strtoul(seqbuf, NULL, 10);
   if (seq == 0) return false;
-
   if (sscanf(remarks, "%2s %1u%2u", run, &tx, &rnd) != 3) return false;
   if ((strcmp(run, "CQ") != 0 && strcmp(run, "SP") != 0) || tx > 9 || rnd > 99)
     return false;
-
   *qsoid = (uint32_t)(tx * 100000000UL + seq * 10000UL + rnd * 100UL);
   return true;
 }
@@ -554,7 +620,20 @@ static void zmerge_sd_callback_line(const char *line)
   if (!strcmp(line, "#ZLOG# BEGINMERGE-OK")) event = ZMERGE_SD_EV_BEGIN_OK;
   else if (!strcmp(line, "#ZLOG# BEGINMERGE-NG")) event = ZMERGE_SD_EV_BEGIN_NG;
   else if (!strcmp(line, "#ZLOG# ENDQSOIDS")) event = ZMERGE_SD_EV_END_IDS;
-  else if (!strncmp(line, "#ZLOG# PUTLOGEX", 15)) event = ZMERGE_SD_EV_PUTLOGEX;
+  else if (!strncmp(line, "#ZLOG# PUTLOGEX", 15)) {
+    // Preserve the complete reply before zserver.cmdbuf is reused by the next
+    // AsyncTCP line.  The previous event-only handoff later parsed cmdbuf,
+    // which could already contain a different line and caused false
+    // "invalid PUTLOGEX data" failures on HW1.
+    portENTER_CRITICAL(&zmerge_sd_mux);
+    if (!zmerge_sd_putlogex_ready) {
+      strlcpy(zmerge_sd_putlogex, line, sizeof(zmerge_sd_putlogex));
+      zmerge_sd_putlogex_ready = true;
+      zmerge_sd_events |= ZMERGE_SD_EV_PUTLOGEX;
+    }
+    portEXIT_CRITICAL(&zmerge_sd_mux);
+    return;
+  }
   if (event) {
     portENTER_CRITICAL(&zmerge_sd_mux);
     zmerge_sd_events |= event;
@@ -572,9 +651,16 @@ static void zmerge_sd_callback_line(const char *line)
     if (e == p) break;
     if (v) {
       portENTER_CRITICAL(&zmerge_sd_mux);
-      uint8_t next = (uint8_t)((zmerge_sd_idq_w + 1) % ZMERGE_SD_ID_QUEUE);
+      uint16_t next = (uint16_t)((zmerge_sd_idq_w + 1) % ZMERGE_SD_ID_QUEUE);
       if (next == zmerge_sd_idq_r) zmerge_sd_idq_overflow = true;
-      else { zmerge_sd_idq[zmerge_sd_idq_w] = (uint32_t)v; zmerge_sd_idq_w = next; }
+      else {
+        zmerge_sd_idq[zmerge_sd_idq_w] = (uint32_t)v;
+        zmerge_sd_idq_w = next;
+        uint16_t used = (zmerge_sd_idq_w >= zmerge_sd_idq_r)
+                          ? (uint16_t)(zmerge_sd_idq_w - zmerge_sd_idq_r)
+                          : (uint16_t)(ZMERGE_SD_ID_QUEUE - zmerge_sd_idq_r + zmerge_sd_idq_w);
+        if (used > zmerge_sd_idq_highwater) zmerge_sd_idq_highwater = used;
+      }
       portEXIT_CRITICAL(&zmerge_sd_mux);
     }
     p = e;
@@ -590,7 +676,7 @@ static bool zmerge_sd_drain_id_queue()
     portENTER_CRITICAL(&zmerge_sd_mux);
     if (zmerge_sd_idq_r != zmerge_sd_idq_w) {
       id = zmerge_sd_idq[zmerge_sd_idq_r];
-      zmerge_sd_idq_r = (uint8_t)((zmerge_sd_idq_r + 1) % ZMERGE_SD_ID_QUEUE);
+      zmerge_sd_idq_r = (uint16_t)((zmerge_sd_idq_r + 1) % ZMERGE_SD_ID_QUEUE);
       have = true;
     }
     portEXIT_CRITICAL(&zmerge_sd_mux);
@@ -598,6 +684,11 @@ static bool zmerge_sd_drain_id_queue()
     if (!zmerge_sd_raw || zmerge_sd_raw.write((uint8_t *)&id, sizeof(id)) != sizeof(id))
       return false;
     zmerge.server_count++;
+    if (verbose && (zmerge.server_count % 100UL) == 0)
+      plogw->ostream->printf("zmerge: received %u server QSOIDs (queue hwm=%u/%u)\n",
+                             (unsigned)zmerge.server_count,
+                             (unsigned)zmerge_sd_idq_highwater,
+                             (unsigned)(ZMERGE_SD_ID_QUEUE - 1));
     zmerge.deadline = millis() + ZMERGE_REPLY_TIMEOUT_MS;
   }
   return true;
@@ -762,7 +853,7 @@ static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
   const unsigned long qsoid_seq =
       (unsigned long)((qsoid % 100000000UL) / 10000UL);
   const unsigned long server_seq = strtoul(field[6], NULL, 10);
-  if (server_seq != qsoid_seq) {
+  if (server_seq != qsoid_seq && (verbose & 4096)) {
     plogw->ostream->printf(
       "ZMERGE DIAG QSOID/SEQ mismatch: qsoid=%lu expected=%lu "
       "server_seq=%lu qsoid_seq=%lu call=%s\n",
@@ -821,9 +912,10 @@ static bool zmerge_parse_putlogex(const char *line, union qso_union_tag *rec,
     }
     snprintf(freqtmp, sizeof(freqtmp), "%llu", nominal_hz);
     zmerge_set_field(rec->entry.freq, sizeof(rec->entry.freq), freqtmp);
-    plogw->ostream->printf(
-        "zmerge: PUTLOGEX QSOID %lu has no frequency; using nominal %llu Hz\n",
-        (unsigned long)qsoid, nominal_hz);
+    if (verbose & 4096)
+      plogw->ostream->printf(
+          "zmerge: PUTLOGEX QSOID %lu has no frequency; using nominal %llu Hz\n",
+          (unsigned long)qsoid, nominal_hz);
   }
   char tmp[20];
   snprintf(tmp, sizeof(tmp), "%d", bandid);
@@ -872,18 +964,15 @@ static bool zmerge_append_pending_record()
 {
   if (!zmerge.pending_valid) return false;
 
-  // The QSO module owns the persistent append handle.  zserver.cpp never
-  // seeks or writes that handle directly.
-  size_t size_before = 0;
-  size_t size_after = 0;
+  // The QSO module owns the only append handle for QSO.TXT.  Do not open a
+  // second File object here even for size verification.
   const size_t record_size = sizeof(zmerge.pending_record.all);
-  const size_t nw = append_qso_log_record(&zmerge.pending_record,
-                                           &size_before, &size_after);
+  const size_t nw = qso_log_append_record(&zmerge.pending_record,
+                                           QSO_LOG_APPEND_MERGE);
 
-  if (nw != record_size || size_after != size_before + record_size) {
-    plogw->ostream->printf("zmerge: append verification failed: before=%u written=%u after=%u\n",
-                           (unsigned)size_before, (unsigned)nw,
-                           (unsigned)size_after);
+  if (nw != record_size) {
+    plogw->ostream->printf("zmerge: append failed: written=%u expected=%u\n",
+                           (unsigned)nw, (unsigned)record_size);
     return false;
   }
   zmerge.pending_valid = false;
@@ -898,33 +987,74 @@ static void zmergenew_reset()
   memset(&zmergenew,0,sizeof(zmergenew));
   portENTER_CRITICAL(&zmergenew_line_mux);
   zmergenew_line_rptr=zmergenew_line_wptr=0;
+  zmergenew_line_highwater=0;
   zmergenew_line_overflow=false;
+  zmergenew_line_too_long=false;
   portEXIT_CRITICAL(&zmergenew_line_mux);
 }
 
 static void zmergenew_finish(bool success, const char *reason)
 {
+  // Commit any final merge records before changing merge state or connection.
+  qso_log_flush();
+  // NEWENDMERGE can already be queued when an overflow happens.  Do not report
+  // a clean completion if any receive line was lost/truncated on the way.
+  if (success && zmergenew_line_overflow) {
+    success = false;
+    reason = "receive queue overflow during completion";
+  } else if (success && zmergenew_line_too_long) {
+    success = false;
+    reason = "receive line too long during completion";
+  }
   const uint32_t elapsed=millis()-zmergenew.started_ms;
   if (success) {
     plogw->ostream->printf(
-      "zmergenew complete: batch=%u elapsed=%lu ms checks=%lu local=%lu valid=%lu common=%lu uploaded=%lu downloaded=%lu noQSOID=%lu deleted=%lu\\n",
+      "zmergenew complete: batch=%u elapsed=%lu ms checks=%lu local=%lu valid=%lu common=%lu uploaded=%lu downloaded=%lu noQSOID=%lu legacy=%lu deleted=%lu\n",
       (unsigned)zmergenew.batch_size,(unsigned long)elapsed,zmergenew.check_rounds,
       zmergenew.total_records,zmergenew.valid_records,zmergenew.common_records,
       zmergenew.sent_records,zmergenew.received_records,
-      zmergenew.skipped_no_qsoid,zmergenew.skipped_deleted);
+      zmergenew.skipped_no_qsoid,zmergenew.skipped_legacy,zmergenew.skipped_deleted);
     snprintf(dp->lcdbuf,sizeof(dp->lcdbuf),
-             "ZMERGENEW done\\nB%u %lus U%lu D%lu",
-             (unsigned)zmergenew.batch_size,(unsigned long)(elapsed/1000),
-             zmergenew.sent_records,zmergenew.received_records);
+             "ZMERGENEW done\nLocal:%lu Common:%lu\nUp:%lu Down:%lu %lus",
+             zmergenew.valid_records, zmergenew.common_records,
+             zmergenew.sent_records, zmergenew.received_records,
+             (unsigned long)(elapsed/1000));
   } else {
-    plogw->ostream->printf("zmergenew failed: %s (batch=%u elapsed=%lu ms checks=%lu)\\n",
+    plogw->ostream->printf("zmergenew failed: %s (batch=%u elapsed=%lu ms checks=%lu)\n",
                            reason?reason:"unknown",(unsigned)zmergenew.batch_size,
                            (unsigned long)elapsed,zmergenew.check_rounds);
     snprintf(dp->lcdbuf,sizeof(dp->lcdbuf),"ZMERGENEW failed\\n%s",reason?reason:"Unknown");
   }
+  plogw->ostream->printf("zmergenew queue: capacity=%u usable=%u highwater=%u overflow=%u\n",
+                         (unsigned)ZMERGENEW_LINE_QUEUE,
+                         (unsigned)(ZMERGENEW_LINE_QUEUE-1),
+                         (unsigned)zmergenew_line_highwater,
+                         zmergenew_line_overflow ? 1U : 0U);
   upd_display_info_flash(dp->lcdbuf); info_disp.timer=4000;
-  zserver.stat=zserver_client->connected()?4:0;
+
+  // A failed NEW merge can leave the server still streaming PUTLOGEX records.
+  // Do not reuse that TCP session for the next NEWBEGINMERGE: close it and let
+  // the normal state machine reconnect shortly.  This prevents stale stream
+  // data from being mistaken for a CHECKQSOIDS reply in the next run.
+  if (!success && zserver_client->connected()) {
+    plogw->ostream->println("zmergenew: resetting Z-server connection after failure");
+    zserver_suppress_disconnect_notice = true;
+    zserver_connected_state = false;
+    zserver_client->stop();
+    zserver.stat = zserver_auto_enable ? 10 : 11;
+    zserver.timeout = zserver_auto_enable ? millis() + 1000UL : 0;
+  } else {
+    zserver.stat=zserver_client->connected()?4:0;
+  }
   zmergenew_reset();
+
+  // NEW merge may have uploaded/downloaded records, so the live DUPE DB and
+  // contest statistics must be rebuilt from the synchronized QSO.TXT.  Queue
+  // the rebuild after closing the read handle; MAIN runs it incrementally.
+  if (success) {
+    plogw->ostream->println("zmergenew: MAKEDUPE rebuild queued");
+    request_makedupe_rebuild();
+  }
 }
 
 static int zmergenew_batch_index(uint32_t id)
@@ -971,6 +1101,14 @@ static void zmergenew_process_line(char *line)
   if (ZMERGENEW_TRACE_ENABLED())
   plogw->ostream->printf("ZMERGENEW TRACE CHECK reply done batch=%u uploaded_total=%lu common_total=%lu -> phase=1\n",
                            (unsigned)zmergenew.batch_count, zmergenew.sent_records, zmergenew.common_records);
+    if (zmergenew.valid_records &&
+        (zmergenew.valid_records % 100UL) < zmergenew.batch_size) {
+      plogw->ostream->printf("zmergenew: checked=%lu common=%lu uploaded=%lu (queue hwm=%u/%u)\n",
+                             zmergenew.valid_records, zmergenew.common_records,
+                             zmergenew.sent_records, (unsigned)zmergenew_line_highwater,
+                             (unsigned)(ZMERGENEW_LINE_QUEUE-1));
+      zmergenew_show_progress("CHECK");
+    }
     zmergenew.batch_count=0;
     zmergenew.phase=1;
     zmergenew.deadline=millis()+120000UL;
@@ -986,12 +1124,18 @@ static void zmergenew_process_line(char *line)
     if (!zmerge_parse_putlogex(line,&rec,0)) {
       zmergenew_finish(false,"invalid PUTLOGEX data"); return;
     }
-    size_t before=0,after=0;
-    size_t nw=append_qso_log_record(&rec,&before,&after);
-    if (nw!=sizeof(rec.all) || after!=before+sizeof(rec.all)) {
+    size_t nw=qso_log_append_record(&rec,QSO_LOG_APPEND_MERGE);
+    if (nw!=sizeof(rec.all)) {
       zmergenew_finish(false,"cannot append PUTLOGEX"); return;
     }
     zmergenew.received_records++;
+    if ((zmergenew.received_records % 100UL) == 0) {
+      plogw->ostream->printf("zmergenew: downloaded=%lu (queue hwm=%u/%u)\n",
+                             zmergenew.received_records,
+                             (unsigned)zmergenew_line_highwater,
+                             (unsigned)(ZMERGENEW_LINE_QUEUE-1));
+      zmergenew_show_progress("DOWNLOAD");
+    }
   if (ZMERGENEW_TRACE_ENABLED())
   plogw->ostream->printf("ZMERGENEW TRACE PUTLOGEX appended downloaded=%lu\n", zmergenew.received_records);
     zmergenew.deadline=millis()+ZMERGE_REPLY_TIMEOUT_MS;
@@ -1007,8 +1151,14 @@ static void zmergenew_process_line(char *line)
 
 bool zserver_start_merge_new(uint8_t batch_size)
 {
+  zmerge_recover_stale_state("zmergenew start");
   if (zmerge.phase!=0 || zmergenew.phase!=0) {
-    plogw->ostream->println("zmergenew: another merge is already running");
+    plogw->ostream->printf(
+        "zmergenew: another merge is already running "
+        "stat=%d connected=%d zmerge.phase=%u(%s) zmergenew.phase=%u\n",
+        zserver.stat, zserver_client->connected() ? 1 : 0,
+        (unsigned)zmerge.phase, zmerge_phase_name(zmerge.phase),
+        (unsigned)zmergenew.phase);
     return false;
   }
   if (batch_size<1 || batch_size>ZMERGENEW_MAX_BATCH) batch_size=10;
@@ -1032,6 +1182,7 @@ bool zserver_start_merge_new(uint8_t batch_size)
   plogw->ostream->println("ZMERGENEW TRACE TX: <#ZLOG# NEWBEGINMERGE>");
   println_tcpserver(zserver_client,"#ZLOG# NEWBEGINMERGE");
   plogw->ostream->printf("zmergenew: started batch=%u\n",(unsigned)batch_size);
+  zmerge_lcd("ZMERGENEW", "Starting merge", 1500);
   return true;
 }
 
@@ -1048,8 +1199,42 @@ static void zmerge_reset(bool restore_log_pos)
   zmerge_line_overflow = false;
 }
 
+static const char *zmerge_phase_name(uint8_t phase)
+{
+  switch (phase) {
+    case 1: return "wait-begin";
+    case 2: return "receive-server-ids";
+    case 3: return "scan-local";
+    case 4: return "download-server-only";
+    default: return "idle";
+  }
+}
+
+// A live merge always owns zserver.stat 5 (legacy zmerge) or 6 (zmergenew).
+// If a disconnect/reset/reconnect leaves only the phase variable behind, the
+// wire session is already gone and that phase can only block future merges.
+static void zmerge_recover_stale_state(const char *where)
+{
+  if ((zmerge.phase == 0 && zmergenew.phase == 0) ||
+      zserver.stat == 5 || zserver.stat == 6)
+    return;
+
+  plogw->ostream->printf(
+      "ZMERGE state recover: where=%s stat=%d connected=%d "
+      "zmerge.phase=%u(%s) zmergenew.phase=%u -> clearing stale merge state\n",
+      where ? where : "?", zserver.stat,
+      zserver_client->connected() ? 1 : 0,
+      (unsigned)zmerge.phase, zmerge_phase_name(zmerge.phase),
+      (unsigned)zmergenew.phase);
+
+  zmerge_reset(false);
+  zmergenew_reset();
+}
+
 static void zmerge_finish(bool success, const char *reason)
 {
+  // Commit any final merge records before changing merge state or connection.
+  qso_log_flush();
   if (zmerge.locked && zserver_client->connected())
     println_tcpserver(zserver_client, "#ZLOG# ENDMERGE");
   if (!success) {
@@ -1059,14 +1244,17 @@ static void zmerge_finish(bool success, const char *reason)
     unsigned long server_only = (zmerge.server_count > zmerge.common_records)
                                 ? zmerge.server_count - zmerge.common_records : 0;
     if (zmerge.repair_mode) {
-      plogw->ostream->printf("zmerge repair complete: total=%lu, kept=%lu, removed=%lu, duplicate groups=%lu, groups awaiting restore=%lu\n",
+      plogw->ostream->printf("zmerge repair complete: total=%lu, kept=%lu, removed=%lu, duplicate groups=%lu, groups awaiting restore=%lu, ambiguous server groups=%lu\n",
                              zmerge.repair_stats.total_records,
                              zmerge.repair_stats.kept_records,
                              zmerge.repair_stats.removed_records,
                              zmerge.repair_stats.duplicate_groups,
-                             zmerge.repair_stats.groups_restored_by_zmerge);
+                             zmerge.repair_stats.groups_restored_by_zmerge,
+                             zmerge.repair_stats.ambiguous_server_groups);
       if (zmerge.repair_stats.groups_restored_by_zmerge != 0)
         plogw->ostream->println("zmerge repair: run normal zmerge to restore authoritative server QSOs");
+      if (zmerge.repair_stats.ambiguous_server_groups != 0)
+        plogw->ostream->println("zmerge repair: ambiguous server duplicates kept unchanged");
     } else if (zmerge.dry_run) {
       plogw->ostream->printf("zmerge dry complete: server IDs=%u, local=%lu, common=%lu, local only=%lu, server only=%lu, no QSOID=%lu, deleted=%lu\n",
                              (unsigned)zmerge.server_count, zmerge.total_records,
@@ -1081,6 +1269,12 @@ static void zmerge_finish(bool success, const char *reason)
                              zmerge.skipped_deleted);
     }
   }
+  if (!f_spiram)
+    plogw->ostream->printf("zmerge QSOID queue: capacity=%u usable=%u highwater=%u overflow=%u\n",
+                           (unsigned)ZMERGE_SD_ID_QUEUE,
+                           (unsigned)(ZMERGE_SD_ID_QUEUE-1),
+                           (unsigned)zmerge_sd_idq_highwater,
+                           zmerge_sd_idq_overflow ? 1U : 0U);
   if (!success) {
     zmerge_lcd("ZMERGE failed", reason ? reason : "Unknown error", 4000);
   } else if (zmerge.repair_mode) {
@@ -1107,6 +1301,15 @@ static void zmerge_finish(bool success, const char *reason)
   // Stop the AsyncTCP callback from queueing merge lines before freeing buffers.
   zserver.stat = zserver_client->connected() ? 4 : 0;
   zmerge_reset(true);
+
+  // zmerge can add/remove QSO records.  Rebuild DUPE/statistics only after
+  // every merge-owned file handle/buffer has been released.  The rebuild is
+  // asynchronous/incremental: request_makedupe_rebuild() only sets a pending
+  // flag and the normal MAIN loop performs the actual work safely.
+  if (success) {
+    plogw->ostream->println("zmerge: MAKEDUPE rebuild queued");
+    request_makedupe_rebuild();
+  }
 }
 
 static void zmerge_process_line(const char *line)
@@ -1197,8 +1400,14 @@ bool zserver_merge_active()
 
 bool zserver_start_merge(bool dry_run)
 {
-  if (zmerge.phase != 0) {
-    plogw->ostream->println("zmerge: already running");
+  zmerge_recover_stale_state("zmerge start");
+  if (zmerge.phase != 0 || zmergenew.phase != 0) {
+    plogw->ostream->printf(
+        "zmerge: another merge is already running "
+        "stat=%d connected=%d zmerge.phase=%u(%s) zmergenew.phase=%u\n",
+        zserver.stat, zserver_client->connected() ? 1 : 0,
+        (unsigned)zmerge.phase, zmerge_phase_name(zmerge.phase),
+        (unsigned)zmergenew.phase);
     zmerge_lcd("ZMERGE", "Already running", 3000);
     return false;
   }
@@ -1472,8 +1681,20 @@ void handleData_zserver(void *arg, AsyncClient *client, void *data, size_t len)
 
       ret = readfrom_ringbuf(&zserver.ringbuf, zserver.cmdbuf + zserver.cmdbuf_ptr, (char)0x0d, (char)0x0a, zserver.cmdbuf_len - zserver.cmdbuf_ptr);
       if (ret < 0) {
-	// one line read
-	if (!plogw->f_console_emu) {    	
+	// one line read. During zmerge/zmergenew, avoid printing every wire
+	// response from the AsyncTCP callback: serial output here can delay queue
+	// service and itself contribute to receive overflow.  Merge progress is
+	// reported from the MAIN task roughly every 100 QSOs when verbose != 0.
+	bool merge_wire_line =
+	    !strncmp(zserver.cmdbuf, "#ZLOG# QSOIDS", 13) ||
+	    !strcmp(zserver.cmdbuf, "#ZLOG# ENDQSOIDS") ||
+	    !strncmp(zserver.cmdbuf, "#ZLOG# PUTLOGEX", 15) ||
+	    !strncmp(zserver.cmdbuf, "#ZLOG# CHECKQSOIDS", 18) ||
+	    !strcmp(zserver.cmdbuf, "#ZLOG# NEWENDMERGE") ||
+	    !strcmp(zserver.cmdbuf, "#ZLOG# BEGINMERGE-OK") ||
+	    !strcmp(zserver.cmdbuf, "#ZLOG# BEGINMERGE-NG");
+	if (!plogw->f_console_emu && zserver.stat != 5 && zserver.stat != 6 &&
+	    !merge_wire_line) {
 	  console->print("Z readline:");
 	  console->println(zserver.cmdbuf);
 	}
@@ -1582,6 +1803,9 @@ void onConnect_zserver(void *arg, AsyncClient *client)
   upd_display_info_flash(dp->lcdbuf);
 
   zserver.stat = 1;
+  // A reconnect cannot continue an old merge wire transaction.  Recover any
+  // phase left behind by a disconnect/software reset before normal login.
+  zmerge_recover_stale_state("zserver reconnect");
   zserver.timeout = millis() + 2000;
   zserver.timeout_alive = millis() + 120000;
 }
@@ -1598,6 +1822,12 @@ void init_zserver_info() {
   zserver.cmdbuf_ptr = 0;
   zserver.cmdbuf_len = NCHR_ZSERVER_CMD;
   memset(zserver.cmdbuf, '\0', NCHR_ZSERVER_CMD + 1);
+
+  // Merge state is RAM-only and cannot survive a new Z-Server session.
+  // Explicitly reset it here as well as relying on BSS initialization, so a
+  // software reset/re-init can never leave a stale phase blocking a new merge.
+  zmerge_reset(false);
+  zmergenew_reset();
 
   // define handler
   zserver_client->onData(handleData_zserver, zserver_client);
@@ -1708,6 +1938,7 @@ void zserver_process() {
     if (zmergenew.abort_requested || !zserver_client->connected()) {
       zmergenew_finish(false,"connection lost"); break;
     }
+    if (zmergenew_line_too_long) { zmergenew_finish(false,"receive line too long"); break; }
     if (zmergenew_line_overflow) { zmergenew_finish(false,"receive queue overflow"); break; }
     char line[ZMERGENEW_LINE_SIZE+1];
     while (zmergenew_dequeue_line(line,sizeof(line))) {
@@ -1728,8 +1959,12 @@ void zserver_process() {
         zmergenew.total_records++;
         if (rec.entry.type[0]=='D') { zmergenew.skipped_deleted++; continue; }
         if (rec.entry.type[0]!='Q') { zmergenew.skipped_no_qsoid++; continue; }
-        uint32_t id=0;
-        if (!zmerge_qsoid_from_record(&rec,&id)) { zmergenew.skipped_no_qsoid++; continue; }
+        uint32_t id=0; bool safe_upload=false;
+        if (!zmerge_qsoid_from_record(&rec,&id,&safe_upload)) { zmergenew.skipped_no_qsoid++; continue; }
+        if (!safe_upload) {
+          zmergenew.skipped_legacy++;
+          continue;
+        }
         uint8_t i=zmergenew.batch_count++;
         zmergenew.batch_ids[i]=id;
         memcpy(&zmergenew.batch_records[i],&rec,sizeof(rec));
@@ -1754,8 +1989,10 @@ void zserver_process() {
   plogw->ostream->println("ZMERGENEW TRACE TX: <#ZLOG# GETUNREGQSOS>");
         println_tcpserver(zserver_client,"#ZLOG# GETUNREGQSOS");
         zmergenew.phase=3; zmergenew.deadline=millis()+120000UL;
-        if (ZMERGENEW_TRACE_ENABLED())
-          plogw->ostream->printf("zmergenew: local scan done; GETUNREGQSOS sent (checks=%lu)\n",zmergenew.check_rounds);
+        plogw->ostream->printf("zmergenew: local scan done; checked=%lu common=%lu uploaded=%lu; requesting server-only QSOs (checks=%lu)\n",
+                               zmergenew.valid_records, zmergenew.common_records,
+                               zmergenew.sent_records, zmergenew.check_rounds);
+        zmergenew_show_progress("DOWNLOAD");
       }
     }
     break;
@@ -1776,10 +2013,18 @@ void zserver_process() {
     } else {
       bool overflow;
       uint8_t ev;
+      bool putlogex_ready;
+      static char putlogex_line[NCHR_ZSERVER_CMD + 1];
       portENTER_CRITICAL(&zmerge_sd_mux);
       overflow = zmerge_sd_idq_overflow;
       ev = zmerge_sd_events;
       zmerge_sd_events = 0;
+      putlogex_ready = zmerge_sd_putlogex_ready;
+      if (putlogex_ready) {
+        memcpy(putlogex_line, zmerge_sd_putlogex, sizeof(putlogex_line));
+        zmerge_sd_putlogex_ready = false;
+        zmerge_sd_putlogex[0] = '\0';
+      }
       portEXIT_CRITICAL(&zmerge_sd_mux);
       if (overflow) { zmerge_finish(false, "QSOID receive queue overflow"); break; }
 
@@ -1789,7 +2034,8 @@ void zserver_process() {
       if ((ev & ZMERGE_SD_EV_BEGIN_OK) && zmerge.phase==1) {
         zmerge.locked=true; zmerge.phase=2; zmerge.deadline=millis()+ZMERGE_REPLY_TIMEOUT_MS;
         println_tcpserver(zserver_client,"#ZLOG# GETQSOIDS");
-        plogw->ostream->println("zmerge: lock acquired; spooling QSOIDs to SD via 512-byte queue");
+        plogw->ostream->printf("zmerge: lock acquired; spooling QSOIDs to SD via %u-byte queue\n",
+                               (unsigned)sizeof(zmerge_sd_idq));
       }
       if (ev & ZMERGE_SD_EV_BEGIN_NG) { zmerge_finish(false,"Z-Server is already being merged"); }
       if ((ev & ZMERGE_SD_EV_END_IDS) && zmerge.phase==2) {
@@ -1799,15 +2045,25 @@ void zserver_process() {
         if (!open_qso_log_readonly(&zmerge_scanf)) { zmerge_finish(false,"cannot open QSO log for read"); break; }
         zmerge.phase=3; zmerge.next_send=millis(); zmerge.deadline=millis()+120000UL;
       }
-      if ((ev & ZMERGE_SD_EV_PUTLOGEX) && zmerge.phase==4 && !zmerge.pending_valid && zmerge.requested_qsoid) {
-        // GETLOGQSOID is request/reply; no next request is sent until MAIN consumes this reply.
-        if (!zmerge_parse_putlogex(zserver.cmdbuf,&zmerge.pending_record,zmerge.requested_qsoid))
+      if ((ev & ZMERGE_SD_EV_PUTLOGEX) && putlogex_ready &&
+          zmerge.phase==4 && !zmerge.pending_valid && zmerge.requested_qsoid) {
+        // GETLOGQSOID is request/reply; parse the line copied by the callback,
+        // never the shared zserver.cmdbuf which may already have been reused.
+        if (!zmerge_parse_putlogex(putlogex_line,&zmerge.pending_record,zmerge.requested_qsoid))
           zmerge_finish(false,"invalid PUTLOGEX data");
         else { zmerge.pending_valid=true; zmerge.deadline=millis()+ZMERGE_REPLY_TIMEOUT_MS; }
       }
     }
     if (zmerge.phase == 0) break;
     if ((int32_t)(millis() - zmerge.deadline) > 0) {
+      plogw->ostream->printf(
+          "zmerge timeout: phase=%u(%s) server=%u local=%lu common=%lu "
+          "uploaded=%lu downloaded=%lu requested=%lu pending=%u\n",
+          (unsigned)zmerge.phase, zmerge_phase_name(zmerge.phase),
+          (unsigned)zmerge.server_count, zmerge.total_records,
+          zmerge.common_records, zmerge.sent_records, zmerge.received_records,
+          (unsigned long)zmerge.requested_qsoid,
+          zmerge.pending_valid ? 1U : 0U);
       zmerge_finish(false, "timeout");
       break;
     }
@@ -1837,15 +2093,33 @@ void zserver_process() {
         break;
       }
       zmerge.total_records++;
+      // A large local log is intentionally scanned incrementally (one record
+      // per main-loop pass).  Progress is activity, so refresh the watchdog
+      // deadline instead of timing out after a fixed 120 s while still moving.
+      zmerge.deadline = millis() + 120000UL;
+      if ((zmerge.total_records % 100UL) == 0) {
+        const size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        const size_t largest8 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        const size_t min8 = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+        const UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(NULL);
+        plogw->ostream->printf(
+            "ZMERGE local: %lu common=%lu upload=%lu local-only=%lu "
+            "free=%u largest=%u min=%u stack_hwm=%u\n",
+            zmerge.total_records, zmerge.common_records, zmerge.sent_records,
+            zmerge.local_only_records, (unsigned)free8, (unsigned)largest8,
+            (unsigned)min8, (unsigned)stack_hwm);
+      }
       if (workrec->entry.type[0] == 'D') {
         zmerge.skipped_deleted++;
       } else if (workrec->entry.type[0] != 'Q') {
         // Ignore unused/corrupt records rather than interpreting them as QSOs.
         zmerge.skipped_no_qsoid++;
       } else {
-        uint32_t qsoid;
-        if (!zmerge_qsoid_from_record(workrec, &qsoid)) {
+        uint32_t qsoid; bool safe_upload=false;
+        if (!zmerge_qsoid_from_record(workrec, &qsoid, &safe_upload)) {
           zmerge.skipped_no_qsoid++;
+        } else if (!safe_upload) {
+          zmerge.skipped_legacy++;
         } else {
           int server_index = zmerge_find_server_id(qsoid);
           if (server_index >= 0) {

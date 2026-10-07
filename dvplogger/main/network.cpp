@@ -87,28 +87,47 @@ static bool parse_wifiset_line(char *line, char **ssid, char **pass)
 // network 利用のプロセスは、それぞれで、wifi をチェックするのでなく、wifi_status を確認してTrue の時だけ実行するようにする。
 
 void init_multiwifi() {
-  // read from sd for ssid and password if file is available 
-
+  // Diagnostic split of WiFi memory cost:
+  //   SD file handling / each AP registration / ESPWMAP.begin().
+  // This intentionally changes no WiFi behavior.
+  memtrace_event("wifi cfg before SD open");
   f=SD.open("/wifiset.txt","r");
+  memtrace_event("wifi cfg after SD open");
   char *ssid,*pass;
+  unsigned wifi_ap_index = 0;
   
   if (f) {
     // read from wifiset.txt to add all listed ssid
     while (readline(&f, buf, 0x0d0a, 128) != 0) {
       if (parse_wifiset_line(buf, &ssid, &pass)) {
+        ++wifi_ap_index;
         plogw->ostream->print("setting wifi:");
         plogw->ostream->println(ssid);
+
+        char tag[40];
+        snprintf(tag, sizeof(tag), "wifi add %u before", wifi_ap_index);
+        memtrace_event(tag);
         ESPWMAP.add(ssid, pass);
+        snprintf(tag, sizeof(tag), "wifi add %u after", wifi_ap_index);
+        memtrace_event(tag);
       } else {
         plogw->ostream->println("wifiset: ignored malformed entry");
       }
     }
+
+    memtrace_event("wifi cfg before SD close");
     f.close();
+    memtrace_event("wifi cfg after SD close");
   } else {
     plogw->ostream->println("fail opening wifi setting file /wifiset.txt");
   }
-  
+
+  plogw->ostream->printf("WIFI MEMDIAG: registered APs=%u\n",
+                         wifi_ap_index);
+
+  memtrace_event("wifi begin before");
   ESPWMAP.begin();
+  memtrace_event("wifi begin after");
 }
 
 void multiwifi_addap(char *ssid,char *passwd)
@@ -208,10 +227,9 @@ void init_network() {
   memtrace_event("network before wifi check");
   check_wifi();
   memtrace_event("network after wifi check");
-  console->println("MDNS()");
-  memtrace_event("network before mdns");
-  MDNS.begin(plogw->hostname+2); // ホスト名
-  memtrace_event("network after mdns");
+  // mDNS is intentionally deferred until Wi-Fi has actually associated and
+  // obtained an address.  check_wifi()/service_network_background() starts it.
+  console->println("mDNS: deferred until WiFi link is connected");
 
   // older 
   //  timeClient.begin();
@@ -265,6 +283,42 @@ namespace {
 // used to decide whether Wi-Fi itself is connected.
 uint32_t wifi_link_connected_since_ms = 0;
 
+// mDNS must be started only after STA has an address.  At boot ESPWMAP may
+// still be connecting, so init_network() cannot safely start mDNS once and
+// forget it.  Keep explicit state and restart it after every Wi-Fi reconnect.
+bool mdns_started = false;
+uint32_t mdns_next_retry_ms = 0;
+constexpr uint32_t MDNS_RETRY_MS = 5000;
+
+void stop_mdns_service() {
+  if (!mdns_started) return;
+  MDNS.end();
+  mdns_started = false;
+  mdns_next_retry_ms = 0;
+  console->println("mDNS: stopped");
+}
+
+void ensure_mdns_service() {
+  if (!wifi_enable || WiFi.status() != WL_CONNECTED || wifi_status == 0) return;
+  if (mdns_started) return;
+
+  const uint32_t now = millis();
+  if (mdns_next_retry_ms != 0 && (int32_t)(now - mdns_next_retry_ms) < 0) return;
+  mdns_next_retry_ms = now + MDNS_RETRY_MS;
+
+  const char *host = plogw->hostname + 2;
+  console->printf("mDNS: starting %s.local ip=%s\n",
+                  host, WiFi.localIP().toString().c_str());
+  if (!MDNS.begin(host)) {
+    console->println("mDNS: begin failed; retry scheduled");
+    return;
+  }
+  MDNS.addService("http", "tcp", 80);
+  mdns_started = true;
+  mdns_next_retry_ms = 0;
+  console->printf("mDNS: ready http://%s.local/\n", host);
+}
+
 // ESP-IDF/lwIP SNTP is run as a short one-shot attempt.  On success DVPlogger
 // stops SNTP and schedules the next refresh for 30 minutes later.  On failure
 // it stops SNTP and backs off for five minutes, avoiding background DNS/UDP
@@ -286,6 +340,25 @@ uint32_t ntp_last_status_ms = 0;
 constexpr uint32_t ESPWMAP_SLOW_US = 10000;
 constexpr uint32_t ESPWMAP_SUMMARY_MS = 30000;
 
+void flush_espwmap_memdiag() {
+  ESPWMAPDiagEvent e;
+  static uint32_t last_dropped = 0;
+  while (ESPWMAP.popDiag(&e)) {
+    console->printf("[ESPWMAP-MEM] %-20s free=%lu largest=%lu min=%lu\n",
+                    e.phase ? e.phase : "?",
+                    (unsigned long)e.free8,
+                    (unsigned long)e.largest8,
+                    (unsigned long)e.min8);
+  }
+  const uint32_t dropped = ESPWMAP.diagDropped();
+  if (dropped != last_dropped) {
+    console->printf("[ESPWMAP-MEM] event ring dropped=%lu (+%lu)\n",
+                    (unsigned long)dropped,
+                    (unsigned long)(dropped - last_dropped));
+    last_dropped = dropped;
+  }
+}
+
 wl_status_t timed_espwmap_handle(const char *phase) {
   static uint32_t max_us = 0;
   static uint32_t calls = 0;
@@ -296,6 +369,7 @@ wl_status_t timed_espwmap_handle(const char *phase) {
   const uint32_t started_us = micros();
   const wl_status_t handled = ESPWMAP.handle();
   const uint32_t elapsed_us = micros() - started_us;
+  flush_espwmap_memdiag();
   const wl_status_t after = WiFi.status();
 
   calls++;
@@ -473,6 +547,7 @@ int check_wifi() {
       memtrace_event("wifi connected");
       console->printf("WIFI: link connected ip=%s rssi=%d; Internet not required\n",
                       WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      ensure_mdns_service();
     }
     return 1;
   }
@@ -482,6 +557,7 @@ int check_wifi() {
   const bool link_was_up = (wifi_status == 1 || wifi_link_connected_since_ms != 0);
   wifi_status = 0;
   wifi_link_connected_since_ms = 0;
+  if (mdns_started) stop_mdns_service();
   if (link_was_up) {
     memtrace_event("wifi link lost");
     snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
@@ -513,6 +589,7 @@ int check_wifi() {
              WiFi.localIP().toString().c_str());
     upd_display_info_flash(dp->lcdbuf);
     memtrace_event("wifi connected");
+    ensure_mdns_service();
     return 1;
   }
 
@@ -540,6 +617,10 @@ bool network_external_service_ready(uint32_t delay_ms) {
 }
 
 void service_network_background() {
+  // mDNS is a local-link service and should become available as soon as the
+  // station has an address; it must not wait for the 30 s NTP staging delay.
+  ensure_mdns_service();
+
   if (!network_external_service_ready(NTP_START_DELAY_MS)) return;
 
   const uint32_t now = millis();
@@ -568,6 +649,7 @@ void set_wifi_enabled(int enabled) {
   if (!enabled) {
     wifi_enable = 0;
     wifi_link_connected_since_ms = 0;
+    if (mdns_started) stop_mdns_service();
     if (ntp_client_started || esp_sntp_enabled()) {
       stop_ntp_service();
     }

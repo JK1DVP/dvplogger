@@ -43,6 +43,7 @@ int ui_perform_partial_check(struct radio *radio);
 int ui_perform_exch_partial_check(struct radio *radio);
 void set_contest_from_name();
 void set_call_stack_mode(bool enabled);
+void call_stack_discard_state(struct radio *radio);
 const char *call_stack_display_callsign(const struct radio *radio,
                                         int *cursor);
 void process_enter(int option) ;

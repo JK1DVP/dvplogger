@@ -1,5 +1,6 @@
 /*
  * CP2105 dual USB-UART driver for USB Host Shield Library 2.0
+ * Copyright (c) 2026 Eiichiro Araki
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #ifndef __CP2105_H__

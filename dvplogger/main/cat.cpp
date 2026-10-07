@@ -208,7 +208,7 @@ static void ats_mini_service_cw_bandwidth(struct radio *radio,
   ats_mini_bw_last_cmd_ms[idx] = now;
 
   if (verbose & VERBOSE_USB)
-    console->printf("ATS-MINI CW bandwidth step: %s -> 0.5k\\n",
+    console->printf("ATS-MINI CW bandwidth step: %s -> 0.5k\n",
                     bandwidth_desc ? bandwidth_desc : "?");
 }
 
@@ -439,6 +439,7 @@ void set_frequency_rig_radio(unsigned int freq, struct radio *radio) {
     set_frequency(freq, radio);
     radio->f_freqchange_pending = 0;
     radio->f_freqchange_program = 0;
+    radio->freq_readback_once_pending = false;
     radio->bandid_target = 0;
     return;
   }
@@ -448,6 +449,7 @@ void set_frequency_rig_radio(unsigned int freq, struct radio *radio) {
       (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) ? 800 : 200;
   radio->freqchange_retry = 0;
   radio->f_freqchange_pending = 1;
+  radio->freq_readback_once_pending = radio->rig_spec->no_polling;
 }
 
 
@@ -1661,7 +1663,7 @@ static void set_yaesu_scope_span_center(struct radio *radio, int mode)
   }
 
   if (verbose & 16)
-    console->printf("SCOPE_CENTER radio=%d mode=%d span=%d b=%d\\n",
+    console->printf("SCOPE_CENTER radio=%d mode=%d span=%d b=%d\n",
                     radio->rig_idx, mode, span, radio->bandid);
 }
 
@@ -2456,10 +2458,13 @@ void request_mode_change_radio(const char *opmode, int filnr, struct radio *radi
   if (radio->rig_spec && radio->rig_spec->cat_type == CAT_TYPE_NOCAT) {
     set_mode(opmode, filnr, radio);
     radio->f_modechange_pending = 0;
+    radio->mode_readback_once_pending = false;
     return;
   }
 
   radio->f_modechange_pending = 1;
+  radio->mode_readback_once_pending =
+      radio->rig_spec && radio->rig_spec->no_polling;
   radio->mode_target_modenum = rig_modenum(opmode);
   radio->mode_target_filt = filnr;
   strncpy(radio->mode_target_opmode, opmode,
@@ -2515,6 +2520,7 @@ static void accept_mode_report(const char *opmode, int filnr,
   set_scope_mode(radio, reported_modenum);
 
   radio->f_modechange_pending = 0;
+  radio->mode_readback_once_pending = false;
   radio->mode_target_modenum = -1;
   radio->mode_target_filt = 0;
   radio->mode_target_opmode[0] = '\0';
@@ -2891,7 +2897,8 @@ void send_swr_query_civ(struct radio *radio) {
 
 
 // set frequency (received from rig) to the logging system
-void set_frequency(int freq, struct radio *radio) {
+static void set_frequency_internal(int freq, struct radio *radio,
+                                   bool immediate_rig_report) {
 
   // Satellite tuning treats a rig frequency report as an operator input when
   // it differs from both the current target and our last CAT write.  Do this
@@ -2921,6 +2928,7 @@ void set_frequency(int freq, struct radio *radio) {
 
       radio->f_freqchange_pending = 0;
       radio->f_freqchange_program = 0;
+      radio->freq_readback_once_pending = false;
       radio->freqchange_timer = 0;
       radio->freqchange_retry = 0;
       radio->freqchange_program_guard = 0;
@@ -2957,9 +2965,11 @@ void set_frequency(int freq, struct radio *radio) {
         send_freq_set_civ(radio, radio->freq_target);
         radio->freqchange_timer =
             (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI) ? 800 : 200;
+        radio->freq_readback_once_pending = radio->rig_spec->no_polling;
       } else {
         radio->f_freqchange_pending = 0;
         radio->f_freqchange_program = 0;
+        radio->freq_readback_once_pending = false;
         radio->freqchange_retry = 0;
         radio->bandid_target = 0;
         if (verbose & 16) plogw->ostream->println("freq_change akirameru");
@@ -2980,7 +2990,8 @@ void set_frequency(int freq, struct radio *radio) {
       // Confirm a manual dial movement only when the *same* new frequency is
       // received twice.  The old code merely counted any two different
       // values, so two CAT glitches could force CQ -> S&P.
-      if (!is_manual_rig(radio) &&
+      if (!immediate_rig_report &&
+          !is_manual_rig(radio) &&
           radio->rig_spec->cat_type != CAT_TYPE_ATS_MINI) {
         if (radio->freq_change_count == 0 ||
             radio->freq_change_candidate != (unsigned int)freq) {
@@ -2995,7 +3006,9 @@ void set_frequency(int freq, struct radio *radio) {
       }
 
       if (verbose & 16) {
-        if (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI)
+        if (immediate_rig_report)
+          console->print("set_frequency():CI-V transceive immediate freq=");
+        else if (radio->rig_spec->cat_type == CAT_TYPE_ATS_MINI)
           console->print("set_frequency():ATS immediate freq=");
         else
           console->print("set_frequency():confirm change freq=");
@@ -3082,6 +3095,10 @@ void set_frequency(int freq, struct radio *radio) {
     }
     radio->f_recall_freq_mode_filt = 0;    
   }
+}
+
+void set_frequency(int freq, struct radio *radio) {
+  set_frequency_internal(freq, radio, false);
 }
 
 void set_mode_nonfil(const char *opmode, struct radio *radio) {
@@ -4268,7 +4285,8 @@ int civ_check_size(struct radio *radio, int size, const char *type) {
 
 
 
-int check_and_set_frequency(struct radio *radio, unsigned long freq) {
+static int check_and_set_frequency_internal(struct radio *radio, unsigned long freq,
+                                            bool immediate_rig_report) {
     if (freq2bandid(freq)==0) {
       if (!plogw->f_console_emu) {      
 	plogw->ostream->print("faulty freq =");
@@ -4290,8 +4308,12 @@ int check_and_set_frequency(struct radio *radio, unsigned long freq) {
       }
     }
     // store to rig information
-    set_frequency(freq, radio);
+    set_frequency_internal(freq, radio, immediate_rig_report);
     return 1;
+}
+
+int check_and_set_frequency(struct radio *radio, unsigned long freq) {
+  return check_and_set_frequency_internal(radio, freq, false);
 }
 // 現在 CI-V バスが単一のリグ占有の前提となっているので、上手くハンドリング
 // できないと考えられる。civport_shared[]に共有しているradio のリストを定義する等して、ここで他のradio の受信処理も行うのが適切？
@@ -4406,8 +4428,16 @@ void get_civ(struct radio *radio) {
 
     // Explicit satellite queries (notably IC-9700 MAIN/SUB) carry side
     // information that radio->freq alone cannot represent.  Consume them here.
-    if (!sat_accept_icom_frequency_report(radio, freq))
-      check_and_set_frequency(radio,freq);
+    if (!sat_accept_icom_frequency_report(radio, freq)) {
+      // ICOM CI-V Transceive sends unsolicited frequency reports as
+      // FE FE 00 <rig> 00 <freq> FD.  Unlike a polled 03 response, a dial
+      // step is normally reported only once, so the generic two-identical-
+      // reports filter would otherwise prevent the displayed frequency from
+      // ever following the rig (especially with NP:1).
+      const bool civ_transceive_report =
+          (radio->cmdbuf[2] == 0x00 && radio->cmdbuf[4] == 0x00);
+      check_and_set_frequency_internal(radio, freq, civ_transceive_report);
+    }
     /*    
     //    console->print("Freq received=");
     //    console->println(freq);
@@ -5856,13 +5886,15 @@ void select_rig(struct radio *radio) {
 #if RIG_SETUP_VERBOSE
   if (!plogw->f_console_emu) plogw->ostream->println("select_rig()end");
 #else
-  console->printf("RIG%d: %s spec=%d CAT=%d port=%d baud=%d CW=%d FSK=%d PTT=%d BM=%04X\n",
+  console->printf("RIG%d: %s spec=%d CAT=%d port=%d baud=%d CW=%d FSK=%d PTT=%d NP=%d BM=%04X\n",
                   radio->rig_idx,
                   radio->rig_spec->name ? radio->rig_spec->name : "(null)",
                   radio->rig_spec_idx, radio->rig_spec->cat_type,
                   radio->rig_spec->civport_num, radio->rig_spec->civport_baud,
                   radio->rig_spec->cwport, radio->rig_spec->fskport,
-                  radio->rig_spec->pttmethod, radio->rig_spec->band_mask);
+                  radio->rig_spec->pttmethod,
+                  radio->rig_spec->no_polling ? 1 : 0,
+                  radio->rig_spec->band_mask);
 #endif
 }
 
@@ -6284,6 +6316,7 @@ void init_rig() {
     *rig_spec[j].name='\0';
     rig_spec[j].fskport = -1;
     rig_spec[j].rtty_polarity = -1;
+    rig_spec[j].no_polling = false;
     
     for (int i = 0; i < NMAX_TRANSVERTER; i++) {
       rig_spec[j].transverter_enable[i] = 0;
@@ -6341,6 +6374,7 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
   rig_spec->tuner_port = 0;
   rig_spec->swr_limit_x100 = 0;
   rig_spec->tuner_hold_ms = 1500;
+  rig_spec->no_polling = false;
   memset(rig_spec->transverter_freq, 0, sizeof(rig_spec->transverter_freq));
   char *saveptr1, *saveptr2;  
   char *p1; int idx1,idx2; long long val;// for arg parse
@@ -6447,6 +6481,9 @@ void set_rig_spec_from_str_rig(struct rig *rig_spec,const char *s)
     } else if (strncmp(p,"TH:",3)==0) {
       n=atoi(p+3);
       if (n>=500 && n<=3000) rig_spec->tuner_hold_ms=n;
+    } else if (strncmp(p,"NP:",3)==0) {
+      n=atoi(p+3);
+      if (n>=0 && n<=1) rig_spec->no_polling = (n != 0);
 
     } else if (strncmp(p,"BM:",3)==0) {
 #if RIG_SETUP_VERBOSE
@@ -6605,6 +6642,9 @@ void print_rig_spec_str(int rig_idx,char *buf) // reverse set rig_spec_string fr
   }
   if (p->tuner_hold_ms != 1500) {
     sprintf(buf1,"TH:%d,",p->tuner_hold_ms); strcat(buf,buf1);
+  }
+  if (p->no_polling) {
+    strcat(buf,"NP:1,");
   }
   if (p->transverter_freq[0][0]!=0) {
     sprintf(buf1,"XVTR:"); strcat(buf,buf1);
@@ -6860,6 +6900,8 @@ void init_radio(struct radio *radio, const char *rig_name) {
   radio->freqchange_timer = 0;
   radio->freqchange_retry = 0;
   radio->f_freqchange_pending = 0;
+  radio->freq_readback_once_pending = false;
+  radio->mode_readback_once_pending = false;
   radio->transverter_in_use = 0;
 
   set_log_rst(radio);
@@ -8032,7 +8074,7 @@ void recall_freq_mode_filt_for_band(int target_bandid, struct radio *radio) {
 
   if (target_freq == 0 || freq2bandid(target_freq) != target_bandid) {
     if (verbose & 16)
-      console->printf("band target invalid b=%d freq=%u\\n",
+      console->printf("band target invalid b=%d freq=%u\n",
                       target_bandid, target_freq);
     return;
   }
@@ -8046,7 +8088,7 @@ void recall_freq_mode_filt_for_band(int target_bandid, struct radio *radio) {
   radio->last_filtbank[target_bandid] = filt;
 
   if (verbose & 16)
-    console->printf("band target b=%d freq=%u actual b=%d freq=%u\\n",
+    console->printf("band target b=%d freq=%u actual b=%d freq=%u\n",
                     target_bandid, target_freq, radio->bandid, radio->freq);
 
   set_frequency_rig_radio(target_freq, radio);

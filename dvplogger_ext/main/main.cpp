@@ -274,7 +274,6 @@ void control_pkt_handler(struct mux_packet *packet)
     cwbuf_control(packet->buf+5);
     return;
   }
-#if JK1DVPLOG_HWVER != 1
   if (strncmp(packet->buf,"chreset",7)==0) {
     process_callhist_reset_subcpu(packet->buf + 7);
     return;
@@ -290,7 +289,6 @@ void control_pkt_handler(struct mux_packet *packet)
     process_callhist_entry_subcpu(buf);
     return;
   }
-#endif
   if (packet->idx >= 8 &&
       memcmp(packet->buf, "dupemask", 8) == 0) {
     // MUX payloads are length-delimited, not NUL-terminated.  Parse only

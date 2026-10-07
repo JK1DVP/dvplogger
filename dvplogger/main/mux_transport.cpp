@@ -171,15 +171,18 @@ void Mux_transport::recv_pkt() {
 	  break;
 	}
 	packet_reading->status=1;
-	if (packet_reading->size < data_bytes) {
-	  char *newbuf=(char *)realloc(packet_reading->buf,sizeof(char)*data_bytes);
-	  if (newbuf==NULL && data_bytes!=0) {
+	// Keep one extra byte for a trailing NUL.
+	// The wire payload length remains packet_reading->idx.
+	if (packet_reading->size <= data_bytes) {
+	  const int needed = (int)data_bytes + 1;
+	  char *newbuf=(char *)realloc(packet_reading->buf,sizeof(char)*needed);
+	  if (newbuf==NULL) {
 	    packet_reading->status=0;
 	    pkt_status=pkt_wait_bop;
 	    break;
 	  }
 	  packet_reading->buf=newbuf;
-	  packet_reading->size=data_bytes;
+	  packet_reading->size=needed;
 	}
 	packet_reading->idx=0;
 
@@ -252,6 +255,11 @@ void Mux_transport::recv_pkt() {
 	if (c==eop) {
 	  debug_print("eop ok\r\n");	  
 	  // complete packet received and process by handler
+	  // Locally NUL-terminate the completed payload.
+	  // idx remains the authoritative binary payload length.
+	  if (packet_reading->buf && packet_reading->size > packet_reading->idx) {
+	    packet_reading->buf[packet_reading->idx] = '\0';
+	  }
 	  packet_reading->status=2;
 	  if (port_handler[packet_reading->to]!= NULL) {
 #ifndef DVPLOGGER_EXT

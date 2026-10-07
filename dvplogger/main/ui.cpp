@@ -116,7 +116,7 @@ static const HelpPage help_pages[] = {
   {{"A-w:wipe QSO", "C-w:clear field", "A-<=>:bandmap sel.", "A-m:mode", "A-<>:band", "C-l:QSLcard"}},
 
   // CALLSIGN command index. Common prefixes/suffixes are compacted.
-  {{"NEW/READ/MAIL-QSOLOG", "DUMPQSOLOG/LISTQSOFILE", "SWITCHLOG/ZMERGE", "MAKEDUPE/DUPERESET", "DUPEMAXnnn", "SAVE/LOAD"}},
+  {{"NEW/READ/MAIL-QSOLOG", "DUMPQSOLOG/LISTQSOFILE", "SWITCHLOG/ZMERGENEW", "MAKEDUPE/DUPERESET", "DUPEMAXnnn", "SAVE/LOAD"}},
   {{"LOAD/SAVE/RESETRIGS", "NEXTRIG/PREVRIG", "ENABLE/DISABLE-RIG", "BAND/RADIO", "BANDEN/BANDMASK/BANDMAP", "AUTOOFFnn/NATTO"}},
   {{"DISPTYPE0/1/2", "RESETDISP", "DISPCLOCKJST/UTC", "OLDESTnn", "ANTENNA[STATUS]", "ANTENNAON/OFF"}},
   {{"ESM/ALTCQ/2BSIQ", "OFF/ONCONTEST", "CONTEST", "KEY/STRAIGHT", "TOGGLEPTT", "CWJQF/CWNORMAL"}},
@@ -481,6 +481,12 @@ static void clear_current_edit_field(struct radio *radio) {
   }
 
   clear_buf(pwin);
+  if (radio->ptr_curr == 0) {
+    // CALLSTACK has a display/restore shadow while one item is temporarily
+    // selected. Clearing CALL must clear that shadow too; otherwise the
+    // old stack is immediately displayed again over the empty edit buffer.
+    call_stack_discard_state(radio);
+  }
 
   // Keep derived QSO indicators consistent with the field that was cleared,
   // without wiping any of the other QSO fields.
@@ -2167,6 +2173,14 @@ static int call_stack_radio_index(const struct radio *radio) {
   return 0;
 }
 
+void call_stack_discard_state(struct radio *radio) {
+  if (!radio) return;
+  const int idx = call_stack_radio_index(radio);
+  call_stack_pending[idx][0] = '\0';
+  call_stack_original[idx][0] = '\0';
+  call_stack_original_cursor[idx] = 0;
+}
+
 const char *call_stack_display_callsign(const struct radio *radio,
                                         int *cursor) {
   const int idx = call_stack_radio_index(radio);
@@ -2189,6 +2203,7 @@ static bool call_stack_restore_if_pending(struct radio *radio) {
   radio->callsign[1] = call_stack_original_cursor[idx];
   call_stack_pending[idx][0] = '\0';
   call_stack_original[idx][0] = '\0';
+  call_stack_original_cursor[idx] = 0;
   return true;
 }
 
@@ -2200,6 +2215,7 @@ static void call_stack_restore_after_qso(struct radio *radio) {
   radio->callsign[1] = 0;
   call_stack_pending[idx][0] = '\0';
   call_stack_original[idx][0] = '\0';
+  call_stack_original_cursor[idx] = 0;
   radio->ptr_curr = 0;
 }
 
@@ -2373,8 +2389,17 @@ void process_enter(int option) {
       }
     }
     
-    // determine qsoid
-    plogw->qsoid=  plogw->txnum* 100000000 + plogw->seqnr *10000 + random(100)*100;
+    // Determine QSOID only for a genuinely new local QSO.  Edited QSOs keep
+    // the ID restored when the original record was loaded.
+    if (!radio->qsodata_loaded) {
+      plogw->qsoid = qsoid_allocate_local();
+      if (plogw->qsoid == 0) {
+        plogw->ostream->println("QSOID allocation failed; QSO not logged");
+        upd_display_info_flash("QSOID ERROR\nQSO not logged");
+        info_disp.timer = 3000;
+        break;
+      }
+    }
     
     // log current QSO
     print_qso_log();
@@ -3114,8 +3139,7 @@ void process_enter(int option) {
     }
     
     if (strcmp(radio->callsign + 2, "READQSOLOG") == 0) {
-      // create new QSO log
-      read_qso_log(READQSO_PRINT);
+      start_read_qso_job(plogw->ostream);
       clear_buf(radio->callsign);
       break;
     }
@@ -3160,12 +3184,9 @@ void process_enter(int option) {
       break;
     }
 
-    if (strcmp(radio->callsign + 2, "ZMERGE") == 0) {
-      clear_buf(radio->callsign);
-      zserver_start_merge(false);
-      break;
-    }
-
+    // Keep the legacy ZMERGE command available from the serial terminal only.
+    // The CALLSIGN-field command intentionally exposes the low-memory NEW
+    // protocol, which is now the normal operator-facing merge path.
     if (strcmp(radio->callsign + 2, "ZMERGENEW") == 0) {
       clear_buf(radio->callsign);
       zserver_start_merge_new(10);
@@ -3714,7 +3735,7 @@ void process_enter(int option) {
     }
     if (strcmp(radio->callsign + 2, "DUMPQSOLOG") == 0) {
       // create new QSO log
-      dump_qso_log();
+      start_dump_qso_job(plogw->ostream);
       clear_buf(radio->callsign);
       break;
     }
@@ -3970,6 +3991,12 @@ void logw_handler(char key, char c)
 
   struct radio *radio;
   radio = so2r.radio_selected();
+  if (radio->ptr_curr == 0) {
+    // If Enter/ESM temporarily selected one item from CALLSTACK but the
+    // operator comes back to edit CALL before a QSO is committed, collapse
+    // the hidden selected/original dual state back to the editable full list.
+    call_stack_restore_if_pending(radio);
+  }
   char callsign_before[LEN_CALL_STACK_WINDOW + 1];
   uint8_t callsign_cursor_before = 0;
   bool callsign_content_changed = false;
@@ -4174,9 +4201,27 @@ void logw_handler(char key, char c)
   switch (radio->ptr_curr) {
   case 0:  // call sign window
     if (!callsign_content_changed && !callsign_cursor_changed) break;
-    // Do not block keyboard handling on subcpu searches.  One combined
-    // asynchronous request supplies DUPE, exact-match EXCH and partial data.
-    // For Call Stack input it extracts only the token under the cursor.
+
+    if (plogw->call_stack_mode &&
+        strchr(radio->callsign + 2, ',') != NULL) {
+      // While the operator is editing a comma-separated Call Stack, keep the
+      // editor/display path immediate.  Waiting for a SUBCPU DUPE/CALLHIST
+      // response on every inserted/deleted character makes the field appear
+      // frozen when the single remote query slot is busy or timing out.
+      //
+      // A pure cursor move is different: the list text is already stable, so
+      // query the token under the cursor to refresh DUPE/CALLHIST information.
+      if (callsign_content_changed) {
+        radio->dupe = 0;
+        radio->check_entry_list.nentry = 0;
+        radio->check_entry_list.cursor = 0;
+        request_display_update_on_demand();
+        break;
+      }
+    }
+
+    // Normal single-call editing, or cursor-only movement inside Call Stack:
+    // refresh DUPE/CALLHIST asynchronously for the current token.
     request_async_dupe_partial(radio, true);
     request_dupe_aware_display_update();
     defer_display_for_dupe = true;
@@ -4465,26 +4510,26 @@ bool set_satellite_operation(bool enabled) {
     return true;
   }
 
-  // A satellite must already be selected.  If the name field contains a
-  // candidate, resolve it first, but selection itself never enables SAT mode.
-  if ((plogw->sat_idx_selected < 0 || plogw->sat_idx_selected >= N_SATELLITES) &&
-      strlen(plogw->sat_name + 2) != 0) {
-    sat_name_entered();
-  }
-  if (plogw->sat_idx_selected < 0 || plogw->sat_idx_selected >= N_SATELLITES ||
-      sat_info[plogw->sat_idx_selected].name[0] == '\0') {
-    plogw->sat = 0;
-    return false;
+  // SAT mode itself is independent of satellite selection.  This restores the
+  // original operator sequence: SAT ON first, then choose a satellite.
+  if (plogw->tle_unixtime == 0) request_sat_tle_parse(1000);
+  plogw->sat = 1;
+
+  const int idx = plogw->sat_idx_selected;
+  const bool have_sat =
+      idx >= 0 && idx < N_SATELLITES && sat_info[idx].name[0] != '\0';
+
+  if (have_sat) {
+    set_sat_info_calc();
+    // Establish IC-9700 MAIN/SUB layout before the first frequency write.
+    // In RATB, MAIN=RX/downlink and SUB=TX/uplink; in RBTA it is reversed.
+    sat_apply_vfo_mode_to_rig();
+    set_sat_freq_calc();
+    sat_apply_default_opmode();
+  } else if (verbose & 8) {
+    plogw->ostream->println("SAT ON: waiting for satellite selection");
   }
 
-  if (plogw->tle_unixtime == 0) request_sat_tle_parse();
-  plogw->sat = 1;
-  set_sat_info_calc();
-  // Establish IC-9700 MAIN/SUB layout before the first frequency write.
-  // In RATB, MAIN=RX/downlink and SUB=TX/uplink; in RBTA it is reversed.
-  sat_apply_vfo_mode_to_rig();
-  set_sat_freq_calc();
-  sat_apply_default_opmode();
   request_display_update_on_demand();
   return true;
 }
@@ -4496,7 +4541,7 @@ void sat_name_entered() {
   //#ifdef notdef
   // check if tlefile read
   if (plogw->tle_unixtime==0) {
-    request_sat_tle_parse();
+    request_sat_tle_parse(1000);
   }
   if (strcmp(plogw->sat_name + 2, plogw->sat_name_set) != 0) {
     // offset_freq may have been re-anchored by dial operation.  Save the

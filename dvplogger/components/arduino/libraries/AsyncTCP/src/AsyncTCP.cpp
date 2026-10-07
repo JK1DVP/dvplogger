@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright 2016-2025 Hristo Gochkov, Mathieu Carbou, Emil Muratov
+// DVPlogger-specific modifications: Copyright (c) 2026 Eiichiro Araki
 
 #include "AsyncTCP.h"
 

@@ -29,6 +29,9 @@ uint8_t get_dupechk_contest_id();
 // Bitmap helpers. Public bandmode encoding remains bandid*4+modetype;
 // internally bandid 1..16 is packed densely into bitmap bits 0..63.
 bool dupechk_entry_matches_bandmode(int index, byte bandmode, byte mask);
+bool dupechk_get_callsign(int index, char *dst, size_t dst_size);
+bool dupechk_callsign_equal_at(int index, const char *call);
+bool dupechk_callsign_partial_at(int index, const char *pattern);
 byte dupechk_entry_display_bandmode(int index, byte preferred, byte mask);
 // Bitmap helpers. Public bandmode encoding remains bandid*4+modetype;
 // internally bandid 1..16 is packed densely into bitmap bits 0..63.

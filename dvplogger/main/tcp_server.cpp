@@ -36,6 +36,7 @@
 #include "tcp_server.h"
 #include "console.h"
 #include "misc.h"
+#include "network_arena.h"
 
 
 #include <AsyncTCP.h>
@@ -94,10 +95,17 @@ public:
             vTaskDelete(senderHandle);
             senderHandle = nullptr;
         }
+        // If the sender task was deleted while holding a block outside the
+        // queue, return it as well or the shared arena would remain in
+        // TELNET mode indefinitely.
+        if (senderActiveBlock) {
+            network_arena_telnet_release((uint8_t *)senderActiveBlock);
+            senderActiveBlock = nullptr;
+        }
         if (sendQueue) {
             SendBuffer pending;
             while (xQueueReceive(sendQueue, &pending, 0) == pdTRUE) {
-                free(pending.data);
+                network_arena_telnet_release(pending.data);
             }
             vQueueDelete(sendQueue);
             sendQueue = nullptr;
@@ -136,8 +144,29 @@ public:
 
     void flush() override {
         if (bufferLen == 0 || !client || !client->connected()) return;
-        uint8_t* copy = (uint8_t*)malloc(bufferLen);
-        if (!copy) { telnet_diag("TX flush malloc FAILED len=%u free=%u largest=%u\n", (unsigned)bufferLen, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)); return; }
+        // Reuse the common 6144-byte network arena instead of allocating a
+        // fresh heap chunk for every Telnet flush.  Web owns the arena
+        // exclusively while formatting a heavy response, so wait briefly for
+        // that lease (or for a queued Telnet block) to clear.
+        uint8_t* copy = nullptr;
+        const TickType_t arenaStart = xTaskGetTickCount();
+        do {
+            copy = network_arena_telnet_acquire(bufferLen);
+            if (copy) break;
+            vTaskDelay(1);
+        } while ((xTaskGetTickCount() - arenaStart) < pdMS_TO_TICKS(100));
+        if (!copy) {
+            NetworkArenaStatus st = {};
+            network_arena_get_status(&st);
+            telnet_diag("TX arena busy/drop len=%u mode=%u blocks=%u free=%u largest=%u\n",
+                        (unsigned)bufferLen, (unsigned)st.mode,
+                        (unsigned)st.telnet_blocks,
+                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            bufferLen = 0;
+            ++txDroppedChunks;
+            return;
+        }
         memcpy(copy, bufferBuf, bufferLen);
         SendBuffer buf = {copy, bufferLen};
         // Apply bounded backpressure instead of immediately spinning when TCP is
@@ -160,7 +189,7 @@ public:
                         (unsigned)txDroppedChunks,
                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-            free(copy);
+            network_arena_telnet_release(copy);
         }
         bufferLen = 0;
     }
@@ -191,12 +220,14 @@ private:
     UBaseType_t txQueueHighWater = 0;
     uint32_t txDroppedChunks = 0;
     UBaseType_t senderMinWatermark = UINT_MAX;
+    volatile uint8_t *senderActiveBlock = nullptr;
 
     void senderTaskImpl() {
         SendBuffer buf;
         senderMinWatermark = uxTaskGetStackHighWaterMark(nullptr);
         telnet_diag("sender task start watermark=%u\n", (unsigned)senderMinWatermark);
         while (!stopping && xQueueReceive(sendQueue, &buf, portMAX_DELAY) == pdTRUE) {
+            senderActiveBlock = buf.data;
             UBaseType_t watermark = uxTaskGetStackHighWaterMark(nullptr);
             if (watermark < senderMinWatermark) {
                 senderMinWatermark = watermark;
@@ -210,7 +241,8 @@ private:
                 vTaskDelay(1);
             }
             if (stopping || !client || !client->connected()) {
-                free(buf.data);
+                network_arena_telnet_release(buf.data);
+                senderActiveBlock = nullptr;
                 continue;
             }
             _writing = true;
@@ -231,7 +263,8 @@ private:
 		    //                vTaskDelay(1);
 		    //            }
 
-            free(buf.data);
+            network_arena_telnet_release(buf.data);
+            senderActiveBlock = nullptr;
         }
     }
 

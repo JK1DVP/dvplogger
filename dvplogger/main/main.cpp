@@ -283,7 +283,8 @@ void receive_pkt_handler_main_brd(struct mux_packet *packet)
   }
   if (strncmp(packet->buf,"chdone:",7)==0 ||
       strncmp(packet->buf,"chack:",6)==0 ||
-      strncmp(packet->buf,"chpong",6)==0) {
+      strncmp(packet->buf,"chpong",6)==0 ||
+      strncmp(packet->buf,"chdiag:",7)==0) {
     size_t n = min((size_t)packet->idx, sizeof(buf) - 1);
     memcpy(buf, packet->buf, n); buf[n] = '\0';
     process_callhist_control_response_main(buf);
@@ -894,9 +895,9 @@ void setup()
   // also migrates an old persisted callhist_at=1 setting from the former
   // SUBCPU-first policy.  Explicit CALLHISTSUB remains available at runtime.
 #if JK1DVPLOG_HWVER == 1
-  if (!f_spiram && callhist_at == 1) {
-    callhist_at = 0;
-    console->println("CALLHIST: HW1 no-PSRAM startup prefers MAIN-SD; SUBCPU is fallback");
+  if (!f_spiram && subcpu_online && callhist_at == 0) {
+    callhist_at = 1;
+    console->println("CALLHIST: HW1 no-PSRAM startup prefers packed SUBCPU; MAIN-SD is fallback");
   }
 #else
   if (callhist_at == 0 && !f_spiram) {
@@ -1126,6 +1127,8 @@ void loop() {
 
   time_measure_start_name(PROF_QSO_FILE, "qso_file");
   process_qso_file_operation();
+  process_web_prepared_export_job();
+  process_web_filelist_job();
   time_measure_stop(PROF_QSO_FILE);
   time_measure_start_name(PROF_MUX_SERVICE, "mux_svc");
   service_mux_transport();

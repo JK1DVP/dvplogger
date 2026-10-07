@@ -50,6 +50,7 @@ SRCS "dupechk.cpp"
 SRCS "qso.cpp"
 SRCS "callhist.cpp"
 SRCS "callhist_pkb.cpp"
+SRCS "packed_string.cpp"
 SRCS "callhist_remote.cpp"
 SRCS "callhist_mem.cpp"
 SRCS "cluster.cpp"
@@ -70,6 +71,7 @@ SRCS "cp932_utf8.cpp"
 SRCS "console.cpp"
 SRCS "tcp_server.cpp"
 SRCS "network.cpp"
+SRCS "network_arena.cpp"
 SRCS "timekeep.cpp"
 SRCS "zserver.cpp"
 SRCS "ringbuf.cpp"
@@ -79,12 +81,17 @@ SRCS "cty.cpp"
 SRCS "cty_chk.cpp"
 SRCS "esp32_flasher.c"
 SRCS "sd_wrapper.cpp"
-SRCS "AudioPlayer.cpp"
 SRCS "${COMPRESSED_BINARIES_C}"
 INCLUDE_DIRS ""
 INCLUDE_DIRS "../components/esp-serial-flasher/examples/common/"
-REQUIRES mbedtls
+REQUIRES mbedtls nvs_flash
 )
+
+# AudioPlayer is a SUBCPU feature on HW1/Mini.  Do not link it into MAIN:
+# the implementation carries several KiB of permanent audio/I2S buffers.
+if(NOT "${JK1DVPLOG_HWVER}" STREQUAL "1")
+    target_sources(${COMPONENT_LIB} PRIVATE "AudioPlayer.cpp")
+endif()
 # USE_SD 定義を追加
 #target_compile_definitions(${COMPONENT_LIB} PRIVATE USE_SD)
 target_compile_definitions(

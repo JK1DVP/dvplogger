@@ -71,9 +71,6 @@ class U8G2 *u8g2_r;
 #include "freertos/queue.h"
 //#include <u8g2_font_t0_8_mf.h>
 
-#define DVP_STRINGIFY_INNER(x) #x
-#define DVP_STRINGIFY(x) DVP_STRINGIFY_INNER(x)
-
 uint8_t *dispbuf_r=nullptr, *dispbuf_l=nullptr;
 
 enum DisplayRequestType : uint8_t {
@@ -114,6 +111,18 @@ static DupeAwareDisplayState s_dupe_display_state = DUPE_DISPLAY_IDLE;
 static uint32_t s_dupe_display_wait_started_us = 0;
 static bool s_bandmap_update_pending = false;
 static const uint32_t DUPE_DISPLAY_ACK_BUDGET_US = 8000U;
+
+// A remote DUPE result is authoritative for the callsign that produced it.
+// Keep that value until the corresponding right-OLED frame is rendered; a
+// follow-up async query may otherwise clear radio->dupe before DRAW_PENDING.
+static bool s_dupe_commit_valid = false;
+static int8_t s_dupe_commit_radio_idx = -1;
+static int s_dupe_commit_value = 0;
+static char s_dupe_commit_callsign[LEN_CALLSIGN + 1] = "";
+// Generation fencing: never flush a framebuffer drawn for an older DUPE
+// commit after a newer commit has arrived via service_mux_transport().
+static uint32_t s_dupe_commit_generation = 0;
+static uint32_t s_dupe_drawn_generation = 0;
 
 static void upd_display_render(bool flush_to_oled);
 
@@ -202,6 +211,34 @@ void request_bandmap_update_on_demand()
   s_bandmap_update_pending = true;
 }
 
+void request_dupe_committed_display_update(struct radio *radio,
+                                           const char *callsign, int dupe)
+{
+  if (radio != nullptr && callsign != nullptr) {
+    const int ridx = (int)(radio - radio_list);
+    if (ridx >= 0 && ridx < 3) {
+      s_dupe_commit_radio_idx = (int8_t)ridx;
+      s_dupe_commit_value = dupe ? 1 : 0;
+      strlcpy(s_dupe_commit_callsign, callsign, sizeof(s_dupe_commit_callsign));
+      s_dupe_commit_valid = true;
+      ++s_dupe_commit_generation;
+      if (s_dupe_commit_generation == 0) ++s_dupe_commit_generation;
+    }
+  }
+  // This is an authoritative completed DUPE result.  It must be rendered
+  // before any already-pending OLED flush; otherwise an older framebuffer can
+  // be flushed first and clear s_dupe_commit_valid without ever drawing this
+  // result.  Do not wait for a newer remote query here: the commit belongs to
+  // the callsign captured above and upd_display_render() validates that the
+  // selected radio/callsign still matches before using it.
+  if (display_is_main_loop()) {
+    s_dupe_display_wait_started_us = micros();
+    s_dupe_display_state = DUPE_DISPLAY_DRAW_PENDING;
+  } else {
+    request_dupe_aware_display_update();
+  }
+}
+
 void request_dupe_aware_display_update()
 {
   if (!display_is_main_loop()) {
@@ -251,14 +288,16 @@ void process_dupe_aware_display_update()
       time_measure_stop(PROF_DISPLAY_DUPE_STATE);
       break;
 
-    case DUPE_DISPLAY_DRAW_PENDING:
+    case DUPE_DISPLAY_DRAW_PENDING: {
       // Draw into the RAM framebuffer only.  A later loop performs I2C.
       time_measure_start_name(PROF_DISPLAY_DUPE_DRAW, "dupe_draw");
       time_measure_start_name(PROF_DISPLAY_DRAW_MUX_BEFORE, "draw_mux_pre");
       service_mux_transport();
       time_measure_stop(PROF_DISPLAY_DRAW_MUX_BEFORE);
       time_measure_start_name(PROF_DISPLAY_DRAW_RENDER, "draw_render");
+      const uint32_t draw_generation = s_dupe_commit_generation;
       upd_display_render(false);
+      s_dupe_drawn_generation = draw_generation;
       time_measure_stop(PROF_DISPLAY_DRAW_RENDER);
       time_measure_start_name(PROF_DISPLAY_DRAW_MUX_AFTER, "draw_mux_post");
       service_mux_transport();
@@ -266,16 +305,30 @@ void process_dupe_aware_display_update()
       time_measure_stop(PROF_DISPLAY_DUPE_DRAW);
       s_dupe_display_state = DUPE_DISPLAY_FLUSH_PENDING;
       break;
+    }
 
-    case DUPE_DISPLAY_FLUSH_PENDING:
+    case DUPE_DISPLAY_FLUSH_PENDING: {
       // OLED transfer is still synchronous, so service MUX immediately before
       // and after it.  Consecutive key strokes coalesce by resetting the state.
       time_measure_start_name(PROF_DISPLAY_DUPE_FLUSH, "dupe_flush");
       time_measure_start_name(PROF_DISPLAY_FLUSH_MUX_BEFORE, "flush_mux_pre");
       service_mux_transport();
       time_measure_stop(PROF_DISPLAY_FLUSH_MUX_BEFORE);
+      // service_mux_transport() can commit a newer DUPE result.  If that
+      // happened after the framebuffer was drawn, discard this pending flush
+      // and redraw the newest generation first.
+      if (s_dupe_commit_valid &&
+          s_dupe_drawn_generation != s_dupe_commit_generation) {
+        s_dupe_display_state = DUPE_DISPLAY_DRAW_PENDING;
+        break;
+      }
       time_measure_start_name(PROF_DISPLAY_FLUSH_OLED, "flush_oled");
       right_display_sendBuffer();
+      // The committed DUPE value has now reached the OLED.  Do not let it
+      // affect a later callsign/frame.
+      s_dupe_commit_valid = false;
+      s_dupe_commit_radio_idx = -1;
+      s_dupe_commit_callsign[0] = '\0';
       time_measure_stop(PROF_DISPLAY_FLUSH_OLED);
       time_measure_start_name(PROF_DISPLAY_FLUSH_MUX_AFTER, "flush_mux_post");
       service_mux_transport();
@@ -283,6 +336,7 @@ void process_dupe_aware_display_update()
       time_measure_stop(PROF_DISPLAY_DUPE_FLUSH);
       s_dupe_display_state = DUPE_DISPLAY_IDLE;
       break;
+    }
   }
 
   // Bandmap redraws use the left OLED and may also take about 50 ms.  Run
@@ -850,7 +904,15 @@ void upd_display_stat() {
   }
 
   char c;
-  if (radio->dupe == 1) {
+  int display_dupe = radio->dupe;
+  if (s_dupe_commit_valid) {
+    const int ridx = (int)(radio - radio_list);
+    if (ridx == s_dupe_commit_radio_idx &&
+        strcmp(radio->callsign + 2, s_dupe_commit_callsign) == 0) {
+      display_dupe = s_dupe_commit_value;
+    }
+  }
+  if (display_dupe == 1) {
     if (radio->multi < 0) {
       c = '!';  // invalid multi and dupe as well
     } else {
@@ -1372,20 +1434,17 @@ void init_display() {
   //  w = u8g2_r->getStrWidth(lcdbuf);
   dp->wcol = 128;  // the whole line
 
-  char build_line[40];
-  snprintf(build_line, sizeof(build_line), "%s HW%s",
-           __DATE__, DVP_STRINGIFY(JK1DVPLOG_HWVER));
+  char hw_line[8];
+  snprintf(hw_line, sizeof(hw_line), "HW%d", JK1DVPLOG_HWVER);
 
   u8g2_l->drawStr(0, 0, "DVPlogger");
-  u8g2_l->drawStr(0, 13, JK1DVPLOG_VERSION_STRING);
-  u8g2_l->drawStr(0, 26, build_line);
+  u8g2_l->drawStr(0, 13, hw_line);
+  u8g2_l->drawStr(0, 26, __DATE__);
   u8g2_l->drawStr(0, 39, __TIME__);
   u8g2_l->drawUTF8(0, 52, "初期化中...");
 
-  console->printf("[BUILD] DVPlogger %s HW%s built %s %s\n",
-                  JK1DVPLOG_VERSION_STRING,
-                  DVP_STRINGIFY(JK1DVPLOG_HWVER),
-                  __DATE__, __TIME__);
+  console->printf("[BUILD] DVPlogger HW%d built %s %s\n",
+                  JK1DVPLOG_HWVER, __DATE__, __TIME__);
   console->println("初期化中...");
 
   i2c_guarded_send_buffer(u8g2_l, "oled_l");  // transfer internal memory to the display

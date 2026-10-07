@@ -44,7 +44,6 @@
 
 char cluster_server[40] = "arc.jg1vgx.net";
 int cluster_port = 7000;
-char cluster_buf[NCHR_CLUSTER_RINGBUF];
 struct cluster cluster;
 
 char cluster2_startup_cmd[N_CLUSTER2_STARTUP_CMDS][LEN_CLUSTER_CMD + 3];
@@ -74,7 +73,6 @@ struct ClusterRuntime {
 };
 
 static struct cluster cluster2;
-static char cluster2_buf[NCHR_CLUSTER_RINGBUF];
 static ClusterRuntime cluster_rt[N_CLUSTER_CONNECTIONS];
 
 int cluster1_auto_enable = 1;
@@ -97,6 +95,7 @@ static inline bool passed_timeout_cluster(ClusterRuntime *rt) {
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include <string>
 
 static const char* TAG = "cluster";
@@ -109,6 +108,58 @@ struct ClusterRxSpot {
 };
 
 static QueueHandle_t s_cluster_rx_queue = nullptr;
+static volatile UBaseType_t s_cluster_queue_highwater = 0;
+static uint32_t s_cluster_spots_processed = 0;
+static UBaseType_t s_cluster_stack_hwm_min = (UBaseType_t)-1;
+static volatile uint32_t s_cluster_cb_calls = 0;
+static volatile uint32_t s_cluster_cb_bytes = 0;
+static volatile uint32_t s_cluster_complete_lines = 0;
+static volatile uint32_t s_cluster_filtered_lines = 0;
+static volatile uint32_t s_cluster_enqueued_spots = 0;
+static volatile uint32_t s_cluster_cb_min_free = UINT32_MAX;
+static volatile uint32_t s_cluster_cb_min_largest = UINT32_MAX;
+
+static inline void cluster_capture_callback_heap(void) {
+  const uint32_t free8 = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const uint32_t largest8 =
+      (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (free8 < s_cluster_cb_min_free) s_cluster_cb_min_free = free8;
+  if (largest8 < s_cluster_cb_min_largest) s_cluster_cb_min_largest = largest8;
+}
+
+static inline void cluster_note_queue_depth(void) {
+  if (!s_cluster_rx_queue) return;
+  const UBaseType_t queued = uxQueueMessagesWaiting(s_cluster_rx_queue);
+  if (queued > s_cluster_queue_highwater)
+    s_cluster_queue_highwater = queued;
+}
+
+static void cluster_diag_report(const char *reason) {
+  const UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
+  if (stack_hwm < s_cluster_stack_hwm_min)
+    s_cluster_stack_hwm_min = stack_hwm;
+  const UBaseType_t queued = s_cluster_rx_queue
+      ? uxQueueMessagesWaiting(s_cluster_rx_queue) : 0;
+  console->printf("[CLUSTER-MEM] %s processed=%lu queued=%u/%u qmax=%u "
+                  "stack_hwm=%u stack_hwm_min=%u free=%u largest=%u min=%u "
+                  "cb=%lu bytes=%lu lines=%lu filtered=%lu enq=%lu "
+                  "cb_min_free=%lu cb_min_largest=%lu\n",
+                  reason ? reason : "?",
+                  (unsigned long)s_cluster_spots_processed,
+                  (unsigned)queued, (unsigned)CLUSTER_RX_QUEUE_LEN,
+                  (unsigned)s_cluster_queue_highwater,
+                  (unsigned)stack_hwm, (unsigned)s_cluster_stack_hwm_min,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+                  (unsigned long)s_cluster_cb_calls,
+                  (unsigned long)s_cluster_cb_bytes,
+                  (unsigned long)s_cluster_complete_lines,
+                  (unsigned long)s_cluster_filtered_lines,
+                  (unsigned long)s_cluster_enqueued_spots,
+                  (unsigned long)(s_cluster_cb_min_free == UINT32_MAX ? 0 : s_cluster_cb_min_free),
+                  (unsigned long)(s_cluster_cb_min_largest == UINT32_MAX ? 0 : s_cluster_cb_min_largest));
+}
 
 static void note_cluster_rx_overload(ClusterRuntime *rt, size_t dropped_bytes,
                                      bool overlong) {
@@ -166,19 +217,27 @@ static void enqueue_complete_cluster_line(ClusterRuntime *rt) {
   if (!rt || !s_cluster_rx_queue || rt->rx_line_len == 0) return;
 
   rt->rx_line[rt->rx_line_len] = '\0';
+  ++s_cluster_complete_lines;
 
   ClusterRxSpot spot{};
   spot.source = rt->id;
   spot.raw_len = rt->rx_line_len;
-  if (!parse_cluster_spot_for_queue(rt->rx_line, rt->rx_line_len, &spot))
+  if (!parse_cluster_spot_for_queue(rt->rx_line, rt->rx_line_len, &spot)) {
+    ++s_cluster_filtered_lines;
     return;
+  }
 
-  if (xQueueSend(s_cluster_rx_queue, &spot, 0) != pdTRUE) {
+  if (xQueueSend(s_cluster_rx_queue, &spot, 0) == pdTRUE) {
+    ++s_cluster_enqueued_spots;
+    cluster_note_queue_depth();
+  } else {
     // Preserve the newest useful spot under burst load.  Discard one complete
     // parsed spot, never a partial TCP line.
     ClusterRxSpot old_spot;
     if (xQueueReceive(s_cluster_rx_queue, &old_spot, 0) == pdTRUE &&
         xQueueSend(s_cluster_rx_queue, &spot, 0) == pdTRUE) {
+      ++s_cluster_enqueued_spots;
+      cluster_note_queue_depth();
       ClusterRuntime *old_rt = old_spot.source < N_CLUSTER_CONNECTIONS
           ? &cluster_rt[old_spot.source] : rt;
       note_cluster_rx_overload(old_rt, old_spot.raw_len, false);
@@ -196,6 +255,9 @@ void handleData_cluster(void *arg, AsyncClient *client, void *data, size_t len)
   ClusterRuntime *rt = static_cast<ClusterRuntime *>(arg);
   if (!rt || rt->state->stat != 5 || !s_cluster_rx_queue) return;
 
+  ++s_cluster_cb_calls;
+  s_cluster_cb_bytes += (uint32_t)len;
+  cluster_capture_callback_heap();
   renew_timeout_cluster(rt);
   const uint8_t *src = static_cast<const uint8_t *>(data);
   for (size_t i = 0; i < len; ++i) {
@@ -226,6 +288,7 @@ void handleData_cluster(void *arg, AsyncClient *client, void *data, size_t len)
     }
     rt->rx_line[rt->rx_line_len++] = c;
   }
+  cluster_capture_callback_heap();
 }
 
 void upd_bandmap_cluster1(uint8_t source, const char *cmdbuf) {
@@ -313,15 +376,32 @@ static void cluster_worker_task(void* /*pv*/) {
         snprintf(line, sizeof(line), "DX de Q: %s %s CW",
                  spot.freq, spot.station);
         get_info_cluster(line);
+        ++s_cluster_spots_processed;
+        const uint32_t n = s_cluster_spots_processed;
+        if (n == 1U || n == 2U || n == 4U || n == 8U || n == 16U ||
+            (n & 0x1fU) == 0U)
+          cluster_diag_report("worker");
     }
 }
 
 void cluster_io_init() {
     if (!s_cluster_rx_queue) {
+        console->printf("[CLUSTER-MEM] queue init len=%u item=%u payload=%u bytes\n",
+                        (unsigned)CLUSTER_RX_QUEUE_LEN,
+                        (unsigned)sizeof(ClusterRxSpot),
+                        (unsigned)(CLUSTER_RX_QUEUE_LEN * sizeof(ClusterRxSpot)));
         s_cluster_rx_queue = xQueueCreate(CLUSTER_RX_QUEUE_LEN, sizeof(ClusterRxSpot));
         configASSERT(s_cluster_rx_queue != nullptr);
-        xTaskCreatePinnedToCore(cluster_worker_task, "cluster_worker",
-                               6144, nullptr, 4, nullptr, tskNO_AFFINITY);
+#if JK1DVPLOG_HWVER == 1
+        // Observed HW1 high-water minimum is ~3968 bytes with a 6144-byte
+        // stack (about 2.2 KiB actually used).  4096 retains ~1.9 KiB margin.
+        const uint32_t cluster_stack = 4096;
+#else
+        const uint32_t cluster_stack = 6144;
+#endif
+        BaseType_t task_ok = xTaskCreatePinnedToCore(cluster_worker_task, "cluster_worker",
+                               cluster_stack, nullptr, 4, nullptr, tskNO_AFFINITY);
+        configASSERT(task_ok == pdPASS);
     }
 }
 
@@ -475,8 +555,12 @@ void get_info_cluster(const char *ssrc) {
     s1 = strtok(NULL, " ");  // s1 points to freq
   } else return;
   if (s1 == NULL) return;
-  // console->print("FSTR:"); console->print((String)s1); console->print(":");
-  frequency = check_frequency((String)(s1));
+  // Parse directly from the token.  Avoid constructing a temporary Arduino
+  // String for every cluster spot; repeated String allocation fragments the
+  // small HW1 heap under a busy skimmer feed.
+  char *freq_end = nullptr;
+  frequency = strtod(s1, &freq_end);
+  if (!s1[0] || !freq_end || *freq_end != '\0') return;
   // console->print(" freq double "); console->print(frequency);
   ifreq = frequency * (1000/FREQ_UNIT);  // frequency in FREQ_UNIT conversion
 
@@ -1011,9 +1095,12 @@ void cluster_process() {
   for (uint8_t i = 0; i < N_CLUSTER_CONNECTIONS; ++i) cluster_process_one(&cluster_rt[i]);
 }
 
-static void init_cluster_state(struct cluster *st, char *ring_storage) {
-  st->ringbuf.buf = ring_storage;
-  st->ringbuf.len = NCHR_CLUSTER_RINGBUF;
+static void init_cluster_state(struct cluster *st) {
+  // The AsyncTCP callback now parses complete lines directly into the compact
+  // ClusterRxSpot queue.  The old 1 KiB per-connection ring buffers are no
+  // longer read or written, so do not reserve 2 KiB of permanent BSS for them.
+  st->ringbuf.buf = nullptr;
+  st->ringbuf.len = 0;
   st->ringbuf.wptr = 0;
   st->ringbuf.rptr = 0;
   st->timeout = 0;
@@ -1027,8 +1114,8 @@ void init_cluster_info() {
   memtrace_event("cluster before io init");
   cluster_io_init();
   memtrace_event("cluster after io init");
-  init_cluster_state(&cluster, cluster_buf);
-  init_cluster_state(&cluster2, cluster2_buf);
+  init_cluster_state(&cluster);
+  init_cluster_state(&cluster2);
 
   memset(cluster_rt, 0, sizeof(cluster_rt));
 

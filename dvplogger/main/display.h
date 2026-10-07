@@ -24,6 +24,7 @@
 void init_display_dispatch();
 void process_display_requests();
 void request_dupe_aware_display_update();
+void request_dupe_committed_display_update(struct radio *radio, const char *callsign, int dupe);
 void request_display_update_on_demand();
 void request_partial_check_display_on_demand(struct radio *radio);
 void request_bandmap_update_on_demand();

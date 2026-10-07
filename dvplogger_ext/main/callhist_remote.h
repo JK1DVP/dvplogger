@@ -35,4 +35,7 @@ int append_callhist_partial_subcpu(const char *call, struct check_entry_list *en
 int get_callhist_subcpu_count();
 size_t get_callhist_subcpu_bytes();
 bool get_callhist_subcpu_entry(int index, const char **call, const char **exch);
+bool get_callhist_subcpu_match(int index, const char *pattern, bool *exact_match,
+                               char *call, size_t call_size,
+                               char *exch, size_t exch_size);
 #endif

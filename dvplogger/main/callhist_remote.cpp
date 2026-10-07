@@ -23,10 +23,12 @@
 #include "variables.h"
 #include "settings.h"
 #include "callhist_remote.h"
+#include "packed_string.h"
 #include "callhist.h"
 #include "dupechk.h"
 #include "mux_transport.h"
 #include "display.h"
+#include "esp_heap_caps.h"
 #ifdef DVPLOGGER_EXT
 struct remote_callhist_entry { char call[LEN_CALLSIGN+1]; char exch[LEN_EXCH+1]; };
 static remote_callhist_entry *rch = NULL;
@@ -133,6 +135,7 @@ bool get_callhist_subcpu_entry(int i,const char **c,const char **e){if(i<0||i>=r
 static volatile bool ch_done = false;
 static int ch_count = 0;
 static size_t ch_bytes = 0;
+static size_t ch_mem_bytes = 0;
 static volatile bool ch_ack_received = false;
 static volatile bool ch_ping_received = false;
 static int ch_ack_seq = 0;
@@ -140,15 +143,21 @@ static int ch_ack_count = 0;
 static int ch_ack_ok = 0;
 
 void process_callhist_control_response_main(const char *b) {
+  if (!strncmp(b, "chdiag:", 7)) {
+    console->printf("CALLHIST SUB: %s\n", b + 7);
+    return;
+  }
   if (!strcmp(b, "chpong")) {
     ch_ping_received = true;
     return;
   }
   if (!strncmp(b, "chdone:", 7)) {
-    unsigned n = 0, sz = 0;
-    if (sscanf(b + 7, "%u|%u", &n, &sz) == 2) {
+    unsigned n = 0, sz = 0, mem = 0;
+    int parsed = sscanf(b + 7, "%u|%u|%u", &n, &sz, &mem);
+    if (parsed >= 2) {
       ch_count = n;
       ch_bytes = sz;
+      ch_mem_bytes = (parsed >= 3) ? mem : 0;
       ch_done = true;
     }
     return;
@@ -161,6 +170,9 @@ void process_callhist_control_response_main(const char *b) {
       ch_ack_count = count;
       ch_ack_ok = ok;
       ch_ack_received = true;
+      if (seq <= 3 || !ok)
+        console->printf("CALLHIST ACK rx seq=%d count=%d ok=%d\n",
+                        seq, count, ok);
     }
   }
 }
@@ -174,6 +186,12 @@ static bool send_callhist_entry_with_ack(int seq, const char *packet) {
 
   for (int attempt = 0; attempt < max_retries; attempt++) {
     ch_ack_received = false;
+    if (seq <= 3 || attempt > 0) {
+      console->printf("CALLHIST TX seq=%d attempt=%d len=%u free=%u largest=%u\n",
+                      seq, attempt + 1, (unsigned)strlen(packet),
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
                            (unsigned char *)packet, strlen(packet));
 
@@ -182,13 +200,24 @@ static bool send_callhist_entry_with_ack(int seq, const char *packet) {
       if (f_mux_transport) mux_transport.recv_pkt();
       if (ch_ack_received) {
         if (ch_ack_seq == seq) {
-          return ch_ack_ok != 0 && ch_ack_count == seq;
+          const bool ok = ch_ack_ok != 0 && ch_ack_count == seq;
+          if (seq <= 3 || !ok)
+            console->printf("CALLHIST TX result seq=%d attempt=%d ack_count=%d ack_ok=%d result=%s\n",
+                            seq, attempt + 1, ch_ack_count, ch_ack_ok,
+                            ok ? "OK" : "NG");
+          return ok;
         }
-        /* Ignore a stale ACK and continue waiting for this sequence. */
+        console->printf("CALLHIST stale ACK waiting=%d got=%d count=%d ok=%d\n",
+                        seq, ch_ack_seq, ch_ack_count, ch_ack_ok);
         ch_ack_received = false;
       }
       delay(1);
     }
+    console->printf("CALLHIST ACK timeout seq=%d attempt=%d free=%u largest=%u min=%u\n",
+                    seq, attempt + 1,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
   }
 
   return false;
@@ -218,8 +247,29 @@ bool load_callhist_subcpu(const char *fn) {
 
   char line[128];
   int count = 0;
-  while (readline(&f, line, 0x0d0a, sizeof(line)) != 0)
-    if (line[0]) count++;
+  size_t call_pool_bytes = 0;
+  size_t exch_pool_bytes = 0;
+  while (readline(&f, line, 0x0d0a, sizeof(line)) != 0) {
+    char *p = line;
+    while (*p == ' ') p++;
+    char *sp = strchr(p, ' ');
+    if (!sp) continue;
+    *sp++ = '\0';
+    while (*sp == ' ') sp++;
+    if (!*p || !*sp) continue;
+    char call_tmp[LEN_CALLSIGN + 1];
+    strncpy(call_tmp, p, LEN_CALLSIGN);
+    call_tmp[LEN_CALLSIGN] = '\0';
+    uint8_t packed_tmp[PACKED6_CALL_MAX_BYTES];
+    const size_t call_bytes = packed6_encode(call_tmp, true, packed_tmp,
+                                             sizeof(packed_tmp));
+    if (!call_bytes) continue;
+    size_t exch_len = strlen(sp);
+    if (exch_len > LEN_EXCH) exch_len = LEN_EXCH;
+    call_pool_bytes += call_bytes;
+    exch_pool_bytes += exch_len;
+    count++;
+  }
   f.close();
 
   snprintf(dp->lcdbuf, sizeof(dp->lcdbuf),
@@ -227,7 +277,13 @@ bool load_callhist_subcpu(const char *fn) {
   upd_display_info_flash(dp->lcdbuf);
 
   char b[160];
-  snprintf(b, sizeof(b), "chreset%d", count);
+  snprintf(b, sizeof(b), "chreset%d|%u|%u", count,
+           (unsigned)call_pool_bytes, (unsigned)exch_pool_bytes);
+  console->printf("CALLHIST reset entries=%d callpool=%u exchpool=%u packet_len=%u free=%u largest=%u\n",
+                  count, (unsigned)call_pool_bytes, (unsigned)exch_pool_bytes,
+                  (unsigned)strlen(b),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   ch_done = false;
   ch_ack_received = false;
 
@@ -239,6 +295,8 @@ bool load_callhist_subcpu(const char *fn) {
     mux_transport.send_pkt(MUX_PORT_MAIN_BRD_CTRL, MUX_PORT_EXT_BRD_CTRL,
                            (unsigned char *)b, strlen(b));
     reset_ready = callhist_subcpu_alive(750);
+    console->printf("CALLHIST reset attempt=%d ready=%d\n",
+                    attempt + 1, reset_ready ? 1 : 0);
     if (!reset_ready) delay(50);
   }
   if (!reset_ready) {
@@ -261,10 +319,15 @@ bool load_callhist_subcpu(const char *fn) {
     *sp++ = '\0';
     while (*sp == ' ') sp++;
     if (!*p || !*sp) continue;
+    char call_tmp[LEN_CALLSIGN + 1];
+    strncpy(call_tmp, p, LEN_CALLSIGN);
+    call_tmp[LEN_CALLSIGN] = '\0';
+    uint8_t packed_tmp[PACKED6_CALL_MAX_BYTES];
+    if (!packed6_encode(call_tmp, true, packed_tmp, sizeof(packed_tmp))) continue;
 
     int seq = sent + 1;
-    snprintf(b, sizeof(b), "che%d|%.*s|%.*s",
-             seq, LEN_CALLSIGN, p, LEN_EXCH, sp);
+    snprintf(b, sizeof(b), "che%d|%s|%.*s",
+             seq, call_tmp, LEN_EXCH, sp);
     if (!send_callhist_entry_with_ack(seq, b)) {
       console->printf("callhist transfer failed at seq=%d sent=%d\n",
                       seq, sent);
@@ -291,8 +354,9 @@ bool load_callhist_subcpu(const char *fn) {
   }
 
   console->printf(
-      "subcpu callhist: received=%d sent=%d bytes=%u done=%d\n",
-      ch_count, sent, (unsigned)ch_bytes, ch_done ? 1 : 0);
+      "subcpu callhist: received=%d sent=%d source_bytes=%u memory=%u done=%d\n",
+      ch_count, sent, (unsigned)ch_bytes, (unsigned)ch_mem_bytes,
+      ch_done ? 1 : 0);
 
   return ch_done && ch_count == sent;
 }

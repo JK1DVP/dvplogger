@@ -14,6 +14,11 @@
  Web      :  http://www.tkjelectronics.com
  e-mail   :  kristianl@tkjelectronics.com
  */
+/*
+ * DVPlogger-specific modifications:
+ * Copyright (c) 2025-2026 Eiichiro Araki
+ */
+
 
 #include "BTD.h"
 // To enable serial debugging see "settings.h"

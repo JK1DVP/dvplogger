@@ -265,6 +265,51 @@ void interval_process() {
       // protocols retain the legacy response gate.
       if (!yaesu_ascii && radio->f_civ_response_expected) continue;
 
+      if (radio->rig_spec->no_polling) {
+        // Keep the existing 100-ms scheduler and slot layout unchanged.
+        // NP:1 suppresses normal periodic traffic.  A program-originated SET
+        // may arm one confirmation readback, which is sent only when the
+        // corresponding existing interval slot arrives.
+        if (yaesu_ascii) {
+          // Yaesu IF; reports frequency and mode together.
+          switch (interval_process_stat & 3) {
+          case 0:
+          case 2:
+            if (radio->freq_readback_once_pending ||
+                radio->mode_readback_once_pending) {
+              send_query_civ(Freq, radio);
+              radio->freq_readback_once_pending = false;
+              radio->mode_readback_once_pending = false;
+            }
+            break;
+          default:
+            break;
+          }
+        } else {
+          switch (interval_process_stat) {
+          case 0:
+          case 2:
+          case 5:
+          case 8:
+            if (radio->freq_readback_once_pending) {
+              send_query_civ(Freq, radio);
+              radio->freq_readback_once_pending = false;
+            }
+            break;
+          case 6:
+          case 9:
+            if (radio->mode_readback_once_pending) {
+              send_query_civ(Mode, radio);
+              radio->mode_readback_once_pending = false;
+            }
+            break;
+          default:
+            break;
+          }
+        }
+        continue;
+      }
+
       if (yaesu_ascii) {
         switch (interval_process_stat & 3) {
         case 0:

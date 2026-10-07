@@ -1,30 +1,13 @@
-/*
- * dvplogger - field companion for ham radio operator
- * dvplogger - アマチュア無線家のためのフィールド支援ツール
- * Copyright (c) 2021-2026 Eiichiro Araki
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- *
- * SPDX-License-Identifier: GPL-2.0-or-later
- */
-// Copyright (c) 2021-2025 Eiichiro Araki
-// SPDX-FileCopyrightText: 2025 2021-2025 Eiichiro Araki
-//
-// SPDX-License-Identifier: GPL-2.0-or-later
+/*********************************************************************
+ Adafruit invests time and resources providing this open source code,
+ please support Adafruit and open-source hardware by purchasing
+ products from Adafruit!
 
-
-
+ MIT license, check LICENSE for more information
+ Copyright (c) 2019 Ha Thach for Adafruit Industries
+ All text above, and the splash screen below must be included in
+ any redistribution
+*********************************************************************/
 
 // nRF52 and ESP32 use freeRTOS, we may need to run USBhost.task() in its own rtos's thread.
 // Since USBHost.task() will put loop() into dormant state and prevent followed code from running

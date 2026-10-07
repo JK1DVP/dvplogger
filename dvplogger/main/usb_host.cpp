@@ -1892,7 +1892,7 @@ static void ats_mini_start_monitor_if_needed()
 
   ats_mini_monitor_retry_ms = now + 500;
   if (verbose & VERBOSE_USB)
-    console->printf("ATS-MINI monitor start rcode=0x%02X; retrying\\n", rcode);
+    console->printf("ATS-MINI monitor start rcode=0x%02X; retrying\n", rcode);
 }
 
 void ACMprocess() {
