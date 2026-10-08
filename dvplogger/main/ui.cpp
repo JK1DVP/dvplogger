@@ -51,6 +51,7 @@
 #include "ui.h"
 #include "cw_keying.h"
 #include "settings.h"
+#include "web_server.h"
 #include "display.h"
 #include "edit_buf.h"
 #include "dupechk.h"
@@ -2296,6 +2297,19 @@ void process_enter(int option) {
   //          case 0: // non keyer mode
   // 21/11/7 Enter will also be processed similarly in keyer mode
   switch (radio->ptr_curr) {
+  // Commit the LCD Sent EXCH / CW message edit on Enter.  Other fields
+  // retain their existing Enter behavior; don't save on every keystroke.
+  case 5:
+  case 10: case 11: case 12: case 13: case 14: case 15: case 16:
+  case 30: case 31: case 32: case 33: case 34: case 35: case 36:
+    if ((radio->ptr_curr == 5) ||
+        (radio->ptr_curr >= 10 && radio->ptr_curr < 10 + N_CWMSG) ||
+        (radio->ptr_curr >= 30 && radio->ptr_curr < 30 + N_CWMSG)) {
+      if (plogw->contest_id != 0 && plogw->contest_name[2] != '\0')
+        save_contest_runtime_preset(plogw->contest_name + 2);
+      save_settings("");
+    }
+    break;
   case 1: { // number entry
     // A comma or slash means one physical QSO should be recorded for both the
     // active and previous contests.  Parse a copy: do not destroy the edit

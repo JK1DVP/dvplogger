@@ -644,6 +644,10 @@ int load_settings(const char *fn) {
   }
   strcat(fnbuf, ".txt");
   plogw->ostream->println(fnbuf);
+  // Recover an interrupted settings rename (no content validation).
+  char bakbuf[40];
+  snprintf(bakbuf, sizeof(bakbuf), "%s.bak", fnbuf);
+  if (!SD.exists(fnbuf) && SD.exists(bakbuf)) SD.rename(bakbuf, fnbuf);
   // f = SPIFFS.open(fnbuf, FILE_READ);
   f = SD.open(fnbuf, FILE_READ);
 
@@ -789,9 +793,12 @@ int save_settings(const char *fn) {
   strcat(fnbuf, ".txt");
   plogw->ostream->println(fnbuf);
 
-  //  f = SPIFFS.open(settingsfn, FILE_WRITE);
-  //  f = SPIFFS.open(fnbuf, FILE_WRITE);
-  f = SD.open(fnbuf, FILE_WRITE);
+  // Write a temporary file first; do not truncate the live settings.
+  char tmpbuf[40], bakbuf[40];
+  snprintf(tmpbuf, sizeof(tmpbuf), "%s.tmp", fnbuf);
+  snprintf(bakbuf, sizeof(bakbuf), "%s.bak", fnbuf);
+  if (SD.exists(tmpbuf)) SD.remove(tmpbuf);
+  f = SD.open(tmpbuf, FILE_WRITE);
 
   if (!f) {
     if (!plogw->f_console_emu) plogw->ostream->println("Failed to open file settings.txt for writing");
@@ -860,7 +867,20 @@ int save_settings(const char *fn) {
   //   f.print("my_callsign ");   f.println(plogw->my_callsign+2);
   //   f.print("recv_exch ");   f.println(plogw->recv_exch+2);
 
+  f.flush();
   f.close();
+  if (!SD.exists(tmpbuf)) return 0;
+  // Keep the previous good file until the replacement has been installed.
+  if (SD.exists(bakbuf)) SD.remove(bakbuf);
+  if (SD.exists(fnbuf) && !SD.rename(fnbuf, bakbuf)) {
+    SD.remove(tmpbuf);
+    return 0;
+  }
+  if (!SD.rename(tmpbuf, fnbuf)) {
+    if (SD.exists(bakbuf)) SD.rename(bakbuf, fnbuf);
+    return 0;
+  }
+  if (SD.exists(bakbuf)) SD.remove(bakbuf);
   if (!plogw->f_console_emu) plogw->ostream->println("saving finished.");
   return 1;
 }

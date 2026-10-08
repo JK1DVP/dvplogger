@@ -381,7 +381,9 @@ void process_web_ui_queue() {
           strlcpy(plogw->sent_exch + 2, cmd.input0, LEN_SENT_EXCH_WINDOW + 1);
           plogw->sent_exch[1] = strlen(plogw->sent_exch + 2);
           // Keep the currently selected contest preset in sync with /op.
-          save_contest_runtime_preset(plogw->contest_name + 2);
+          if (plogw->contest_id != 0 && plogw->contest_name[2])
+            save_contest_runtime_preset(plogw->contest_name + 2);
+          save_settings("");
           break;
         case 5: strlcpy(plogw->my_callsign+2, cmd.input0, LEN_CALL_WINDOW + 1); break;
       }
@@ -2241,6 +2243,8 @@ static void parse_user_slots_from_cache() {
 static bool read_contest_file_into_cache() {
   contest_web_file_cache[0] = '\0';
   contest_web_file_cache_len = 0;
+  if (!SD.exists(CONTEST_PRESET_FILE) && SD.exists("/CONTEST.BAK"))
+    SD.rename("/CONTEST.BAK", CONTEST_PRESET_FILE);
   File f = SD.open(CONTEST_PRESET_FILE, FILE_READ);
   if (!f) {
     contest_web_file_loaded = false;
@@ -3129,9 +3133,19 @@ void setupSettingsPageHandler() {
             return;
           }
 
-          strncpy(pwin_index(index) + 2, value.c_str(),
-                  pwin_index(index)[0] - 1);
-          (pwin_index(index) + 2)[pwin_index(index)[0] - 1] = '\0';
+          char *field = pwin_index(index);
+          const size_t capacity = field[0] - 1;
+          strlcpy(field + 2, value.c_str(), capacity + 1);
+          field[1] = strlen(field + 2);
+          // Settings page indices: 5=Sent EXCH, 10..16=CW F1..F7.
+          if (index == 5 || (index >= 10 && index < 10 + N_CWMSG)) {
+            if (plogw->contest_id != 0 && plogw->contest_name[2])
+              save_contest_runtime_preset(plogw->contest_name + 2);
+            if (!save_settings("")) {
+              request->send(500, "text/plain", "Settings save failed");
+              return;
+            }
+          }
         }
         request->send(200, "text/plain", "Updated setting.");
         return;
